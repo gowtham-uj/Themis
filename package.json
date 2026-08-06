@@ -16,6 +16,7 @@
     "lint": "eslint src --max-warnings 0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.0.0",
     "eslint": "^9.0.0",
     "tsx": "^4.19.0",
@@ -23,6 +24,8 @@
     "vitest": "^2.1.0"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "file:../_inspect/pi/packages/coding-agent"
+    "@earendil-works/pi-coding-agent": "file:../_inspect/pi/packages/coding-agent",
+    "better-sqlite3": "^13.0.3",
+    "drizzle-orm": "^0.45.2"
   }
 }
