@@ -10,9 +10,12 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createServer as createNetServer } from "node:net";
 import type {
   ContainerHandle,
   ContainerRuntime,
+  PortMapping,
+  ResolvedPort,
   RunContainerSpec,
 } from "./runtime.js";
 
@@ -87,11 +90,49 @@ export interface FakeRuntimeRecord {
   workspaceDir: string;
   argv: string[];
   image: string;
+  /** Published ports with ephemeral requests resolved to concrete host ports. */
+  ports?: ResolvedPort[];
+}
+
+/**
+ * Ask the OS for a free TCP port by binding :0 and reading it back.
+ *
+ * The fake runtime has no daemon to do port publishing, so it resolves
+ * `hostPort: 0` the same way the real one would: by getting a concrete port
+ * the caller can address. The probe socket is closed immediately — a narrow
+ * race the real Docker backend does not have, and acceptable for a test double.
+ */
+async function freePort(): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const srv = createNetServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+/** Resolve every requested mapping to a concrete host port. */
+export async function resolvePorts(
+  ports: PortMapping[] | undefined,
+): Promise<ResolvedPort[]> {
+  if (!ports || ports.length === 0) return [];
+  const out: ResolvedPort[] = [];
+  for (const p of ports) {
+    const hostPort =
+      p.hostPort && p.hostPort > 0 ? p.hostPort : await freePort();
+    out.push({ ...p, hostPort, protocol: p.protocol ?? "tcp" });
+  }
+  return out;
 }
 
 class FakeContainerHandle implements ContainerHandle {
   readonly id: string;
   readonly image: string;
+  /** Published ports, ephemeral requests already resolved. */
+  readonly ports: ResolvedPort[];
   /** Snapshot of the launch spec knobs (limits, network, …) for tests. */
   readonly record: FakeRuntimeRecord;
 
@@ -108,10 +149,16 @@ class FakeContainerHandle implements ContainerHandle {
   private killTimer: NodeJS.Timeout | undefined;
   private stopGraceMs: number;
 
-  constructor(spec: RunContainerSpec, child: ChildProcess) {
+  constructor(
+    spec: RunContainerSpec,
+    child: ChildProcess,
+    ports: ResolvedPort[] = [],
+  ) {
     this.id = `fake-${randomUUID()}`;
     this.image = spec.image;
+    this.ports = ports;
     this.record = {
+      ports: ports.length > 0 ? ports : undefined,
       limits: { ...spec.limits },
       network: spec.network,
       networkAllowlist: spec.networkAllowlist
@@ -375,16 +422,28 @@ export class FakeContainerRuntime implements ContainerRuntime {
       throw new Error("FakeContainerRuntime.run: missing executable in argv");
     }
 
+    // Resolve published ports before spawning so the child can be told which
+    // host ports it got (AGENTEVAL_PORT_<NAME>), mirroring how a real runtime
+    // publishes before the process starts.
+    const ports = await resolvePorts(spec.ports);
+    const portEnv: Record<string, string> = {};
+    for (const p of ports) {
+      const key = (p.name ?? String(p.containerPort))
+        .toUpperCase()
+        .replace(/[^A-Z0-9]+/g, "_");
+      portEnv[`AGENTEVAL_PORT_${key}`] = String(p.hostPort);
+    }
+
     // Limits (cpus/memory/pids) and network policy are recorded only — host has no
     // cgroup enforcement in this double. See handle.record.
     const child = spawn(file, args, {
       cwd: spec.workspaceDir,
-      env: { ...process.env, ...spec.env },
+      env: { ...process.env, ...spec.env, ...portEnv },
       stdio: ["ignore", "pipe", "pipe"],
       // detached:false — we want the child in our process group for SIGSTOP/SIGCONT.
     });
 
-    const handle = new FakeContainerHandle(spec, child);
+    const handle = new FakeContainerHandle(spec, child, ports);
     this.handles.push(handle);
     return handle;
   }

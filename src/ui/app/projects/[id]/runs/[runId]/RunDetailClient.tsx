@@ -11,12 +11,16 @@ import {
   runEventsUrl,
   runReportUrl,
 } from "../../../../../lib/api.js";
+import { ArtifactsPanel } from "../../../../../components/ArtifactsPanel.js";
 import { DiffViewer } from "../../../../../components/DiffViewer.js";
 import { RunControlToolbar } from "../../../../../components/RunControlToolbar.js";
 import {
   TraceTimeline,
   type TimelineEvent,
 } from "../../../../../components/TraceTimeline.js";
+
+/** Tabs on the run detail page; also the values `?tab=` accepts. */
+type RunTab = "trace" | "diff" | "report" | "artifacts";
 
 export interface RunDetailClientProps {
   projectId: string;
@@ -45,16 +49,17 @@ export function RunDetailClient({
   // tab + a trace seq-selection to be driven by the URL so a finding's
   // #diff:file:hunk / #trace:start:end / #tool:... link jumps straight to the
   // evidence, not the default Trace tab.
-  function tabFromQuery(): "trace" | "diff" | "report" {
+  function tabFromQuery(): RunTab {
     if (typeof window === "undefined") return "trace";
     const q = new URLSearchParams(window.location.search).get("tab");
-    return q === "diff" || q === "report" ? q : "trace";
+    return q === "diff" || q === "report" || q === "artifacts" ? q : "trace";
   }
   const [run, setRun] = useState<Run | null>(initialRun);
   const [events, setEvents] = useState<TimelineEvent[]>(initialEvents);
   const [diff, setDiff] = useState(initialDiff);
-  const [tab, setTab] = useState<"trace" | "diff" | "report">(tabFromQuery);
+  const [tab, setTab] = useState<RunTab>(tabFromQuery);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+  const [selectedArtifact, setSelectedArtifact] = useState<string | null>(null);
 
   // On mount, act on the deep-link hash (#trace:start:end selects that seq range
   // in the Trace tab; #diff:… / #tool:… only need the tab, set above).
@@ -84,6 +89,9 @@ export function RunDetailClient({
         return prev;
       });
       setTab("trace");
+    } else if (hash.startsWith("artifact:")) {
+      setSelectedArtifact(hash.slice("artifact:".length));
+      setTab("artifacts");
     }
   }, []);
   const [live, setLive] = useState(false);
@@ -292,6 +300,15 @@ export function RunDetailClient({
         </button>
         <button
           type="button"
+          className={
+            tab === "artifacts" ? "font-semibold text-white" : "text-slate-400"
+          }
+          onClick={() => setTab("artifacts")}
+        >
+          Artifacts
+        </button>
+        <button
+          type="button"
           className={tab === "report" ? "font-semibold text-white" : "text-slate-400"}
           onClick={() => setTab("report")}
         >
@@ -307,6 +324,8 @@ export function RunDetailClient({
         />
       ) : tab === "diff" ? (
         <DiffViewer patch={diff} />
+      ) : tab === "artifacts" ? (
+        <ArtifactsPanel runId={runId} selectedPath={selectedArtifact} />
       ) : (
         <div className="space-y-3" data-testid="report-panel">
           <div className="flex items-center justify-between gap-2">

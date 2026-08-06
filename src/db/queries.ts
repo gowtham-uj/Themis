@@ -56,6 +56,10 @@ import {
   type Schema,
 } from "./schema.js";
 import { rubricsEqual } from "../tasks/index.js";
+import {
+  DEFAULT_ARTIFACT_RETENTION,
+  resolveRetentionPolicy,
+} from "../runner/artifact-retention.js";
 
 // Re-export finding row types for consumers.
 export type {
@@ -86,6 +90,8 @@ export interface Project {
   adapterOverrides: Record<string, unknown> | null;
   networkPolicy: string;
   retentionRuns: number | null;
+  /** What run artifacts survive judgement: keep|referenced|all. */
+  artifactRetention: string;
   archived: boolean;
   createdAt: string;
   updatedAt: string;
@@ -105,6 +111,7 @@ export interface CreateProjectInput {
   adapterOverrides?: Record<string, unknown>;
   networkPolicy?: string;
   retentionRuns?: number | null;
+  artifactRetention?: string;
   id?: string;
 }
 
@@ -121,6 +128,7 @@ export interface UpdateProjectInput {
   adapterOverrides?: Record<string, unknown> | null;
   networkPolicy?: string;
   retentionRuns?: number | null;
+  artifactRetention?: string;
 }
 
 export interface Task {
@@ -1166,6 +1174,7 @@ function mapProject(row: typeof projects.$inferSelect): Project {
     adapterOverrides: parseJson(row.adapterOverridesJson, null),
     networkPolicy: row.networkPolicy ?? "allow",
     retentionRuns: row.retentionRuns,
+    artifactRetention: row.artifactRetention ?? "keep",
     archived: row.archived === 1,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -1675,6 +1684,9 @@ export class SqliteQueries implements QueryStore {
       adapterOverridesJson: stringifyJson(input.adapterOverrides ?? null),
       networkPolicy: input.networkPolicy ?? "allow",
       retentionRuns: input.retentionRuns ?? null,
+      artifactRetention: resolveRetentionPolicy(
+        input.artifactRetention ?? DEFAULT_ARTIFACT_RETENTION,
+      ),
       archived: 0,
       createdAt: ts,
       updatedAt: ts,
@@ -1748,6 +1760,10 @@ export class SqliteQueries implements QueryStore {
           patch.retentionRuns !== undefined
             ? patch.retentionRuns
             : existing.retentionRuns,
+        artifactRetention:
+          patch.artifactRetention !== undefined
+            ? resolveRetentionPolicy(patch.artifactRetention)
+            : existing.artifactRetention,
         updatedAt: ts,
       })
       .where(eq(projects.id, id))
@@ -3682,6 +3698,9 @@ export class MemoryQueries implements QueryStore {
       adapterOverrides: input.adapterOverrides ?? null,
       networkPolicy: input.networkPolicy ?? "allow",
       retentionRuns: input.retentionRuns ?? null,
+      artifactRetention: resolveRetentionPolicy(
+        input.artifactRetention ?? DEFAULT_ARTIFACT_RETENTION,
+      ),
       archived: false,
       createdAt: ts,
       updatedAt: ts,
@@ -3745,6 +3764,10 @@ export class MemoryQueries implements QueryStore {
         patch.retentionRuns !== undefined
           ? patch.retentionRuns
           : existing.retentionRuns,
+      artifactRetention:
+        patch.artifactRetention !== undefined
+          ? resolveRetentionPolicy(patch.artifactRetention)
+          : existing.artifactRetention,
       updatedAt: nowIso(),
     };
     this.projects.set(id, next);

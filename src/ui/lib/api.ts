@@ -736,6 +736,61 @@ export async function getRunReport(
 }
 
 // ---------------------------------------------------------------------------
+// Run artifacts — screenshots + exported outputs a run produced
+// ---------------------------------------------------------------------------
+
+/** One artifact under a run's outputs dir, as returned by the API. */
+export interface RunArtifactSummary {
+  path: string;
+  sizeBytes: number;
+  sha256: string;
+  contentType: string;
+  isImage: boolean;
+  modifiedAt: string;
+  /** Path-only URL for fetching the bytes (see {@link runArtifactUrl}). */
+  url: string;
+}
+
+/** Build the URL for a single run artifact's bytes. */
+export function runArtifactUrl(
+  runId: string,
+  artifactPath: string,
+  opts: { baseUrl?: string } = {},
+): string {
+  const base = opts.baseUrl !== undefined ? opts.baseUrl : getApiBaseUrl();
+  const encoded = artifactPath
+    .split("/")
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .join("/");
+  return joinUrl(base, `/api/runs/${encodeURIComponent(runId)}/artifacts/${encoded}`);
+}
+
+/** GET /api/runs/:id/artifacts — list what the run wrote to its outputs dir. */
+export async function listRunArtifacts(
+  runId: string,
+  opts: ApiClientOptions = {},
+): Promise<RunArtifactSummary[]> {
+  const raw = await apiRequest<{ artifacts?: unknown }>(
+    `/api/runs/${encodeURIComponent(runId)}/artifacts`,
+    { ...opts, method: "GET" },
+  );
+  const list = Array.isArray(raw.artifacts) ? raw.artifacts : [];
+  return list.map((item) => {
+    const a = (item ?? {}) as Record<string, unknown>;
+    return {
+      path: String(a.path ?? ""),
+      sizeBytes: Number(a.size_bytes ?? 0),
+      sha256: String(a.sha256 ?? ""),
+      contentType: String(a.content_type ?? "application/octet-stream"),
+      isImage: a.is_image === true,
+      modifiedAt: String(a.modified_at ?? ""),
+      url: String(a.url ?? ""),
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Run events — SSE URL + EventSource + fetch-stream reader
 // ---------------------------------------------------------------------------
 

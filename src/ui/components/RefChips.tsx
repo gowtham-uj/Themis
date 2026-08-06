@@ -34,6 +34,10 @@ export function refHref(
     const toolCallId = String(refField(r, "toolCallId") ?? "");
     return `${base}?tab=trace#tool:${encodeURIComponent(toolCallId)}`;
   }
+  if (kind === "artifact") {
+    const path = String(refField(r, "path") ?? "");
+    return `${base}?tab=artifacts#artifact:${encodeURIComponent(path)}`;
+  }
   return base;
 }
 
@@ -59,6 +63,11 @@ export function refLabel(ref: object): string {
     const id = String(refField(r, "toolCallId") ?? "");
     return `tool ${id.length > 10 ? `${id.slice(0, 8)}…` : id}`;
   }
+  if (kind === "artifact") {
+    const path = String(refField(r, "path") ?? "?");
+    const short = path.length > 28 ? `…${path.slice(-27)}` : path;
+    return `artifact ${short}`;
+  }
   return kind;
 }
 
@@ -66,6 +75,7 @@ function kindIcon(kind: string): string {
   if (kind === "diff") return "△";
   if (kind === "trace") return "◎";
   if (kind === "tool") return "⚙";
+  if (kind === "artifact") return "▣";
   return "○";
 }
 

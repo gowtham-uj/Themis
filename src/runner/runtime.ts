@@ -16,6 +16,11 @@ import { FakeContainerRuntime } from "./fake-runtime.js";
 export interface ContainerHandle {
   readonly id: string;
   readonly image: string;
+  /**
+   * Ports actually published, with ephemeral (hostPort: 0) requests resolved
+   * to concrete host ports. Empty when the spec requested none.
+   */
+  readonly ports?: ResolvedPort[];
   /** Pause the container's CPU (cgroup freezer / `docker pause`). Hard-pause only. */
   pause(): Promise<void>;
   /** Thaw a paused container and resume execution. */
@@ -29,6 +34,30 @@ export interface ContainerHandle {
   wait(): Promise<{ exitCode: number; timedOut: boolean }>;
   /** Remove the container's filesystem (best-effort, on finalize). */
   remove(): Promise<void>;
+}
+
+/**
+ * A port the sandbox exposes to the host.
+ *
+ * Agents that start a dev server, or drive a headless browser over a debug
+ * port (CDP), need reachable ports. `hostPort: 0` asks the runtime to pick a
+ * free ephemeral port — the assignment is reported back on the handle so the
+ * caller can address it without racing.
+ */
+export interface PortMapping {
+  /** Port inside the sandbox the agent listens on. */
+  containerPort: number;
+  /** Host port to publish on; 0 (or omitted) → runtime picks a free one. */
+  hostPort?: number;
+  protocol?: "tcp" | "udp";
+  /** Optional label surfaced in the UI/telemetry (e.g. "devserver", "cdp"). */
+  name?: string;
+}
+
+/** A port mapping after the runtime has resolved any ephemeral assignment. */
+export interface ResolvedPort extends PortMapping {
+  /** Always concrete once the container is running. */
+  hostPort: number;
 }
 
 /** Launch spec fed to {@link ContainerRuntime.run}. Records every reproducibility knob. */
@@ -46,6 +75,12 @@ export interface RunContainerSpec {
   timeoutMs: number;
   network: "allow" | "allowlist" | "offline";
   networkAllowlist?: string[];
+  /**
+   * Ports published from the sandbox to the host. Needed by agents that run a
+   * dev server or drive a headless browser over a debug port. Independent of
+   * `network`: an offline sandbox may still publish a loopback port.
+   */
+  ports?: PortMapping[];
   /** Non-root inside the container. */
   nonRoot: boolean;
 }

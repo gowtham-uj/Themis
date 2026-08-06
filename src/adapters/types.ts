@@ -4,6 +4,7 @@
  */
 
 import type { CanonicalEvent } from "../schema/events.js";
+import type { PortMapping } from "../runner/runtime.js";
 
 export type WorkspaceSpec =
   | { source: "git"; repo: string; ref?: string }
@@ -22,6 +23,12 @@ export interface AdapterOverrides {
   params?: Record<string, unknown>;
   allowedTools?: string[];
   network?: "allow" | "allowlist" | "offline";
+  /**
+   * Ports the sandbox should publish (dev servers, headless-browser debug
+   * ports). `hostPort` omitted/0 → the runtime picks a free one and reports it
+   * back on the container handle.
+   */
+  ports?: PortMapping[];
 }
 
 export interface RunContext {

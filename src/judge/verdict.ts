@@ -22,7 +22,14 @@
 export type Ref =
   | { kind: "diff"; file: string; hunk: number; lines?: [number, number] }
   | { kind: "trace"; runId: string; seqs: [number, number] }
-  | { kind: "tool"; toolCallId: string };
+  | { kind: "tool"; toolCallId: string }
+  /**
+   * An output artifact produced by the run (screenshot, report, exported file).
+   * Categories with no source diff — browser, data, research — locate findings
+   * against outputs rather than hunks (plan/execution.md §49). `path` is
+   * relative to the run's outputs dir; `sha256` pins the exact bytes reviewed.
+   */
+  | { kind: "artifact"; path: string; sha256?: string; note?: string };
 
 /** Severity ordering — lower index = more severe. */
 export const SEVERITY_ORDER = ["blocker", "major", "minor", "nit"] as const;
@@ -258,6 +265,11 @@ function assertRef(v: unknown, ctx: string): asserts v is Ref {
   }
   if (kind === "tool") {
     if (typeof v.toolCallId !== "string") throw new VerdictValidationError(`${ctx}: tool ref missing toolCallId`);
+    return;
+  }
+  if (kind === "artifact") {
+    if (typeof v.path !== "string" || !v.path)
+      throw new VerdictValidationError(`${ctx}: artifact ref missing path`);
     return;
   }
   throw new VerdictValidationError(`${ctx}: unknown ref kind ${String(kind)}`);

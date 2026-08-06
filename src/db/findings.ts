@@ -110,9 +110,10 @@ function normalizeFilePath(file: string): string {
 
 /**
  * Choose the most stable identifying location for a finding, in precedence:
- *  1. FIRST diff ref  → file@hunk  (survives reformatting of surrounding code)
- *  2. FIRST tool ref  → tool:<toolCallId>
- *  3. else (trace-only / no refs / meta) → claim:<normalizeClaim(claim)>
+ *  1. FIRST diff ref     → file@hunk  (survives reformatting of surrounding code)
+ *  2. FIRST artifact ref → artifact:<path>  (no-diff categories: browser/data)
+ *  3. FIRST tool ref     → tool:<toolCallId>
+ *  4. else (trace-only / no refs / meta) → claim:<normalizeClaim(claim)>
  *
  * Never throws on an unexpected ref shape — falls through to claim-based.
  */
@@ -126,6 +127,17 @@ export function canonicalLocationOf(
     const r = raw as Record<string, unknown>;
     if (r.kind === "diff" && typeof r.file === "string" && typeof r.hunk === "number") {
       return `${normalizeFilePath(r.file)}@${r.hunk}`;
+    }
+  }
+  // Artifact-located findings (screenshots, exported outputs) locate on the
+  // artifact path — stable across runs of the same task, so recurrence works
+  // for categories that produce no diff. Deliberately NOT keyed on sha256:
+  // the same defect in a re-captured screenshot has different bytes.
+  for (const raw of refs) {
+    if (!raw || typeof raw !== "object") continue;
+    const r = raw as Record<string, unknown>;
+    if (r.kind === "artifact" && typeof r.path === "string" && r.path) {
+      return `artifact:${normalizeFilePath(r.path)}`;
     }
   }
   for (const raw of refs) {

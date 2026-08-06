@@ -342,16 +342,18 @@ const DDL: string[] = [
 ];
 
 /**
- * Best-effort ADD COLUMN for DBs that already have a narrower users table.
+ * Best-effort ADD COLUMN for DBs created before a column existed.
  * SQLite has no IF NOT EXISTS for columns — ignore "duplicate column" errors.
  */
-function ensureUserColumns(db: Database.Database): void {
+function ensureColumns(db: Database.Database): void {
   const alters = [
     "ALTER TABLE users ADD COLUMN username TEXT",
     "ALTER TABLE users ADD COLUMN password_hash TEXT",
     "ALTER TABLE users ADD COLUMN role TEXT",
     "ALTER TABLE users ADD COLUMN created_at TEXT",
     "ALTER TABLE users ADD COLUMN email TEXT",
+    // Artifact retention: what survives judgement (keep|referenced|all).
+    "ALTER TABLE projects ADD COLUMN artifact_retention TEXT DEFAULT 'keep'",
   ];
   for (const sql of alters) {
     try {
@@ -379,7 +381,7 @@ export function migrate(db: Database.Database): void {
       for (const stmt of DDL) {
         db.exec(stmt);
       }
-      ensureUserColumns(db);
+      ensureColumns(db);
       const row = db
         .prepare("SELECT version FROM schema_migrations WHERE version = ?")
         .get(SCHEMA_VERSION) as { version: number } | undefined;
@@ -397,7 +399,7 @@ export function migrate(db: Database.Database): void {
     for (const stmt of DDL) {
       db.exec(stmt);
     }
-    ensureUserColumns(db);
+    ensureColumns(db);
     db.prepare(
       "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     ).run(SCHEMA_VERSION, new Date().toISOString());

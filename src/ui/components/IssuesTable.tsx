@@ -136,6 +136,9 @@ function refHref(ref: IssueRef): string {
   if (kind === "tool") {
     return `#tool:${String(refField(ref, "toolCallId") ?? "")}`;
   }
+  if (kind === "artifact") {
+    return `#artifact:${String(refField(ref, "path") ?? "")}`;
+  }
   return `#ref:${kind}`;
 }
 
@@ -155,6 +158,9 @@ function refLabel(ref: IssueRef): string {
   }
   if (kind === "tool") {
     return `tool call ${String(refField(ref, "toolCallId") ?? "")}`;
+  }
+  if (kind === "artifact") {
+    return `artifact ${String(refField(ref, "path") ?? "?")}`;
   }
   return kind;
 }

@@ -91,6 +91,8 @@ export function refHref(ref: Ref): string {
       return `#trace:${ref.runId}:${ref.seqs[0]}:${ref.seqs[1]}`;
     case "tool":
       return `#tool:${ref.toolCallId}`;
+    case "artifact":
+      return `#artifact:${ref.path}`;
     default: {
       // Exhaustiveness guard — unknown kind renders a safe empty anchor.
       const _never: never = ref;
@@ -111,6 +113,8 @@ export function refLabel(ref: Ref): string {
       return `trace seq ${ref.seqs[0]}–${ref.seqs[1]}`;
     case "tool":
       return `tool call ${ref.toolCallId}`;
+    case "artifact":
+      return `artifact ${ref.path}`;
     default: {
       const _never: never = ref;
       return String(_never);

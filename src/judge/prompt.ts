@@ -153,7 +153,7 @@ Emit a SINGLE valid JSON object matching this shape (schemaVersion must be 1):
   "findings": [
     { "id": "<stable-id>", "category": "<vocab>", "severity": "blocker"|"major"|"minor"|"nit",
       "confidence": <0..1>, "criterion": "<optional>", "claim": "<one line>",
-      "refs": [ {"kind":"diff","file":"...","hunk":<n>} | {"kind":"trace","runId":"...","seqs":[a,b]} | {"kind":"tool","toolCallId":"..."} ],
+      "refs": [ {"kind":"diff","file":"...","hunk":<n>} | {"kind":"trace","runId":"...","seqs":[a,b]} | {"kind":"tool","toolCallId":"..."} | {"kind":"artifact","path":"outputs/...","sha256":"<optional>"} ],
       "fix": { "direction": "...", "repro": { "command": "...", "expected": "..." } } }
   ],
   "positiveFindings": [ /* same shape as findings */ ],
@@ -182,7 +182,9 @@ Emit a SINGLE valid JSON object matching this shape (schemaVersion must be 1):
 HARD RULES:
 - Every finding has ≥1 structured ref, or do not emit it.
 - Diagnostics are objects {value, refs?, note?}, never bare booleans.
-- withoutSource refs are trace/tool only (never kind:"diff").
+- withoutSource refs are trace/tool/artifact only (never kind:"diff").
+- Runs with no diff (browser/data/research) locate findings on kind:"artifact"
+  (screenshots, exported outputs) — path is relative to the run's outputs dir.
 - withSource present ONLY when the SOURCE / LENS GATE says source artifacts are present.
 - Ground every score in cited evidence. Prefer absolute standards over relative ranking.
 - STEP 1 must be valid JSON only. No prose before/after. Do not emit HTML.

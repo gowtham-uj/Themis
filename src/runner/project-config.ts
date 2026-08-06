@@ -10,6 +10,7 @@
  */
 
 import type { AdapterOverrides } from "../adapters/types.js";
+import type { PortMapping } from "./runtime.js";
 
 /** Network modes a container may be launched with (runtime.RunContainerSpec). */
 export type NetworkMode = "allow" | "allowlist" | "offline";
@@ -50,6 +51,44 @@ function asStringArray(v: unknown): string[] | undefined {
   if (!Array.isArray(v)) return undefined;
   const out = v.filter((x): x is string => typeof x === "string");
   return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Parse a loose ports array from the stored JSON blob.
+ *
+ * Accepts either a bare number (`8080` → publish 8080 on an ephemeral host
+ * port) or an object. Entries without a usable containerPort are dropped
+ * rather than launching a container with a nonsense mapping.
+ */
+export function parsePorts(v: unknown): PortMapping[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: PortMapping[] = [];
+  for (const raw of v) {
+    if (typeof raw === "number") {
+      if (isValidPort(raw)) out.push({ containerPort: raw });
+      continue;
+    }
+    if (!raw || typeof raw !== "object") continue;
+    const o = raw as Record<string, unknown>;
+    const containerPort = toPort(o.containerPort ?? o.container_port ?? o.port);
+    if (containerPort === undefined) continue;
+    const hostPort = toPort(o.hostPort ?? o.host_port);
+    const mapping: PortMapping = { containerPort };
+    if (hostPort !== undefined) mapping.hostPort = hostPort;
+    if (o.protocol === "udp" || o.protocol === "tcp") mapping.protocol = o.protocol;
+    if (typeof o.name === "string" && o.name.trim()) mapping.name = o.name.trim();
+    out.push(mapping);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function isValidPort(n: number): boolean {
+  return Number.isInteger(n) && n > 0 && n <= 65535;
+}
+
+function toPort(v: unknown): number | undefined {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  return isValidPort(n) ? n : undefined;
 }
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
@@ -106,6 +145,9 @@ export function resolveAdapterOverrides(
     typeof merged.network === "string" ? merged.network : undefined,
   );
   if (typeof merged.network === "string") out.network = network;
+
+  const ports = parsePorts(merged.ports);
+  if (ports) out.ports = ports;
 
   return Object.keys(out).length > 0 ? out : undefined;
 }

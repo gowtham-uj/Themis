@@ -29,6 +29,10 @@ import {
   type Router,
 } from "./router.js";
 import { badRequest, notFound } from "./errors.js";
+import {
+  purgeRunArtifacts,
+  resolveRetentionPolicy,
+} from "../runner/artifact-retention.js";
 
 // ---------------------------------------------------------------------------
 // Injectable judge runner (tests inject a fake; production may use worker)
@@ -173,6 +177,39 @@ function judgementDetailJson(j: JudgementWithVerdict) {
 
 function appOf(ctx: RequestContext): JudgementAppCtx {
   return ctx.app as JudgementAppCtx;
+}
+
+/**
+ * Apply the project's artifact retention policy to a run whose judgement just
+ * finished. Best-effort: reclaiming disk must never fail or delay a judgement,
+ * and the verdict itself is already durable by this point.
+ */
+async function purgeJudgedRunArtifacts(
+  app: JudgementAppCtx,
+  runId: string,
+  projectId: string,
+): Promise<void> {
+  try {
+    const project = app.queries.getProject(projectId);
+    const policy = resolveRetentionPolicy(project?.artifactRetention);
+    if (policy === "keep") return;
+
+    // Pin evidence cited by ANY completed verdict for this run, not just the
+    // newest — an older verdict's finding refs stay live in the findings table.
+    const verdicts: unknown[] = [];
+    for (const j of app.queries.listJudgements({ runId }).judgements) {
+      if (j.status !== "completed") continue;
+      const full = app.queries.getJudgement(j.id);
+      if (full?.verdictBody) verdicts.push(full.verdictBody);
+    }
+
+    await purgeRunArtifacts(
+      join(app.dataDir, "projects", projectId, "runs", runId),
+      { policy, verdict: verdicts },
+    );
+  } catch {
+    // best-effort — disk reclamation is not worth failing a judgement over
+  }
 }
 
 function header(req: IncomingMessage, name: string): string | undefined {
@@ -492,6 +529,12 @@ export function registerJudgementRoutes(router: Router): void {
             // best-effort
           }
           await app.judgeRunner!(runnerCtx);
+
+          // Artifact retention: the verdict is written, so the run's outputs
+          // can go. Default policy `keep` changes nothing; `referenced` keeps
+          // only what the verdict's artifact refs cite, so located evidence
+          // stays clickable. Never fails the judgement.
+          await purgeJudgedRunArtifacts(app, run.id, run.projectId);
 
           // P8c: emit verdict.completed once if the runner completed the judgement.
           // No-ops when outbound webhooks are off or the judgement is not completed.

@@ -71,6 +71,7 @@ import { registerQueueRoutes } from "./queue-routes.js";
 import { registerWebhooksRoutes } from "./webhooks-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerRubricRoutes } from "./rubric-routes.js";
+import { registerArtifactRoutes } from "./artifact-routes.js";
 import {
   OutboundWebhookDispatcher,
   RealDeliverySink,
@@ -303,6 +304,7 @@ function projectJson(p: Project) {
     adapter_overrides: p.adapterOverrides,
     network_policy: p.networkPolicy,
     retention_runs: p.retentionRuns,
+    artifact_retention: p.artifactRetention,
     archived: p.archived,
     created_at: p.createdAt,
     updated_at: p.updatedAt,
@@ -676,6 +678,7 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
       default_model?: string;
       default_provider?: string;
       network_policy?: string;
+      artifact_retention?: string;
     }>(req);
 
     if (!body.name || !String(body.name).trim()) {
@@ -698,6 +701,7 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
       defaultModel: body.default_model,
       defaultProvider: body.default_provider,
       networkPolicy: body.network_policy,
+      artifactRetention: body.artifact_retention,
     });
     resolveProjectDir(app.dataDir, project.id);
     sendJson(res, 201, projectJson(project));
@@ -748,6 +752,12 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     }
     if ("network_policy" in body && typeof body.network_policy === "string") {
       patch.networkPolicy = body.network_policy;
+    }
+    if (
+      "artifact_retention" in body &&
+      typeof body.artifact_retention === "string"
+    ) {
+      patch.artifactRetention = body.artifact_retention;
     }
     const updated = app.queries.updateProject(ctx.params.id!, patch);
     sendJson(res, 200, projectJson(updated));
@@ -1508,6 +1518,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerSettingsRoutes(router);
   // Project-scoped reusable rubrics — CRUD.
   registerRubricRoutes(router);
+  registerArtifactRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {

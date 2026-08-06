@@ -52,6 +52,8 @@ export const projects = sqliteTable("projects", {
   networkPolicy: text("network_policy").default("allow"),
   /** Keep last N runs per task; null = unlimited. */
   retentionRuns: integer("retention_runs"),
+  /** What run artifacts survive judgement: keep|referenced|all. */
+  artifactRetention: text("artifact_retention").default("keep"),
   archived: integer("archived").notNull().default(0),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),

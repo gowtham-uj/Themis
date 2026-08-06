@@ -147,7 +147,8 @@ export function getDefaultAdapter(): Adapter | undefined {
   return defaultAdapter;
 }
 
-function runDirPath(dataDir: string, projectId: string, runId: string): string {
+/** On-disk dir for a run: `<dataDir>/projects/<pid>/runs/<rid>`. */
+export function runDirPath(dataDir: string, projectId: string, runId: string): string {
   return join(dataDir, "projects", projectId, "runs", runId);
 }
 
@@ -276,25 +277,6 @@ export async function startRun(
     "utf8",
   );
 
-  // Resolved execution provenance — which image/network/overrides this run
-  // actually launched with after the project's config was applied. Kept in its
-  // own artifact because run.json is owned by the query layer, which rewrites
-  // it from the DB row on every status transition.
-  await writeFile(
-    join(runDir, "exec.json"),
-    `${JSON.stringify(
-      {
-        runId,
-        image: adapter.image(ctx),
-        network: networkMode,
-        adapterOverrides: overrides ?? null,
-      },
-      null,
-      2,
-    )}\n`,
-    "utf8",
-  );
-
   const startedAt = Date.now();
   const startedAtIso = new Date(startedAt).toISOString();
 
@@ -359,9 +341,33 @@ export async function startRun(
       limits: { cpus: 1, memoryMiB: 512, pids: 128 },
       timeoutMs,
       network: networkMode,
+      ...(overrides?.ports ? { ports: overrides.ports } : {}),
       nonRoot: true,
     });
   }
+
+  // Resolved execution provenance — which image/network/overrides this run
+  // actually launched with after the project's config was applied, plus the
+  // ports the sandbox published (ephemeral requests now resolved to concrete
+  // host ports, so a dev server / browser debug port is addressable). Written
+  // post-launch for exactly that reason. Kept in its own artifact because
+  // run.json is owned by the query layer, which rewrites it from the DB row on
+  // every status transition.
+  await writeFile(
+    join(runDir, "exec.json"),
+    `${JSON.stringify(
+      {
+        runId,
+        image: adapter.image(ctx),
+        network: networkMode,
+        adapterOverrides: overrides ?? null,
+        ports: handle.ports ?? [],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
 
   const controller = new RunController({
     handle,
