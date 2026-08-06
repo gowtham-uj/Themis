@@ -13,19 +13,36 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "cli": "tsx src/cli/index.ts",
-    "lint": "eslint src --max-warnings 0"
+    "lint": "eslint src --max-warnings 0",
+    "ui:dev": "next dev src/ui",
+    "ui:build": "next build src/ui",
+    "ui:start": "next start src/ui",
+    "ui:typecheck": "tsc -p src/ui/tsconfig.json --noEmit"
   },
+
   "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.3",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.0.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
     "eslint": "^9.0.0",
+    "jsdom": "^30.0.1",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "file:../_inspect/pi/packages/coding-agent",
+    "autoprefixer": "^10.5.4",
     "better-sqlite3": "^13.0.3",
-    "drizzle-orm": "^0.45.2"
+    "drizzle-orm": "^0.45.2",
+    "next": "^15.5.22",
+    "postcss": "^8.5.26",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tailwindcss": "^3.4.19"
   }
 }

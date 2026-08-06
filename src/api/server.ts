@@ -1,0 +1,1154 @@
+/**
+ * REST API server — project/task/run CRUD + run control + SSE events.
+ *
+ * Bootstraps a tiny zero-dep router with a shared AppCtx. Routes follow
+ * plan/api.md (project-scoped). Auth is deferred (P8).
+ *
+ * In this Dockerless env runs execute via FakeContainerRuntime (see
+ * run-controller-bridge.ts). Concurrency cap is 1 for P3 (sequential starts).
+ */
+
+import { createServer as createHttpServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { existsSync, watch as fsWatch } from "node:fs";
+import { readFile } from "node:fs/promises";
+import type { Adapter } from "../adapters/types.js";
+import { openDb as defaultOpenDb, resolveProjectDir, type OpenDbResult } from "../db/index.js";
+import type {
+  DbQueries,
+  Project,
+  Run,
+  Task,
+  UpdateProjectInput,
+  UpdateTaskInput,
+} from "../db/queries.js";
+import type { ProjectCtx, TaskSpec } from "../domain.js";
+import {
+  buildTaskSpec,
+  createTaskSource,
+  rubricsEqual,
+  syncTasks,
+  type BuildTaskSpecInput,
+  type TaskStore,
+} from "../tasks/index.js";
+import { readFromSeq } from "../schema/jsonl.js";
+import { Router, readJsonBody, sendJson, type RequestContext } from "./router.js";
+import {
+  badRequest,
+  conflict,
+  handleError,
+  HttpError,
+  notFound,
+} from "./errors.js";
+import {
+  abortRun,
+  createFixtureAdapter,
+  createLiveRunsMap,
+  isTerminalStatus,
+  pauseRun,
+  resolveDiffPath,
+  resolveEventsPath,
+  resumeRun,
+  setNetwork,
+  startRun,
+  type LiveRunsMap,
+  type StartRunOptions,
+} from "./run-controller-bridge.js";
+
+// ---------------------------------------------------------------------------
+// App context
+// ---------------------------------------------------------------------------
+
+export interface AppCtx {
+  queries: DbQueries;
+  dataDir: string;
+  liveRuns: LiveRunsMap;
+  /** Injected fixture adapter (tests). */
+  adapter?: Adapter;
+  /** Max concurrent live runs (P3 = 1). */
+  concurrency: number;
+  /** In-memory Idempotency-Key → response body. */
+  idempotency: Map<string, { status: number; body: unknown; headers?: Record<string, string> }>;
+  /** FIFO of run ids waiting for a slot (concurrency). */
+  startQueue: string[];
+  /** Currently starting/running count. */
+  activeStarts: number;
+  /** Extra startRun options forwarded from createServer. */
+  startOpts?: Omit<StartRunOptions, "adapter">;
+}
+
+export interface CreateServerOptions {
+  dataDir: string;
+  /** Pre-opened queries; when omitted, openDb(dataDir) is used. */
+  queries?: DbQueries;
+  /** Override openDb (tests / custom backends). */
+  openDb?: (dataDir: string) => OpenDbResult;
+  /**
+   * Injected adapter for tests. Documented seam: use createFixtureAdapter()
+   * so tests never hit a real model.
+   */
+  adapter?: Adapter;
+  /** Concurrency cap for starting runs (default 1 for P3). */
+  concurrency?: number;
+  /** Extra startRun options (timeout, skipAgent, …). */
+  startOpts?: Omit<StartRunOptions, "adapter">;
+}
+
+export interface ApiServer {
+  server: Server;
+  queries: DbQueries;
+  liveRuns: LiveRunsMap;
+  app: AppCtx;
+  /** Listen on an ephemeral port (or given port). Resolves with the bound port. */
+  listen(port?: number, host?: string): Promise<number>;
+  /** Close the HTTP server and best-effort abort live runs. */
+  close(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// TaskStore over DbQueries (for POST .../tasks/sync)
+// ---------------------------------------------------------------------------
+
+function createDbTaskStore(queries: DbQueries): TaskStore {
+  return {
+    get(projectId, externalId) {
+      const tasks = queries.listTasks(projectId, { includeArchived: true });
+      const hit = tasks.find((t) => t.externalId === externalId);
+      if (!hit) return null;
+      return taskToSpec(hit);
+    },
+    upsert(ctx, spec) {
+      const externalId = spec.id ?? spec.name;
+      const existing = queries
+        .listTasks(ctx.projectId, { includeArchived: true })
+        .find((t) => t.externalId === externalId);
+
+      if (!existing) {
+        const created = queries.createTask(ctx.projectId, spec, {
+          sourceKind: "repo-md",
+        });
+        return { taskId: created.id, rubricVersionBumped: false };
+      }
+
+      const bumped = !rubricsEqual(existing.rubric, spec.rubric);
+      const updated = queries.updateTask(existing.id, {
+        name: spec.name,
+        prompt: spec.prompt,
+        workspace: spec.workspace,
+        rubric: spec.rubric,
+        agentCategory: spec.agentCategory,
+        profile: spec.profile ?? null,
+        referenceSolution: spec.referenceSolution ?? null,
+        checks: (spec.checks ?? null) as unknown[] | null,
+        tags: spec.tags ?? null,
+        externalId,
+        sourceKind: "repo-md",
+      });
+      return {
+        taskId: updated.id,
+        rubricVersionBumped: bumped || updated.rubricVersion > existing.rubricVersion,
+      };
+    },
+  };
+}
+
+function taskToSpec(t: Task): TaskSpec {
+  return {
+    id: t.externalId ?? t.id,
+    name: t.name,
+    prompt: t.prompt,
+    workspace: t.workspace,
+    rubric: t.rubric,
+    ...(t.profile ? { profile: t.profile } : {}),
+    ...(t.tags ? { tags: t.tags } : {}),
+    agentCategory: t.agentCategory,
+    ...(t.referenceSolution ? { referenceSolution: t.referenceSolution } : {}),
+    ...(t.checks ? { checks: t.checks as TaskSpec["checks"] } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Serialization helpers
+// ---------------------------------------------------------------------------
+
+function projectJson(p: Project) {
+  return {
+    id: p.id,
+    name: p.name,
+    slug: p.slug,
+    description: p.description,
+    task_source: p.taskSource,
+    default_agent_id: p.defaultAgentId,
+    default_model: p.defaultModel,
+    default_provider: p.defaultProvider,
+    default_judge_model: p.defaultJudgeModel,
+    workspace_image: p.workspaceImage,
+    check_runners: p.checkRunners,
+    adapter_overrides: p.adapterOverrides,
+    network_policy: p.networkPolicy,
+    retention_runs: p.retentionRuns,
+    archived: p.archived,
+    created_at: p.createdAt,
+    updated_at: p.updatedAt,
+  };
+}
+
+function taskJson(t: Task) {
+  return {
+    id: t.id,
+    project_id: t.projectId,
+    external_id: t.externalId,
+    name: t.name,
+    prompt: t.prompt,
+    workspace: t.workspace,
+    rubric: t.rubric,
+    rubric_version: t.rubricVersion,
+    agent_category: t.agentCategory,
+    profile: t.profile,
+    reference_solution: t.referenceSolution,
+    checks: t.checks,
+    tags: t.tags,
+    source_kind: t.sourceKind,
+    archived: t.archived,
+    created_at: t.createdAt,
+    updated_at: t.updatedAt,
+  };
+}
+
+function runJson(r: Run) {
+  return {
+    id: r.id,
+    batch_id: r.batchId,
+    task_id: r.taskId,
+    project_id: r.projectId,
+    agent_id: r.agentId,
+    model: r.model,
+    provider: r.provider,
+    repeat_index: r.repeatIndex,
+    status: r.status,
+    control_state: r.controlState,
+    workspace_commit: r.workspaceCommit,
+    agent_image: r.agentImage,
+    agent_commit: r.agentCommit,
+    agent_image_source: r.agentImageSource,
+    trigger: r.trigger,
+    trigger_ref: r.triggerRef,
+    paused_at: r.pausedAt,
+    resumed_at: r.resumedAt,
+    pause_count: r.pauseCount,
+    started_at: r.startedAt,
+    ended_at: r.endedAt,
+    duration_ms: r.durationMs,
+    usage: {
+      input_tokens: r.inputTokens,
+      output_tokens: r.outputTokens,
+      reasoning_tokens: r.reasoningTokens,
+      total_cost: r.totalCost,
+    },
+    provenance: {
+      workspace_commit: r.workspaceCommit,
+      agent_image: r.agentImage,
+      agent_commit: r.agentCommit,
+      agent_image_source: r.agentImageSource,
+      trigger: r.trigger,
+      trigger_ref: r.triggerRef,
+    },
+    events_path: r.eventsPath,
+    diff_path: r.diffPath,
+    error: r.error,
+  };
+}
+
+function appOf(ctx: RequestContext): AppCtx {
+  return ctx.app as AppCtx;
+}
+
+function requireProject(queries: DbQueries, id: string): Project {
+  const p = queries.getProject(id);
+  if (!p || p.archived) throw notFound(`project not found: ${id}`);
+  return p;
+}
+
+function requireTask(queries: DbQueries, projectId: string, taskId: string): Task {
+  const t = queries.getTask(taskId);
+  if (!t || t.projectId !== projectId || t.archived) {
+    throw notFound(`task not found: ${taskId}`);
+  }
+  return t;
+}
+
+function requireRun(queries: DbQueries, id: string): Run {
+  const r = queries.getRun(id);
+  if (!r) throw notFound(`run not found: ${id}`);
+  return r;
+}
+
+function assertNotTerminal(run: Run): void {
+  if (isTerminalStatus(run.status)) {
+    throw conflict(`run ${run.id} is terminal (${run.status})`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sequential start queue (concurrency cap)
+// ---------------------------------------------------------------------------
+
+async function enqueueStart(app: AppCtx, runId: string): Promise<void> {
+  app.startQueue.push(runId);
+  void drainStartQueue(app);
+}
+
+async function drainStartQueue(app: AppCtx): Promise<void> {
+  while (app.activeStarts < app.concurrency && app.startQueue.length > 0) {
+    const runId = app.startQueue.shift()!;
+    // Skip if already live or terminal.
+    const run = app.queries.getRun(runId);
+    if (!run || isTerminalStatus(run.status) || app.liveRuns.has(runId)) {
+      continue;
+    }
+    app.activeStarts += 1;
+    try {
+      const live = await startRun(app.dataDir, app.queries, runId, app.liveRuns, {
+        ...(app.startOpts ?? {}),
+        ...(app.adapter ? { adapter: app.adapter } : {}),
+      });
+      // When the run finishes, free a slot and drain more.
+      void live.done.finally(() => {
+        app.activeStarts = Math.max(0, app.activeStarts - 1);
+        void drainStartQueue(app);
+      });
+    } catch (err) {
+      app.activeStarts = Math.max(0, app.activeStarts - 1);
+      try {
+        app.queries.finalizeRun(runId, {
+          status: "failed",
+          error: err instanceof Error ? err.message : String(err),
+          controlState: "done",
+        });
+      } catch {
+        // best-effort
+      }
+      void drainStartQueue(app);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SSE / ndjson event streaming
+// ---------------------------------------------------------------------------
+
+async function streamEvents(
+  req: IncomingMessage,
+  res: ServerResponse,
+  app: AppCtx,
+  run: Run,
+  since: number,
+  mode: "sse" | "ndjson",
+): Promise<void> {
+  const eventsPath = resolveEventsPath(
+    app.dataDir,
+    run.projectId,
+    run.id,
+    run.eventsPath,
+  );
+
+  if (mode === "sse") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    // Flush headers.
+    res.write(`: ok\n\n`);
+  } else {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+  }
+
+  let lastSeq = since;
+  let closed = false;
+  const onClose = () => {
+    closed = true;
+  };
+  req.on("close", onClose);
+  res.on("close", onClose);
+
+  const writeEvent = (obj: unknown) => {
+    if (closed || res.writableEnded) return;
+    if (mode === "sse") {
+      res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    } else {
+      res.write(`${JSON.stringify(obj)}\n`);
+    }
+    if (obj && typeof obj === "object" && "seq" in obj) {
+      const s = (obj as { seq: unknown }).seq;
+      if (typeof s === "number" && s > lastSeq) lastSeq = s;
+    }
+  };
+
+  // Replay existing events.
+  try {
+    for await (const obj of readFromSeq(eventsPath, lastSeq)) {
+      if (closed) break;
+      writeEvent(obj);
+    }
+  } catch {
+    // missing file is fine — live tail will pick up new events
+  }
+
+  // If already terminal and nothing more is expected, end after replay.
+  const fresh = app.queries.getRun(run.id);
+  const live = app.liveRuns.get(run.id);
+  if (
+    (fresh && isTerminalStatus(fresh.status) && !live) ||
+    (live?.finished)
+  ) {
+    // One more pass in case the final events just landed.
+    try {
+      for await (const obj of readFromSeq(eventsPath, lastSeq)) {
+        if (closed) break;
+        writeEvent(obj);
+      }
+    } catch {
+      // ignore
+    }
+    if (!closed && !res.writableEnded) res.end();
+    req.off("close", onClose);
+    res.off("close", onClose);
+    return;
+  }
+
+  // Live-tail: poll the file for new lines (portable; works with FakeContainerRuntime).
+  const pollMs = 50;
+  const maxWaitMs = 120_000;
+  const started = Date.now();
+
+  await new Promise<void>((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    let watcher: ReturnType<typeof fsWatch> | undefined;
+
+    const cleanup = () => {
+      if (timer) clearInterval(timer);
+      try {
+        watcher?.close();
+      } catch {
+        // ignore
+      }
+      req.off("close", onClose);
+      res.off("close", onClose);
+    };
+
+    const tick = async () => {
+      if (closed || res.writableEnded) {
+        cleanup();
+        resolve();
+        return;
+      }
+      try {
+        for await (const obj of readFromSeq(eventsPath, lastSeq)) {
+          if (closed) break;
+          writeEvent(obj);
+        }
+      } catch {
+        // ignore transient read errors
+      }
+
+      const r = app.queries.getRun(run.id);
+      const lr = app.liveRuns.get(run.id);
+      const terminal =
+        (r && isTerminalStatus(r.status) && (!lr || lr.finished)) ||
+        (lr?.finished ?? false);
+
+      // Also stop when we see a run.end in the stream.
+      // (lastSeq advanced above)
+
+      if (terminal || Date.now() - started > maxWaitMs) {
+        // Final drain.
+        try {
+          for await (const obj of readFromSeq(eventsPath, lastSeq)) {
+            if (closed) break;
+            writeEvent(obj);
+          }
+        } catch {
+          // ignore
+        }
+        if (!closed && !res.writableEnded) res.end();
+        cleanup();
+        resolve();
+      }
+    };
+
+    timer = setInterval(() => {
+      void tick();
+    }, pollMs);
+    timer.unref?.();
+
+    // Also wake on fs changes when the file exists.
+    try {
+      if (existsSync(eventsPath)) {
+        watcher = fsWatch(eventsPath, () => {
+          void tick();
+        });
+      }
+    } catch {
+      // polling only
+    }
+
+    // Immediate first poll.
+    void tick();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Route registration
+// ---------------------------------------------------------------------------
+
+function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpts"]): void {
+  // Stash startOpts on a closure via app.startOpts (set at create time).
+  void startOpts;
+
+  // ---- projects ----
+
+  router.post("/api/projects", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const body = await readJsonBody<{
+      name?: string;
+      slug?: string;
+      description?: string;
+      task_source?: { kind: string; params?: Record<string, unknown> };
+      taskSource?: { kind: string; params?: Record<string, unknown> };
+      default_agent_id?: string;
+      default_model?: string;
+      default_provider?: string;
+      network_policy?: string;
+    }>(req);
+
+    if (!body.name || !String(body.name).trim()) {
+      throw badRequest("name is required");
+    }
+    const slug =
+      body.slug?.trim() ||
+      String(body.name)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "") ||
+      "project";
+
+    const project = app.queries.createProject({
+      name: String(body.name).trim(),
+      slug,
+      description: body.description,
+      taskSource: body.task_source ?? body.taskSource ?? { kind: "ui-builder" },
+      defaultAgentId: body.default_agent_id,
+      defaultModel: body.default_model,
+      defaultProvider: body.default_provider,
+      networkPolicy: body.network_policy,
+    });
+    resolveProjectDir(app.dataDir, project.id);
+    sendJson(res, 201, projectJson(project));
+  });
+
+  router.get("/api/projects", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const includeArchived = ctx.query.include_archived === "1" || ctx.query.include_archived === "true";
+    const list = app.queries.listProjects({ includeArchived }).map(projectJson);
+    sendJson(res, 200, { projects: list });
+  });
+
+  router.get("/api/projects/:id", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const p = requireProject(app.queries, ctx.params.id!);
+    sendJson(res, 200, projectJson(p));
+  });
+
+  router.patch("/api/projects/:id", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const body = await readJsonBody<Record<string, unknown>>(req);
+    const patch: UpdateProjectInput = {};
+    if (typeof body.name === "string") patch.name = body.name;
+    if ("description" in body) {
+      patch.description =
+        body.description === null || body.description === undefined
+          ? null
+          : String(body.description);
+    }
+    if (body.task_source && typeof body.task_source === "object") {
+      patch.taskSource = body.task_source as UpdateProjectInput["taskSource"];
+    }
+    if (body.taskSource && typeof body.taskSource === "object") {
+      patch.taskSource = body.taskSource as UpdateProjectInput["taskSource"];
+    }
+    if ("default_model" in body) {
+      patch.defaultModel =
+        body.default_model === null || body.default_model === undefined
+          ? null
+          : String(body.default_model);
+    }
+    if ("default_provider" in body) {
+      patch.defaultProvider =
+        body.default_provider === null || body.default_provider === undefined
+          ? null
+          : String(body.default_provider);
+    }
+    if ("network_policy" in body && typeof body.network_policy === "string") {
+      patch.networkPolicy = body.network_policy;
+    }
+    const updated = app.queries.updateProject(ctx.params.id!, patch);
+    sendJson(res, 200, projectJson(updated));
+  });
+
+  router.delete("/api/projects/:id", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const archived = app.queries.archiveProject(ctx.params.id!);
+    sendJson(res, 200, projectJson(archived));
+  });
+
+  // ---- tasks ----
+
+  router.get("/api/projects/:id/tasks", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const includeArchived =
+      ctx.query.include_archived === "1" || ctx.query.include_archived === "true";
+    const list = app.queries
+      .listTasks(ctx.params.id!, { includeArchived })
+      .map(taskJson);
+    sendJson(res, 200, { tasks: list });
+  });
+
+  router.post("/api/projects/:id/tasks", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const project = requireProject(app.queries, ctx.params.id!);
+    const body = await readJsonBody<BuildTaskSpecInput & { source_kind?: string }>(req);
+    let spec: TaskSpec;
+    try {
+      spec = buildTaskSpec(body);
+    } catch (err) {
+      throw badRequest(err instanceof Error ? err.message : String(err));
+    }
+    const task = app.queries.createTask(project.id, spec, {
+      sourceKind: body.source_kind ?? "ui-builder",
+    });
+    sendJson(res, 201, taskJson(task));
+  });
+
+  router.get("/api/projects/:id/tasks/:taskId", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const task = requireTask(app.queries, ctx.params.id!, ctx.params.taskId!);
+    sendJson(res, 200, taskJson(task));
+  });
+
+  router.patch("/api/projects/:id/tasks/:taskId", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    requireTask(app.queries, ctx.params.id!, ctx.params.taskId!);
+    const body = await readJsonBody<Record<string, unknown>>(req);
+
+    // repo-md / manifest tasks are read-only via API (source of truth is the repo).
+    const existing = app.queries.getTask(ctx.params.taskId!)!;
+    if (
+      existing.sourceKind &&
+      existing.sourceKind !== "ui-builder" &&
+      existing.sourceKind !== "http-push"
+    ) {
+      throw conflict(
+        `task ${existing.id} is sourced from ${existing.sourceKind}; edit via the source and re-sync`,
+        "https://agenteval.dev/errors/task-read-only",
+      );
+    }
+
+    const patch: UpdateTaskInput = {};
+    if (typeof body.name === "string") patch.name = body.name;
+    if (typeof body.prompt === "string") patch.prompt = body.prompt;
+    if (body.workspace && typeof body.workspace === "object") {
+      patch.workspace = body.workspace as UpdateTaskInput["workspace"];
+    }
+    if (body.rubric && typeof body.rubric === "object") {
+      patch.rubric = body.rubric as UpdateTaskInput["rubric"];
+    }
+    if (typeof body.agent_category === "string") {
+      patch.agentCategory = body.agent_category as UpdateTaskInput["agentCategory"];
+    }
+    if ("profile" in body) {
+      patch.profile =
+        body.profile === null || body.profile === undefined
+          ? null
+          : (body.profile as UpdateTaskInput["profile"]);
+    }
+    if ("tags" in body) {
+      patch.tags = Array.isArray(body.tags)
+        ? (body.tags as string[])
+        : null;
+    }
+    if ("reference_solution" in body) {
+      patch.referenceSolution =
+        body.reference_solution === null || body.reference_solution === undefined
+          ? null
+          : String(body.reference_solution);
+    }
+
+    const updated = app.queries.updateTask(ctx.params.taskId!, patch);
+    sendJson(res, 200, taskJson(updated));
+  });
+
+  router.delete("/api/projects/:id/tasks/:taskId", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    requireTask(app.queries, ctx.params.id!, ctx.params.taskId!);
+    const archived = app.queries.archiveTask(ctx.params.taskId!);
+    sendJson(res, 200, taskJson(archived));
+  });
+
+  router.post("/api/projects/:id/tasks/sync", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const project = requireProject(app.queries, ctx.params.id!);
+    const projectDir = resolveProjectDir(app.dataDir, project.id);
+    const kind =
+      (project.taskSource?.kind as "ui-builder" | "repo-md") ?? "ui-builder";
+    if (kind !== "ui-builder" && kind !== "repo-md") {
+      throw badRequest(`sync not supported for task source kind: ${kind}`);
+    }
+    const source = createTaskSource(kind);
+    const store = createDbTaskStore(app.queries);
+    const pctx: ProjectCtx = {
+      projectId: project.id,
+      projectDir,
+      defaultAgentCategory: "coding",
+    };
+    // repo-md may need workspaceDir from params
+    if (kind === "repo-md" && project.taskSource?.params?.workspaceDir) {
+      pctx.workspaceDir = String(project.taskSource.params.workspaceDir);
+    }
+    const result = await syncTasks(pctx, source, store);
+    sendJson(res, 200, result);
+  });
+
+  // ---- runs (create under project) ----
+
+  router.post("/api/projects/:id/runs", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const project = requireProject(app.queries, ctx.params.id!);
+
+    const idemKey = header(req, "idempotency-key");
+    if (idemKey && app.idempotency.has(idemKey)) {
+      const cached = app.idempotency.get(idemKey)!;
+      sendJson(res, cached.status, cached.body, cached.headers);
+      return;
+    }
+
+    const body = await readJsonBody<{
+      taskId?: string;
+      task_id?: string;
+      taskTags?: string[];
+      task_tags?: string[];
+      agent?: string;
+      agentId?: string;
+      agent_id?: string;
+      model?: string;
+      provider?: string;
+      repeats?: number;
+      params?: Record<string, unknown>;
+      adapterOverrides?: Record<string, unknown>;
+      adapter_overrides?: Record<string, unknown>;
+      autoJudge?: boolean;
+      trigger?: string;
+      trigger_ref?: string;
+    }>(req);
+
+    const taskId = body.taskId ?? body.task_id;
+    const taskTags = body.taskTags ?? body.task_tags ?? [];
+    let task: Task | null = null;
+
+    if (taskId) {
+      task = requireTask(app.queries, project.id, taskId);
+    } else if (taskTags.length > 0) {
+      const all = app.queries.listTasks(project.id);
+      task =
+        all.find(
+          (t) => t.tags && taskTags.every((tag) => t.tags!.includes(tag)),
+        ) ?? null;
+      if (!task) throw notFound(`no task matching tags: ${taskTags.join(",")}`);
+    } else {
+      throw badRequest("taskId (or taskTags) is required");
+    }
+
+    const agentId =
+      body.agent ?? body.agentId ?? body.agent_id ?? project.defaultAgentId ?? "fixture";
+    const model =
+      body.model ?? project.defaultModel ?? "claude-sonnet-4-20250514";
+    const provider =
+      body.provider ?? project.defaultProvider ?? "anthropic";
+    const repeats = Math.max(1, Math.min(100, Number(body.repeats ?? 1) || 1));
+
+    // Ensure agent is registered (best-effort).
+    try {
+      app.queries.registerAgent({
+        id: agentId,
+        displayName: agentId,
+        defaultModel: model,
+        defaultProvider: provider,
+      });
+    } catch {
+      // ignore
+    }
+
+    const batch = app.queries.createBatch({
+      taskId: task.id,
+      projectId: project.id,
+      agentId,
+      model,
+      provider,
+      params: body.params ?? {},
+      repeats,
+      trigger: body.trigger,
+      triggerRef: body.trigger_ref,
+    });
+
+    const runs: Run[] = [];
+    for (let i = 0; i < repeats; i++) {
+      const r = app.queries.createRun({
+        batchId: batch.id,
+        taskId: task.id,
+        projectId: project.id,
+        agentId,
+        model,
+        provider,
+        repeatIndex: i,
+        status: "queued",
+        controlState: "running",
+        startedAt: new Date().toISOString(),
+        trigger: body.trigger,
+        triggerRef: body.trigger_ref,
+      });
+      runs.push(r);
+    }
+
+    // Start the first run (concurrency 1 → sequential via queue).
+    for (const r of runs) {
+      void enqueueStart(app, r.id);
+    }
+
+    const bodyOut = {
+      batch_id: batch.id,
+      run_ids: runs.map((r) => r.id),
+      runs: runs.map(runJson),
+      status: "accepted",
+    };
+    const headers = {
+      Location: `/api/runs/${runs[0]!.id}`,
+    };
+
+    if (idemKey) {
+      app.idempotency.set(idemKey, { status: 202, body: bodyOut, headers });
+    }
+
+    sendJson(res, 202, bodyOut, headers);
+  });
+
+  router.get("/api/projects/:id/runs", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const list = app.queries.listRuns({ projectId: ctx.params.id! }).map(runJson);
+    sendJson(res, 200, { runs: list });
+  });
+
+  // ---- run detail / events / diff / report ----
+
+  router.get("/api/runs/:id", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const run = requireRun(app.queries, ctx.params.id!);
+    sendJson(res, 200, runJson(run));
+  });
+
+  router.get("/api/runs/:id/events", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const run = requireRun(app.queries, ctx.params.id!);
+    // `since` is exclusive (last received seq). Default -1 so a first connect
+    // with since=0 (common client convention for "from the start") still
+    // includes seq 0 (run.start). readFromSeq yields seq > sinceSeq.
+    // Mapping: omitted or "0" → -1 (full replay); "5" → 5 (resume after 5).
+    let sinceSeq = -1;
+    if (ctx.query.since !== undefined && ctx.query.since !== "") {
+      const n = Number(ctx.query.since);
+      if (Number.isFinite(n)) {
+        // Treat since=0 as "from the beginning" (include seq 0).
+        sinceSeq = n === 0 ? -1 : n;
+      }
+    }
+    // Also accept Accept header preference.
+    const accept = header(req, "accept") ?? "";
+    const finalMode =
+      ctx.query.stream === "ndjson"
+        ? "ndjson"
+        : accept.includes("ndjson")
+          ? "ndjson"
+          : "sse";
+    await streamEvents(req, res, app, run, sinceSeq, finalMode);
+  });
+
+  router.get("/api/runs/:id/diff", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const run = requireRun(app.queries, ctx.params.id!);
+    const path = resolveDiffPath(
+      app.dataDir,
+      run.projectId,
+      run.id,
+      run.diffPath,
+    );
+    if (!existsSync(path)) {
+      throw notFound(`diff not available for run ${run.id}`);
+    }
+    const text = await readFile(path, "utf8");
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Content-Length", Buffer.byteLength(text));
+    res.end(text);
+  });
+
+  router.get("/api/runs/:id/report", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const run = requireRun(app.queries, ctx.params.id!);
+    const partial = ctx.query.partial === "1" || ctx.query.partial === "true";
+    // Minimal envelope for P3; full report is P5.
+    sendJson(res, 200, {
+      run_id: run.id,
+      status: run.status,
+      control_state: run.controlState,
+      partial,
+      report: null,
+      note: "Full report generation lands in P5",
+    });
+  });
+
+  // ---- run control ----
+
+  router.post("/api/runs/:id/pause", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const run = requireRun(app.queries, ctx.params.id!);
+    assertNotTerminal(run);
+    const mode =
+      (ctx.query.mode === "hard" ? "hard" : "soft") as "soft" | "hard";
+    try {
+      const updated = await pauseRun(run.id, mode, app.queries, app.liveRuns);
+      sendJson(res, 200, runJson(updated));
+    } catch (err) {
+      mapControlError(err);
+    }
+  });
+
+  router.post("/api/runs/:id/resume", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const run = requireRun(app.queries, ctx.params.id!);
+    assertNotTerminal(run);
+    try {
+      const updated = await resumeRun(run.id, app.queries, app.liveRuns);
+      sendJson(res, 200, runJson(updated));
+    } catch (err) {
+      mapControlError(err);
+    }
+  });
+
+  router.post("/api/runs/:id/abort", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const run = requireRun(app.queries, ctx.params.id!);
+    assertNotTerminal(run);
+    try {
+      const updated = await abortRun(run.id, app.queries, app.liveRuns);
+      sendJson(res, 200, runJson(updated));
+    } catch (err) {
+      mapControlError(err);
+    }
+  });
+
+  router.post("/api/runs/:id/control", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const run = requireRun(app.queries, ctx.params.id!);
+    const body = await readJsonBody<{
+      action?: string;
+      enabled?: boolean;
+      mode?: string;
+      value?: unknown;
+    }>(req);
+
+    const action = body.action;
+    if (!action) throw badRequest("action is required");
+
+    if (action === "network") {
+      if (typeof body.enabled !== "boolean") {
+        throw badRequest("enabled (boolean) is required for action=network");
+      }
+      // Network toggle is allowed even if terminal? Spec says live control —
+      // only while live. But tests expect 200 after start. If not live yet,
+      // create a stub or return 409.
+      try {
+        const result = setNetwork(run.id, body.enabled, app.liveRuns);
+        sendJson(res, 200, result);
+      } catch (err) {
+        // If run is queued and not yet live, wait briefly for start.
+        if (
+          err &&
+          typeof err === "object" &&
+          (err as { code?: string }).code === "NOT_LIVE"
+        ) {
+          // Brief wait for the start queue.
+          const ok = await waitForLive(app, run.id, 5_000);
+          if (!ok) {
+            throw conflict(`run ${run.id} is not live yet`);
+          }
+          const result = setNetwork(run.id, body.enabled, app.liveRuns);
+          sendJson(res, 200, result);
+          return;
+        }
+        mapControlError(err);
+      }
+      return;
+    }
+
+    assertNotTerminal(run);
+
+    if (action === "pause") {
+      const mode = body.mode === "hard" ? "hard" : "soft";
+      const updated = await pauseRun(run.id, mode, app.queries, app.liveRuns);
+      sendJson(res, 200, runJson(updated));
+      return;
+    }
+    if (action === "resume") {
+      const updated = await resumeRun(run.id, app.queries, app.liveRuns);
+      sendJson(res, 200, runJson(updated));
+      return;
+    }
+    if (action === "abort") {
+      const updated = await abortRun(run.id, app.queries, app.liveRuns);
+      sendJson(res, 200, runJson(updated));
+      return;
+    }
+
+    throw badRequest(`unknown action: ${action}`);
+  });
+}
+
+function mapControlError(err: unknown): never {
+  if (err && typeof err === "object" && (err as { code?: string }).code === "TERMINAL") {
+    throw conflict(err instanceof Error ? err.message : "run is terminal");
+  }
+  if (err instanceof HttpError) throw err;
+  throw err;
+}
+
+function header(req: IncomingMessage, name: string): string | undefined {
+  const v = req.headers[name.toLowerCase()];
+  if (Array.isArray(v)) return v[0];
+  return v;
+}
+
+async function waitForLive(
+  app: AppCtx,
+  runId: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (app.liveRuns.has(runId)) return true;
+    const r = app.queries.getRun(runId);
+    if (r && isTerminalStatus(r.status)) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return app.liveRuns.has(runId);
+}
+
+// ---------------------------------------------------------------------------
+// createServer
+// ---------------------------------------------------------------------------
+
+/**
+ * Bootstrap the REST API.
+ *
+ * ```ts
+ * const api = createServer({ dataDir, adapter: createFixtureAdapter() });
+ * const port = await api.listen(0);
+ * // ...
+ * await api.close();
+ * ```
+ */
+export function createServer(opts: CreateServerOptions): ApiServer {
+  const open = opts.openDb ?? defaultOpenDb;
+  const opened = opts.queries
+    ? { queries: opts.queries, dataDir: opts.dataDir }
+    : open(opts.dataDir);
+
+  const liveRuns = createLiveRunsMap();
+  const app: AppCtx = {
+    queries: opened.queries,
+    dataDir: opts.dataDir,
+    liveRuns,
+    adapter: opts.adapter,
+    concurrency: opts.concurrency ?? 1,
+    idempotency: new Map(),
+    startQueue: [],
+    activeStarts: 0,
+  };
+  app.startOpts = opts.startOpts;
+
+  const router = new Router();
+  registerRoutes(router, opts.startOpts);
+
+  const server = createHttpServer((req, res) => {
+    void router.handle(req, res, app).catch((err) => {
+      handleError(res, err);
+    });
+  });
+
+  return {
+    server,
+    queries: app.queries,
+    liveRuns,
+    app,
+    listen(port = 0, host = "127.0.0.1") {
+      return new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(port, host, () => {
+          server.off("error", reject);
+          const addr = server.address();
+          if (addr && typeof addr === "object") {
+            resolve(addr.port);
+          } else {
+            reject(new Error("failed to bind server"));
+          }
+        });
+      });
+    },
+    async close() {
+      // Best-effort abort of live runs so tests don't hang.
+      for (const [id, live] of [...liveRuns.entries()]) {
+        try {
+          if (!live.finished) {
+            await live.controller.abort().catch(() => undefined);
+            await live.handle.remove().catch(() => undefined);
+          }
+        } catch {
+          // ignore
+        }
+        liveRuns.delete(id);
+      }
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    },
+  };
+}
+
+// Re-exports for consumers / tests.
+export {
+  createFixtureAdapter,
+  createLiveRunsMap,
+  isTerminalStatus,
+  startRun,
+  pauseRun,
+  resumeRun,
+  abortRun,
+  setNetwork,
+};
+export type { LiveRun, LiveRunsMap, StartRunOptions } from "./run-controller-bridge.js";

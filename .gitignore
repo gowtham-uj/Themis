@@ -7,5 +7,8 @@ dist/
 !.env.example
 .DS_Store
 coverage/
+# Next.js
+.next/
+src/ui/.next/
 # local eval data — never commit runs/findings/reports
 data/
