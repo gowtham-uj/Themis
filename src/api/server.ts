@@ -72,6 +72,7 @@ import { registerWebhooksRoutes } from "./webhooks-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerRubricRoutes } from "./rubric-routes.js";
 import { registerArtifactRoutes } from "./artifact-routes.js";
+import { registerSandboxRoutes } from "./sandbox-routes.js";
 import {
   OutboundWebhookDispatcher,
   RealDeliverySink,
@@ -305,6 +306,7 @@ function projectJson(p: Project) {
     network_policy: p.networkPolicy,
     retention_runs: p.retentionRuns,
     artifact_retention: p.artifactRetention,
+    sandbox: p.sandbox,
     archived: p.archived,
     created_at: p.createdAt,
     updated_at: p.updatedAt,
@@ -1519,6 +1521,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   // Project-scoped reusable rubrics — CRUD.
   registerRubricRoutes(router);
   registerArtifactRoutes(router);
+  registerSandboxRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {

@@ -1,0 +1,400 @@
+/**
+ * Real container backend: podman.
+ *
+ * Chosen over Docker because it is daemonless — each container is a direct
+ * fork/exec of an OCI runtime (crun), so there is no root daemon to run,
+ * nothing to keep alive between runs, and teardown is a process exiting. The
+ * per-detail control a project wants (capabilities, devices, mounts, tmpfs,
+ * ulimits, seccomp) maps onto flags one-for-one; see sandbox-policy.ts.
+ *
+ * Every knob comes from the {@link SandboxPolicy}, so a project controls its own
+ * sandbox over the API without this file knowing anything about projects.
+ *
+ * Verified working in this environment: run, image pull, bridge networking,
+ * `--network=none` egress cutoff, ephemeral port publish + readback, pause /
+ * unpause, `--pids-limit`, `--cpus`, and `--privileged` (nested containers).
+ * Memory limits are accepted but the host cgroup does not delegate the memory
+ * controller here, so crun fails — see `podmanSupportsMemoryLimits`.
+ */
+
+import { spawn, type ChildProcess } from "node:child_process";
+import type {
+  ContainerHandle,
+  ContainerRuntime,
+  ResolvedPort,
+  RunContainerSpec,
+} from "./runtime.js";
+import { buildPodmanRunArgs } from "./podman-argv.js";
+import {
+  defaultSandboxPolicy,
+  resolveSandboxPolicy,
+  type SandboxPolicy,
+} from "./sandbox-policy.js";
+
+/** Options for constructing a {@link PodmanRuntime}. */
+export interface PodmanRuntimeOptions {
+  /** podman binary; defaults to AGENTEVAL_PODMAN_BIN or "podman". */
+  bin?: string;
+  /**
+   * Prefix argv, e.g. `["sudo", "-n"]`. Rootless podman needs a subuid range;
+   * where the host has none, running via sudo is the working path.
+   * Defaults to AGENTEVAL_PODMAN_SUDO=1 → ["sudo", "-n"].
+   */
+  prefix?: string[];
+  /** Sandbox policy applied when a run does not carry its own. */
+  policy?: SandboxPolicy;
+  /** Milliseconds to wait for an image pull + container create. */
+  startTimeoutMs?: number;
+}
+
+/** Result of running a podman CLI command to completion. */
+interface CliResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/** Spawn a podman subcommand and collect its output. */
+function runCli(
+  argv: string[],
+  opts: { timeoutMs?: number } = {},
+): Promise<CliResult> {
+  return new Promise((resolve) => {
+    const [file, ...args] = argv;
+    if (!file) {
+      resolve({ code: 1, stdout: "", stderr: "empty argv" });
+      return;
+    }
+    const child = spawn(file, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = opts.timeoutMs
+      ? setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            /* already gone */
+          }
+        }, opts.timeoutMs)
+      : undefined;
+
+    child.stdout?.on("data", (c: Buffer) => {
+      stdout += c.toString("utf8");
+    });
+    child.stderr?.on("data", (c: Buffer) => {
+      stderr += c.toString("utf8");
+    });
+    const finish = (code: number): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    };
+    child.on("error", (err) => {
+      stderr += String(err);
+      finish(127);
+    });
+    child.on("close", (code) => finish(code ?? 0));
+  });
+}
+
+/** Turn a `podman logs -f` child process into an async byte stream. */
+async function* streamOf(child: ChildProcess, which: "stdout" | "stderr"): AsyncGenerator<Buffer> {
+  const src = child[which];
+  if (!src) return;
+  for await (const chunk of src) {
+    yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+  }
+}
+
+/**
+ * Parse `podman port <ctr>` output into resolved mappings.
+ *
+ * Lines look like `8000/tcp -> 127.0.0.1:35635`. The host port is the whole
+ * point: an ephemeral request is only useful once the caller can read back what
+ * it actually got.
+ */
+export function parsePortOutput(
+  out: string,
+  requested: RunContainerSpec["ports"],
+): ResolvedPort[] {
+  const byContainerPort = new Map<number, ResolvedPort>();
+  for (const line of out.split("\n")) {
+    const m = /^(\d+)\/(tcp|udp)\s*->\s*\S*?:(\d+)\s*$/.exec(line.trim());
+    if (!m) continue;
+    const containerPort = Number(m[1]);
+    const hostPort = Number(m[3]);
+    if (!Number.isInteger(containerPort) || !Number.isInteger(hostPort)) continue;
+    byContainerPort.set(containerPort, {
+      containerPort,
+      hostPort,
+      protocol: m[2] === "udp" ? "udp" : "tcp",
+    });
+  }
+  // Carry the caller's names across so AGENTEVAL_PORT_<NAME> stays meaningful.
+  const out2: ResolvedPort[] = [];
+  for (const req of requested ?? []) {
+    const found = byContainerPort.get(req.containerPort);
+    if (!found) continue;
+    out2.push(req.name ? { ...found, name: req.name } : found);
+    byContainerPort.delete(req.containerPort);
+  }
+  // Anything published but not requested (policy ports) still gets reported.
+  out2.push(...byContainerPort.values());
+  return out2;
+}
+
+/** A running podman container. */
+class PodmanContainerHandle implements ContainerHandle {
+  readonly id: string;
+  readonly image: string;
+  readonly ports: ResolvedPort[];
+
+  private readonly podman: string[];
+  private readonly logsChild: ChildProcess;
+  private readonly timeoutMs: number;
+  private readonly autoRemove: boolean;
+  private waitPromise: Promise<{ exitCode: number; timedOut: boolean }> | undefined;
+  private timedOut = false;
+  private removed = false;
+  private timeoutTimer: NodeJS.Timeout | undefined;
+
+  constructor(opts: {
+    id: string;
+    image: string;
+    ports: ResolvedPort[];
+    podman: string[];
+    timeoutMs: number;
+    autoRemove: boolean;
+  }) {
+    this.id = opts.id;
+    this.image = opts.image;
+    this.ports = opts.ports;
+    this.podman = opts.podman;
+    this.timeoutMs = opts.timeoutMs;
+    this.autoRemove = opts.autoRemove;
+
+    // Follow logs from the start; podman keeps both streams separate, so the
+    // canonical trace never has stderr interleaved into stdout.
+    const [file, ...prefixArgs] = [...this.podman, "logs", "-f", this.id];
+    this.logsChild = spawn(file!, prefixArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    if (this.timeoutMs > 0) {
+      this.timeoutTimer = setTimeout(() => {
+        this.timedOut = true;
+        void this.kill();
+      }, this.timeoutMs);
+      this.timeoutTimer.unref?.();
+    }
+  }
+
+  private cli(args: string[], timeoutMs = 30_000): Promise<CliResult> {
+    return runCli([...this.podman, ...args], { timeoutMs });
+  }
+
+  /** SIGKILL the container immediately (timeout path). */
+  private async kill(): Promise<void> {
+    await this.cli(["kill", "--signal", "KILL", this.id], 15_000);
+  }
+
+  async pause(): Promise<void> {
+    await this.cli(["pause", this.id]);
+  }
+
+  async resume(): Promise<void> {
+    await this.cli(["unpause", this.id]);
+  }
+
+  async stop(graceMs = 10_000): Promise<void> {
+    // podman's -t is seconds; it sends SIGTERM then SIGKILL after the grace.
+    const seconds = Math.max(0, Math.ceil(graceMs / 1000));
+    await this.cli(["stop", "-t", String(seconds), this.id], graceMs + 15_000);
+  }
+
+  stdout(): AsyncIterable<Buffer> {
+    return streamOf(this.logsChild, "stdout");
+  }
+
+  stderr(): AsyncIterable<Buffer> {
+    return streamOf(this.logsChild, "stderr");
+  }
+
+  async wait(): Promise<{ exitCode: number; timedOut: boolean }> {
+    this.waitPromise ??= this.doWait();
+    return this.waitPromise;
+  }
+
+  private async doWait(): Promise<{ exitCode: number; timedOut: boolean }> {
+    // `podman wait` blocks until exit and prints the code. With --rm the
+    // container may be reaped before we can inspect it, so this is the only
+    // reliable read of the exit status.
+    const res = await this.cli(["wait", this.id], 0);
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+
+    let exitCode = Number.parseInt(res.stdout.trim(), 10);
+    if (!Number.isInteger(exitCode)) {
+      // `wait` could not report (container vanished, or podman errored). Ask
+      // inspect before giving up — losing a real exit code would mislabel a
+      // successful run as failed.
+      const insp = await this.cli(
+        ["inspect", this.id, "--format", "{{.State.ExitCode}}"],
+        15_000,
+      );
+      const fromInspect = Number.parseInt(insp.stdout.trim(), 10);
+      exitCode = Number.isInteger(fromInspect)
+        ? fromInspect
+        : res.code === 0
+          ? 0
+          : 1;
+    }
+
+    // Let the log follower drain what it has before callers stop reading.
+    await new Promise<void>((resolve) => {
+      if (this.logsChild.exitCode !== null || this.logsChild.killed) {
+        resolve();
+        return;
+      }
+      const done = (): void => resolve();
+      this.logsChild.once("close", done);
+      setTimeout(() => {
+        try {
+          this.logsChild.kill("SIGTERM");
+        } catch {
+          /* already gone */
+        }
+        resolve();
+      }, 1_000).unref?.();
+    });
+
+    return { exitCode, timedOut: this.timedOut };
+  }
+
+  async remove(): Promise<void> {
+    if (this.removed) return;
+    this.removed = true;
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+    try {
+      this.logsChild.kill("SIGTERM");
+    } catch {
+      /* already gone */
+    }
+    // The container is never started with `--rm` (that would race `podman
+    // wait`), so removal is ours to do. `keepAfterExit` projects opt out to
+    // keep the stopped container for post-mortem inspection.
+    if (this.autoRemove) {
+      await this.cli(["rm", "-f", "-i", this.id], 30_000);
+    }
+  }
+}
+
+/**
+ * Daemonless ContainerRuntime backed by podman.
+ *
+ * One `podman run -d` per eval run; the handle drives pause/stop/wait/remove
+ * through the CLI. No long-lived daemon, no socket, nothing to clean up between
+ * runs beyond the container itself.
+ */
+export class PodmanRuntime implements ContainerRuntime {
+  private readonly bin: string;
+  private readonly prefix: string[];
+  private readonly policy: SandboxPolicy;
+  private readonly startTimeoutMs: number;
+
+  constructor(opts: PodmanRuntimeOptions = {}) {
+    this.bin = opts.bin ?? process.env.AGENTEVAL_PODMAN_BIN ?? "podman";
+    this.prefix =
+      opts.prefix ??
+      (process.env.AGENTEVAL_PODMAN_SUDO === "1" ? ["sudo", "-n"] : []);
+    this.policy = opts.policy ?? defaultSandboxPolicy();
+    // Generous: the first run of an image pays for the registry pull.
+    this.startTimeoutMs = opts.startTimeoutMs ?? 600_000;
+  }
+
+  /** Full argv prefix for any podman invocation. */
+  private cmd(): string[] {
+    return [...this.prefix, this.bin];
+  }
+
+  /**
+   * Launch a container for `spec`.
+   *
+   * The per-run policy rides on `spec.sandbox` when present (set by the API
+   * bridge from project config); otherwise the runtime's default applies.
+   */
+  async run(spec: RunContainerSpec): Promise<ContainerHandle> {
+    if (spec.argv.length === 0) {
+      throw new Error("PodmanRuntime.run: empty argv");
+    }
+    // spec.sandbox is typed unknown at the seam so runtime.ts stays independent
+    // of the policy module; narrow it here.
+    const policy = spec.sandbox
+      ? resolveSandboxPolicy(this.policy, spec.sandbox)
+      : this.policy;
+
+    const name = `agenteval-${Date.now().toString(36)}-${Math.floor(
+      Math.random() * 1e6,
+    ).toString(36)}`;
+
+    const args = buildPodmanRunArgs(spec, policy, { name });
+    const created = await runCli([...this.cmd(), ...args], {
+      timeoutMs: this.startTimeoutMs,
+    });
+    if (created.code !== 0) {
+      throw new Error(
+        `podman run failed (exit ${created.code}): ${created.stderr.trim() || created.stdout.trim()}`,
+      );
+    }
+    const id = created.stdout.trim().split("\n").pop()?.trim() ?? name;
+
+    // Read back what the ephemeral port requests actually resolved to. Only
+    // meaningful once the container exists, which is why it happens here.
+    let ports: ResolvedPort[] = [];
+    const wanted = [...(spec.ports ?? []), ...policy.ports];
+    if (wanted.length > 0) {
+      const portRes = await runCli([...this.cmd(), "port", id], {
+        timeoutMs: 30_000,
+      });
+      if (portRes.code === 0) {
+        ports = parsePortOutput(portRes.stdout, wanted);
+      }
+    }
+
+    return new PodmanContainerHandle({
+      id,
+      image: spec.image,
+      ports,
+      podman: this.cmd(),
+      timeoutMs: spec.timeoutMs,
+      autoRemove: policy.autoRemove,
+    });
+  }
+
+  /** True when the podman binary is present and responsive. */
+  async available(): Promise<boolean> {
+    const res = await runCli([...this.cmd(), "--version"], { timeoutMs: 15_000 });
+    return res.code === 0;
+  }
+}
+
+/**
+ * Whether this host delegates the memory cgroup controller.
+ *
+ * Nested container hosts frequently delegate only `cpuset cpu pids`, and a
+ * `--memory` flag then fails the run outright rather than degrading. Callers
+ * that want a run to survive on such a host should drop `limits.memoryMiB`.
+ */
+export async function podmanSupportsMemoryLimits(): Promise<boolean> {
+  const { readFile } = await import("node:fs/promises");
+  try {
+    const controllers = await readFile(
+      "/sys/fs/cgroup/cgroup.subtree_control",
+      "utf8",
+    );
+    return controllers.split(/\s+/).includes("memory");
+  } catch {
+    return false;
+  }
+}

@@ -354,6 +354,8 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE users ADD COLUMN email TEXT",
     // Artifact retention: what survives judgement (keep|referenced|all).
     "ALTER TABLE projects ADD COLUMN artifact_retention TEXT DEFAULT 'keep'",
+    // Sandbox policy: per-project container controls (caps, mounts, devices…).
+    "ALTER TABLE projects ADD COLUMN sandbox_json TEXT",
   ];
   for (const sql of alters) {
     try {

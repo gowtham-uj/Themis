@@ -11,6 +11,7 @@
 import { existsSync } from "node:fs";
 import { DockerSocketRuntime } from "./docker-socket.js";
 import { FakeContainerRuntime } from "./fake-runtime.js";
+import { PodmanRuntime } from "./podman-runtime.js";
 
 /** A container that has been started and can be controlled. */
 export interface ContainerHandle {
@@ -83,6 +84,12 @@ export interface RunContainerSpec {
   ports?: PortMapping[];
   /** Non-root inside the container. */
   nonRoot: boolean;
+  /**
+   * Per-project sandbox controls (capabilities, mounts, devices, tmpfs, …).
+   * Typed as unknown here so the seam does not depend on the policy module;
+   * real backends narrow it via `resolveSandboxPolicy`. Absent → backend default.
+   */
+  sandbox?: unknown;
 }
 
 export interface ContainerRuntime {
@@ -112,6 +119,19 @@ export function setRuntime(rt: ContainerRuntime | undefined): void {
 }
 
 /**
+ * True when the podman backend should be selected.
+ *
+ * Explicit opt-in via `AGENTEVAL_PODMAN=1` (or `AGENTEVAL_RUNTIME=podman`).
+ * Deliberately not auto-detected from the binary being present: a developer
+ * box may have podman installed without wanting every unit test to launch real
+ * containers.
+ */
+export function isPodmanEnvironment(): boolean {
+  if (process.env.AGENTEVAL_PODMAN === "1") return true;
+  return (process.env.AGENTEVAL_RUNTIME ?? "").toLowerCase() === "podman";
+}
+
+/**
  * True when a real Docker backend should be selected:
  *  - `AGENTEVAL_DOCKER=1`, or
  *  - `DOCKER_HOST` is set, or
@@ -135,6 +155,9 @@ export function isDockerEnvironment(): boolean {
  */
 export function resolveRuntime(): ContainerRuntime {
   if (injectedRuntime) return injectedRuntime;
+  // Podman is the preferred real backend: daemonless, rootless-capable, and
+  // the same OCI images. Checked first so a host with both picks it.
+  if (isPodmanEnvironment()) return new PodmanRuntime();
   if (isDockerEnvironment()) {
     // DockerSocketRuntime.run() currently throws NotImplementedError in this build;
     // live container smoke is deferred to a Docker+root environment (@needs-docker).

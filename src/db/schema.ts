@@ -54,6 +54,8 @@ export const projects = sqliteTable("projects", {
   retentionRuns: integer("retention_runs"),
   /** What run artifacts survive judgement: keep|referenced|all. */
   artifactRetention: text("artifact_retention").default("keep"),
+  /** Per-project sandbox controls (capabilities, mounts, devices, ports…). */
+  sandboxJson: text("sandbox_json"),
   archived: integer("archived").notNull().default(0),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),

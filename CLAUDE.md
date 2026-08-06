@@ -42,23 +42,27 @@ data/          # gitignored runtime artifacts (projects/<pid>/...)
 - `npm test` — vitest. Every phase adds tests; QC requires green.
 - `npm run cli -- <cmd>` — exercises real adapters locally.
 
-## Execution environment constraint (read before you assume)
+## Execution environment (updated 2026-08-06 — podman now works)
 
-This build runs in a **Dockerless sandbox** (verified: non-root `nobody`, `NoNewPrivs=1`, no
-`CAP_SYS_ADMIN`, no docker socket/CLI, install requires superuser → fails). Therefore:
+This build now has **passwordless `sudo` + podman 4.3.1 / crun**, so real containers run here.
+Podman is the chosen backend over Docker: daemonless (fork/exec per container, nothing to keep
+alive), rootless-capable, same OCI images, and every per-detail knob maps to a flag.
 
-- **Adapter runs + the judge run as live local processes**, not in containers, for P1 QC and
-  unit/integration tests. (A real model API key is available via `ANTHROPIC_AUTH_TOKEN`/
-  `ANTHROPIC_BASE_URL`.)
-- **Phase 2's container runner is real library code** (`runner/docker.ts` etc.), but its
-  container-execution path is unit-tested against a **Docker test-double** (a fake provider implementing
-  the `ContainerRuntime` interface) so the spawn/mount/limit/pause/diff logic is verifiable here.
-  The `ContainerRuntime` interface is the seam: in tests it's the fake; in a real deployment it's the
-  Docker-socket-backed impl. Never inline `docker` CLI calls in domain logic — always go through
-  `ContainerRuntime`.
-- **Live-container smoke tests are deferred** to an environment with Docker + root. Mark such tests
-  `// @needs-docker` and guard them so `npm test` stays green here; they run only when
-  `AGENTEVAL_DOCKER=1`.
+- **`PodmanRuntime`** (`runner/podman-runtime.ts`) is the real backend, selected by
+  `AGENTEVAL_PODMAN=1` (or `AGENTEVAL_RUNTIME=podman`). It needs `AGENTEVAL_PODMAN_SUDO=1` here
+  because uid 65534 `nobody` has no `/etc/subuid` range, so rootless mode cannot map uids.
+- **`FakeContainerRuntime` remains the default** for unit tests: fast, no daemon, and most tests
+  care about runner/redaction/diff/control logic rather than real isolation.
+- **Live container tests** live in `tests/podman-live.test.ts`, guarded by `AGENTEVAL_PODMAN=1`
+  so `npm test` stays green on hosts without podman. Run them with:
+  `AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=1 npx vitest run tests/podman-live.test.ts`
+- Never inline `podman`/`docker` CLI calls in domain logic — always go through `ContainerRuntime`.
+
+Two environment limits worth knowing before debugging a failure:
+- **Memory limits do not work**: the host cgroup delegates only `cpuset cpu pids`, so `--memory`
+  makes crun fail the run outright. Leave `limits.memoryMiB` unset here. cpus/pids work.
+- Podman must never be given `--rm`: it reaps the container before `podman wait` can read the exit
+  code, turning every successful run into a reported failure. The handle removes it in `remove()`.
 
 ## Quality gates (enforced per phase before commit)
 

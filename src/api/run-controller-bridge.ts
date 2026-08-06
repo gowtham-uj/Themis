@@ -234,6 +234,9 @@ export async function startRun(
   const projectRow = queries.getProject(projectId);
   const overrides = resolveAdapterOverrides(projectRow);
   const networkMode = resolveRunNetwork(projectRow, overrides);
+  // Per-project sandbox controls (caps, mounts, devices, tmpfs, ...). Passed
+  // through the spec so real backends apply them; the fake ignores it.
+  const sandbox = projectRow?.sandbox ?? undefined;
 
   const ctx: RunContext = {
     runId,
@@ -342,6 +345,7 @@ export async function startRun(
       timeoutMs,
       network: networkMode,
       ...(overrides?.ports ? { ports: overrides.ports } : {}),
+      ...(sandbox ? { sandbox } : {}),
       nonRoot: true,
     });
   }
@@ -361,6 +365,7 @@ export async function startRun(
         image: adapter.image(ctx),
         network: networkMode,
         adapterOverrides: overrides ?? null,
+        sandbox: sandbox ?? null,
         ports: handle.ports ?? [],
       },
       null,

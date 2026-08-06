@@ -92,6 +92,8 @@ export interface Project {
   retentionRuns: number | null;
   /** What run artifacts survive judgement: keep|referenced|all. */
   artifactRetention: string;
+  /** Per-project sandbox controls; null when the project configures none. */
+  sandbox: Record<string, unknown> | null;
   archived: boolean;
   createdAt: string;
   updatedAt: string;
@@ -112,6 +114,7 @@ export interface CreateProjectInput {
   networkPolicy?: string;
   retentionRuns?: number | null;
   artifactRetention?: string;
+  sandbox?: Record<string, unknown> | null;
   id?: string;
 }
 
@@ -129,6 +132,7 @@ export interface UpdateProjectInput {
   networkPolicy?: string;
   retentionRuns?: number | null;
   artifactRetention?: string;
+  sandbox?: Record<string, unknown> | null;
 }
 
 export interface Task {
@@ -1175,6 +1179,7 @@ function mapProject(row: typeof projects.$inferSelect): Project {
     networkPolicy: row.networkPolicy ?? "allow",
     retentionRuns: row.retentionRuns,
     artifactRetention: row.artifactRetention ?? "keep",
+    sandbox: parseJson(row.sandboxJson, null),
     archived: row.archived === 1,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -1687,6 +1692,7 @@ export class SqliteQueries implements QueryStore {
       artifactRetention: resolveRetentionPolicy(
         input.artifactRetention ?? DEFAULT_ARTIFACT_RETENTION,
       ),
+      sandboxJson: stringifyJson(input.sandbox ?? null),
       archived: 0,
       createdAt: ts,
       updatedAt: ts,
@@ -1764,6 +1770,10 @@ export class SqliteQueries implements QueryStore {
           patch.artifactRetention !== undefined
             ? resolveRetentionPolicy(patch.artifactRetention)
             : existing.artifactRetention,
+        sandboxJson:
+          patch.sandbox !== undefined
+            ? stringifyJson(patch.sandbox)
+            : stringifyJson(existing.sandbox),
         updatedAt: ts,
       })
       .where(eq(projects.id, id))
@@ -3701,6 +3711,7 @@ export class MemoryQueries implements QueryStore {
       artifactRetention: resolveRetentionPolicy(
         input.artifactRetention ?? DEFAULT_ARTIFACT_RETENTION,
       ),
+      sandbox: input.sandbox ?? null,
       archived: false,
       createdAt: ts,
       updatedAt: ts,
@@ -3768,6 +3779,7 @@ export class MemoryQueries implements QueryStore {
         patch.artifactRetention !== undefined
           ? resolveRetentionPolicy(patch.artifactRetention)
           : existing.artifactRetention,
+      sandbox: patch.sandbox !== undefined ? patch.sandbox : existing.sandbox,
       updatedAt: nowIso(),
     };
     this.projects.set(id, next);
