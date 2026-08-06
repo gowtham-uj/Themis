@@ -26,6 +26,10 @@ import { prepareWorkspace, ensureGitRepo } from "../runner/workspace.js";
 import type { ContainerHandle } from "../runner/runtime.js";
 import { runChecks } from "../runner/check-runner.js";
 import { captureDiff } from "../runner/diff.js";
+import {
+  resolveAdapterOverrides,
+  resolveRunNetwork,
+} from "../runner/project-config.js";
 
 /** Terminal run statuses (control actions return 409). */
 export const TERMINAL_RUN_STATUSES = new Set([
@@ -223,6 +227,13 @@ export async function startRun(
   const timeoutMs = opts.timeoutMs ?? 120_000;
   const network = new NetworkCutoff();
 
+  // Per-project execution config refines the global adapter for this codebase
+  // (plan/projects.md §82): image pin, project env, tool allowlist, network
+  // policy. Absent config → undefined overrides → adapter defaults unchanged.
+  const projectRow = queries.getProject(projectId);
+  const overrides = resolveAdapterOverrides(projectRow);
+  const networkMode = resolveRunNetwork(projectRow, overrides);
+
   const ctx: RunContext = {
     runId,
     project: { id: projectId },
@@ -232,9 +243,10 @@ export async function startRun(
     },
     model: run.model,
     provider: run.provider,
-    params: {},
+    params: overrides?.params ?? {},
     workspaceDir,
     apiKeys: collectApiKeys(),
+    ...(overrides ? { overrides } : {}),
   };
 
   // Snapshot run.json for provenance (alongside DB row).
@@ -257,6 +269,25 @@ export async function startRun(
             : {}),
         },
         startedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
+  // Resolved execution provenance — which image/network/overrides this run
+  // actually launched with after the project's config was applied. Kept in its
+  // own artifact because run.json is owned by the query layer, which rewrites
+  // it from the DB row on every status transition.
+  await writeFile(
+    join(runDir, "exec.json"),
+    `${JSON.stringify(
+      {
+        runId,
+        image: adapter.image(ctx),
+        network: networkMode,
+        adapterOverrides: overrides ?? null,
       },
       null,
       2,
@@ -315,7 +346,7 @@ export async function startRun(
       env: {},
       limits: { cpus: 1, memoryMiB: 256, pids: 64 },
       timeoutMs: 5_000,
-      network: "allow",
+      network: networkMode,
       nonRoot: true,
     });
   } else {
@@ -327,7 +358,7 @@ export async function startRun(
       env,
       limits: { cpus: 1, memoryMiB: 512, pids: 128 },
       timeoutMs,
-      network: "allow",
+      network: networkMode,
       nonRoot: true,
     });
   }
