@@ -63,6 +63,14 @@ and its own task-ingest method (see [projects.md](projects.md)).
   **Abort** (graceful, keeps partial logs), with confirmation on hard-pause/abort. Disabled states
   match `control_state` (e.g. Resume only when paused). Partial trace + partial diff always viewable
   here regardless of state; **"results so far"** banner while running/paused/aborted.
+- **Sandbox controls (live)**: a widget to intervene mid-run — **Network cutoff** toggle (cut egress
+  immediately, `net{blocked:"live-cutoff"}` events follow; reversible without restart), **CPU/memory**
+  sliders + **kill**, plus pause/resume/abort. Each action lands on the run timeline when acted. See
+  execution.md "Sandbox control + telemetry".
+- **Telemetry lanes**: alongside the trace timeline, a **commands** lane (`exec` events: argv, cwd, uid,
+  exit, duration) and a **network** lane (`net` events: host:port, proto, bytes, status, blocked?).
+  These are the agent's *actual* sandbox behavior — independent of its `tool.call` claims — and findings
+  deep-link into them (e.g. an unannounced `rm -rf`, or a connection to an unknown host).
 - **Trace timeline** (the centerpiece): chronological canonical events rendered as:
   - **thinking** blocks (collapsible, dimmed) — reasoning traces
   - **assistant messages**

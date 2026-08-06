@@ -116,9 +116,16 @@ Run **control** (task #11 semantics):
 POST   /api/runs/:id/pause?mode=soft|hard          pause (soft = stop dequeuing; hard = cgroup freeze)
 POST   /api/runs/:id/resume                        resume (re-enqueue / thaw + reconnect stream)
 POST   /api/runs/:id/abort                         abort (graceful SIGTERM→KILL, keep partial logs)
-POST   /api/projects/:id/control                   batch/project fan-out: {action:pause|resume|abort, scope:batch|all}
+POST   /api/runs/:id/control                       live sandbox control: {action:"network", enabled:false}
+                                                  → cut egress now (reversible with enabled:true);
+                                                  {action:"cpu"|"memory", value} → live limit change;
+                                                  {action:"pause"|"resume"|"abort"} → alias of the above
+POST   /api/projects/:id/control                   batch/project fan-out: {action:pause|resume|abort|network, scope:batch|all}
 ```
-Partial results are always available via the `GET`s above regardless of `control_state`.
+Sandbox telemetry lands in the same event stream: `exec` (every command run) and `net` (every outbound
+network call, incl. `blocked`) events are appended to `events.jsonl` and streamed over `GET .../events`.
+A finding can `refs` an `exec`/`net` event by seq range. Partial results are always available via the
+`GET`s above regardless of `control_state`.
 
 ### Judgements + findings
 ```

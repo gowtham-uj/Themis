@@ -30,6 +30,8 @@ type EventType =
   | "message"                        // assistant text (delta or full)
   | "tool.call" | "tool.result"
   | "usage"
+  | "exec"                           // a command the sandbox executed (instrumented)
+  | "net"                            // an outbound network call the sandbox made (instrumented)
   | "error"
   | "log";                           // adapter/system note (non-model)
 ```
@@ -86,6 +88,40 @@ on disk if needed).
 ```
 Cost is passed through when the agent supplies it (pi does); otherwise the harness computes it from a
 model-pricing table.
+
+### exec  (a command the sandbox executed — instrumented, not model-authored)
+```ts
+{ type: "exec", turn?: number,
+  argv: string[],                       // the exact argv as exec'd in the sandbox
+  cwd: string,                         // working dir inside the container
+  user: string,                        // uid/name it ran as (sanity: must be the non-root sandbox user)
+  exitCode: number | null,             // null if killed/killed-by-timeout
+  durationMs: number,
+  blocked?: boolean,                   // true if a policy (net allowlist / command denylist) refused it
+  blockedReason?: string }             // why, if blocked
+```
+Captured by the sandbox's **exec instrumentation** (see [execution.md](execution.md)), not by the agent.
+This is the ground truth of *what the agent actually ran* — distinct from `tool.call` (what the agent
+*asked* a tool to do). It is indexed and addressable as `refs{kind:"trace",...}` so a finding can point
+at the exact command (e.g. a `rm -rf` an agent slipped in).
+
+### net  (an outbound network call the sandbox made — instrumented)
+```ts
+{ type: "net", turn?: number,
+  host: string, port: number,
+  proto: "tcp"|"udp"|"http",
+  direction: "outbound" | "inbound",   // inbound only when the task exposes a server the harness probes
+  method?: string, url?: string,       // for http(s)
+  bytesSent?: number, bytesRecv?: number,
+  status?: number, durationMs?: number,
+  blocked?: boolean,                   // true if a network policy refused the connection
+  blockedReason?: string }            // why, if blocked (allowlist miss, live cutoff, offline mode)
+```
+Captured at the container network edge. A connection the agent made to `npmjs.org` to install deps is
+normal and logged; one to an unexpected exfil host is a finding (and, with live cutoff enabled, the
+packet that triggered the block). Both `exec` and `net` events are first-class run logs, streamed over
+SSE and judged exactly like `tool.call`/`tool.result` — the judge sees what the agent *did in the
+sandbox*, not just what it claimed.
 
 ### error / log
 ```ts

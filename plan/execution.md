@@ -74,7 +74,55 @@ After the agent finishes, diff capture depends on the task's **agent category**
   can start an eval batch, pause it mid-run, and resume later; results captured so far are always
   persisted and accessible.
 
-## Run control — start · pause · resume · abort
+## Sandbox control + telemetry (live, from the project dashboard)
+
+The sandbox is **observable and controllable live** from the project dashboard — every command it
+executes and every network call it makes is captured into the run's log, and the operator can intervene
+mid-run (not just after). This is the difference between "we ran the agent in a box" and "we know, to
+the syscall, what it did, and can cut it off when it misbehaves."
+
+### Live control (project dashboard → sandbox)
+
+Exposed as run-control actions (same surface as pause/resume/abort, [api.md](api.md)):
+
+- **Network cutoff** — toggle the sandbox's egress **off** mid-run. A running agent loses outbound
+  network immediately (new connections refused at the container edge); in-flight connections are killed.
+  Recorded as the moment of cutoff on the run timeline; connections attempted *after* are emitted as
+  `net{blocked:true, blockedReason:"live-cutoff"}` events. Reversible (re-enable) without restarting the
+  run. Distinct from the static per-task `network` policy (`allow`/`allowlist`/`offline`) — cutoff is a
+  live override that supersedes the static policy for this run.
+- **CPU/memory kill** — raise/lower the live `--cpus`/`--memory` limits; "stop the run" (abort) keeps
+  partial logs. A runaway loop consuming all memory is observable (the `exec`/`usage` telemetry) and
+  stoppable before it OOMs the host.
+- **Pause/resume** (already specced) and **abort** — as in the run-control section below.
+- **eBPF-backed** where available (cgroup + `tc`/`nftables` for net, `cgroup freezer` for pause), so
+  control is enforced by the kernel, not cooperatively by the agent.
+
+### Telemetry: exec + net events as first-class run logs
+
+The sandbox instruments two channels and emits them as canonical `exec` / `net` events
+([event-schema.md](event-schema.md)) — persisted into `events.jsonl`, streamed over SSE, and judged.
+
+- **Exec instrumentation** — every process the sandbox spawns (argv, cwd, uid, exit code, duration) is
+  logged as an `exec` event. Captured via an **exec logger**: either an LD_PRELOAD shim / a shell
+  wrapper that wraps `execve`, or eBPF `exec`/`tracepoint` probes where the host allows it. This is the
+  ground truth of *what the agent actually ran* — independent of (and corroborating or contradicting)
+  the agent's own `tool.call` claims. A `rm -rf` the agent didn't announce shows up here regardless.
+- **Network instrumentation** — every outbound connection (host:port, proto, method/url for http, bytes,
+  status, duration) is logged as a `net` event, captured at the container network edge: a transparent
+  proxy (mitmproxy/tinyproxy) for http(s) flow + `nftables`/`conntrack` logging for raw TCP/UDP. Blocked
+  connections (allowlist miss, live cutoff, offline mode) are emitted with `blocked:true` + reason.
+- **Both are evidence** — the judge treats `exec`/`net` events as first-class artifacts: a finding can
+  `refs` a specific `exec` event ("the agent ran `git push` to an external remote — exfil") or `net`
+  event ("DNS resolution of an unknown host"). They feed the safety/verification axes (F, D) directly
+  and the manipulation/destructive diagnostics.
+
+### What the dashboard shows
+
+Per-run, alongside the trace timeline: a **commands** lane (exec events, argv + exit) and a **network**
+lane (net events, host + bytes + status), both deep-linkable from findings. A live **sandbox controls**
+widget: network cutoff toggle, cpu/mem sliders/kill, pause/resume/abort — each applied to the running
+container and reflected on the timeline when acted.
 
 Evals are long, expensive, and parallel; you must be able to **pause** a batch/run in the middle and
 **resume** later, and **abort** cleanly while keeping whatever was captured. Crucially, **partial
