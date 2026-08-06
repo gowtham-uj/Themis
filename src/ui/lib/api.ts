@@ -940,6 +940,384 @@ export function setNetwork(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Issues / Findings log (P6b)
+// ---------------------------------------------------------------------------
+
+/** Finding kind: defect / positive / meta (mirrors findings table). */
+export type IssueKind = "defect" | "positive" | "meta" | string;
+
+/** Lifecycle status of a de-duplicated finding fingerprint. */
+export type IssueStatus =
+  | "open"
+  | "resolved"
+  | "regressed"
+  | "wontfix"
+  | string;
+
+/** Severity vocabulary used by the judge + issues log. */
+export type IssueSeverity = "blocker" | "major" | "minor" | "nit" | string;
+
+/** Structured evidence ref (same shape as judge verdict Ref). */
+export type IssueRef =
+  | { kind: "diff"; file: string; hunk: number; lines?: [number, number] }
+  | { kind: "trace"; runId: string; seqs: [number, number] }
+  | { kind: "tool"; toolCallId: string }
+  | { kind: string; [key: string]: unknown };
+
+/** Optional fix direction attached to a finding. */
+export interface IssueFix {
+  direction: string;
+  repro?: { command: string; expected: string };
+  [key: string]: unknown;
+}
+
+/** Recurrence summary returned alongside list + detail. */
+export interface IssueRecurrence {
+  firstSeenRunId?: string | null;
+  lastSeenRunId?: string | null;
+  count?: number;
+}
+
+/** Batch recurrence: k occurrences of this finding / n runs in the batch. */
+export interface IssueBatchRecurrence {
+  batchId: string;
+  k: number;
+  n: number;
+}
+
+/**
+ * One row in the project issues log.
+ * Mirrors FindingRow + a recurrence annotation from the list endpoint.
+ */
+export interface IssueListItem {
+  fingerprint: string;
+  taskId: string;
+  projectId: string;
+  category: string;
+  kind: IssueKind;
+  claim: string;
+  latestSeverity: IssueSeverity | null;
+  latestConfidence: number | null;
+  firstSeenJudgement: string | null;
+  lastSeenJudgement: string | null;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+  occurrenceCount: number;
+  resolvedAt: string | null;
+  status: IssueStatus;
+  recurrence?: IssueRecurrence;
+  [key: string]: unknown;
+}
+
+/** One occurrence of a finding (decoded refs/fix for the client). */
+export interface IssueOccurrence {
+  id: string;
+  findingFingerprint: string;
+  judgementId: string;
+  runId: string;
+  severity: IssueSeverity | string;
+  confidence: number;
+  claim: string;
+  criterion: string | null;
+  /** Decoded from refsJson. */
+  refs?: IssueRef[];
+  refsJson?: string;
+  /** Decoded from fixJson. */
+  fix?: IssueFix | null;
+  fixJson?: string | null;
+  status: string;
+  createdAt: string;
+  [key: string]: unknown;
+}
+
+/** Detail payload for GET /api/projects/:id/findings/:fingerprint. */
+export interface IssueDetail {
+  finding: IssueListItem & { occurrences: IssueOccurrence[] };
+  recurrence: IssueRecurrence;
+  kByBatch: IssueBatchRecurrence[];
+  [key: string]: unknown;
+}
+
+export interface ListIssuesOptions {
+  status?: IssueStatus;
+  category?: string;
+  /** taskId filter (query key: task). */
+  task?: string;
+  kind?: IssueKind;
+  severity?: IssueSeverity;
+  limit?: number;
+  cursor?: string | number;
+}
+
+/**
+ * Build the URL for the project issues log.
+ * Filters map 1:1 to the GET /api/projects/:id/findings query string.
+ */
+export function listIssuesUrl(
+  projectId: string,
+  opts: ListIssuesOptions & { baseUrl?: string } = {},
+): string {
+  const base = opts.baseUrl !== undefined ? opts.baseUrl : getApiBaseUrl();
+  const path = `/api/projects/${encodeURIComponent(projectId)}/findings`;
+  const query: Record<string, string | number | undefined> = {};
+  if (opts.status) query.status = String(opts.status);
+  if (opts.category) query.category = opts.category;
+  if (opts.task) query.task = opts.task;
+  if (opts.kind) query.kind = String(opts.kind);
+  if (opts.severity) query.severity = String(opts.severity);
+  if (opts.limit !== undefined && opts.limit !== null) query.limit = opts.limit;
+  if (opts.cursor !== undefined && opts.cursor !== null) {
+    query.cursor = opts.cursor;
+  }
+  return joinUrl(base, path) + buildQuery(query);
+}
+
+/**
+ * Build the URL for a single finding's lifecycle detail.
+ * Fingerprint is URL-encoded (sha256 hex is safe, but we encode defensively).
+ */
+export function runIssuesUrl(
+  projectId: string,
+  fingerprint: string,
+  opts: { baseUrl?: string } = {},
+): string {
+  const base = opts.baseUrl !== undefined ? opts.baseUrl : getApiBaseUrl();
+  const path = `/api/projects/${encodeURIComponent(projectId)}/findings/${encodeURIComponent(fingerprint)}`;
+  return joinUrl(base, path);
+}
+
+/** Normalize a list-item row (tolerates snake_case + missing recurrence). */
+export function normalizeIssueListItem(
+  raw: Record<string, unknown>,
+): IssueListItem {
+  const recurrenceRaw =
+    (raw.recurrence as Record<string, unknown> | undefined) ?? undefined;
+  const recurrence: IssueRecurrence | undefined = recurrenceRaw
+    ? {
+        firstSeenRunId:
+          (recurrenceRaw.firstSeenRunId as string | null | undefined) ??
+          (recurrenceRaw.first_seen_run_id as string | null | undefined) ??
+          null,
+        lastSeenRunId:
+          (recurrenceRaw.lastSeenRunId as string | null | undefined) ??
+          (recurrenceRaw.last_seen_run_id as string | null | undefined) ??
+          null,
+        count:
+          (recurrenceRaw.count as number | undefined) ??
+          (raw.occurrenceCount as number | undefined) ??
+          (raw.occurrence_count as number | undefined),
+      }
+    : undefined;
+
+  return {
+    ...raw,
+    fingerprint: String(raw.fingerprint ?? ""),
+    taskId: String(raw.taskId ?? raw.task_id ?? ""),
+    projectId: String(raw.projectId ?? raw.project_id ?? ""),
+    category: String(raw.category ?? ""),
+    kind: String(raw.kind ?? "defect"),
+    claim: String(raw.claim ?? ""),
+    latestSeverity:
+      ((raw.latestSeverity as string | null | undefined) ??
+        (raw.latest_severity as string | null | undefined) ??
+        null) as IssueSeverity | null,
+    latestConfidence:
+      (raw.latestConfidence as number | null | undefined) ??
+      (raw.latest_confidence as number | null | undefined) ??
+      null,
+    firstSeenJudgement:
+      (raw.firstSeenJudgement as string | null | undefined) ??
+      (raw.first_seen_judgement as string | null | undefined) ??
+      null,
+    lastSeenJudgement:
+      (raw.lastSeenJudgement as string | null | undefined) ??
+      (raw.last_seen_judgement as string | null | undefined) ??
+      null,
+    firstSeenAt:
+      (raw.firstSeenAt as string | null | undefined) ??
+      (raw.first_seen_at as string | null | undefined) ??
+      null,
+    lastSeenAt:
+      (raw.lastSeenAt as string | null | undefined) ??
+      (raw.last_seen_at as string | null | undefined) ??
+      null,
+    occurrenceCount: Number(
+      raw.occurrenceCount ?? raw.occurrence_count ?? 0,
+    ),
+    resolvedAt:
+      (raw.resolvedAt as string | null | undefined) ??
+      (raw.resolved_at as string | null | undefined) ??
+      null,
+    status: String(raw.status ?? "open"),
+    recurrence,
+  };
+}
+
+/** Parse refsJson / fixJson if the server left them as strings. */
+function decodeJsonField<T>(value: unknown, fallback: T): T {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return value as T;
+}
+
+/** Normalize a detail occurrence (decode refs/fix). */
+export function normalizeIssueOccurrence(
+  raw: Record<string, unknown>,
+): IssueOccurrence {
+  const refsJson =
+    (raw.refsJson as string | undefined) ??
+    (raw.refs_json as string | undefined);
+  const fixJson =
+    (raw.fixJson as string | null | undefined) ??
+    (raw.fix_json as string | null | undefined) ??
+    null;
+  const refs =
+    (raw.refs as IssueRef[] | undefined) ??
+    decodeJsonField<IssueRef[]>(refsJson, []);
+  const fix =
+    (raw.fix as IssueFix | null | undefined) ??
+    (fixJson ? decodeJsonField<IssueFix | null>(fixJson, null) : null);
+
+  return {
+    ...raw,
+    id: String(raw.id ?? ""),
+    findingFingerprint: String(
+      raw.findingFingerprint ?? raw.finding_fingerprint ?? "",
+    ),
+    judgementId: String(raw.judgementId ?? raw.judgement_id ?? ""),
+    runId: String(raw.runId ?? raw.run_id ?? ""),
+    severity: String(raw.severity ?? "nit"),
+    confidence: Number(raw.confidence ?? 0),
+    claim: String(raw.claim ?? ""),
+    criterion:
+      (raw.criterion as string | null | undefined) ?? null,
+    refs,
+    refsJson,
+    fix,
+    fixJson,
+    status: String(raw.status ?? "introduced"),
+    createdAt: String(
+      raw.createdAt ?? raw.created_at ?? "",
+    ),
+  };
+}
+
+/** Normalize the issue detail envelope. */
+export function normalizeIssueDetail(
+  raw: Record<string, unknown>,
+): IssueDetail {
+  const findingRaw =
+    (raw.finding as Record<string, unknown> | undefined) ?? raw;
+  const occurrencesRaw =
+    (findingRaw.occurrences as unknown[]) ??
+    (raw.occurrences as unknown[]) ??
+    [];
+  const base = normalizeIssueListItem(findingRaw);
+  const occurrences = Array.isArray(occurrencesRaw)
+    ? occurrencesRaw.map((o) =>
+        normalizeIssueOccurrence(o as Record<string, unknown>),
+      )
+    : [];
+
+  const recurrenceRaw =
+    (raw.recurrence as Record<string, unknown> | undefined) ??
+    (base.recurrence as Record<string, unknown> | undefined) ??
+    {};
+  const recurrence: IssueRecurrence = {
+    firstSeenRunId:
+      (recurrenceRaw.firstSeenRunId as string | null | undefined) ??
+      (recurrenceRaw.first_seen_run_id as string | null | undefined) ??
+      null,
+    lastSeenRunId:
+      (recurrenceRaw.lastSeenRunId as string | null | undefined) ??
+      (recurrenceRaw.last_seen_run_id as string | null | undefined) ??
+      null,
+    count:
+      (recurrenceRaw.count as number | undefined) ??
+      base.occurrenceCount,
+  };
+
+  const kByBatchRaw = (raw.kByBatch as unknown[]) ?? (raw.k_by_batch as unknown[]) ?? [];
+  const kByBatch: IssueBatchRecurrence[] = Array.isArray(kByBatchRaw)
+    ? kByBatchRaw.map((row) => {
+        const r = row as Record<string, unknown>;
+        return {
+          batchId: String(r.batchId ?? r.batch_id ?? ""),
+          k: Number(r.k ?? 0),
+          n: Number(r.n ?? 0),
+        };
+      })
+    : [];
+
+  return {
+    ...raw,
+    finding: { ...base, occurrences },
+    recurrence,
+    kByBatch,
+  };
+}
+
+/**
+ * GET /api/projects/:id/findings — project issues log.
+ * Unwraps the `{ findings: [...] }` envelope via {@link unwrapList}.
+ */
+export async function listIssues(
+  projectId: string,
+  opts: ApiClientOptions & ListIssuesOptions = {},
+): Promise<IssueListItem[]> {
+  const {
+    status,
+    category,
+    task,
+    kind,
+    severity,
+    limit,
+    cursor,
+    ...client
+  } = opts;
+  const path = `/api/projects/${encodeURIComponent(projectId)}/findings`;
+  const query: Record<string, string | number | boolean | undefined | null> = {};
+  if (status) query.status = String(status);
+  if (category) query.category = category;
+  if (task) query.task = task;
+  if (kind) query.kind = String(kind);
+  if (severity) query.severity = String(severity);
+  if (limit !== undefined && limit !== null) query.limit = limit;
+  if (cursor !== undefined && cursor !== null) query.cursor = cursor;
+
+  const raw = await apiRequest<unknown>(path, {
+    ...client,
+    method: "GET",
+    query,
+  });
+  return unwrapList(raw, "findings").map((row) =>
+    normalizeIssueListItem(row as Record<string, unknown>),
+  );
+}
+
+/**
+ * GET /api/projects/:id/findings/:fingerprint — lifecycle detail
+ * (occurrences + k/N by batch + recurrence).
+ */
+export async function getIssue(
+  projectId: string,
+  fingerprint: string,
+  opts: ApiClientOptions = {},
+): Promise<IssueDetail> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/findings/${encodeURIComponent(fingerprint)}`,
+    { ...opts, method: "GET" },
+  );
+  return normalizeIssueDetail(raw);
+}
+
 /** Bundle of client methods for DI into components/tests. */
 export function createApiClient(opts: ApiClientOptions = {}) {
   return {
@@ -974,6 +1352,14 @@ export function createApiClient(opts: ApiClientOptions = {}) {
     abortRun: (runId: string) => abortRun(runId, opts),
     setNetwork: (runId: string, enabled: boolean) =>
       setNetwork(runId, enabled, opts),
+    listIssues: (projectId: string, o?: ListIssuesOptions) =>
+      listIssues(projectId, { ...opts, ...o }),
+    getIssue: (projectId: string, fingerprint: string) =>
+      getIssue(projectId, fingerprint, opts),
+    listIssuesUrl: (projectId: string, o?: ListIssuesOptions) =>
+      listIssuesUrl(projectId, { ...o, baseUrl: opts.baseUrl }),
+    runIssuesUrl: (projectId: string, fingerprint: string) =>
+      runIssuesUrl(projectId, fingerprint, { baseUrl: opts.baseUrl }),
   };
 }
 

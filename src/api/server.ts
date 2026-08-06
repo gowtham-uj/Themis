@@ -61,6 +61,7 @@ import {
   serveHtmlFile,
   type JudgeRunner,
 } from "./judgements-routes.js";
+import { registerFindingsRoutes } from "./findings-routes.js";
 
 // ---------------------------------------------------------------------------
 // App context
@@ -1146,6 +1147,8 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerRoutes(router, opts.startOpts);
   // Judgement routes (P4c) — modular mount so this file stays focused on runs.
   registerJudgementRoutes(router);
+  // Findings / issues-log routes (P6b) — list + lifecycle detail + k/N.
+  registerFindingsRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void router.handle(req, res, app).catch((err) => {
