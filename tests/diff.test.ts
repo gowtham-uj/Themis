@@ -1,5 +1,6 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -157,5 +158,59 @@ describe("captureDiff", () => {
     expect(result.hunks).toEqual([]);
     const patchText = await readFile(result.patchPath, "utf8");
     expect(patchText.trim()).toBe("");
+  });
+});
+
+describe("agent-internal state exclusion", () => {
+  // Regression: agents write their own bookkeeping into the workspace —
+  // ReaperCode keeps .reaper/ (trajectory, model-call transcripts, run
+  // manifests) beside the code. Those landed in the captured diff, so the judge
+  // would have scored an agent on its own log files. Found by running the real
+  // agent: 13 of the 14 "changed files" were its own logs.
+  it("excludes .reaper/ and friends by default", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agenteval-diffx-"));
+    try {
+      execFileSync("git", ["-C", dir, "init", "-q"]);
+      execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+      execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+      mkdirSync(join(dir, "src"), { recursive: true });
+      writeFileSync(join(dir, "src/app.js"), "const a = 1;\n");
+      execFileSync("git", ["-C", dir, "add", "-A"]);
+      execFileSync("git", ["-C", dir, "commit", "-qm", "seed"]);
+
+      // The agent edits real code AND writes its own state.
+      writeFileSync(join(dir, "src/app.js"), "const a = 2;\n");
+      mkdirSync(join(dir, ".reaper/runs/x/logs"), { recursive: true });
+      writeFileSync(join(dir, ".reaper/runs/x/logs/trajectory.jsonl"), "{}\n");
+      writeFileSync(join(dir, ".reaper/latest-run.json"), "{}\n");
+
+      const res = await captureDiff(dir, { outPath: join(dir, "out.patch") });
+      expect(res.rawDiff).toContain("src/app.js");
+      expect(res.rawDiff).not.toContain(".reaper");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps everything when exclusions are explicitly cleared", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agenteval-diffx2-"));
+    try {
+      execFileSync("git", ["-C", dir, "init", "-q"]);
+      execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+      execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+      writeFileSync(join(dir, "seed.txt"), "x\n");
+      execFileSync("git", ["-C", dir, "add", "-A"]);
+      execFileSync("git", ["-C", dir, "commit", "-qm", "seed"]);
+      mkdirSync(join(dir, ".reaper"), { recursive: true });
+      writeFileSync(join(dir, ".reaper/state.json"), "{}\n");
+
+      const res = await captureDiff(dir, {
+        outPath: join(dir, "out.patch"),
+        excludePaths: [],
+      });
+      expect(res.rawDiff).toContain(".reaper");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

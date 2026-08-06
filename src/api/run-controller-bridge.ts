@@ -238,7 +238,12 @@ export async function startRun(
   // A per-run image pin (POST /runs adapterOverrides.image, stored on the run/
   // batch as agentImage) is more specific than the project's workspaceImage, so
   // it layers on top.
-  const runOverrides = run.agentImage ? { image: run.agentImage } : undefined;
+  // The run's own overrides (env, params, tools) layer over the project's.
+  // agentImage is kept as a fallback for runs created before the blob was
+  // stored, and for queue promotes that only carry an image tag.
+  const runOverrides =
+    run.adapterOverrides ??
+    (run.agentImage ? { image: run.agentImage } : undefined);
   const overrides = resolveAdapterOverrides(projectRow, runOverrides);
   const networkMode = resolveRunNetwork(projectRow, overrides);
   // Per-project sandbox controls (caps, mounts, devices, tmpfs, ...). Passed

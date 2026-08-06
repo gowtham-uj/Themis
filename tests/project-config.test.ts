@@ -409,3 +409,60 @@ describe("per-run adapterOverrides (POST /runs)", () => {
     }
   }, 20_000);
 });
+
+describe("adapter env precedence (gateway/proxy pinning)", () => {
+  // Regression: both adapters applied ctx.apiKeys — harvested from the HARNESS
+  // HOST's environment — AFTER the project/run overrides, so a run that
+  // deliberately pinned ANTHROPIC_BASE_URL (a proxy, a gateway, a regional
+  // endpoint) was silently redirected to whatever the host exported. Found when
+  // a containerized agent ignored its pinned gateway and hit the real API.
+  it("an explicit override beats the host environment", async () => {
+    const { buildReaperCommand } = await import("../src/adapters/reapercode.ts");
+    const { buildPiCommand } = await import("../src/adapters/pi.ts");
+
+    const ctx = {
+      runId: "r",
+      project: { id: "p" },
+      task: { prompt: "x", workspace: { source: "empty" as const } },
+      model: "m",
+      provider: "anthropic",
+      params: {},
+      workspaceDir: "/workspace",
+      // What collectApiKeys() scrapes off the host.
+      apiKeys: {
+        ANTHROPIC_BASE_URL: "https://host-env.example.com",
+        ANTHROPIC_API_KEY: "host-key",
+      },
+      overrides: {
+        env: {
+          ANTHROPIC_BASE_URL: "http://pinned-gateway.internal:9999/v1",
+          ANTHROPIC_API_KEY: "pinned-key",
+        },
+      },
+    } as unknown as RunContext;
+
+    expect(buildReaperCommand(ctx).env.ANTHROPIC_BASE_URL).toBe(
+      "http://pinned-gateway.internal:9999/v1",
+    );
+    expect(buildReaperCommand(ctx).env.ANTHROPIC_API_KEY).toBe("pinned-key");
+    expect(buildPiCommand(ctx).env.ANTHROPIC_BASE_URL).toBe(
+      "http://pinned-gateway.internal:9999/v1",
+    );
+    expect(buildPiCommand(ctx).env.ANTHROPIC_API_KEY).toBe("pinned-key");
+  });
+
+  it("still uses host keys when the run pins nothing", async () => {
+    const { buildReaperCommand } = await import("../src/adapters/reapercode.ts");
+    const ctx = {
+      runId: "r",
+      project: { id: "p" },
+      task: { prompt: "x", workspace: { source: "empty" as const } },
+      model: "m",
+      provider: "anthropic",
+      params: {},
+      workspaceDir: "/workspace",
+      apiKeys: { ANTHROPIC_API_KEY: "host-key" },
+    } as unknown as RunContext;
+    expect(buildReaperCommand(ctx).env.ANTHROPIC_API_KEY).toBe("host-key");
+  });
+});

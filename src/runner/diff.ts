@@ -56,7 +56,30 @@ export interface CaptureDiffOptions {
   outPath?: string;
   /** Also write a sibling `diff.hunks.json` (default true). */
   writeIndex?: boolean;
+  /**
+   * Workspace-relative paths to leave out of the diff, as git pathspecs.
+   *
+   * Agents write their own state into the workspace — ReaperCode keeps
+   * `.reaper/` (trajectory, model-call transcripts, run manifests) right next
+   * to the code. That is harness bookkeeping, not the agent's work product, and
+   * letting it into the diff means the judge scores an agent on its own log
+   * files. Defaults to {@link DEFAULT_DIFF_EXCLUDES}; pass `[]` to keep
+   * everything.
+   */
+  excludePaths?: readonly string[];
 }
+
+/**
+ * Agent-internal state directories excluded from a captured diff by default.
+ *
+ * These are written BY the agent runtime, about the run — not changes the agent
+ * made to the codebase it was asked to work on.
+ */
+export const DEFAULT_DIFF_EXCLUDES: readonly string[] = [
+  ".reaper/",
+  ".pi/",
+  ".agent/",
+];
 
 /**
  * Stage every change in `workspaceDir` and write a hunk-numbered patch.
@@ -69,7 +92,10 @@ export async function captureDiff(
   // Stage everything (including untracked) so empty-init workspaces produce a full tree diff.
   await execFileAsync("git", ["-C", workspaceDir, "add", "-A"]);
 
-  const rawDiff = await gitDiffCached(workspaceDir);
+  const rawDiff = await gitDiffCached(
+    workspaceDir,
+    options.excludePaths ?? DEFAULT_DIFF_EXCLUDES,
+  );
   const hunks = numberHunks(rawDiff);
   const numbered = injectHunkMarkers(rawDiff, hunks);
 
@@ -214,11 +240,27 @@ function formatHunkMarker(h: HunkIndexEntry): string {
   return parts.join(" ");
 }
 
-async function gitDiffCached(workspaceDir: string): Promise<string> {
+async function gitDiffCached(
+  workspaceDir: string,
+  excludePaths: readonly string[] = [],
+): Promise<string> {
+  // `:(exclude)` pathspecs need the `--` separator to be read as paths.
+  const pathspecs =
+    excludePaths.length > 0
+      ? ["--", ".", ...excludePaths.map((p) => `:(exclude)${p}`)]
+      : [];
   try {
     const { stdout } = await execFileAsync(
       "git",
-      ["-C", workspaceDir, "diff", "--cached", "--no-color", "--no-ext-diff"],
+      [
+        "-C",
+        workspaceDir,
+        "diff",
+        "--cached",
+        "--no-color",
+        "--no-ext-diff",
+        ...pathspecs,
+      ],
       {
         maxBuffer: 64 * 1024 * 1024,
         // git diff exits 0 even with changes; empty is fine.

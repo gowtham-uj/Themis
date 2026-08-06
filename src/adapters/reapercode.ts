@@ -696,7 +696,6 @@ export function buildReaperCommand(ctx: RunContext): AdapterCommand {
   }
 
   const env: Record<string, string> = {
-    ...ctx.overrides?.env,
     // Env-form of the stream flag, accepted per plan/reapercode-changes.md.
     REAPER_STREAM_EVENTS: "1",
   };
@@ -704,6 +703,11 @@ export function buildReaperCommand(ctx: RunContext): AdapterCommand {
   for (const [k, v] of Object.entries(ctx.apiKeys)) {
     env[k] = v;
   }
+  // Project/run overrides come LAST so they win. ctx.apiKeys is harvested from
+  // the harness host's environment, so applying it afterwards would silently
+  // redirect a run that explicitly pinned ANTHROPIC_BASE_URL (a proxy, a
+  // gateway, a regional endpoint) back to whatever the host happens to export.
+  Object.assign(env, ctx.overrides?.env ?? {});
 
   return { argv, env };
 }

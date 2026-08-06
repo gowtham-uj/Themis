@@ -1083,6 +1083,9 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
         ...(pinnedImage
           ? { agentImage: pinnedImage, agentImageSource: "run_override" }
           : {}),
+        // Store the WHOLE override blob, not just the image: env (proxy /
+        // gateway endpoints), params, and allowedTools are equally per-run.
+        ...(runOverrides ? { adapterOverrides: runOverrides } : {}),
       });
       runs.push(r);
     }

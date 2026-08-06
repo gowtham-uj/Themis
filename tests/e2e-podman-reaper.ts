@@ -3,10 +3,13 @@
  * reapercode adapter, judged by the REAL judge worker, rendered to a REAL HTML
  * report — all over the public REST API.
  *
- * Only the two MODELS are mocked, and they are mocked at the gateway boundary:
- *  - the agent's model: the pod replays a scripted trajectory (authored to
- *    contain a genuine defect), but its tool calls really touch the workspace;
- *  - the judge's model: a scripted provider returns a verdict.
+ * The AGENT is the real ReaperCode build (tests/fixtures/pods/
+ * reapercode-real.Containerfile) running its genuine loop, tools and trajectory
+ * logging. Only the two MODELS are mocked, at the gateway boundary:
+ *  - the agent's model: an Anthropic-Messages-compatible server the agent calls
+ *    over HTTP (tests/fixtures/mock-model-gateway.ts), scripted to produce a
+ *    run with a genuine defect;
+ *  - the judge's model: a scripted verdict grounded in the real captured trace.
  * Everything between them is production code: podman, event capture, redaction,
  * diff capture, checks, verdict validation, findings ingest, report render.
  *
@@ -26,8 +29,14 @@ import type { DbQueries } from "../src/db/queries.js";
 import type { Verdict } from "../src/judge/verdict.js";
 import { validateVerdict } from "../src/judge/verdict.js";
 import { renderVerdictReport } from "../src/judge/report/render.js";
+import {
+  bugfixPolicy,
+  startMockGateway,
+  type MockGateway,
+} from "./fixtures/mock-model-gateway.js";
 
-const POD_IMAGE = "localhost/agenteval/reapercode-mock:latest";
+const POD_IMAGE =
+  process.env.AGENTEVAL_E2E_IMAGE ?? "localhost/agenteval/reapercode-real:latest";
 const FIXTURE = "/tmp/e2e/fixture-repo";
 
 let failures = 0;
@@ -339,11 +348,20 @@ function makeJudgeGateway(): (ctx: JudgeRunContext) => Promise<void> {
 }
 
 async function main(): Promise<void> {
-  console.log("agenteval end-to-end: real pod + real judge pipeline\n");
+  console.log("agenteval end-to-end: REAL agent in a pod + real judge pipeline\n");
 
   if (!existsSync(FIXTURE)) {
     throw new Error(`fixture repo missing: ${FIXTURE}`);
   }
+
+  // MODEL GATEWAY (agent side). The agent in the pod is the real ReaperCode
+  // build; only its model is ours. It reaches this server through podman's
+  // host gateway address, so the URL the container sees is not the loopback
+  // one we bound.
+  const gateway: MockGateway = await startMockGateway({ policy: bugfixPolicy() });
+  const gatewayPort = new URL(gateway.baseUrl).port;
+  const containerGatewayUrl = `http://host.containers.internal:${gatewayPort}/v1`;
+  console.log(`   model gateway: ${gateway.baseUrl} (container: ${containerGatewayUrl})`);
 
   const dataDir = await mkdtemp(join(tmpdir(), "agenteval-e2e-pod-"));
   const runtime = new PodmanRuntime({
@@ -372,16 +390,18 @@ async function main(): Promise<void> {
     const projectId = proj.json.id as string;
 
     // Pin the pod image + keep artifacts, via the project API.
+    // The agent must reach the model gateway, so this project allows network.
+    // (The offline path is covered by tests/podman-live.test.ts.)
     const patched = await http(base, "PATCH", `/api/projects/${projectId}`, {
-      network_policy: "offline",
+      network_policy: "allow",
       artifact_retention: "referenced",
     });
-    check("network policy set to offline", patched.status === 200);
+    check("network policy applied", patched.status === 200);
 
-    // workdir is load-bearing here: the adapter launches `node bin/reaper`,
-    // which resolves relative to cwd. Pointing cwd at the image's own /agent
-    // keeps harness scaffolding out of /workspace — anything written there
-    // would otherwise show up in the captured diff as agent work.
+    // workdir is load-bearing: the adapter launches `node bin/reaper`, which
+    // resolves relative to cwd. The real agent lives at /agent in the image, so
+    // cwd points there — which also keeps its own files out of /workspace,
+    // where anything written would land in the captured diff as agent work.
     const sandbox = await http(base, "PUT", `/api/projects/${projectId}/sandbox`, {
       profile: "standard",
       user: "root",
@@ -427,10 +447,20 @@ async function main(): Promise<void> {
     const start = await http(base, "POST", `/api/projects/${projectId}/runs`, {
       taskId,
       agentId: "reapercode",
-      model: "mock-model",
-      provider: "mock",
+      // A real provider/model id the agent recognises — the MODEL is mocked at
+      // the gateway (ANTHROPIC_BASE_URL), not by inventing a provider the agent
+      // has no client for.
+      model: "claude-sonnet-4-20250514",
+      provider: "anthropic",
       repeats: 1,
-      adapterOverrides: { image: POD_IMAGE },
+      adapterOverrides: {
+        image: POD_IMAGE,
+        env: {
+          ANTHROPIC_BASE_URL: containerGatewayUrl,
+          ANTHROPIC_API_KEY: "mock-gateway-key",
+          AGENTEVAL_WORKSPACE: "/workspace",
+        },
+      },
     });
     check("run accepted", [200, 201, 202].includes(start.status), start.text.slice(0, 200));
     const runId = (start.json.runs as Array<{ id: string }>)[0]!.id;
@@ -462,7 +492,17 @@ async function main(): Promise<void> {
       "   event types:",
       [...byType.entries()].map(([k, v]) => `${k}=${v}`).join(" "),
     );
-    check("captured thinking events", (byType.get("thinking") ?? 0) > 0);
+    // ReaperCode does not yet emit structured `thinking` (change ① of
+    // plan/reapercode-changes.md is unlanded — verified against the live tree).
+    // Assert the honest thing: the adapter maps it WHEN present, and today's
+    // agent produces none, so this is reported rather than silently expected.
+    const thinkingCount = byType.get("thinking") ?? 0;
+    console.log(
+      `   thinking events: ${thinkingCount}` +
+        (thinkingCount === 0
+          ? "  (expected 0 — ReaperCode has not landed structured thinking)"
+          : ""),
+    );
     check("captured tool calls", (byType.get("tool.call") ?? 0) > 0);
     check("captured tool results", (byType.get("tool.result") ?? 0) > 0);
     check("captured assistant messages", (byType.get("message") ?? 0) > 0);
@@ -556,6 +596,7 @@ async function main(): Promise<void> {
     );
     if (failures > 0) process.exitCode = 1;
   } finally {
+    await gateway.close();
     await api.close();
     // Keep dataDir when something failed so the artifacts can be inspected.
     if (failures === 0) {

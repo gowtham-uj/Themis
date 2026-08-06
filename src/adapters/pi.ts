@@ -728,8 +728,16 @@ export async function* parsePiStream(
  * Resolve the `pi` CLI entry (dist/cli.js). Falls back to PATH `pi`.
  * package.json is not in the package `exports` map, so we resolve the package
  * root via the main entry and walk to dist/cli.js.
+ *
+ * `AGENTEVAL_PI_BIN` overrides everything. That matters for containerized runs:
+ * host resolution yields a HOST path (this repo's node_modules), which does not
+ * exist inside the sandbox. An image that ships pi at its own location sets the
+ * env var — or `image` overrides supply it — so the argv is valid where it runs.
  */
 export function resolvePiBin(): string {
+  const fromEnv = process.env.AGENTEVAL_PI_BIN;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+
   const anchors: string[] = [];
   if (typeof import.meta.url === "string" && import.meta.url.length > 0) {
     anchors.push(import.meta.url);
@@ -828,12 +836,21 @@ export function buildPiEnv(
     env.ANTHROPIC_API_KEY = apiKey;
   }
 
+  // An explicit project/run override outranks the harness host's environment:
+  // ctx.apiKeys is harvested from the host, so preferring it would silently
+  // redirect a run that deliberately pinned a proxy/gateway endpoint.
+  const overrideBaseUrl = ctx.overrides?.env?.ANTHROPIC_BASE_URL;
   const baseUrl =
-    ctx.apiKeys.ANTHROPIC_BASE_URL ??
-    env.ANTHROPIC_BASE_URL ??
+    (typeof overrideBaseUrl === "string" && overrideBaseUrl) ||
+    ctx.apiKeys.ANTHROPIC_BASE_URL ||
+    env.ANTHROPIC_BASE_URL ||
     process.env.ANTHROPIC_BASE_URL;
   if (baseUrl) {
     env.ANTHROPIC_BASE_URL = baseUrl;
+  }
+  const overrideKey = ctx.overrides?.env?.ANTHROPIC_API_KEY;
+  if (typeof overrideKey === "string" && overrideKey) {
+    env.ANTHROPIC_API_KEY = overrideKey;
   }
 
   if (ctx.apiKeys.OPENAI_API_KEY) {
@@ -860,7 +877,14 @@ export function buildPiCommand(
   ctx: RunContext,
   options: { agentDir?: string; noSession?: boolean; piBin?: string } = {},
 ): AdapterCommand {
-  const piBin = options.piBin ?? resolvePiBin();
+  // Precedence: explicit option > project override (`piBin`, for containerized
+  // images that ship pi elsewhere) > host resolution.
+  const overridePiBin = ctx.overrides?.env?.AGENTEVAL_PI_BIN;
+  const piBin =
+    options.piBin ??
+    (typeof overridePiBin === "string" && overridePiBin.trim()
+      ? overridePiBin.trim()
+      : resolvePiBin());
   // Always launch via node + absolute cli.js when we resolved a .js path.
   const useNode = piBin.endsWith(".js") || piBin.includes(`${join("dist", "cli")}`);
   const argv: string[] = useNode ? [process.execPath, piBin] : [piBin];

@@ -243,6 +243,8 @@ export const runs = sqliteTable("runs", {
   agentCommit: text("agent_commit"),
   /** registry|built */
   agentImageSource: text("agent_image_source"),
+  /** Per-run adapter overrides as submitted (image, env, params, tools). */
+  adapterOverridesJson: text("adapter_overrides_json"),
   trigger: text("trigger"),
   triggerRef: text("trigger_ref"),
   triggerRuleId: text("trigger_rule_id"),

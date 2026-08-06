@@ -356,6 +356,8 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE projects ADD COLUMN artifact_retention TEXT DEFAULT 'keep'",
     // Sandbox policy: per-project container controls (caps, mounts, devices…).
     "ALTER TABLE projects ADD COLUMN sandbox_json TEXT",
+    // Per-run adapter overrides (image, env, params, tools) as submitted.
+    "ALTER TABLE runs ADD COLUMN adapter_overrides_json TEXT",
   ];
   for (const sql of alters) {
     try {
