@@ -73,6 +73,33 @@ function emitRunCompletedHook(
   }
 }
 
+/**
+ * Invoke the run-finalized callback, swallowing anything it throws.
+ *
+ * Judging is downstream bookkeeping: a judge that fails must leave the run's
+ * recorded status untouched, not turn a completed run into a failed one.
+ */
+async function notifyRunFinalized(
+  opts: StartRunOptions,
+  queries: DbQueries,
+  runId: string,
+  projectId: string,
+  status: string,
+): Promise<void> {
+  if (!opts.onRunFinalized) return;
+  try {
+    const run = queries.getRun(runId);
+    await opts.onRunFinalized({
+      runId,
+      projectId,
+      batchId: run?.batchId ?? "",
+      status,
+    });
+  } catch {
+    // never let judging affect the run outcome
+  }
+}
+
 /** In-memory handle for a live (or recently finished) run. */
 export interface LiveRun {
   runId: string;
@@ -126,6 +153,20 @@ export interface StartRunOptions {
    * so runner stays unchanged for callers that do not enable outbound webhooks.
    */
   outboundWebhooks?: OutboundWebhookEmitter;
+  /**
+   * Called exactly once after a run reaches terminal status, with the batch it
+   * belonged to. The API layer uses this to auto-judge the run and, when the
+   * run was the LAST of its batch, to judge the release as a whole.
+   *
+   * A callback rather than a direct call so the runner keeps no dependency on
+   * the judge. Failures here never affect the run's recorded status.
+   */
+  onRunFinalized?: (info: {
+    runId: string;
+    projectId: string;
+    batchId: string;
+    status: string;
+  }) => void | Promise<void>;
 }
 
 /** Mutable in-memory registry of live runs (P8 will replace with a queue). */
@@ -505,6 +546,10 @@ export async function startRun(
 
         // P8c: emit run.completed exactly once at terminal finalization.
         emitRunCompletedHook(opts.outboundWebhooks, queries, runId, projectId, status);
+
+        // Auto-judge + batch rollup. Deliberately after finalizeRun so the
+        // judge reads a run whose terminal state is already durable.
+        await notifyRunFinalized(opts, queries, runId, projectId, status);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -545,6 +590,7 @@ export async function startRun(
       live.finished = true;
       // P8c: emit run.completed for the failed path too.
       emitRunCompletedHook(opts.outboundWebhooks, queries, runId, projectId, "failed");
+      await notifyRunFinalized(opts, queries, runId, projectId, "failed");
     } finally {
       try {
         await handle.remove();

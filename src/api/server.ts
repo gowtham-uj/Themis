@@ -73,6 +73,9 @@ import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerRubricRoutes } from "./rubric-routes.js";
 import { registerArtifactRoutes } from "./artifact-routes.js";
 import { registerSandboxRoutes } from "./sandbox-routes.js";
+import { registerReleaseRoutes } from "./release-routes.js";
+import { handleRunFinalized, type AutoJudgeDeps } from "./auto-judge.js";
+import { createBatchClaimStore } from "../judge/batch-completion.js";
 import {
   OutboundWebhookDispatcher,
   RealDeliverySink,
@@ -159,6 +162,11 @@ export interface AppCtx {
    * Emit sites no-op cleanly when this is undefined.
    */
   outboundWebhooks?: OutboundWebhookDispatcher;
+  /**
+   * Single-winner claims over batch ids, so N runs finishing concurrently
+   * produce exactly one release rollup.
+   */
+  batchClaims: ReturnType<typeof createBatchClaimStore>;
 }
 
 export interface CreateServerOptions {
@@ -413,6 +421,23 @@ function assertNotTerminal(run: Run): void {
 // Sequential start queue (concurrency cap)
 // ---------------------------------------------------------------------------
 
+/** Collect the auto-judge coordinator's dependencies from the app context. */
+function autoJudgeDeps(app: AppCtx): AutoJudgeDeps {
+  return {
+    queries: app.queries,
+    dataDir: app.dataDir,
+    claims: app.batchClaims,
+    ...(app.judgeRunner ? { judgeRunner: app.judgeRunner } : {}),
+    ...(app.defaultJudgeModel ? { defaultJudgeModel: app.defaultJudgeModel } : {}),
+    ...(app.defaultJudgeProvider
+      ? { defaultJudgeProvider: app.defaultJudgeProvider }
+      : {}),
+    ...(app.defaultSystemPromptVersion
+      ? { defaultSystemPromptVersion: app.defaultSystemPromptVersion }
+      : {}),
+  };
+}
+
 async function enqueueStart(app: AppCtx, runId: string): Promise<void> {
   app.startQueue.push(runId);
   void drainStartQueue(app);
@@ -456,6 +481,9 @@ async function drainStartQueue(app: AppCtx): Promise<void> {
         ...(app.outboundWebhooks
           ? { outboundWebhooks: app.outboundWebhooks }
           : {}),
+        // Auto-judge each run, then roll up the release when its batch is done.
+        onRunFinalized: (info) =>
+          handleRunFinalized(autoJudgeDeps(app), info),
       });
       // When the run finishes, free a slot and drain more.
       void live.done.finally(() => {
@@ -1506,6 +1534,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
     refResolver: opts.refResolver ?? defaultRefResolver(),
     // Bound below after app is constructed so the closure sees the final object.
     enqueueStart: () => undefined,
+    batchClaims: createBatchClaimStore(),
   };
   // Wire the real start-pipeline seam (concurrency-limited).
   app.enqueueStart = (runId: string) => enqueueStart(app, runId);
@@ -1540,6 +1569,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerRubricRoutes(router);
   registerArtifactRoutes(router);
   registerSandboxRoutes(router);
+  registerReleaseRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {
