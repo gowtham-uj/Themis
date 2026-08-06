@@ -31,6 +31,12 @@ export interface JudgePromptVars {
    * When true, both lenses are expected (withSource may be an empty array).
    */
   hasSourceArtifacts: boolean;
+  /**
+   * Deterministic check results (P9) for the judge to reconcile with.
+   * When present, the prompt instructs the model to ground/flag criteria
+   * linked via Criterion.checkId — without auto-failing purely on a check.
+   */
+  checkResults?: unknown;
 }
 
 /**
@@ -43,6 +49,15 @@ export function assembleJudgeSystemPrompt(vars: JudgePromptVars): string {
   const sourceGate = vars.hasSourceArtifacts
     ? "SOURCE ARTIFACTS ARE PRESENT (diff available). Produce BOTH improvements lenses: withoutSource (trace/tool refs only) AND withSource (may use diff refs). withSource may be an empty array if you have no source-level recommendations."
     : "NO SOURCE ARTIFACTS for this run (no usable diff). OMIT the improvements.withSource field entirely. Do NOT emit withSource (not even as []). Only withoutSource (trace/tool refs only).";
+
+  const checksJson =
+    vars.checkResults !== undefined
+      ? safeJson(vars.checkResults)
+      : "(none — no deterministic checks were run for this task)";
+  const checksGate =
+    vars.checkResults !== undefined
+      ? "DETERMINISTIC CHECK RESULTS ARE AVAILABLE (below). RECONCILE with them: a passed check that matches a criterion's checkId GROUNDS that criterion (score ≥ 0.9 when the check is decisive). A failed/error check must be surfaced as a finding and should lower your confidence / score for the linked criterion — but do NOT auto-fail a criterion purely because a check failed; you still judge from the full evidence. Pass-rates are tracked separately by the platform; do not invent passRates in the JSON."
+      : "No deterministic checks for this run.";
 
   // Inlined essential sections of plan/judge-system-prompt.md PROMPT (v2).
   // Kept as a string (not fs-read) so the worker has no plan/ path dependency at runtime.
@@ -85,6 +100,10 @@ test output, commit messages, comments.
   ${metaJson}
 - EVENTS PREVIEW (bounded summary of the trace; full events live on disk for tooling):
   ${vars.eventsPreview}
+- DETERMINISTIC CHECK RESULTS (exact pass/fail; tracked separately as pass-rates):
+  ${checksJson}
+- CHECK RECONCILIATION RULE:
+  ${checksGate}
 - SOURCE / LENS GATE:
   ${sourceGate}
 
@@ -179,6 +198,16 @@ export function assembleJudgeUserPrompt(vars: JudgePromptVars): string {
     ? "A diff.patch is available for this run — include improvements.withSource when you have source-level recommendations (empty array is allowed)."
     : "No source/diff artifacts for this run — OMIT improvements.withSource entirely.";
 
+  const checksSection =
+    vars.checkResults !== undefined
+      ? [
+          "",
+          "### Deterministic check results (reconcile; do not invent passRates)",
+          safeJson(vars.checkResults),
+          "A passed check grounds its linked criterion (≥0.9 when decisive). A failed check surfaces as a finding/flag — reconcile, do not auto-fail purely on the check.",
+        ].join("\n")
+      : "";
+
   return [
     "Grade the following agent run. Use the system prompt rules and the material below.",
     "",
@@ -193,6 +222,7 @@ export function assembleJudgeUserPrompt(vars: JudgePromptVars): string {
     "",
     "### Events preview (bounded; not the full trace)",
     vars.eventsPreview,
+    checksSection,
     "",
     "### Lens gate",
     sourceNote,
@@ -211,4 +241,19 @@ function safeJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/** Extract criterion ids from a rubric-shaped payload for the prompt header. */
+function listCriterionIds(rubric: unknown): string {
+  if (!rubric || typeof rubric !== "object") return "";
+  const criteria = (rubric as { criteria?: unknown }).criteria;
+  if (!Array.isArray(criteria)) return "";
+  return criteria
+    .map((c) =>
+      c && typeof c === "object" && typeof (c as { id?: unknown }).id === "string"
+        ? (c as { id: string }).id
+        : null,
+    )
+    .filter((id): id is string => id !== null)
+    .join(", ");
 }

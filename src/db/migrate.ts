@@ -245,11 +245,22 @@ const DDL: string[] = [
     detail TEXT
   )`,
 
+  // Users (P9-settings). username + scrypt password_hash; first user = admin.
+  // Note: older DBs may have had (email, pw_hash) — ensureUserColumns() heals.
   `CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
-    email TEXT UNIQUE,
-    pw_hash TEXT,
-    role TEXT
+    username TEXT UNIQUE,
+    password_hash TEXT,
+    role TEXT,
+    created_at TEXT,
+    email TEXT UNIQUE
+  )`,
+
+  // Global settings (P9) — key/value JSON; secrets never stored as raw values.
+  `CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
   )`,
 
   // API tokens (P8b-auth). Plaintext is NEVER stored — only sha256 hex of bearer.
@@ -296,12 +307,43 @@ const DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_project_created ON webhook_deliveries(project_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_sub ON webhook_deliveries(subscription_id)`,
 
+  // Deterministic check results (P9, rubric.md §5). The verdict JSON also
+  // carries checkResults; this table is a run-keyed DB mirror so API consumers
+  // can query pass-rates without parsing the verdict body.
+  `CREATE TABLE IF NOT EXISTS check_results (
+    run_id TEXT NOT NULL,
+    results_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_check_results_run ON check_results(run_id)`,
+
   // Version bookkeeping (in addition to PRAGMA user_version).
   `CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
   )`,
 ];
+
+/**
+ * Best-effort ADD COLUMN for DBs that already have a narrower users table.
+ * SQLite has no IF NOT EXISTS for columns — ignore "duplicate column" errors.
+ */
+function ensureUserColumns(db: Database.Database): void {
+  const alters = [
+    "ALTER TABLE users ADD COLUMN username TEXT",
+    "ALTER TABLE users ADD COLUMN password_hash TEXT",
+    "ALTER TABLE users ADD COLUMN role TEXT",
+    "ALTER TABLE users ADD COLUMN created_at TEXT",
+    "ALTER TABLE users ADD COLUMN email TEXT",
+  ];
+  for (const sql of alters) {
+    try {
+      db.exec(sql);
+    } catch {
+      // column already present — ok
+    }
+  }
+}
 
 /**
  * Apply schema migrations to an open better-sqlite3 Database.
@@ -320,6 +362,7 @@ export function migrate(db: Database.Database): void {
       for (const stmt of DDL) {
         db.exec(stmt);
       }
+      ensureUserColumns(db);
       const row = db
         .prepare("SELECT version FROM schema_migrations WHERE version = ?")
         .get(SCHEMA_VERSION) as { version: number } | undefined;
@@ -337,6 +380,7 @@ export function migrate(db: Database.Database): void {
     for (const stmt of DDL) {
       db.exec(stmt);
     }
+    ensureUserColumns(db);
     db.prepare(
       "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     ).run(SCHEMA_VERSION, new Date().toISOString());

@@ -28,9 +28,11 @@ import type { ProjectCtx, TaskSpec } from "../domain.js";
 import {
   buildTaskSpec,
   createTaskSource,
+  pushHttpTask,
   rubricsEqual,
   syncTasks,
   type BuildTaskSpecInput,
+  type CreateTaskSourceOptions,
   type TaskStore,
 } from "../tasks/index.js";
 import { readFromSeq } from "../schema/jsonl.js";
@@ -67,6 +69,7 @@ import { registerRegressionRoutes } from "./regression-routes.js";
 import { registerWatcherRoutes } from "./watcher-routes.js";
 import { registerQueueRoutes } from "./queue-routes.js";
 import { registerWebhooksRoutes } from "./webhooks-routes.js";
+import { registerSettingsRoutes } from "./settings-routes.js";
 import {
   OutboundWebhookDispatcher,
   RealDeliverySink,
@@ -779,8 +782,13 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     } catch (err) {
       throw badRequest(err instanceof Error ? err.message : String(err));
     }
+    const sourceKind = body.source_kind ?? "ui-builder";
+    // http-push creates are also mirrored into the push catalog so sync re-yields them.
+    if (sourceKind === "http-push") {
+      pushHttpTask(project.id, spec);
+    }
     const task = app.queries.createTask(project.id, spec, {
-      sourceKind: body.source_kind ?? "ui-builder",
+      sourceKind,
     });
     sendJson(res, 201, taskJson(task));
   });
@@ -857,24 +865,103 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     const app = appOf(ctx);
     const project = requireProject(app.queries, ctx.params.id!);
     const projectDir = resolveProjectDir(app.dataDir, project.id);
-    const kind =
-      (project.taskSource?.kind as "ui-builder" | "repo-md") ?? "ui-builder";
-    if (kind !== "ui-builder" && kind !== "repo-md") {
-      throw badRequest(`sync not supported for task source kind: ${kind}`);
+    const kind = (project.taskSource?.kind as
+      | "ui-builder"
+      | "repo-md"
+      | "manifest-yaml"
+      | "ci-artifact"
+      | "http-push") ?? "ui-builder";
+    const params = project.taskSource?.params ?? {};
+    const sourceOpts: CreateTaskSourceOptions = {};
+    if (kind === "repo-md" && typeof params.glob === "string") {
+      (sourceOpts as { glob?: string }).glob = params.glob;
     }
-    const source = createTaskSource(kind);
+    if (kind === "manifest-yaml" && typeof params.path === "string") {
+      (sourceOpts as { path?: string }).path = params.path;
+    }
+    if (kind === "ci-artifact") {
+      if (typeof params.artifactDir === "string") {
+        (sourceOpts as { artifactDir?: string }).artifactDir = params.artifactDir;
+      }
+      if (typeof params.manifestFile === "string") {
+        (sourceOpts as { manifestFile?: string }).manifestFile = params.manifestFile;
+      }
+    }
+    const source = createTaskSource(kind, sourceOpts);
     const store = createDbTaskStore(app.queries);
     const pctx: ProjectCtx = {
       projectId: project.id,
       projectDir,
       defaultAgentCategory: "coding",
     };
-    // repo-md may need workspaceDir from params
-    if (kind === "repo-md" && project.taskSource?.params?.workspaceDir) {
-      pctx.workspaceDir = String(project.taskSource.params.workspaceDir);
+    // Pull sources may need workspaceDir / artifactDir from params.
+    if (
+      (kind === "repo-md" ||
+        kind === "manifest-yaml" ||
+        kind === "ci-artifact") &&
+      params.workspaceDir
+    ) {
+      pctx.workspaceDir = String(params.workspaceDir);
     }
     const result = await syncTasks(pctx, source, store);
     sendJson(res, 200, result);
+  });
+
+  /**
+   * HTTP-push ingest: POST a TaskSpec into the project's http-push catalog.
+   * Fully mutable afterwards via PATCH (plan/api.md §Tasks).
+   */
+  router.post("/api/projects/:id/tasks:push", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const project = requireProject(app.queries, ctx.params.id!);
+    const body = await readJsonBody<BuildTaskSpecInput & Record<string, unknown>>(req);
+
+    let spec: TaskSpec;
+    try {
+      // Prefer buildTaskSpec when the body has the form shape; else accept loose.
+      if (
+        typeof body.name === "string" &&
+        typeof body.prompt === "string" &&
+        body.rubric &&
+        typeof body.rubric === "object"
+      ) {
+        spec = buildTaskSpec(body);
+      } else {
+        throw new Error("name, prompt, and rubric are required");
+      }
+    } catch (err) {
+      throw badRequest(err instanceof Error ? err.message : String(err));
+    }
+
+    // Mirror into the in-memory http-push catalog so sync list() can re-yield.
+    pushHttpTask(project.id, spec);
+
+    // Upsert by external id when one already exists for this project.
+    const externalId = spec.id ?? spec.name;
+    const existing = app.queries
+      .listTasks(project.id, { includeArchived: false })
+      .find((t) => t.externalId === externalId || t.name === externalId);
+
+    if (existing) {
+      const updated = app.queries.updateTask(existing.id, {
+        name: spec.name,
+        prompt: spec.prompt,
+        workspace: spec.workspace,
+        rubric: spec.rubric,
+        profile: spec.profile ?? null,
+        tags: spec.tags ?? null,
+        agentCategory: spec.agentCategory,
+        referenceSolution: spec.referenceSolution ?? null,
+        sourceKind: "http-push",
+      });
+      sendJson(res, 200, taskJson(updated));
+      return;
+    }
+
+    const task = app.queries.createTask(project.id, spec, {
+      sourceKind: "http-push",
+    });
+    sendJson(res, 201, taskJson(task));
   });
 
   // ---- runs (create under project) ----
@@ -1416,6 +1503,8 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerQueueRoutes(router);
   // Outbound webhook subscriptions (P8c) — CRUD + deliveries + test fire.
   registerWebhooksRoutes(router);
+  // Settings + password auth + project export (P9).
+  registerSettingsRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {

@@ -24,6 +24,7 @@ import { NetworkCutoff } from "../runner/network-control.js";
 import { redactEvent } from "../runner/redact.js";
 import { prepareWorkspace, ensureGitRepo } from "../runner/workspace.js";
 import type { ContainerHandle } from "../runner/runtime.js";
+import { runChecks } from "../runner/check-runner.js";
 import { captureDiff } from "../runner/diff.js";
 
 /** Terminal run statuses (control actions return 409). */
@@ -423,6 +424,31 @@ export async function startRun(
           controlState: final.controlState === "aborted" ? "aborted" : "done",
         });
         live.finished = true;
+
+        // P9: run deterministic checks (rubric.checks) post-exec on a successful
+        // run, writing checks.json + mirroring to the DB. The judge worker loads
+        // these via loadCheckResults and folds pass-rates into the verdict
+        // (plan/rubric.md §5). Best-effort: never breaks the run for checks.
+        // Opt-in: tasks without rubric.checks run unchanged (runChecks no-ops).
+        if (status === "completed") {
+          try {
+            // Project may have been archived/deleted mid-run; checks are
+            // best-effort + opt-in, so fall back to a config-less project
+            // slice rather than skipping (default runner mapping applies).
+            const project = queries.getProject(projectId);
+            const checkProject = project
+              ? { id: project.id, checkRunners: project.checkRunners }
+              : { id: projectId };
+            await runChecks(queries, runtime, checkProject, task, runDir, {
+              workspaceDir,
+              runId,
+              timeoutMs,
+            });
+          } catch {
+            // a check-runner failure must not affect run finalization
+          }
+        }
+
         // P8c: emit run.completed exactly once at terminal finalization.
         emitRunCompletedHook(opts.outboundWebhooks, queries, runId, projectId, status);
       }

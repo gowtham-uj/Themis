@@ -2140,6 +2140,129 @@ export async function testWebhook(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Settings + auth (P9)
+// ---------------------------------------------------------------------------
+
+/** Global settings payload (secret key NAMES only — never values). */
+export interface GlobalSettings {
+  judgePromptOverrides?: unknown;
+  defaultModels?: unknown;
+  limits?: unknown;
+  /** Secret key names the deployment has configured (values never returned). */
+  keys?: string[];
+  [key: string]: unknown;
+}
+
+export interface PublicUser {
+  id: string;
+  username: string;
+  role: string;
+  createdAt?: string;
+  email?: string | null;
+  [key: string]: unknown;
+}
+
+export interface LoginResponse {
+  token: string;
+  user?: PublicUser;
+  [key: string]: unknown;
+}
+
+export interface AuthMe {
+  userId: string;
+  username: string;
+  role: string;
+  [key: string]: unknown;
+}
+
+/** GET /api/settings */
+export async function getSettings(
+  opts: ApiClientOptions = {},
+): Promise<GlobalSettings> {
+  return apiRequest<GlobalSettings>("/api/settings", { ...opts, method: "GET" });
+}
+
+/** PUT /api/settings */
+export async function putSettings(
+  body: Partial<GlobalSettings>,
+  opts: ApiClientOptions = {},
+): Promise<GlobalSettings> {
+  return apiRequest<GlobalSettings>("/api/settings", {
+    ...opts,
+    method: "PUT",
+    body,
+  });
+}
+
+/** POST /api/auth/login → { token, user } */
+export async function login(
+  username: string,
+  password: string,
+  opts: ApiClientOptions = {},
+): Promise<LoginResponse> {
+  return apiRequest<LoginResponse>("/api/auth/login", {
+    ...opts,
+    method: "POST",
+    body: { username, password },
+  });
+}
+
+/** GET /api/auth/me */
+export async function getAuthMe(
+  opts: ApiClientOptions = {},
+): Promise<AuthMe> {
+  return apiRequest<AuthMe>("/api/auth/me", { ...opts, method: "GET" });
+}
+
+/** GET /api/auth/users */
+export async function listUsers(
+  opts: ApiClientOptions = {},
+): Promise<PublicUser[]> {
+  const raw = await apiRequest<unknown>("/api/auth/users", {
+    ...opts,
+    method: "GET",
+  });
+  return unwrapList(raw, "users") as PublicUser[];
+}
+
+/** POST /api/auth/users */
+export async function createUser(
+  body: { username: string; password: string; role?: string; email?: string },
+  opts: ApiClientOptions = {},
+): Promise<PublicUser> {
+  return apiRequest<PublicUser>("/api/auth/users", {
+    ...opts,
+    method: "POST",
+    body,
+  });
+}
+
+/** DELETE /api/auth/users/:id */
+export async function deleteUser(
+  id: string,
+  opts: ApiClientOptions = {},
+): Promise<{ deleted: boolean; id: string }> {
+  return apiRequest<{ deleted: boolean; id: string }>(
+    `/api/auth/users/${encodeURIComponent(id)}`,
+    { ...opts, method: "DELETE" },
+  );
+}
+
+/**
+ * POST /api/projects/:id/export → portable JSON bundle.
+ * Secrets + api tokens are stripped server-side.
+ */
+export async function exportProject(
+  projectId: string,
+  opts: ApiClientOptions = {},
+): Promise<Record<string, unknown>> {
+  return apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/export`,
+    { ...opts, method: "POST", body: {} },
+  );
+}
+
 /** Bundle of client methods for DI into components/tests. */
 export function createApiClient(opts: ApiClientOptions = {}) {
   return {
@@ -2231,6 +2354,20 @@ export function createApiClient(opts: ApiClientOptions = {}) {
       listWebhookDeliveries(projectId, subId, opts),
     testWebhook: (projectId: string, subId: string) =>
       testWebhook(projectId, subId, opts),
+    getSettings: () => getSettings(opts),
+    putSettings: (body: Partial<GlobalSettings>) => putSettings(body, opts),
+    login: (username: string, password: string) =>
+      login(username, password, opts),
+    getAuthMe: () => getAuthMe(opts),
+    listUsers: () => listUsers(opts),
+    createUser: (body: {
+      username: string;
+      password: string;
+      role?: string;
+      email?: string;
+    }) => createUser(body, opts),
+    deleteUser: (id: string) => deleteUser(id, opts),
+    exportProject: (projectId: string) => exportProject(projectId, opts),
   };
 }
 

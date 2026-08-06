@@ -21,7 +21,7 @@ import type {
   TaskSpec,
 } from "../domain.js";
 import type { WorkspaceSpec } from "../adapters/types.js";
-import type { Verdict } from "../judge/verdict.js";
+import type { CheckResult, Verdict } from "../judge/verdict.js";
 import {
   applyRecurrenceToVerdict,
   ingestFindings as runIngestFindings,
@@ -36,6 +36,7 @@ import {
 import {
   agents,
   apiTokens,
+  checkResults,
   findingOccurrences,
   findings,
   judgements,
@@ -45,7 +46,9 @@ import {
   runBatches,
   runs,
   scores,
+  settings,
   tasks,
+  users,
   watcherEvents,
   watcherRules,
   webhookDeliveries,
@@ -603,6 +606,58 @@ export interface ListApiTokensOpts {
   includeRevoked?: boolean;
 }
 
+// ---- Users + settings (P9) ----
+
+/** Deployment user role. First registered user is always admin (bootstrap). */
+export type UserRole = "admin" | "user";
+
+/**
+ * User row. passwordHash is the scrypt salt:hash hex — NEVER log or export it
+ * in API responses (auth-users strips it).
+ */
+export interface User {
+  id: string;
+  username: string;
+  /** scrypt `saltHex:hashHex`. Present on query-layer rows; strip before API. */
+  passwordHash: string;
+  role: UserRole | string;
+  createdAt: string;
+  email?: string | null;
+}
+
+export interface CreateUserInput {
+  username: string;
+  /** Already-hashed password (scrypt). Callers hash before insert. */
+  passwordHash: string;
+  /** Defaults: first user → admin, subsequent → user. */
+  role?: UserRole | string;
+  id?: string;
+  email?: string | null;
+}
+
+/** One global settings row (value is already JSON-parsed). */
+export interface SettingRow {
+  key: string;
+  value: unknown;
+  updatedAt: string;
+}
+
+/**
+ * Portable project export rows (P9). Secrets stripped: watcher webhookSecret,
+ * outbound subscription secret, and no api_tokens.
+ */
+export interface ProjectExportRows {
+  project: Project;
+  tasks: Task[];
+  /** Run metadata only (no event payloads). */
+  runs: Run[];
+  /** Watcher rules with webhookSecret forced to null. */
+  watchers: WatcherRule[];
+  queue: QueueEntry[];
+  /** Outbound webhook subs with secret forced to null. */
+  outboundWebhooks: OutboundSubscription[];
+}
+
 // ---- Outbound webhook subscriptions + deliveries (P8c) ----
 
 /** Event types an outbound subscription may filter on. Empty list = all. */
@@ -818,6 +873,37 @@ export interface QueryStore {
    */
   listApiTokens(opts?: ListApiTokensOpts): ApiToken[];
 
+  // ---- Users (P9-settings) ----
+  /**
+   * Insert a user row. Caller supplies passwordHash (scrypt). Role defaults:
+   * admin when the table is empty, otherwise "user" (unless role is passed).
+   */
+  createUser(input: CreateUserInput): User;
+  getUser(id: string): User | null;
+  getUserByUsername(username: string): User | null;
+  listUsers(): User[];
+  /** Hard-delete a user by id. No-op if missing. */
+  deleteUser(id: string): void;
+  /** Number of users (for first-user bootstrap). */
+  countUsers(): number;
+
+  // ---- Settings (P9) ----
+  /** Read a single setting (JSON-parsed). null when missing. */
+  getSetting(key: string): unknown | null;
+  /** Upsert a setting value (JSON-encoded). */
+  setSetting(key: string, value: unknown): void;
+  /** All settings rows (values JSON-parsed). */
+  listSettings(): SettingRow[];
+  /** Delete a setting key. */
+  deleteSetting(key: string): void;
+
+  // ---- Project export (P9) ----
+  /**
+   * Assemble portable DB rows for a project. Secrets stripped (webhook secrets,
+   * outbound secrets). Does NOT include api_tokens. Throws if project missing.
+   */
+  exportRows(projectId: string): ProjectExportRows;
+
   // ---- Outbound webhooks (P8c) ----
   /**
    * Create an outbound subscription. Returns the sub WITH secret surfaced ONCE
@@ -850,6 +936,11 @@ export interface QueryStore {
     projectId: string,
     opts?: ListWebhookDeliveriesOpts,
   ): WebhookDelivery[];
+
+  /** Persist deterministic check results for a run (P9 DB mirror). */
+  storeCheckResults(runId: string, results: CheckResult[]): void;
+  /** Load persisted check results for a run (P9 DB mirror). */
+  getCheckResults(runId: string): CheckResult[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,6 +1430,17 @@ function mapApiTokenRow(row: typeof apiTokens.$inferSelect): ApiToken {
     readOnly: row.readOnly === 1,
     createdAt: row.createdAt,
     revokedAt: row.revokedAt ?? null,
+  };
+}
+
+function mapUserRow(row: typeof users.$inferSelect): User {
+  return {
+    id: row.id,
+    username: row.username ?? "",
+    passwordHash: row.passwordHash ?? "",
+    role: (row.role as UserRole) ?? "user",
+    createdAt: row.createdAt ?? "",
+    email: row.email ?? null,
   };
 }
 
@@ -2977,6 +3079,132 @@ export class SqliteQueries implements QueryStore {
     return rows;
   }
 
+  // ---- Users (P9-settings) ----
+
+  createUser(input: CreateUserInput): User {
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    const count = this.countUsers();
+    const role =
+      input.role ?? (count === 0 ? "admin" : "user");
+    this.db
+      .insert(users)
+      .values({
+        id,
+        username: input.username,
+        passwordHash: input.passwordHash,
+        role: String(role),
+        createdAt: ts,
+        email: input.email ?? null,
+      })
+      .run();
+    const row = this.getUser(id);
+    if (!row) throw new Error("failed to create user");
+    return row;
+  }
+
+  getUser(id: string): User | null {
+    const row = this.db.select().from(users).where(eq(users.id, id)).get();
+    return row ? mapUserRow(row) : null;
+  }
+
+  getUserByUsername(username: string): User | null {
+    const row = this.db
+      .select()
+      .from(users)
+      .where(eq(users.username, username))
+      .get();
+    return row ? mapUserRow(row) : null;
+  }
+
+  listUsers(): User[] {
+    const rows = this.db.select().from(users).all().map(mapUserRow);
+    rows.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return a.createdAt.localeCompare(b.createdAt);
+      return a.username.localeCompare(b.username);
+    });
+    return rows;
+  }
+
+  deleteUser(id: string): void {
+    this.db.delete(users).where(eq(users.id, id)).run();
+  }
+
+  countUsers(): number {
+    return this.db.select().from(users).all().length;
+  }
+
+  // ---- Settings (P9) ----
+
+  getSetting(key: string): unknown | null {
+    const row = this.db
+      .select()
+      .from(settings)
+      .where(eq(settings.key, key))
+      .get();
+    if (!row) return null;
+    return parseJson(row.value, null);
+  }
+
+  setSetting(key: string, value: unknown): void {
+    const ts = nowIso();
+    const encoded = JSON.stringify(value ?? null);
+    const existing = this.db
+      .select()
+      .from(settings)
+      .where(eq(settings.key, key))
+      .get();
+    if (existing) {
+      this.db
+        .update(settings)
+        .set({ value: encoded, updatedAt: ts })
+        .where(eq(settings.key, key))
+        .run();
+    } else {
+      this.db
+        .insert(settings)
+        .values({ key, value: encoded, updatedAt: ts })
+        .run();
+    }
+  }
+
+  listSettings(): SettingRow[] {
+    return this.db
+      .select()
+      .from(settings)
+      .all()
+      .map((row) => ({
+        key: row.key,
+        value: parseJson(row.value, null),
+        updatedAt: row.updatedAt,
+      }));
+  }
+
+  deleteSetting(key: string): void {
+    this.db.delete(settings).where(eq(settings.key, key)).run();
+  }
+
+  // ---- Project export (P9) ----
+
+  exportRows(projectId: string): ProjectExportRows {
+    const project = this.getProject(projectId);
+    if (!project) throw notFound("project", projectId);
+    const taskList = this.listTasks(projectId, { includeArchived: true });
+    const runList = this.listRuns({ projectId });
+    // Secrets stripped on list.
+    const watchers = this.listWatcherRules(projectId, { includeDisabled: true });
+    const queue = this.listQueueEntries(projectId);
+    const outboundWebhooks = this.listOutboundSubscriptions(projectId);
+    return {
+      project,
+      tasks: taskList,
+      runs: runList,
+      watchers,
+      queue,
+      outboundWebhooks,
+    };
+  }
+
   // ---- Outbound webhooks (P8c) ----
 
   createOutboundSubscription(
@@ -3159,6 +3387,46 @@ export class SqliteQueries implements QueryStore {
         : 50;
     return rows.slice(0, limit);
   }
+
+  storeCheckResults(runId: string, results: CheckResult[]): void {
+    // Upsert: replace any existing row for this run (one row per run).
+    const ts = nowIso();
+    this.db
+      .delete(checkResults)
+      .where(eq(checkResults.runId, runId))
+      .run();
+    this.db
+      .insert(checkResults)
+      .values({
+        runId,
+        resultsJson: JSON.stringify(results),
+        recordedAt: ts,
+      })
+      .run();
+  }
+
+  getCheckResults(runId: string): CheckResult[] {
+    const row = this.db
+      .select()
+      .from(checkResults)
+      .where(eq(checkResults.runId, runId))
+      .get();
+    if (!row) return [];
+    try {
+      const parsed = JSON.parse(row.resultsJson) as unknown;
+      return Array.isArray(parsed)
+        ? (parsed.filter(
+            (r) =>
+              r &&
+              typeof r === "object" &&
+              typeof (r as CheckResult).checkId === "string" &&
+              typeof (r as CheckResult).status === "string",
+          ) as CheckResult[])
+        : [];
+    } catch {
+      return [];
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3181,6 +3449,9 @@ export class MemoryQueries implements QueryStore {
   private apiTokens = new Map<string, ApiToken>();
   private outboundSubscriptions = new Map<string, OutboundSubscription>();
   private webhookDeliveries = new Map<string, WebhookDelivery>();
+  private users = new Map<string, User>();
+  private settings = new Map<string, SettingRow>();
+  private checkResultsByRun = new Map<string, CheckResult[]>();
 
   constructor(private readonly dataDir: string) {}
 
@@ -4325,6 +4596,90 @@ export class MemoryQueries implements QueryStore {
     return rows;
   }
 
+  // ---- Users (P9-settings) ----
+
+  createUser(input: CreateUserInput): User {
+    const count = this.users.size;
+    const role = input.role ?? (count === 0 ? "admin" : "user");
+    const user: User = {
+      id: input.id ?? newId(),
+      username: input.username,
+      passwordHash: input.passwordHash,
+      role: String(role),
+      createdAt: nowIso(),
+      email: input.email ?? null,
+    };
+    this.users.set(user.id, user);
+    return { ...user };
+  }
+
+  getUser(id: string): User | null {
+    const u = this.users.get(id);
+    return u ? { ...u } : null;
+  }
+
+  getUserByUsername(username: string): User | null {
+    for (const u of this.users.values()) {
+      if (u.username === username) return { ...u };
+    }
+    return null;
+  }
+
+  listUsers(): User[] {
+    const rows = [...this.users.values()].map((u) => ({ ...u }));
+    rows.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return a.createdAt.localeCompare(b.createdAt);
+      return a.username.localeCompare(b.username);
+    });
+    return rows;
+  }
+
+  deleteUser(id: string): void {
+    this.users.delete(id);
+  }
+
+  countUsers(): number {
+    return this.users.size;
+  }
+
+  // ---- Settings (P9) ----
+
+  getSetting(key: string): unknown | null {
+    const row = this.settings.get(key);
+    return row ? row.value : null;
+  }
+
+  setSetting(key: string, value: unknown): void {
+    this.settings.set(key, {
+      key,
+      value: value ?? null,
+      updatedAt: nowIso(),
+    });
+  }
+
+  listSettings(): SettingRow[] {
+    return [...this.settings.values()].map((s) => ({ ...s }));
+  }
+
+  deleteSetting(key: string): void {
+    this.settings.delete(key);
+  }
+
+  // ---- Project export (P9) ----
+
+  exportRows(projectId: string): ProjectExportRows {
+    const project = this.getProject(projectId);
+    if (!project) throw notFound("project", projectId);
+    return {
+      project,
+      tasks: this.listTasks(projectId, { includeArchived: true }),
+      runs: this.listRuns({ projectId }),
+      watchers: this.listWatcherRules(projectId, { includeDisabled: true }),
+      queue: this.listQueueEntries(projectId),
+      outboundWebhooks: this.listOutboundSubscriptions(projectId),
+    };
+  }
+
   // ---- Outbound webhooks (P8c) ----
 
   createOutboundSubscription(
@@ -4454,6 +4809,15 @@ export class MemoryQueries implements QueryStore {
         ? Math.max(1, Math.min(200, Math.floor(opts.limit)))
         : 50;
     return rows.slice(0, limit).map((d) => ({ ...d }));
+  }
+
+  storeCheckResults(runId: string, results: CheckResult[]): void {
+    this.checkResultsByRun.set(runId, results.map((r) => ({ ...r })));
+  }
+
+  getCheckResults(runId: string): CheckResult[] {
+    const stored = this.checkResultsByRun.get(runId);
+    return stored ? stored.map((r) => ({ ...r })) : [];
   }
 }
 

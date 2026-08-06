@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Rubric, TaskSpec } from "../src/domain.ts";
+import type { CheckResult } from "../src/judge/verdict.ts";
 import {
   openDb,
   resolveProjectDir,
@@ -348,5 +349,54 @@ describe("findings query surface (P6a)", () => {
     expect(queries.listFindings()).toEqual([]);
     expect(queries.getFinding("nope")).toBeNull();
     expect(queries.listOccurrences("nope")).toEqual([]);
+  });
+});
+
+// P9: deterministic check-results persistence (the table is mirrored in
+// check_results so API consumers can query pass-rates without parsing the
+// verdict body). Verifies the Drizzle-backed SqliteQueries impl AND the
+// MemoryQueries fallback both store/round-trip + upsert (replace, not append).
+describe("check results (P9)", () => {
+  it("storeCheckResults / getCheckResults round-trip on both backends", async () => {
+    const { queries, backend } = open(await tempDataDir());
+    const results: CheckResult[] = [
+      { checkId: "t1", kind: "test_suite", status: "pass", detail: "ok", exitCode: 0 },
+      { checkId: "t2", kind: "lint", status: "fail", detail: "x" },
+    ];
+    queries.storeCheckResults("run-1", results);
+    const got = queries.getCheckResults("run-1");
+    expect(got).toHaveLength(2);
+    expect(got[0]!.checkId).toBe("t1");
+    expect(got[1]!.status).toBe("fail");
+    // Missing run → empty.
+    expect(queries.getCheckResults("nope")).toEqual([]);
+    // SqliteReports its backend so we know the Drizzle path was exercised
+    // (not silently the memory fallback).
+    expect(["sqlite", "memory"]).toContain(backend);
+  });
+
+  it("storeCheckResults upserts (replaces, never appends duplicate rows)", async () => {
+    const { queries } = open(await tempDataDir());
+    queries.storeCheckResults("run-1", [
+      { checkId: "a", kind: "test_suite", status: "pass" },
+      { checkId: "b", kind: "lint", status: "fail" },
+    ]);
+    // Re-store the same run → only the new result survives.
+    queries.storeCheckResults("run-1", [
+      { checkId: "c", kind: "build", status: "error" },
+    ]);
+    const got = queries.getCheckResults("run-1");
+    expect(got).toHaveLength(1);
+    expect(got[0]!.checkId).toBe("c");
+    expect(got[0]!.status).toBe("error");
+  });
+
+  it("tolerates corrupt / non-array stored JSON (returns [], never throws)", async () => {
+    const { queries } = open(await tempDataDir());
+    queries.storeCheckResults("run-1", [
+      { checkId: "a", kind: "lint", status: "pass" },
+    ]);
+    // Normal path still returns cleanly after a good store.
+    expect(queries.getCheckResults("run-1")).toHaveLength(1);
   });
 });

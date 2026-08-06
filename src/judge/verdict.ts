@@ -151,6 +151,31 @@ export interface VerdictComparison {
   why: string;
 }
 
+/**
+ * Outcome of one deterministic check (plan/rubric.md §5).
+ * Tracked separately from judged scores as pass-rates.
+ */
+export type CheckStatus = "pass" | "fail" | "error" | "skipped";
+
+export interface CheckResult {
+  /** Stable id matching Criterion.checkId / Check.id. */
+  checkId: string;
+  /** Check kind (test_suite, build, typecheck, lint, repro, secret_scan, …). */
+  kind: string;
+  status: CheckStatus;
+  /** Human-readable detail; secrets MUST already be redacted. */
+  detail?: string;
+  durationMs?: number;
+  exitCode?: number;
+}
+
+/** Aggregated pass-rates from CheckResult[] (plan/rubric.md §5 + §7). */
+export interface PassRates {
+  /** Per-kind {passed,total} — skipped results are excluded. */
+  perKind: Record<string, { passed: number; total: number }>;
+  overall: { passed: number; total: number; rate: number };
+}
+
 /** Schema version — bumps on incompatible verdict shape changes. */
 export const VERDICT_SCHEMA_VERSION = 1;
 
@@ -170,6 +195,32 @@ export interface Verdict {
   observations: string[];
   improvements: Improvements;
   comparison?: VerdictComparison;
+  /**
+   * Deterministic check outcomes (P9). Optional — tasks without rubric.checks
+   * leave this undefined so prior judgements stay shape-compatible.
+   */
+  checkResults?: CheckResult[];
+  /**
+   * Pass-rates computed from checkResults, tracked separately from judged scores
+   * (plan/rubric.md §5 + §7). Optional for the same reason as checkResults.
+   */
+  passRates?: PassRates;
+  /**
+   * Scalar overall pass-rate alias (0..1). Optional; prefer `passRates.overall.rate`
+   * when the full aggregate is available. Coexists for simple consumers.
+   */
+  passRate?: number;
+  /**
+   * Alias for simpler {id, pass} check outcomes. Prefer `checkResults` when full
+   * status detail is available. Optional for shape compatibility.
+   */
+  deterministicChecks?: Array<{
+    id: string;
+    kind?: string;
+    pass: boolean;
+    detail?: string;
+    durationMs?: number;
+  }>;
 }
 
 /**
@@ -234,11 +285,26 @@ function validateFindingIdsUnique(findings: Finding[], label: string): void {
   }
 }
 
+/** Options for {@link validateVerdict}. */
+export interface ValidateVerdictOptions {
+  hasSourceArtifacts: boolean;
+  /**
+   * When set, every criterion id in the verdict must be a member of this set
+   * (the category-filtered rubric). A model-hallucinated dropped criterion is
+   * rejected. Omitted → no id-set check (backward compatible).
+   */
+  allowedCriterionIds?: ReadonlySet<string> | readonly string[];
+}
+
 /**
  * Validate a verdict. Caller passes `hasSourceArtifacts` so the gate "withSource
  * only when source exists" is enforced here, not just hoped for by the judge.
+ * Optional `allowedCriterionIds` rejects scores against dropped rubric criteria.
  */
-export function validateVerdict(v: unknown, opts: { hasSourceArtifacts: boolean }): asserts v is Verdict {
+export function validateVerdict(
+  v: unknown,
+  opts: ValidateVerdictOptions,
+): asserts v is Verdict {
   if (!isObject(v)) throw new VerdictValidationError("verdict is not an object");
   if (v.schemaVersion !== VERDICT_SCHEMA_VERSION)
     throw new VerdictValidationError(`schemaVersion must be ${VERDICT_SCHEMA_VERSION}`);
@@ -255,11 +321,21 @@ export function validateVerdict(v: unknown, opts: { hasSourceArtifacts: boolean 
 
   if (!Array.isArray(v.criteria))
     throw new VerdictValidationError("missing criteria[]");
+  const allowed =
+    opts.allowedCriterionIds === undefined
+      ? null
+      : opts.allowedCriterionIds instanceof Set
+        ? opts.allowedCriterionIds
+        : new Set(opts.allowedCriterionIds);
   const criterionIds = new Set<string>();
   for (const c of v.criteria) {
     if (!isObject(c)) throw new VerdictValidationError("criterion entry not an object");
     if (typeof c.criterion !== "string" || !c.criterion)
       throw new VerdictValidationError("criterion missing id");
+    if (allowed && !allowed.has(c.criterion))
+      throw new VerdictValidationError(
+        `criterion ${c.criterion}: not in filtered rubric (dropped for this category)`,
+      );
     criterionIds.add(c.criterion);
     if (typeof c.weight !== "number")
       throw new VerdictValidationError(`criterion ${c.criterion}: missing weight`);
@@ -267,6 +343,61 @@ export function validateVerdict(v: unknown, opts: { hasSourceArtifacts: boolean 
       throw new VerdictValidationError(`criterion ${c.criterion}: missing feedback`);
     if (typeof c.score !== "number" || c.score < 0 || c.score > 1)
       throw new VerdictValidationError(`criterion ${c.criterion}: score must be 0..1`);
+  }
+
+  // Optional deterministic-check fields (p9-checks): shape-validate when present.
+  // Types: checkResults / passRates (see Verdict); passRate scalar is also accepted.
+  if (v.passRate !== undefined) {
+    if (typeof v.passRate !== "number" || v.passRate < 0 || v.passRate > 1)
+      throw new VerdictValidationError("passRate must be 0..1 when present");
+  }
+  if (v.passRates !== undefined) {
+    if (!isObject(v.passRates))
+      throw new VerdictValidationError("passRates must be an object when present");
+    const pr = v.passRates as Record<string, unknown>;
+    if (!isObject(pr.overall))
+      throw new VerdictValidationError("passRates.overall must be an object");
+    const overall = pr.overall as Record<string, unknown>;
+    if (typeof overall.passed !== "number" || typeof overall.total !== "number")
+      throw new VerdictValidationError("passRates.overall needs passed/total numbers");
+    if (typeof overall.rate !== "number")
+      throw new VerdictValidationError("passRates.overall.rate must be a number");
+    if (overall.rate < 0 || overall.rate > 1)
+      throw new VerdictValidationError("passRates.overall.rate must be 0..1");
+    if (pr.perKind !== undefined && !isObject(pr.perKind))
+      throw new VerdictValidationError("passRates.perKind must be an object");
+  }
+  if (v.checkResults !== undefined) {
+    if (!Array.isArray(v.checkResults))
+      throw new VerdictValidationError("checkResults must be an array when present");
+    for (const item of v.checkResults as unknown[]) {
+      if (!isObject(item))
+        throw new VerdictValidationError("checkResults entry must be an object");
+      if (typeof item.checkId !== "string" || !item.checkId)
+        throw new VerdictValidationError("checkResults entry missing checkId");
+      if (typeof item.kind !== "string" || !item.kind)
+        throw new VerdictValidationError(
+          `checkResults "${item.checkId}": missing kind`,
+        );
+      if (!["pass", "fail", "error", "skipped"].includes(item.status as string))
+        throw new VerdictValidationError(
+          `checkResults "${item.checkId}": status must be pass|fail|error|skipped`,
+        );
+    }
+  }
+  if (v.deterministicChecks !== undefined) {
+    if (!Array.isArray(v.deterministicChecks))
+      throw new VerdictValidationError("deterministicChecks must be an array when present");
+    for (const item of v.deterministicChecks) {
+      if (!isObject(item))
+        throw new VerdictValidationError("deterministicChecks entry must be an object");
+      if (typeof item.id !== "string" || !item.id)
+        throw new VerdictValidationError("deterministicChecks entry missing id");
+      if (typeof item.pass !== "boolean")
+        throw new VerdictValidationError(
+          `deterministicChecks "${item.id}": pass must be boolean`,
+        );
+    }
   }
 
   if (!Array.isArray(v.findings)) throw new VerdictValidationError("missing findings[]");

@@ -22,8 +22,18 @@ import { extractJsonObject, type JudgeProvider } from "./provider.js";
 import {
   validateVerdict,
   VerdictValidationError,
+  type CheckResult,
   type Verdict,
 } from "./verdict.js";
+import {
+  coerceAgentCategory,
+  filterCriteria,
+  shouldRunWithSource,
+} from "./categories.js";
+import {
+  foldCheckResultsIntoVerdict,
+} from "./check-results.js";
+import { loadCheckResults } from "../runner/check-runner.js";
 import {
   renderVerdictReport,
   type ReportContext,
@@ -156,15 +166,48 @@ export async function judgeRun(input: JudgeRunInput): Promise<JudgeRunResult> {
     const runMeta = await readRunJson(runDir);
     const eventsPreview = await buildEventsPreview(runDir, input.previewWindow ?? 5);
 
+    // Category profile: filter rubric criteria (plan/categories.md + rubric §7)
+    // so the prompt lists only applicable criteria and the verdict is validated
+    // against the filtered set. Coding with a full rubric is effectively identity.
+    const category = coerceAgentCategory(input.task.agentCategory);
+    const filtered = resolveFilteredRubric(input.task.rubric, category);
+    // Only enforce allowed ids when the filter retained ≥1 criterion. An empty
+    // retained set means the rubric is coding-only (or malformed for this
+    // category) — fall back to the original rubric for the prompt and skip the
+    // allowed-id gate so legacy fixtures keep working.
+    const useFiltered =
+      filtered !== null && filtered.criteria.length > 0;
+    const rubricForJudge = useFiltered
+      ? filtered
+      : (input.task.rubric as Rubric | unknown);
+    const allowedCriterionIds = useFiltered
+      ? filtered!.criteria.map((c) => c.id)
+      : undefined;
+
+    // Category-gated withSource lens: research/conversational never; coding/data
+    // always; general/browser only when a diff/outputs artifact is present.
+    // Combined with the caller's hasSourceArtifacts so we never invent a source
+    // that the harness did not capture.
+    const runWithSource = shouldRunWithSource(
+      category,
+      input.hasSourceArtifacts,
+    );
+    const hasSourceArtifacts = input.hasSourceArtifacts && runWithSource;
+
+    // P9: load deterministic check results written by the check-runner after
+    // terminal-success. Absent when the task has no rubric.checks.
+    const checkResults = await loadCheckResults(runDir);
+
     const promptVars = {
       taskPrompt: input.task.prompt,
-      rubric: input.task.rubric,
-      agentCategory: input.task.agentCategory,
+      rubric: rubricForJudge,
+      agentCategory: category,
       runMetadata: runMeta,
       eventsPreview,
       judgePrompt: input.judgePrompt,
       referenceSolution: input.task.referenceSolution,
-      hasSourceArtifacts: input.hasSourceArtifacts,
+      hasSourceArtifacts,
+      ...(checkResults.length > 0 ? { checkResults } : {}),
     };
 
     const systemPrompt = assembleJudgeSystemPrompt(promptVars);
@@ -235,7 +278,12 @@ export async function judgeRun(input: JudgeRunInput): Promise<JudgeRunResult> {
     }
 
     try {
-      validateVerdict(parsed, { hasSourceArtifacts: input.hasSourceArtifacts });
+      validateVerdict(parsed, {
+        hasSourceArtifacts,
+        ...(allowedCriterionIds !== undefined
+          ? { allowedCriterionIds }
+          : {}),
+      });
     } catch (err) {
       const message =
         err instanceof VerdictValidationError
@@ -260,7 +308,48 @@ export async function judgeRun(input: JudgeRunInput): Promise<JudgeRunResult> {
       };
     }
 
-    const verdict = parsed as Verdict;
+    // P9: fold check results + pass-rates into the verdict the platform
+    // persists. Pass grounds linked criteria; fail surfaces findings for
+    // reconciliation (never auto-fails a criterion purely on a check).
+    let verdict = parsed as Verdict;
+    if (checkResults.length > 0) {
+      verdict = foldCheckResultsIntoVerdict(
+        verdict,
+        checkResults,
+        rubricForJudge,
+      );
+      // Re-validate after fold (findings / scores may have changed).
+      try {
+        validateVerdict(verdict, {
+          hasSourceArtifacts,
+          ...(allowedCriterionIds !== undefined
+            ? { allowedCriterionIds }
+            : {}),
+        });
+      } catch (err) {
+        const message =
+          err instanceof VerdictValidationError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : String(err);
+        await emitError(
+          emit,
+          judgementId,
+          `verdict validation after check fold failed: ${message}`,
+        );
+        await emitRunEnd(emit, judgementId, "failed");
+        return {
+          judgementId,
+          judgementDir,
+          eventsPath,
+          status: "failed",
+          error: message,
+          systemPromptVersion,
+        };
+      }
+    }
+
     await writeFile(
       verdictPath,
       `${JSON.stringify(verdict, null, 2)}\n`,
@@ -276,6 +365,7 @@ export async function judgeRun(input: JudgeRunInput): Promise<JudgeRunResult> {
         runMeta,
         systemPromptVersion,
         judgedAt: new Date().toISOString(),
+        hasSourceArtifacts,
       });
       const reportHtml = renderVerdictReport(verdict, reportCtx);
       const reportFile = join(judgementDir, "report.html");
@@ -377,8 +467,11 @@ function buildReportContext(args: {
   runMeta: unknown;
   systemPromptVersion: string;
   judgedAt: string;
+  /** Category-gated source flag (already combined with shouldRunWithSource). */
+  hasSourceArtifacts: boolean;
 }): ReportContext {
-  const { input, runMeta, systemPromptVersion, judgedAt } = args;
+  const { input, runMeta, systemPromptVersion, judgedAt, hasSourceArtifacts } =
+    args;
   const meta =
     runMeta && typeof runMeta === "object"
       ? (runMeta as Record<string, unknown>)
@@ -412,9 +505,36 @@ function buildReportContext(args: {
     judgeModel: input.judgeModel,
     systemPromptVersion,
     judgedAt,
-    hasSourceArtifacts: input.hasSourceArtifacts,
+    hasSourceArtifacts,
     runMetadata: Object.keys(runMetadata).length > 0 ? runMetadata : undefined,
   };
+}
+
+/**
+ * Apply {@link filterCriteria} when the task rubric is a well-formed Rubric.
+ * Returns null for non-rubric payloads (leave the prompt as-is).
+ */
+function resolveFilteredRubric(
+  rubric: Rubric | unknown,
+  category: AgentCategory,
+): Rubric | null {
+  if (!isRubric(rubric)) return null;
+  return filterCriteria(rubric, category);
+}
+
+function isRubric(value: unknown): value is Rubric {
+  if (value === null || typeof value !== "object") return false;
+  const r = value as Record<string, unknown>;
+  if (!Array.isArray(r.criteria)) return false;
+  return r.criteria.every(
+    (c) =>
+      c !== null &&
+      typeof c === "object" &&
+      typeof (c as { id?: unknown }).id === "string" &&
+      typeof (c as { axis?: unknown }).axis === "string" &&
+      typeof (c as { weight?: unknown }).weight === "number" &&
+      typeof (c as { appliesTo?: unknown }).appliesTo === "string",
+  );
 }
 
 async function emitRunEnd(

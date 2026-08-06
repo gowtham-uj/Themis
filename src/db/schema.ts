@@ -378,11 +378,33 @@ export const checks = sqliteTable("checks", {
   detail: text("detail"),
 });
 
+/**
+ * Deployment users (P9-settings). Password is scrypt-hashed (password_hash);
+ * plaintext is NEVER stored. role: "admin" | "user".
+ * First registered user is auto-admin (bootstrap).
+ */
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
+  /** Unique login name (plan also listed email; username is the auth identifier). */
+  username: text("username").notNull().unique(),
+  /** scrypt salt:hash hex. NEVER plaintext. */
+  passwordHash: text("password_hash").notNull(),
+  /** "admin" | "user" */
+  role: text("role").notNull(),
+  createdAt: text("created_at").notNull(),
+  /** Optional legacy/plan email column (nullable). */
   email: text("email").unique(),
-  pwHash: text("pw_hash"),
-  role: text("role"),
+});
+
+/**
+ * Global key/value settings (P9). value is JSON-encoded text.
+ * Secrets (API keys) are stored as name-only references, never raw secret values.
+ */
+export const settings = sqliteTable("settings", {
+  key: text("key").primaryKey(),
+  /** JSON-encoded value. */
+  value: text("value").notNull(),
+  updatedAt: text("updated_at").notNull(),
 });
 
 // ---------------------------------------------------------------------------
@@ -462,6 +484,19 @@ export const webhookDeliveries = sqliteTable(
   ],
 );
 
+// Deterministic check results (P9, rubric.md §5). Run-keyed JSON mirror of the
+// verdict's checkResults array so API consumers can query pass-rates without
+// parsing the verdict body. One row per run (upserted on re-store).
+export const checkResults = sqliteTable(
+  "check_results",
+  {
+    runId: text("run_id").notNull(),
+    resultsJson: text("results_json").notNull(),
+    recordedAt: text("recorded_at").notNull(),
+  },
+  (t) => [index("idx_check_results_run").on(t.runId)],
+);
+
 // ---------------------------------------------------------------------------
 // Schema registry (for drizzle + openDb)
 // ---------------------------------------------------------------------------
@@ -481,9 +516,11 @@ export const schema = {
   findingOccurrences,
   checks,
   users,
+  settings,
   apiTokens,
   outboundSubscriptions,
   webhookDeliveries,
+  checkResults,
 };
 
 export type Schema = typeof schema;

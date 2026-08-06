@@ -1,8 +1,12 @@
 /**
  * Task sources — pluggable ingest turning a project's representation into TaskSpecs.
  *
- * Built-ins shipped here: `ui-builder` (UI form + task.json readback) and
- * `repo-md` (markdown + YAML frontmatter under the workspace).
+ * Built-ins shipped here:
+ * - `ui-builder` (UI form + task.json readback)
+ * - `repo-md` (markdown + YAML frontmatter under the workspace)
+ * - `manifest-yaml` (single YAML manifest enumerating tasks)
+ * - `ci-artifact` (CI directory-of-JSON / single manifest.json)
+ * - `http-push` (programmatic push; fully mutable via API)
  *
  * ## Sync seam (P3b ↔ P3c / P3a)
  *
@@ -27,6 +31,21 @@
  */
 
 import type { ProjectCtx, TaskSource, TaskSpec, ValidationResult } from "../domain.js";
+import {
+  CiArtifactSource,
+  type CiArtifactSourceOptions,
+} from "./ci-artifact.js";
+import {
+  HttpPushSource,
+  pushHttpTask,
+  resetHttpPushStore,
+  type HttpPushSourceOptions,
+} from "./http-push.js";
+import {
+  ManifestYamlSource,
+  parseManifestYaml,
+  type ManifestYamlSourceOptions,
+} from "./manifest-yaml.js";
 import { RepoMdSource, type RepoMdSourceOptions } from "./repo-md.js";
 import {
   UIBuilderSource,
@@ -36,15 +55,34 @@ import {
 } from "./ui-builder.js";
 import { splitFrontmatter, parseYamlSubset } from "./parse-frontmatter.js";
 
-export type { BuildTaskSpecInput, RepoMdSourceOptions };
+export type {
+  BuildTaskSpecInput,
+  RepoMdSourceOptions,
+  ManifestYamlSourceOptions,
+  CiArtifactSourceOptions,
+  HttpPushSourceOptions,
+};
 export {
   RepoMdSource,
   UIBuilderSource,
+  ManifestYamlSource,
+  parseManifestYaml,
+  CiArtifactSource,
+  HttpPushSource,
+  pushHttpTask,
+  resetHttpPushStore,
   buildTaskSpec,
   validateTaskSpec,
   splitFrontmatter,
   parseYamlSubset,
 };
+
+/** Options accepted by {@link createTaskSource} (union of per-source opts). */
+export type CreateTaskSourceOptions =
+  | RepoMdSourceOptions
+  | ManifestYamlSourceOptions
+  | CiArtifactSourceOptions
+  | HttpPushSourceOptions;
 
 /**
  * Injectable persistence seam for task sync.
@@ -177,13 +215,32 @@ function sortKeys(value: unknown): unknown {
   return value;
 }
 
-/** Factory: create a built-in source by kind. */
+/**
+ * Factory: create a built-in source by kind.
+ * Accepts the full TaskSource kind union (5 built-ins). Existing
+ * `ui-builder` / `repo-md` paths are unchanged in behavior.
+ */
 export function createTaskSource(
-  kind: "ui-builder" | "repo-md",
-  opts?: RepoMdSourceOptions,
+  kind: TaskSource["kind"],
+  opts?: CreateTaskSourceOptions,
 ): TaskSource {
-  if (kind === "ui-builder") return new UIBuilderSource();
-  return new RepoMdSource(opts);
+  switch (kind) {
+    case "ui-builder":
+      return new UIBuilderSource();
+    case "repo-md":
+      return new RepoMdSource(opts as RepoMdSourceOptions | undefined);
+    case "manifest-yaml":
+      return new ManifestYamlSource(opts as ManifestYamlSourceOptions | undefined);
+    case "ci-artifact":
+      return new CiArtifactSource(opts as CiArtifactSourceOptions | undefined);
+    case "http-push":
+      return new HttpPushSource(opts as HttpPushSourceOptions | undefined);
+    default: {
+      // Exhaustiveness guard — keep runtime safe if a new kind lands in domain.
+      const _exhaustive: never = kind;
+      throw new Error(`createTaskSource: unknown kind ${String(_exhaustive)}`);
+    }
+  }
 }
 
 /**

@@ -238,11 +238,18 @@ export function getRequestAuth(req: IncomingMessage): AuthInfo | undefined {
 
 /**
  * Paths that stay public even when authEnabled is true.
- * Currently: GET /api/health only.
+ * Currently: GET /api/health + POST /api/auth/login (password bootstrap).
  */
 export function isPublicApiPath(method: string, path: string): boolean {
   const m = method.toUpperCase();
   if (m === "GET" && (path === "/api/health" || path === "/api/health/")) {
+    return true;
+  }
+  // Login must work without a prior bearer (P9 password auth).
+  if (
+    m === "POST" &&
+    (path === "/api/auth/login" || path === "/api/auth/login/")
+  ) {
     return true;
   }
   return false;
