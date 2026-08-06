@@ -12,7 +12,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, desc } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import type {
   AgentCategory,
@@ -39,10 +39,13 @@ import {
   findings,
   judgements,
   projects,
+  queueEntries,
   runBatches,
   runs,
   scores,
   tasks,
+  watcherEvents,
+  watcherRules,
   type Schema,
 } from "./schema.js";
 
@@ -259,6 +262,8 @@ export interface CreateRunInput {
   agentImageSource?: string;
   trigger?: string;
   triggerRef?: string;
+  /** Watcher rule that enqueued this run (null for ad-hoc / queue promote). */
+  triggerRuleId?: string;
   controlState?: ControlState;
   startedAt?: string;
   id?: string;
@@ -384,6 +389,177 @@ export interface ListFindingsFilter {
   category?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Watcher rules + events + eval queue (P8a)
+// ---------------------------------------------------------------------------
+
+export type WatcherRole = "agent" | "workspace";
+export type WatcherTrigger =
+  | "tag"
+  | "commit"
+  | "pr"
+  | "schedule"
+  | "manual"
+  | "webhook";
+/** matched|ignored|deduped|enqueued|failed|building — see plan/data-model.md */
+export type WatcherEventStatus =
+  | "matched"
+  | "ignored"
+  | "deduped"
+  | "enqueued"
+  | "failed"
+  | "building";
+export type QueueTargetKind = "task" | "task_set";
+export type QueueEntryStatus =
+  | "queued"
+  | "promoted"
+  | "running"
+  | "removed"
+  | "failed";
+
+/** Action payload stored as action_json on a watcher rule. */
+export interface WatcherAction {
+  enqueue: "all" | "subset";
+  taskTags?: string[];
+  repeats?: number;
+  adapterOverrides?: Record<string, unknown>;
+  autoJudge?: boolean;
+  judgeModel?: string;
+}
+
+/** Watcher rule domain row. webhookSecret is present only on create result. */
+export interface WatcherRule {
+  id: string;
+  projectId: string;
+  role: WatcherRole;
+  repo: string;
+  trigger: WatcherTrigger | string;
+  ref: string | null;
+  semverFilter: string | null;
+  action: WatcherAction;
+  /** Plaintext secret; stripped (null) on get/list/update. Present only on create. */
+  webhookSecret: string | null;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateWatcherRuleInput {
+  role: WatcherRole;
+  repo: string;
+  trigger: WatcherTrigger | string;
+  ref?: string | null;
+  semverFilter?: string | null;
+  action: WatcherAction;
+  /** If absent, generated as newId()+"-"+newId() and returned once. */
+  webhookSecret?: string;
+  enabled?: boolean;
+}
+
+export interface UpdateWatcherRulePatch {
+  ref?: string | null;
+  semverFilter?: string | null;
+  action?: WatcherAction;
+  enabled?: boolean;
+  repo?: string;
+}
+
+export interface WatcherEvent {
+  id: string;
+  ruleId: string;
+  projectId: string;
+  receivedAt: string;
+  trigger: string;
+  ref: string | null;
+  resolvedSha: string | null;
+  status: WatcherEventStatus | string;
+  batchId: string | null;
+  error: string | null;
+}
+
+export interface RecordWatcherEventInput {
+  ruleId: string;
+  projectId: string;
+  trigger: string;
+  ref?: string | null;
+  resolvedSha?: string | null;
+  status: WatcherEventStatus | string;
+  batchId?: string | null;
+  error?: string | null;
+}
+
+/** Eval-queue domain row. JSON columns are parsed. */
+export interface QueueEntry {
+  id: string;
+  projectId: string;
+  triggerRef: string | null;
+  targetKind: QueueTargetKind | string;
+  taskId: string | null;
+  /** Parsed from task_tags_json. */
+  taskTags: string[] | null;
+  agentId: string;
+  model: string | null;
+  provider: string | null;
+  repeats: number | null;
+  /** Parsed from params_json. */
+  params: Record<string, unknown> | null;
+  /** Parsed from adapter_overrides_json. */
+  adapterOverrides: Record<string, unknown> | null;
+  /** int 1 === true; null when unset. */
+  autoJudge: boolean | null;
+  judgeModel: string | null;
+  priority: number;
+  position: number;
+  status: QueueEntryStatus | string;
+  dedupKey: string | null;
+  source: string | null;
+  createdAt: string;
+  promotedAt: string | null;
+  promotedBatchId: string | null;
+  removedAt: string | null;
+}
+
+export type QueuePositionSpec =
+  | number
+  | { after?: string }
+  | { before?: string };
+
+export interface CreateQueueEntryInput {
+  triggerRef?: string | null;
+  targetKind: QueueTargetKind;
+  taskId?: string | null;
+  taskTags?: string[];
+  agentId: string;
+  model?: string | null;
+  provider?: string | null;
+  repeats?: number | null;
+  params?: Record<string, unknown> | null;
+  adapterOverrides?: Record<string, unknown> | null;
+  autoJudge?: boolean | null;
+  judgeModel?: string | null;
+  priority?: number;
+  /** Absolute position, or relative {after|before} entry id. Omitted → append tail. */
+  position?: QueuePositionSpec;
+  dedupKey?: string | null;
+  source?: string | null;
+}
+
+export interface ReorderQueueEntryOpts {
+  position?: number;
+  after?: string;
+  before?: string;
+  priority?: number;
+}
+
+export interface PromoteQueueEntryResult {
+  entry: QueueEntry;
+  /** First batch created (also stored as promotedBatchId). */
+  batchId: string;
+  runIds: string[];
+  /** All batches when task_set fans out to multiple tasks. */
+  batchIds: string[];
+}
+
 /**
  * Shared query surface. Both SqliteQueries and MemoryQueries implement this.
  */
@@ -454,6 +630,49 @@ export interface QueryStore {
   getFinding(fingerprint: string): FindingDetail | null;
   /** Occurrences for a fingerprint (newest first). */
   listOccurrences(findingFingerprint: string): OccurrenceRow[];
+
+  // ---- watcher rules + events (P8a) ----
+  /** Create a watcher rule. Returns webhookSecret once (only time it surfaces). */
+  createWatcherRule(projectId: string, input: CreateWatcherRuleInput): WatcherRule;
+  /** Get a rule with webhookSecret stripped to null. */
+  getWatcherRule(id: string): WatcherRule | null;
+  /** List project rules with secrets stripped. */
+  listWatcherRules(
+    projectId: string,
+    opts?: { includeDisabled?: boolean },
+  ): WatcherRule[];
+  /** Patch a rule (secret never touchable). Secret stripped on return. */
+  updateWatcherRule(id: string, patch: UpdateWatcherRulePatch): WatcherRule;
+  /** Hard-delete a rule; watcher_events rows remain for audit. */
+  deleteWatcherRule(id: string): void;
+  /** Insert a watcher_events row and return it. */
+  recordWatcherEvent(input: RecordWatcherEventInput): WatcherEvent;
+  /** Newest-receivedAt-first. */
+  listWatcherEvents(
+    projectId: string,
+    opts?: { ruleId?: string; limit?: number },
+  ): WatcherEvent[];
+
+  // ---- eval queue (P8a) ----
+  /** Enqueue an eval. Fractional position + default dedupKey when applicable. */
+  createQueueEntry(projectId: string, input: CreateQueueEntryInput): QueueEntry;
+  getQueueEntry(id: string): QueueEntry | null;
+  /** Sorted by priority DESC then position ASC (stable run order). */
+  listQueueEntries(
+    projectId: string,
+    opts?: { status?: string },
+  ): QueueEntry[];
+  /** Recompute fractional position and/or priority. */
+  reorderQueueEntry(id: string, opts: ReorderQueueEntryOpts): QueueEntry;
+  /**
+   * Resolve a queued entry into run_batch(es) + runs (status queued).
+   * Does not start runs — promotion only creates queued work for the runner.
+   */
+  promoteQueueEntry(id: string): PromoteQueueEntryResult;
+  /** Soft-remove (status=removed). Idempotent if already removed. */
+  removeQueueEntry(id: string): QueueEntry;
+  /** Soft-remove all status=queued entries. Leaves promoted/running untouched. */
+  drainQueue(projectId: string): { removed: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -808,6 +1027,179 @@ function parseCursorOffset(cursor: string | undefined): number {
 
 function notFound(kind: string, id: string): Error {
   return new Error(`${kind} not found: ${id}`);
+}
+
+/** Default gap for fractional queue positions (leave room for inserts). */
+const QUEUE_POSITION_GAP = 1000;
+
+/** Strip webhook secret so it is never leaked after create. */
+function stripWebhookSecret(rule: WatcherRule): WatcherRule {
+  return { ...rule, webhookSecret: null };
+}
+
+/** Parse watcher action_json with a safe default. */
+function parseWatcherAction(raw: string | null | undefined): WatcherAction {
+  const parsed = parseJson<Partial<WatcherAction>>(raw, {});
+  return {
+    enqueue: parsed.enqueue === "subset" ? "subset" : "all",
+    ...(parsed.taskTags !== undefined ? { taskTags: parsed.taskTags } : {}),
+    ...(parsed.repeats !== undefined ? { repeats: parsed.repeats } : {}),
+    ...(parsed.adapterOverrides !== undefined
+      ? { adapterOverrides: parsed.adapterOverrides }
+      : {}),
+    ...(parsed.autoJudge !== undefined ? { autoJudge: parsed.autoJudge } : {}),
+    ...(parsed.judgeModel !== undefined ? { judgeModel: parsed.judgeModel } : {}),
+  };
+}
+
+function defaultQueueDedupKey(
+  triggerRef: string | null | undefined,
+  targetKind: string,
+  taskId: string | null | undefined,
+  taskTags: string[] | null | undefined,
+): string {
+  const refPart = triggerRef ?? "";
+  if (targetKind === "task") {
+    return `${refPart}:task:${taskId ?? ""}`;
+  }
+  return `${refPart}:tags:${(taskTags ?? []).join(",")}`;
+}
+
+/**
+ * Fractional indexing for queue order (spreadsheet-row style).
+ * - absolute number → use as-is
+ * - {after:id} → midpoint between that entry and its next neighbor (or tail gap)
+ * - {before:id} → midpoint between previous neighbor and that entry (or head gap)
+ * - omitted → append after max (or QUEUE_POSITION_GAP when empty)
+ */
+function computeFractionalPosition(
+  entries: Array<{ id: string; position: number }>,
+  opts?: QueuePositionSpec,
+): number {
+  const sorted = [...entries].sort((a, b) => a.position - b.position);
+  if (typeof opts === "number" && Number.isFinite(opts)) {
+    return opts;
+  }
+  if (sorted.length === 0) {
+    return QUEUE_POSITION_GAP;
+  }
+  const afterId =
+    opts && typeof opts === "object" && "after" in opts ? opts.after : undefined;
+  const beforeId =
+    opts && typeof opts === "object" && "before" in opts ? opts.before : undefined;
+
+  if (afterId) {
+    const idx = sorted.findIndex((e) => e.id === afterId);
+    if (idx < 0) {
+      return sorted[sorted.length - 1]!.position + QUEUE_POSITION_GAP;
+    }
+    const a = sorted[idx]!.position;
+    if (idx + 1 < sorted.length) {
+      return (a + sorted[idx + 1]!.position) / 2;
+    }
+    return a + QUEUE_POSITION_GAP;
+  }
+
+  if (beforeId) {
+    const idx = sorted.findIndex((e) => e.id === beforeId);
+    if (idx < 0) {
+      // Unknown anchor → insert at head (gap below min).
+      const min = sorted[0]!.position;
+      return min > 0 ? min / 2 : min - QUEUE_POSITION_GAP;
+    }
+    const b = sorted[idx]!.position;
+    if (idx === 0) {
+      return b > 0 ? b / 2 : b - QUEUE_POSITION_GAP;
+    }
+    return (sorted[idx - 1]!.position + b) / 2;
+  }
+
+  // Default: append at tail.
+  return sorted[sorted.length - 1]!.position + QUEUE_POSITION_GAP;
+}
+
+function mapWatcherRuleRow(row: typeof watcherRules.$inferSelect): WatcherRule {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    role: row.role as WatcherRole,
+    repo: row.repo,
+    trigger: row.trigger,
+    ref: row.ref ?? null,
+    semverFilter: row.semverFilter ?? null,
+    action: parseWatcherAction(row.actionJson),
+    webhookSecret: row.webhookSecret ?? null,
+    enabled: row.enabled === 1,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function mapWatcherEventRow(
+  row: typeof watcherEvents.$inferSelect,
+): WatcherEvent {
+  return {
+    id: row.id,
+    ruleId: row.ruleId,
+    projectId: row.projectId,
+    receivedAt: row.receivedAt,
+    trigger: row.trigger,
+    ref: row.ref ?? null,
+    resolvedSha: row.resolvedSha ?? null,
+    status: row.status,
+    batchId: row.batchId ?? null,
+    error: row.error ?? null,
+  };
+}
+
+function mapQueueEntryRow(row: typeof queueEntries.$inferSelect): QueueEntry {
+  const auto =
+    row.autoJudge == null ? null : row.autoJudge === 1 ? true : false;
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    triggerRef: row.triggerRef ?? null,
+    targetKind: row.targetKind,
+    taskId: row.taskId ?? null,
+    taskTags: parseJson<string[] | null>(row.taskTagsJson, null),
+    agentId: row.agentId,
+    model: row.model ?? null,
+    provider: row.provider ?? null,
+    repeats: row.repeats ?? null,
+    params: parseJson<Record<string, unknown> | null>(row.paramsJson, null),
+    adapterOverrides: parseJson<Record<string, unknown> | null>(
+      row.adapterOverridesJson,
+      null,
+    ),
+    autoJudge: auto,
+    judgeModel: row.judgeModel ?? null,
+    priority: row.priority ?? 0,
+    position: row.position,
+    status: row.status,
+    dedupKey: row.dedupKey ?? null,
+    source: row.source ?? null,
+    createdAt: row.createdAt,
+    promotedAt: row.promotedAt ?? null,
+    promotedBatchId: row.promotedBatchId ?? null,
+    removedAt: row.removedAt ?? null,
+  };
+}
+
+function sortQueueEntries(entries: QueueEntry[]): QueueEntry[] {
+  return [...entries].sort((a, b) => {
+    if (b.priority !== a.priority) return b.priority - a.priority;
+    if (a.position !== b.position) return a.position - b.position;
+    return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0;
+  });
+}
+
+function tasksMatchingTags(
+  all: Task[],
+  tags: string[] | null | undefined,
+): Task[] {
+  if (!tags || tags.length === 0) return [...all];
+  const want = new Set(tags);
+  return all.filter((t) => (t.tags ?? []).some((tag) => want.has(tag)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,7 +1571,7 @@ export class SqliteQueries implements QueryStore {
         agentImageSource: input.agentImageSource ?? null,
         trigger: input.trigger ?? null,
         triggerRef: input.triggerRef ?? null,
-        triggerRuleId: null,
+        triggerRuleId: input.triggerRuleId ?? null,
         controlState: input.controlState ?? null,
         pausedAt: null,
         resumedAt: null,
@@ -1785,6 +2177,469 @@ export class SqliteQueries implements QueryStore {
     );
     return mapped;
   }
+
+  // ---- watcher rules + events (P8a) ----
+
+  createWatcherRule(
+    projectId: string,
+    input: CreateWatcherRuleInput,
+  ): WatcherRule {
+    if (!this.getProject(projectId)) throw notFound("project", projectId);
+    const id = newId();
+    const ts = nowIso();
+    const secret =
+      input.webhookSecret !== undefined && input.webhookSecret !== ""
+        ? input.webhookSecret
+        : `${newId()}-${newId()}`;
+    const enabled = input.enabled === false ? 0 : 1;
+    this.db
+      .insert(watcherRules)
+      .values({
+        id,
+        projectId,
+        role: input.role,
+        repo: input.repo,
+        trigger: input.trigger,
+        ref: input.ref ?? null,
+        semverFilter: input.semverFilter ?? null,
+        actionJson: JSON.stringify(input.action),
+        webhookSecret: secret,
+        enabled,
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    const row = this.db
+      .select()
+      .from(watcherRules)
+      .where(eq(watcherRules.id, id))
+      .get();
+    if (!row) throw new Error("failed to create watcher rule");
+    // Return WITH secret present — only create surfaces it.
+    return mapWatcherRuleRow(row);
+  }
+
+  getWatcherRule(id: string): WatcherRule | null {
+    const row = this.db
+      .select()
+      .from(watcherRules)
+      .where(eq(watcherRules.id, id))
+      .get();
+    return row ? stripWebhookSecret(mapWatcherRuleRow(row)) : null;
+  }
+
+  listWatcherRules(
+    projectId: string,
+    opts: { includeDisabled?: boolean } = {},
+  ): WatcherRule[] {
+    const rows = this.db
+      .select()
+      .from(watcherRules)
+      .where(eq(watcherRules.projectId, projectId))
+      .all();
+    return rows
+      .map(mapWatcherRuleRow)
+      .filter((r) => opts.includeDisabled || r.enabled)
+      .map(stripWebhookSecret);
+  }
+
+  updateWatcherRule(
+    id: string,
+    patch: UpdateWatcherRulePatch,
+  ): WatcherRule {
+    const existing = this.db
+      .select()
+      .from(watcherRules)
+      .where(eq(watcherRules.id, id))
+      .get();
+    if (!existing) throw notFound("watcher rule", id);
+    const next = {
+      ref: patch.ref !== undefined ? patch.ref : existing.ref,
+      semverFilter:
+        patch.semverFilter !== undefined
+          ? patch.semverFilter
+          : existing.semverFilter,
+      actionJson:
+        patch.action !== undefined
+          ? JSON.stringify(patch.action)
+          : existing.actionJson,
+      enabled:
+        patch.enabled !== undefined
+          ? patch.enabled
+            ? 1
+            : 0
+          : existing.enabled,
+      repo: patch.repo !== undefined ? patch.repo : existing.repo,
+      updatedAt: nowIso(),
+    };
+    this.db
+      .update(watcherRules)
+      .set(next)
+      .where(eq(watcherRules.id, id))
+      .run();
+    const row = this.db
+      .select()
+      .from(watcherRules)
+      .where(eq(watcherRules.id, id))
+      .get();
+    if (!row) throw notFound("watcher rule", id);
+    return stripWebhookSecret(mapWatcherRuleRow(row));
+  }
+
+  deleteWatcherRule(id: string): void {
+    this.db.delete(watcherRules).where(eq(watcherRules.id, id)).run();
+  }
+
+  recordWatcherEvent(input: RecordWatcherEventInput): WatcherEvent {
+    const id = newId();
+    const receivedAt = nowIso();
+    this.db
+      .insert(watcherEvents)
+      .values({
+        id,
+        ruleId: input.ruleId,
+        projectId: input.projectId,
+        receivedAt,
+        trigger: input.trigger,
+        ref: input.ref ?? null,
+        resolvedSha: input.resolvedSha ?? null,
+        status: input.status,
+        batchId: input.batchId ?? null,
+        error: input.error ?? null,
+      })
+      .run();
+    const row = this.db
+      .select()
+      .from(watcherEvents)
+      .where(eq(watcherEvents.id, id))
+      .get();
+    if (!row) throw new Error("failed to record watcher event");
+    return mapWatcherEventRow(row);
+  }
+
+  listWatcherEvents(
+    projectId: string,
+    opts: { ruleId?: string; limit?: number } = {},
+  ): WatcherEvent[] {
+    const rows = this.db
+      .select()
+      .from(watcherEvents)
+      .where(eq(watcherEvents.projectId, projectId))
+      .all();
+    let events = rows.map(mapWatcherEventRow);
+    if (opts.ruleId) {
+      events = events.filter((e) => e.ruleId === opts.ruleId);
+    }
+    events.sort((a, b) =>
+      a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0,
+    );
+    if (opts.limit !== undefined) {
+      const lim = Math.max(0, Math.floor(opts.limit));
+      events = events.slice(0, lim);
+    }
+    return events;
+  }
+
+  // ---- eval queue (P8a) ----
+
+  createQueueEntry(
+    projectId: string,
+    input: CreateQueueEntryInput,
+  ): QueueEntry {
+    if (!this.getProject(projectId)) throw notFound("project", projectId);
+    const existing = this.db
+      .select()
+      .from(queueEntries)
+      .where(eq(queueEntries.projectId, projectId))
+      .all()
+      .map(mapQueueEntryRow);
+    const position = computeFractionalPosition(
+      existing.map((e) => ({ id: e.id, position: e.position })),
+      input.position,
+    );
+    const taskTags = input.taskTags ?? null;
+    let dedupKey: string | null;
+    if (input.dedupKey !== undefined) {
+      dedupKey = input.dedupKey;
+    } else if (input.source === "manual") {
+      dedupKey = null;
+    } else {
+      dedupKey = defaultQueueDedupKey(
+        input.triggerRef ?? null,
+        input.targetKind,
+        input.taskId ?? null,
+        taskTags,
+      );
+    }
+    const id = newId();
+    const ts = nowIso();
+    this.db
+      .insert(queueEntries)
+      .values({
+        id,
+        projectId,
+        triggerRef: input.triggerRef ?? null,
+        targetKind: input.targetKind,
+        taskId: input.taskId ?? null,
+        taskTagsJson: taskTags ? JSON.stringify(taskTags) : null,
+        agentId: input.agentId,
+        model: input.model ?? null,
+        provider: input.provider ?? null,
+        repeats: input.repeats ?? null,
+        paramsJson:
+          input.params !== undefined && input.params !== null
+            ? JSON.stringify(input.params)
+            : null,
+        adapterOverridesJson:
+          input.adapterOverrides !== undefined &&
+          input.adapterOverrides !== null
+            ? JSON.stringify(input.adapterOverrides)
+            : null,
+        autoJudge:
+          input.autoJudge === undefined || input.autoJudge === null
+            ? null
+            : input.autoJudge
+              ? 1
+              : 0,
+        judgeModel: input.judgeModel ?? null,
+        priority: input.priority ?? 0,
+        position,
+        status: "queued",
+        dedupKey,
+        source: input.source ?? null,
+        createdAt: ts,
+        promotedAt: null,
+        promotedBatchId: null,
+        removedAt: null,
+      })
+      .run();
+    const row = this.getQueueEntry(id);
+    if (!row) throw new Error("failed to create queue entry");
+    return row;
+  }
+
+  getQueueEntry(id: string): QueueEntry | null {
+    const row = this.db
+      .select()
+      .from(queueEntries)
+      .where(eq(queueEntries.id, id))
+      .get();
+    return row ? mapQueueEntryRow(row) : null;
+  }
+
+  listQueueEntries(
+    projectId: string,
+    opts: { status?: string } = {},
+  ): QueueEntry[] {
+    const rows = this.db
+      .select()
+      .from(queueEntries)
+      .where(eq(queueEntries.projectId, projectId))
+      .all()
+      .map(mapQueueEntryRow);
+    const filtered =
+      opts.status !== undefined
+        ? rows.filter((e) => e.status === opts.status)
+        : rows;
+    return sortQueueEntries(filtered);
+  }
+
+  reorderQueueEntry(id: string, opts: ReorderQueueEntryOpts): QueueEntry {
+    const existing = this.getQueueEntry(id);
+    if (!existing) throw notFound("queue entry", id);
+    const siblings = this.db
+      .select()
+      .from(queueEntries)
+      .where(eq(queueEntries.projectId, existing.projectId))
+      .all()
+      .map(mapQueueEntryRow)
+      .filter((e) => e.id !== id);
+    let position = existing.position;
+    if (opts.position !== undefined) {
+      position = opts.position;
+    } else if (opts.after !== undefined || opts.before !== undefined) {
+      const spec: QueuePositionSpec =
+        opts.after !== undefined
+          ? { after: opts.after }
+          : { before: opts.before };
+      position = computeFractionalPosition(
+        siblings.map((e) => ({ id: e.id, position: e.position })),
+        spec,
+      );
+    }
+    const priority =
+      opts.priority !== undefined ? opts.priority : existing.priority;
+    this.db
+      .update(queueEntries)
+      .set({ position, priority })
+      .where(eq(queueEntries.id, id))
+      .run();
+    const row = this.getQueueEntry(id);
+    if (!row) throw notFound("queue entry", id);
+    return row;
+  }
+
+  promoteQueueEntry(id: string): PromoteQueueEntryResult {
+    const entry = this.getQueueEntry(id);
+    if (!entry) throw notFound("queue entry", id);
+    if (entry.status === "promoted") {
+      // Idempotent-ish: return existing promotion metadata when available.
+      if (entry.promotedBatchId) {
+        const runIds = this.listRuns({ batchId: entry.promotedBatchId }).map(
+          (r) => r.id,
+        );
+        return {
+          entry,
+          batchId: entry.promotedBatchId,
+          runIds,
+          batchIds: [entry.promotedBatchId],
+        };
+      }
+    }
+    if (entry.status !== "queued") {
+      throw new Error(
+        `cannot promote queue entry ${id}: status is ${entry.status}`,
+      );
+    }
+
+    let targetTasks: Task[] = [];
+    if (entry.targetKind === "task") {
+      if (!entry.taskId) {
+        throw new Error(
+          `cannot promote queue entry ${id}: target_kind=task but taskId is missing`,
+        );
+      }
+      const t = this.getTask(entry.taskId);
+      if (!t || t.projectId !== entry.projectId) {
+        throw new Error(
+          `cannot promote queue entry ${id}: task not found: ${entry.taskId}`,
+        );
+      }
+      targetTasks = [t];
+    } else {
+      const all = this.listTasks(entry.projectId);
+      targetTasks = tasksMatchingTags(all, entry.taskTags);
+      if (targetTasks.length === 0) {
+        throw new Error(
+          `cannot promote queue entry ${id}: no tasks match tags ${(entry.taskTags ?? []).join(",") || "(none)"}`,
+        );
+      }
+    }
+
+    const project = this.getProject(entry.projectId);
+    const agent = this.getAgent(entry.agentId);
+    const model =
+      entry.model ?? project?.defaultModel ?? agent?.defaultModel ?? "unknown";
+    const provider =
+      entry.provider ??
+      project?.defaultProvider ??
+      agent?.defaultProvider ??
+      "unknown";
+    const repeats = entry.repeats ?? 1;
+    const params = entry.params ?? {};
+    const agentImage =
+      entry.adapterOverrides &&
+      typeof entry.adapterOverrides.imageTag === "string"
+        ? String(entry.adapterOverrides.imageTag)
+        : undefined;
+    // Queue entries are not watcher rules — triggerRuleId stays null.
+    const trigger =
+      entry.source === "watcher"
+        ? "webhook"
+        : entry.source === "manual"
+          ? "manual"
+          : entry.source === "ci"
+            ? "manual"
+            : entry.source === "api"
+              ? "manual"
+              : entry.source ?? "manual";
+
+    const batchIds: string[] = [];
+    const runIds: string[] = [];
+    for (const task of targetTasks) {
+      const batch = this.createBatch({
+        taskId: task.id,
+        projectId: entry.projectId,
+        agentId: entry.agentId,
+        model,
+        provider,
+        params,
+        repeats,
+        trigger,
+        triggerRef: entry.triggerRef ?? undefined,
+        agentImage,
+      });
+      batchIds.push(batch.id);
+      for (let i = 0; i < repeats; i++) {
+        const run = this.createRun({
+          batchId: batch.id,
+          taskId: task.id,
+          projectId: entry.projectId,
+          agentId: entry.agentId,
+          model,
+          provider,
+          repeatIndex: i,
+          status: "queued",
+          trigger,
+          triggerRef: entry.triggerRef ?? undefined,
+          agentImage,
+          // Queue promote: triggerRuleId null (not a rule).
+          triggerRuleId: undefined,
+        });
+        runIds.push(run.id);
+      }
+    }
+
+    const firstBatchId = batchIds[0]!;
+    const promotedAt = nowIso();
+    this.db
+      .update(queueEntries)
+      .set({
+        status: "promoted",
+        promotedAt,
+        promotedBatchId: firstBatchId,
+      })
+      .where(eq(queueEntries.id, id))
+      .run();
+    const updated = this.getQueueEntry(id);
+    if (!updated) throw notFound("queue entry", id);
+    return {
+      entry: updated,
+      batchId: firstBatchId,
+      runIds,
+      batchIds,
+    };
+  }
+
+  removeQueueEntry(id: string): QueueEntry {
+    const existing = this.getQueueEntry(id);
+    if (!existing) throw notFound("queue entry", id);
+    if (existing.status === "removed") {
+      return existing;
+    }
+    const removedAt = nowIso();
+    this.db
+      .update(queueEntries)
+      .set({ status: "removed", removedAt })
+      .where(eq(queueEntries.id, id))
+      .run();
+    const row = this.getQueueEntry(id);
+    if (!row) throw notFound("queue entry", id);
+    return row;
+  }
+
+  drainQueue(projectId: string): { removed: number } {
+    const queued = this.listQueueEntries(projectId, { status: "queued" });
+    const removedAt = nowIso();
+    for (const e of queued) {
+      this.db
+        .update(queueEntries)
+        .set({ status: "removed", removedAt })
+        .where(eq(queueEntries.id, e.id))
+        .run();
+    }
+    return { removed: queued.length };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,6 +2656,9 @@ export class MemoryQueries implements QueryStore {
   private scores = new Map<string, ScoreRow>();
   private findings = new Map<string, FindingRow>();
   private occurrences = new Map<string, OccurrenceRow>();
+  private watcherRules = new Map<string, WatcherRule>();
+  private watcherEvents = new Map<string, WatcherEvent>();
+  private queueEntries = new Map<string, QueueEntry>();
 
   constructor(private readonly dataDir: string) {}
 
@@ -2067,7 +2925,7 @@ export class MemoryQueries implements QueryStore {
       agentImageSource: input.agentImageSource ?? null,
       trigger: input.trigger ?? null,
       triggerRef: input.triggerRef ?? null,
-      triggerRuleId: null,
+      triggerRuleId: input.triggerRuleId ?? null,
       controlState: input.controlState ?? null,
       pausedAt: null,
       resumedAt: null,
@@ -2482,6 +3340,406 @@ export class MemoryQueries implements QueryStore {
       next,
     );
     return { ...next };
+  }
+
+  // ---- watcher rules + events (P8a) ----
+
+  createWatcherRule(
+    projectId: string,
+    input: CreateWatcherRuleInput,
+  ): WatcherRule {
+    if (!this.projects.has(projectId)) throw notFound("project", projectId);
+    const ts = nowIso();
+    const secret =
+      input.webhookSecret !== undefined && input.webhookSecret !== ""
+        ? input.webhookSecret
+        : `${newId()}-${newId()}`;
+    const rule: WatcherRule = {
+      id: newId(),
+      projectId,
+      role: input.role,
+      repo: input.repo,
+      trigger: input.trigger,
+      ref: input.ref ?? null,
+      semverFilter: input.semverFilter ?? null,
+      action: { ...input.action },
+      webhookSecret: secret,
+      enabled: input.enabled === false ? false : true,
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    this.watcherRules.set(rule.id, rule);
+    // Return WITH secret present — only create surfaces it.
+    return { ...rule, action: { ...rule.action } };
+  }
+
+  getWatcherRule(id: string): WatcherRule | null {
+    const r = this.watcherRules.get(id);
+    return r ? stripWebhookSecret({ ...r, action: { ...r.action } }) : null;
+  }
+
+  listWatcherRules(
+    projectId: string,
+    opts: { includeDisabled?: boolean } = {},
+  ): WatcherRule[] {
+    return [...this.watcherRules.values()]
+      .filter(
+        (r) =>
+          r.projectId === projectId && (opts.includeDisabled || r.enabled),
+      )
+      .map((r) => stripWebhookSecret({ ...r, action: { ...r.action } }));
+  }
+
+  updateWatcherRule(
+    id: string,
+    patch: UpdateWatcherRulePatch,
+  ): WatcherRule {
+    const existing = this.watcherRules.get(id);
+    if (!existing) throw notFound("watcher rule", id);
+    const next: WatcherRule = {
+      ...existing,
+      ref: patch.ref !== undefined ? patch.ref : existing.ref,
+      semverFilter:
+        patch.semverFilter !== undefined
+          ? patch.semverFilter
+          : existing.semverFilter,
+      action:
+        patch.action !== undefined ? { ...patch.action } : { ...existing.action },
+      enabled:
+        patch.enabled !== undefined ? patch.enabled : existing.enabled,
+      repo: patch.repo !== undefined ? patch.repo : existing.repo,
+      updatedAt: nowIso(),
+      // Secret is never touchable via update.
+      webhookSecret: existing.webhookSecret,
+    };
+    this.watcherRules.set(id, next);
+    return stripWebhookSecret({ ...next, action: { ...next.action } });
+  }
+
+  deleteWatcherRule(id: string): void {
+    this.watcherRules.delete(id);
+  }
+
+  recordWatcherEvent(input: RecordWatcherEventInput): WatcherEvent {
+    const event: WatcherEvent = {
+      id: newId(),
+      ruleId: input.ruleId,
+      projectId: input.projectId,
+      receivedAt: nowIso(),
+      trigger: input.trigger,
+      ref: input.ref ?? null,
+      resolvedSha: input.resolvedSha ?? null,
+      status: input.status,
+      batchId: input.batchId ?? null,
+      error: input.error ?? null,
+    };
+    this.watcherEvents.set(event.id, event);
+    return { ...event };
+  }
+
+  listWatcherEvents(
+    projectId: string,
+    opts: { ruleId?: string; limit?: number } = {},
+  ): WatcherEvent[] {
+    let events = [...this.watcherEvents.values()].filter(
+      (e) => e.projectId === projectId,
+    );
+    if (opts.ruleId) {
+      events = events.filter((e) => e.ruleId === opts.ruleId);
+    }
+    events.sort((a, b) =>
+      a.receivedAt < b.receivedAt ? 1 : a.receivedAt > b.receivedAt ? -1 : 0,
+    );
+    if (opts.limit !== undefined) {
+      const lim = Math.max(0, Math.floor(opts.limit));
+      events = events.slice(0, lim);
+    }
+    return events.map((e) => ({ ...e }));
+  }
+
+  // ---- eval queue (P8a) ----
+
+  createQueueEntry(
+    projectId: string,
+    input: CreateQueueEntryInput,
+  ): QueueEntry {
+    if (!this.projects.has(projectId)) throw notFound("project", projectId);
+    const existing = [...this.queueEntries.values()].filter(
+      (e) => e.projectId === projectId,
+    );
+    const position = computeFractionalPosition(
+      existing.map((e) => ({ id: e.id, position: e.position })),
+      input.position,
+    );
+    const taskTags = input.taskTags ?? null;
+    let dedupKey: string | null;
+    if (input.dedupKey !== undefined) {
+      dedupKey = input.dedupKey;
+    } else if (input.source === "manual") {
+      dedupKey = null;
+    } else {
+      dedupKey = defaultQueueDedupKey(
+        input.triggerRef ?? null,
+        input.targetKind,
+        input.taskId ?? null,
+        taskTags,
+      );
+    }
+    const entry: QueueEntry = {
+      id: newId(),
+      projectId,
+      triggerRef: input.triggerRef ?? null,
+      targetKind: input.targetKind,
+      taskId: input.taskId ?? null,
+      taskTags: taskTags ? [...taskTags] : null,
+      agentId: input.agentId,
+      model: input.model ?? null,
+      provider: input.provider ?? null,
+      repeats: input.repeats ?? null,
+      params:
+        input.params !== undefined && input.params !== null
+          ? { ...input.params }
+          : null,
+      adapterOverrides:
+        input.adapterOverrides !== undefined && input.adapterOverrides !== null
+          ? { ...input.adapterOverrides }
+          : null,
+      autoJudge:
+        input.autoJudge === undefined ? null : input.autoJudge,
+      judgeModel: input.judgeModel ?? null,
+      priority: input.priority ?? 0,
+      position,
+      status: "queued",
+      dedupKey,
+      source: input.source ?? null,
+      createdAt: nowIso(),
+      promotedAt: null,
+      promotedBatchId: null,
+      removedAt: null,
+    };
+    this.queueEntries.set(entry.id, entry);
+    return {
+      ...entry,
+      taskTags: entry.taskTags ? [...entry.taskTags] : null,
+      params: entry.params ? { ...entry.params } : null,
+      adapterOverrides: entry.adapterOverrides
+        ? { ...entry.adapterOverrides }
+        : null,
+    };
+  }
+
+  getQueueEntry(id: string): QueueEntry | null {
+    const e = this.queueEntries.get(id);
+    if (!e) return null;
+    return {
+      ...e,
+      taskTags: e.taskTags ? [...e.taskTags] : null,
+      params: e.params ? { ...e.params } : null,
+      adapterOverrides: e.adapterOverrides
+        ? { ...e.adapterOverrides }
+        : null,
+    };
+  }
+
+  listQueueEntries(
+    projectId: string,
+    opts: { status?: string } = {},
+  ): QueueEntry[] {
+    let entries = [...this.queueEntries.values()].filter(
+      (e) => e.projectId === projectId,
+    );
+    if (opts.status !== undefined) {
+      entries = entries.filter((e) => e.status === opts.status);
+    }
+    return sortQueueEntries(entries).map((e) => ({
+      ...e,
+      taskTags: e.taskTags ? [...e.taskTags] : null,
+      params: e.params ? { ...e.params } : null,
+      adapterOverrides: e.adapterOverrides
+        ? { ...e.adapterOverrides }
+        : null,
+    }));
+  }
+
+  reorderQueueEntry(id: string, opts: ReorderQueueEntryOpts): QueueEntry {
+    const existing = this.queueEntries.get(id);
+    if (!existing) throw notFound("queue entry", id);
+    const siblings = [...this.queueEntries.values()].filter(
+      (e) => e.projectId === existing.projectId && e.id !== id,
+    );
+    let position = existing.position;
+    if (opts.position !== undefined) {
+      position = opts.position;
+    } else if (opts.after !== undefined || opts.before !== undefined) {
+      const spec: QueuePositionSpec =
+        opts.after !== undefined
+          ? { after: opts.after }
+          : { before: opts.before };
+      position = computeFractionalPosition(
+        siblings.map((e) => ({ id: e.id, position: e.position })),
+        spec,
+      );
+    }
+    const next: QueueEntry = {
+      ...existing,
+      position,
+      priority:
+        opts.priority !== undefined ? opts.priority : existing.priority,
+    };
+    this.queueEntries.set(id, next);
+    return this.getQueueEntry(id)!;
+  }
+
+  promoteQueueEntry(id: string): PromoteQueueEntryResult {
+    const entry = this.queueEntries.get(id);
+    if (!entry) throw notFound("queue entry", id);
+    if (entry.status === "promoted" && entry.promotedBatchId) {
+      const runIds = this.listRuns({ batchId: entry.promotedBatchId }).map(
+        (r) => r.id,
+      );
+      return {
+        entry: this.getQueueEntry(id)!,
+        batchId: entry.promotedBatchId,
+        runIds,
+        batchIds: [entry.promotedBatchId],
+      };
+    }
+    if (entry.status !== "queued") {
+      throw new Error(
+        `cannot promote queue entry ${id}: status is ${entry.status}`,
+      );
+    }
+
+    let targetTasks: Task[] = [];
+    if (entry.targetKind === "task") {
+      if (!entry.taskId) {
+        throw new Error(
+          `cannot promote queue entry ${id}: target_kind=task but taskId is missing`,
+        );
+      }
+      const t = this.getTask(entry.taskId);
+      if (!t || t.projectId !== entry.projectId) {
+        throw new Error(
+          `cannot promote queue entry ${id}: task not found: ${entry.taskId}`,
+        );
+      }
+      targetTasks = [t];
+    } else {
+      const all = this.listTasks(entry.projectId);
+      targetTasks = tasksMatchingTags(all, entry.taskTags);
+      if (targetTasks.length === 0) {
+        throw new Error(
+          `cannot promote queue entry ${id}: no tasks match tags ${(entry.taskTags ?? []).join(",") || "(none)"}`,
+        );
+      }
+    }
+
+    const project = this.getProject(entry.projectId);
+    const agent = this.getAgent(entry.agentId);
+    const model =
+      entry.model ?? project?.defaultModel ?? agent?.defaultModel ?? "unknown";
+    const provider =
+      entry.provider ??
+      project?.defaultProvider ??
+      agent?.defaultProvider ??
+      "unknown";
+    const repeats = entry.repeats ?? 1;
+    const params = entry.params ?? {};
+    const agentImage =
+      entry.adapterOverrides &&
+      typeof entry.adapterOverrides.imageTag === "string"
+        ? String(entry.adapterOverrides.imageTag)
+        : undefined;
+    const trigger =
+      entry.source === "watcher"
+        ? "webhook"
+        : entry.source === "manual"
+          ? "manual"
+          : entry.source === "ci"
+            ? "manual"
+            : entry.source === "api"
+              ? "manual"
+              : entry.source ?? "manual";
+
+    const batchIds: string[] = [];
+    const runIds: string[] = [];
+    for (const task of targetTasks) {
+      const batch = this.createBatch({
+        taskId: task.id,
+        projectId: entry.projectId,
+        agentId: entry.agentId,
+        model,
+        provider,
+        params,
+        repeats,
+        trigger,
+        triggerRef: entry.triggerRef ?? undefined,
+        agentImage,
+      });
+      batchIds.push(batch.id);
+      for (let i = 0; i < repeats; i++) {
+        const run = this.createRun({
+          batchId: batch.id,
+          taskId: task.id,
+          projectId: entry.projectId,
+          agentId: entry.agentId,
+          model,
+          provider,
+          repeatIndex: i,
+          status: "queued",
+          trigger,
+          triggerRef: entry.triggerRef ?? undefined,
+          agentImage,
+          triggerRuleId: undefined,
+        });
+        runIds.push(run.id);
+      }
+    }
+
+    const firstBatchId = batchIds[0]!;
+    const next: QueueEntry = {
+      ...entry,
+      status: "promoted",
+      promotedAt: nowIso(),
+      promotedBatchId: firstBatchId,
+    };
+    this.queueEntries.set(id, next);
+    return {
+      entry: this.getQueueEntry(id)!,
+      batchId: firstBatchId,
+      runIds,
+      batchIds,
+    };
+  }
+
+  removeQueueEntry(id: string): QueueEntry {
+    const existing = this.queueEntries.get(id);
+    if (!existing) throw notFound("queue entry", id);
+    if (existing.status === "removed") {
+      return this.getQueueEntry(id)!;
+    }
+    const next: QueueEntry = {
+      ...existing,
+      status: "removed",
+      removedAt: nowIso(),
+    };
+    this.queueEntries.set(id, next);
+    return this.getQueueEntry(id)!;
+  }
+
+  drainQueue(projectId: string): { removed: number } {
+    const queued = [...this.queueEntries.values()].filter(
+      (e) => e.projectId === projectId && e.status === "queued",
+    );
+    const removedAt = nowIso();
+    for (const e of queued) {
+      this.queueEntries.set(e.id, {
+        ...e,
+        status: "removed",
+        removedAt,
+      });
+    }
+    return { removed: queued.length };
   }
 }
 
