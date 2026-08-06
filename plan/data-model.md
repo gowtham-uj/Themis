@@ -272,11 +272,19 @@ CREATE INDEX idx_occurrences_run ON finding_occurrences(run_id);
 CREATE INDEX idx_occurrences_judgement ON finding_occurrences(judgement_id);
 
 -- Fingerprint canonicalization (computed by the platform on ingest, not by the judge):
---   fingerprint = sha256(category + ":" + canonical_location)
---   canonical_location for a diff ref  = file + hunk
---   for a trace ref = runId? no -> task-relative turn range (store run-relative; cross-run via category)
---   for a tool ref  = toolName + normalized(args key fields)
--- Same defect recurring at the same file+hunk under the same category => same fingerprint across runs.
+--   fingerprint = sha256(taskId + ":" + category + ":" + canonical_location)  -- TASK-SCOPED
+--   (taskId baked into the material so the global PK fingerprint cannot collide across tasks;
+--    the formula in the original sketch omitted taskId, which silently dropped findings — see
+--    src/db/findings.ts fingerprintOf + tests/findings.test.ts "cross-task ... no silent drop".
+--    This preserves the intent: "same defect recurring across runs OF THE SAME TASK => one row".)
+--   canonical_location precedence:
+--     diff ref  = file + hunk  (strip leading "./", normalize "/" separators)
+--     tool ref  = "tool:" + toolCallId  (when no diff ref)
+--     trace ref = IGNORED for the key (run-relative; not stable across runs) -> fall through
+--     fallback  = "claim:" + normalizeClaim(claim)  (lowercase, whitespace-collapsed, trailing .;: + space stripped)
+--   (tool ref uses toolCallId, not toolName+args as the sketch suggested — toolCallId is the
+--    stable in-verdict identifier; documented deviation of the sketch, faithful to the P6a contract.)
+-- Same defect recurring at the same file+hunk under the same category for the same task => same fingerprint across runs.
 
 -- Optional deterministic checks folded into the rubric (project-scoped via run)
 CREATE TABLE checks (

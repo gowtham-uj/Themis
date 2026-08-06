@@ -342,9 +342,11 @@ describe("agents + batches + runs", () => {
   });
 });
 
-describe("stubs (P6)", () => {
-  it("finding methods throw until later phases", async () => {
+describe("findings query surface (P6a)", () => {
+  it("listFindings / getFinding start empty and are callable", async () => {
     const { queries } = open(await tempDataDir());
-    expect(() => queries.createFinding()).toThrow(/not implemented/);
+    expect(queries.listFindings()).toEqual([]);
+    expect(queries.getFinding("nope")).toBeNull();
+    expect(queries.listOccurrences("nope")).toEqual([]);
   });
 });

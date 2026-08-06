@@ -23,7 +23,20 @@ import type {
 import type { WorkspaceSpec } from "../adapters/types.js";
 import type { Verdict } from "../judge/verdict.js";
 import {
+  applyRecurrenceToVerdict,
+  ingestFindings as runIngestFindings,
+  type FindingDetail,
+  type FindingKind,
+  type FindingLifecycleStatus,
+  type FindingRow,
+  type FindingsIngestStore,
+  type OccurrenceRow,
+  type OccurrenceStatus,
+} from "./findings.js";
+import {
   agents,
+  findingOccurrences,
+  findings,
   judgements,
   projects,
   runBatches,
@@ -32,6 +45,16 @@ import {
   tasks,
   type Schema,
 } from "./schema.js";
+
+// Re-export finding row types for consumers.
+export type {
+  FindingDetail,
+  FindingKind,
+  FindingLifecycleStatus,
+  FindingRow,
+  OccurrenceRow,
+  OccurrenceStatus,
+} from "./findings.js";
 
 // ---------------------------------------------------------------------------
 // Domain row types (I/O of the query layer)
@@ -350,9 +373,17 @@ export interface ListJudgementsResult {
   nextCursor: string | null;
 }
 
+/** Filter for listFindings (all fields optional; AND-combined). */
+export interface ListFindingsFilter {
+  projectId?: string;
+  taskId?: string;
+  status?: string;
+  kind?: FindingKind | string;
+  category?: string;
+}
+
 /**
  * Shared query surface. Both SqliteQueries and MemoryQueries implement this.
- * Finding methods are stubs (throw) until P6.
  */
 export interface QueryStore {
   createProject(input: CreateProjectInput): Project;
@@ -392,7 +423,9 @@ export interface QueryStore {
   createScores(judgementId: string, scores: CreateScoreInput[]): ScoreRow[];
   /**
    * Persist a completed verdict: write verdict.json, mirror overall + per-criterion
-   * scores into SQLite, mark judgement completed.
+   * scores into SQLite, mark judgement completed, then ingest findings (P6a).
+   * Findings-ingest errors are caught + console.warn'd — they must not break
+   * verdict persistence (verdict.json remains the source of truth).
    */
   storeVerdict(judgementId: string, verdict: Verdict): JudgementWithVerdict;
   /** Load judgement row + verdict.json body (if present). */
@@ -406,8 +439,19 @@ export interface QueryStore {
     endedAt?: string | null,
   ): Judgement;
 
-  /** P6 stub — not implemented yet. */
-  createFinding(..._args: unknown[]): never;
+  /**
+   * Ingest findings/positiveFindings/metaFindings from a verdict into the
+   * durable issues log (findings + finding_occurrences). Called by storeVerdict;
+   * also usable standalone. Rewrites verdict.json with Finding.recurring when
+   * an occurrence is "persisted" (same call, single-threaded).
+   */
+  ingestFindings(judgementId: string, verdict: Verdict): void;
+  /** List de-duplicated findings (issues log), filterable. */
+  listFindings(filter?: ListFindingsFilter): FindingRow[];
+  /** One finding + its occurrences, or null. */
+  getFinding(fingerprint: string): FindingDetail | null;
+  /** Occurrences for a fingerprint (newest first). */
+  listOccurrences(findingFingerprint: string): OccurrenceRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +753,45 @@ function mapScore(row: typeof scores.$inferSelect): ScoreRow {
   };
 }
 
+function mapFinding(row: typeof findings.$inferSelect): FindingRow {
+  return {
+    fingerprint: row.fingerprint,
+    taskId: row.taskId,
+    projectId: row.projectId,
+    category: row.category,
+    kind: row.kind as FindingKind,
+    claim: row.claim,
+    latestSeverity: row.latestSeverity,
+    latestConfidence: row.latestConfidence,
+    firstSeenJudgement: row.firstSeenJudgement,
+    lastSeenJudgement: row.lastSeenJudgement,
+    firstSeenAt: row.firstSeenAt,
+    lastSeenAt: row.lastSeenAt,
+    occurrenceCount: row.occurrenceCount ?? 1,
+    resolvedAt: row.resolvedAt,
+    status: row.status,
+  };
+}
+
+function mapOccurrence(
+  row: typeof findingOccurrences.$inferSelect,
+): OccurrenceRow {
+  return {
+    id: row.id,
+    findingFingerprint: row.findingFingerprint,
+    judgementId: row.judgementId,
+    runId: row.runId,
+    severity: row.severity,
+    confidence: row.confidence,
+    claim: row.claim,
+    criterion: row.criterion,
+    refsJson: row.refsJson,
+    fixJson: row.fixJson,
+    status: row.status,
+    createdAt: row.createdAt,
+  };
+}
+
 function clampLimit(n: number | undefined): number {
   const v = Number.isFinite(n) ? Number(n) : 50;
   return Math.max(1, Math.min(200, Math.floor(v) || 50));
@@ -723,12 +806,6 @@ function parseCursorOffset(cursor: string | undefined): number {
 
 function notFound(kind: string, id: string): Error {
   return new Error(`${kind} not found: ${id}`);
-}
-
-function stub(name: string): never {
-  throw new Error(
-    `${name} is not implemented in P3a (filled in a later phase)`,
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,6 +1447,18 @@ export class SqliteQueries implements QueryStore {
       .where(eq(judgements.id, judgementId))
       .run();
 
+    // P6a: ingest findings after score mirror. Errors are swallowed so a
+    // findings-ingest glitch cannot break verdict persistence. Goes through the
+    // public ingestFindings method so tests can force-fail it for isolation.
+    try {
+      this.ingestFindings(judgementId, verdict);
+    } catch (err) {
+      console.warn(
+        `[findings] ingest failed for judgement ${judgementId}:`,
+        err,
+      );
+    }
+
     const row = this.db
       .select()
       .from(judgements)
@@ -1381,7 +1470,235 @@ export class SqliteQueries implements QueryStore {
       judgementSnapshotPath(this.dataDir, mapped.projectId, mapped.id),
       mapped,
     );
-    return { ...mapped, verdictBody: verdict };
+    // Prefer the post-ingest on-disk body (may include Finding.recurring).
+    const verdictBody =
+      readVerdictFromDisk(
+        this.dataDir,
+        mapped.projectId,
+        mapped.id,
+        jVerdictPath,
+      ) ?? verdict;
+    return { ...mapped, verdictBody };
+  }
+
+  /**
+   * Resolve taskId from the run, run pure ingest, rewrite verdict.json with
+   * recurrence annotations. Shared by storeVerdict + public ingestFindings.
+   */
+  private ingestFindingsAndRewrite(
+    judgementId: string,
+    runId: string,
+    projectId: string,
+    jVerdictPath: string,
+    verdict: Verdict,
+  ): Verdict {
+    const run = this.getRun(runId);
+    if (!run) {
+      throw new Error(
+        `cannot ingest findings: run not found for judgement ${judgementId} (runId=${runId})`,
+      );
+    }
+    const store = this.asFindingsStore();
+    const result = runIngestFindings(store, {
+      judgementId,
+      runId,
+      projectId,
+      taskId: run.taskId,
+      verdict,
+    });
+    const withRecurring = applyRecurrenceToVerdict(
+      verdict,
+      result.recurringByFindingId,
+    );
+    // Rewrite verdict.json in the SAME call (single-threaded SQLite) so the
+    // report + API see Finding.recurring without a separate race-prone pass.
+    writeSnapshot(jVerdictPath, withRecurring);
+    return withRecurring;
+  }
+
+  /** Public entry — re-ingests a stored judgement's verdict (or a fresh one). */
+  ingestFindings(judgementId: string, verdict: Verdict): void {
+    const existing = this.db
+      .select()
+      .from(judgements)
+      .where(eq(judgements.id, judgementId))
+      .get();
+    if (!existing) throw notFound("judgement", judgementId);
+    const jVerdictPath =
+      existing.verdictPath ??
+      verdictPath(this.dataDir, existing.projectId, judgementId);
+    this.ingestFindingsAndRewrite(
+      judgementId,
+      existing.runId,
+      existing.projectId,
+      jVerdictPath,
+      verdict,
+    );
+  }
+
+  /** Adapter: SqliteQueries → FindingsIngestStore for the pure state machine. */
+  private asFindingsStore(): FindingsIngestStore {
+    const self = this;
+    return {
+      findFindingForTask(taskId, fingerprint) {
+        const row = self.db
+          .select()
+          .from(findings)
+          .where(eq(findings.fingerprint, fingerprint))
+          .get();
+        if (!row) return null;
+        // Fingerprints are task-scoped: only match when taskId agrees.
+        if (row.taskId !== taskId) return null;
+        return mapFinding(row);
+      },
+      insertFinding(row) {
+        self.db
+          .insert(findings)
+          .values({
+            fingerprint: row.fingerprint,
+            taskId: row.taskId,
+            projectId: row.projectId,
+            category: row.category,
+            kind: row.kind,
+            claim: row.claim,
+            latestSeverity: row.latestSeverity,
+            latestConfidence: row.latestConfidence,
+            firstSeenJudgement: row.firstSeenJudgement,
+            lastSeenJudgement: row.lastSeenJudgement,
+            firstSeenAt: row.firstSeenAt,
+            lastSeenAt: row.lastSeenAt,
+            occurrenceCount: row.occurrenceCount,
+            resolvedAt: row.resolvedAt,
+            status: row.status,
+          })
+          .run();
+      },
+      updateFinding(fingerprint, patch) {
+        self.db
+          .update(findings)
+          .set({
+            ...(patch.claim !== undefined ? { claim: patch.claim } : {}),
+            ...(patch.latestSeverity !== undefined
+              ? { latestSeverity: patch.latestSeverity }
+              : {}),
+            ...(patch.latestConfidence !== undefined
+              ? { latestConfidence: patch.latestConfidence }
+              : {}),
+            ...(patch.lastSeenJudgement !== undefined
+              ? { lastSeenJudgement: patch.lastSeenJudgement }
+              : {}),
+            ...(patch.lastSeenAt !== undefined
+              ? { lastSeenAt: patch.lastSeenAt }
+              : {}),
+            ...(patch.occurrenceCount !== undefined
+              ? { occurrenceCount: patch.occurrenceCount }
+              : {}),
+            ...(patch.resolvedAt !== undefined
+              ? { resolvedAt: patch.resolvedAt }
+              : {}),
+            ...(patch.status !== undefined ? { status: patch.status } : {}),
+            ...(patch.firstSeenJudgement !== undefined
+              ? { firstSeenJudgement: patch.firstSeenJudgement }
+              : {}),
+            ...(patch.firstSeenAt !== undefined
+              ? { firstSeenAt: patch.firstSeenAt }
+              : {}),
+          })
+          .where(eq(findings.fingerprint, fingerprint))
+          .run();
+      },
+      insertOccurrence(row) {
+        self.db
+          .insert(findingOccurrences)
+          .values({
+            id: row.id,
+            findingFingerprint: row.findingFingerprint,
+            judgementId: row.judgementId,
+            runId: row.runId,
+            severity: row.severity,
+            confidence: row.confidence,
+            claim: row.claim,
+            criterion: row.criterion,
+            refsJson: row.refsJson,
+            fixJson: row.fixJson,
+            status: row.status,
+            createdAt: row.createdAt,
+          })
+          .run();
+      },
+      listFindingsForTask(taskId) {
+        return self.db
+          .select()
+          .from(findings)
+          .where(eq(findings.taskId, taskId))
+          .all()
+          .map(mapFinding);
+      },
+      getJudgementRunId(judgementId) {
+        const row = self.db
+          .select()
+          .from(judgements)
+          .where(eq(judgements.id, judgementId))
+          .get();
+        return row?.runId ?? null;
+      },
+      now: () => nowIso(),
+      newId: () => newId(),
+    };
+  }
+
+  listFindings(filter: ListFindingsFilter = {}): FindingRow[] {
+    let rows = this.db.select().from(findings).all().map(mapFinding);
+    if (filter.projectId) {
+      rows = rows.filter((f) => f.projectId === filter.projectId);
+    }
+    if (filter.taskId) {
+      rows = rows.filter((f) => f.taskId === filter.taskId);
+    }
+    if (filter.status) {
+      rows = rows.filter((f) => f.status === filter.status);
+    }
+    if (filter.kind) {
+      rows = rows.filter((f) => f.kind === filter.kind);
+    }
+    if (filter.category) {
+      rows = rows.filter((f) => f.category === filter.category);
+    }
+    // Newest lastSeen first, then fingerprint for stability.
+    rows.sort((a, b) => {
+      const ta = a.lastSeenAt ?? "";
+      const tb = b.lastSeenAt ?? "";
+      if (ta !== tb) return tb.localeCompare(ta);
+      return a.fingerprint.localeCompare(b.fingerprint);
+    });
+    return rows;
+  }
+
+  getFinding(fingerprint: string): FindingDetail | null {
+    const row = this.db
+      .select()
+      .from(findings)
+      .where(eq(findings.fingerprint, fingerprint))
+      .get();
+    if (!row) return null;
+    const base = mapFinding(row);
+    const occurrences = this.listOccurrences(fingerprint);
+    return { ...base, occurrences };
+  }
+
+  listOccurrences(findingFingerprint: string): OccurrenceRow[] {
+    const rows = this.db
+      .select()
+      .from(findingOccurrences)
+      .where(eq(findingOccurrences.findingFingerprint, findingFingerprint))
+      .all()
+      .map(mapOccurrence);
+    // Newest first.
+    rows.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
+      return b.id.localeCompare(a.id);
+    });
+    return rows;
   }
 
   getJudgement(id: string): JudgementWithVerdict | null {
@@ -1469,10 +1786,6 @@ export class SqliteQueries implements QueryStore {
     );
     return mapped;
   }
-
-  createFinding(..._args: unknown[]): never {
-    return stub("createFinding");
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1487,6 +1800,8 @@ export class MemoryQueries implements QueryStore {
   private runs = new Map<string, Run>();
   private judgements = new Map<string, Judgement>();
   private scores = new Map<string, ScoreRow>();
+  private findings = new Map<string, FindingRow>();
+  private occurrences = new Map<string, OccurrenceRow>();
 
   constructor(private readonly dataDir: string) {}
 
@@ -1962,7 +2277,147 @@ export class MemoryQueries implements QueryStore {
       judgementSnapshotPath(this.dataDir, next.projectId, next.id),
       next,
     );
-    return { ...next, verdictBody: verdict };
+
+    // P6a: ingest findings after score mirror (error-isolated). Goes through the
+    // public ingestFindings method so tests can force-fail it for isolation.
+    try {
+      this.ingestFindings(judgementId, verdict);
+    } catch (err) {
+      console.warn(
+        `[findings] ingest failed for judgement ${judgementId}:`,
+        err,
+      );
+    }
+
+    const verdictBody =
+      readVerdictFromDisk(
+        this.dataDir,
+        next.projectId,
+        next.id,
+        jVerdictPath,
+      ) ?? verdict;
+    return { ...next, verdictBody };
+  }
+
+  private ingestFindingsAndRewrite(
+    judgementId: string,
+    runId: string,
+    projectId: string,
+    jVerdictPath: string,
+    verdict: Verdict,
+  ): Verdict {
+    const run = this.getRun(runId);
+    if (!run) {
+      throw new Error(
+        `cannot ingest findings: run not found for judgement ${judgementId} (runId=${runId})`,
+      );
+    }
+    const result = runIngestFindings(this.asFindingsStore(), {
+      judgementId,
+      runId,
+      projectId,
+      taskId: run.taskId,
+      verdict,
+    });
+    const withRecurring = applyRecurrenceToVerdict(
+      verdict,
+      result.recurringByFindingId,
+    );
+    writeSnapshot(jVerdictPath, withRecurring);
+    return withRecurring;
+  }
+
+  ingestFindings(judgementId: string, verdict: Verdict): void {
+    const existing = this.judgements.get(judgementId);
+    if (!existing) throw notFound("judgement", judgementId);
+    const jVerdictPath =
+      existing.verdictPath ??
+      verdictPath(this.dataDir, existing.projectId, judgementId);
+    this.ingestFindingsAndRewrite(
+      judgementId,
+      existing.runId,
+      existing.projectId,
+      jVerdictPath,
+      verdict,
+    );
+  }
+
+  private asFindingsStore(): FindingsIngestStore {
+    const self = this;
+    return {
+      findFindingForTask(taskId, fingerprint) {
+        const row = self.findings.get(fingerprint);
+        if (!row || row.taskId !== taskId) return null;
+        return { ...row };
+      },
+      insertFinding(row) {
+        self.findings.set(row.fingerprint, { ...row });
+      },
+      updateFinding(fingerprint, patch) {
+        const existing = self.findings.get(fingerprint);
+        if (!existing) return;
+        self.findings.set(fingerprint, { ...existing, ...patch });
+      },
+      insertOccurrence(row) {
+        self.occurrences.set(row.id, { ...row });
+      },
+      listFindingsForTask(taskId) {
+        return [...self.findings.values()]
+          .filter((f) => f.taskId === taskId)
+          .map((f) => ({ ...f }));
+      },
+      getJudgementRunId(judgementId) {
+        return self.judgements.get(judgementId)?.runId ?? null;
+      },
+      now: () => nowIso(),
+      newId: () => newId(),
+    };
+  }
+
+  listFindings(filter: ListFindingsFilter = {}): FindingRow[] {
+    let rows = [...this.findings.values()];
+    if (filter.projectId) {
+      rows = rows.filter((f) => f.projectId === filter.projectId);
+    }
+    if (filter.taskId) {
+      rows = rows.filter((f) => f.taskId === filter.taskId);
+    }
+    if (filter.status) {
+      rows = rows.filter((f) => f.status === filter.status);
+    }
+    if (filter.kind) {
+      rows = rows.filter((f) => f.kind === filter.kind);
+    }
+    if (filter.category) {
+      rows = rows.filter((f) => f.category === filter.category);
+    }
+    rows.sort((a, b) => {
+      const ta = a.lastSeenAt ?? "";
+      const tb = b.lastSeenAt ?? "";
+      if (ta !== tb) return tb.localeCompare(ta);
+      return a.fingerprint.localeCompare(b.fingerprint);
+    });
+    return rows.map((f) => ({ ...f }));
+  }
+
+  getFinding(fingerprint: string): FindingDetail | null {
+    const row = this.findings.get(fingerprint);
+    if (!row) return null;
+    return {
+      ...row,
+      occurrences: this.listOccurrences(fingerprint),
+    };
+  }
+
+  listOccurrences(findingFingerprint: string): OccurrenceRow[] {
+    const rows = [...this.occurrences.values()].filter(
+      (o) => o.findingFingerprint === findingFingerprint,
+    );
+    rows.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
+      return b.id.localeCompare(a.id);
+    });
+    return rows.map((o) => ({ ...o }));
   }
 
   getJudgement(id: string): JudgementWithVerdict | null {
@@ -2027,10 +2482,6 @@ export class MemoryQueries implements QueryStore {
       next,
     );
     return { ...next };
-  }
-
-  createFinding(..._args: unknown[]): never {
-    return stub("createFinding");
   }
 }
 

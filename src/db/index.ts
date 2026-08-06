@@ -155,6 +155,13 @@ export {
   type CreateScoreInput,
   type ListJudgementsFilter,
   type ListJudgementsResult,
+  type ListFindingsFilter,
+  type FindingRow,
+  type FindingDetail,
+  type FindingKind,
+  type FindingLifecycleStatus,
+  type OccurrenceRow,
+  type OccurrenceStatus,
   type CreateProjectInput,
   type UpdateProjectInput,
   type UpdateTaskInput,
@@ -168,3 +175,11 @@ export {
   judgeEventsPath,
   readVerdictFromDisk,
 } from "./queries.js";
+
+export {
+  fingerprintOf,
+  normalizeClaim,
+  canonicalLocationOf,
+  ingestFindings,
+  applyRecurrenceToVerdict,
+} from "./findings.js";
