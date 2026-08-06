@@ -70,6 +70,7 @@ import { registerWatcherRoutes } from "./watcher-routes.js";
 import { registerQueueRoutes } from "./queue-routes.js";
 import { registerWebhooksRoutes } from "./webhooks-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
+import { registerRubricRoutes } from "./rubric-routes.js";
 import {
   OutboundWebhookDispatcher,
   RealDeliverySink,
@@ -1505,6 +1506,8 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerWebhooksRoutes(router);
   // Settings + password auth + project export (P9).
   registerSettingsRoutes(router);
+  // Project-scoped reusable rubrics — CRUD.
+  registerRubricRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {

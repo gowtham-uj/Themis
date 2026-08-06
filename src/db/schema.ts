@@ -497,6 +497,28 @@ export const checkResults = sqliteTable(
   (t) => [index("idx_check_results_run").on(t.runId)],
 );
 
+// Project-scoped reusable rubrics (plan/rubric.md §6). A task may embed its own
+// rubric_json or reference one of these; the project rubric is the shared,
+// versioned baseline. Editing the criteria bumps rubric_version (new baseline).
+export const projectRubrics = sqliteTable(
+  "project_rubrics",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    name: text("name").notNull(),
+    description: text("description"),
+    rubricJson: text("rubric_json").notNull(),
+    rubricVersion: integer("rubric_version").notNull().default(1),
+    isDefault: integer("is_default").notNull().default(0),
+    archived: integer("archived").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (t) => [index("idx_project_rubrics_project").on(t.projectId)],
+);
+
 // ---------------------------------------------------------------------------
 // Schema registry (for drizzle + openDb)
 // ---------------------------------------------------------------------------
@@ -521,6 +543,7 @@ export const schema = {
   outboundSubscriptions,
   webhookDeliveries,
   checkResults,
+  projectRubrics,
 };
 
 export type Schema = typeof schema;

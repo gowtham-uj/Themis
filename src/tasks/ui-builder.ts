@@ -87,6 +87,18 @@ export function validateTaskSpec(spec: TaskSpec): ValidationResult {
   return { ok: errors.length === 0, errors, warnings };
 }
 
+/**
+ * Validate a standalone Rubric (no surrounding task). Never throws.
+ * Used by the project-rubric CRUD routes, which accept a rubric on its own
+ * rather than as part of a TaskSpec.
+ */
+export function validateRubricSpec(rubric: Rubric): ValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  validateRubric(rubric, errors, warnings);
+  return { ok: errors.length === 0, errors, warnings };
+}
+
 function validateRubric(rubric: Rubric, errors: string[], warnings: string[]): void {
   if (!Array.isArray(rubric.criteria) || rubric.criteria.length === 0) {
     errors.push("rubric must have ≥1 criterion");

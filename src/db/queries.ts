@@ -41,6 +41,7 @@ import {
   findings,
   judgements,
   outboundSubscriptions,
+  projectRubrics,
   projects,
   queueEntries,
   runBatches,
@@ -54,6 +55,7 @@ import {
   webhookDeliveries,
   type Schema,
 } from "./schema.js";
+import { rubricsEqual } from "../tasks/index.js";
 
 // Re-export finding row types for consumers.
 export type {
@@ -153,6 +155,42 @@ export interface UpdateTaskInput {
   tags?: string[] | null;
   externalId?: string | null;
   sourceKind?: string | null;
+}
+
+/**
+ * A project-scoped reusable rubric (plan/rubric.md §6). Tasks may embed their
+ * own rubric; a project rubric is the shared, versioned baseline many tasks can
+ * start from. Editing the criteria bumps `rubricVersion` (new comparison
+ * baseline), exactly as a task rubric edit does.
+ */
+export interface ProjectRubric {
+  id: string;
+  projectId: string;
+  name: string;
+  description: string | null;
+  rubric: Rubric;
+  rubricVersion: number;
+  /** Exactly one rubric per project may be the default (enforced on write). */
+  isDefault: boolean;
+  archived: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateProjectRubricInput {
+  projectId: string;
+  name: string;
+  description?: string | null;
+  rubric: Rubric;
+  isDefault?: boolean;
+  id?: string;
+}
+
+export interface UpdateProjectRubricInput {
+  name?: string;
+  description?: string | null;
+  rubric?: Rubric;
+  isDefault?: boolean;
 }
 
 export interface Agent {
@@ -941,6 +979,22 @@ export interface QueryStore {
   storeCheckResults(runId: string, results: CheckResult[]): void;
   /** Load persisted check results for a run (P9 DB mirror). */
   getCheckResults(runId: string): CheckResult[];
+
+  /** Create a project-scoped reusable rubric. */
+  createProjectRubric(input: CreateProjectRubricInput): ProjectRubric;
+  /** Fetch one project rubric by id (null when missing). */
+  getProjectRubric(id: string): ProjectRubric | null;
+  /** List a project's rubrics, newest first; archived excluded by default. */
+  listProjectRubrics(
+    projectId: string,
+    opts?: { includeArchived?: boolean },
+  ): ProjectRubric[];
+  /** The project's default rubric, if one is marked (null otherwise). */
+  getDefaultProjectRubric(projectId: string): ProjectRubric | null;
+  /** Patch a project rubric; a semantic rubric edit bumps rubricVersion. */
+  updateProjectRubric(id: string, patch: UpdateProjectRubricInput): ProjectRubric;
+  /** Soft-delete (archive) a project rubric. */
+  archiveProjectRubric(id: string): ProjectRubric;
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,6 +1349,39 @@ function parseCursorOffset(cursor: string | undefined): number {
 
 function notFound(kind: string, id: string): Error {
   return new Error(`${kind} not found: ${id}`);
+}
+
+/** Map a project_rubrics row to the domain shape (rubric_json parsed). */
+function mapProjectRubric(
+  row: typeof projectRubrics.$inferSelect,
+): ProjectRubric {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    name: row.name,
+    description: row.description,
+    rubric: parseJson<Rubric>(row.rubricJson, {
+      criteria: [],
+      profile: "bugfix",
+      version: 1,
+    } as Rubric),
+    rubricVersion: row.rubricVersion,
+    isDefault: row.isDefault === 1,
+    archived: row.archived === 1,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+/**
+ * Newest-first ordering shared by both project-rubric list impls
+ * (createdAt desc, id desc as a stable tiebreak for same-ms inserts).
+ */
+function sortProjectRubrics(rows: ProjectRubric[]): ProjectRubric[] {
+  return rows.sort((a, b) => {
+    if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
+    return b.id.localeCompare(a.id);
+  });
 }
 
 /** Default gap for fractional queue positions (leave room for inserts). */
@@ -3427,6 +3514,128 @@ export class SqliteQueries implements QueryStore {
       return [];
     }
   }
+
+  // ---- project rubrics ----
+
+  createProjectRubric(input: CreateProjectRubricInput): ProjectRubric {
+    const project = this.getProject(input.projectId);
+    if (!project) throw notFound("project", input.projectId);
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    // Only one default per project — demote any incumbent first.
+    if (input.isDefault) this.clearDefaultRubric(input.projectId);
+    this.db
+      .insert(projectRubrics)
+      .values({
+        id,
+        projectId: input.projectId,
+        name: input.name,
+        description: input.description ?? null,
+        rubricJson: JSON.stringify(input.rubric),
+        rubricVersion: input.rubric.version ?? 1,
+        isDefault: input.isDefault ? 1 : 0,
+        archived: 0,
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    const row = this.getProjectRubric(id);
+    if (!row) throw new Error("failed to create project rubric");
+    return row;
+  }
+
+  /** Demote whichever rubric currently holds the default flag for a project. */
+  private clearDefaultRubric(projectId: string): void {
+    this.db
+      .update(projectRubrics)
+      .set({ isDefault: 0 })
+      .where(eq(projectRubrics.projectId, projectId))
+      .run();
+  }
+
+  getProjectRubric(id: string): ProjectRubric | null {
+    const row = this.db
+      .select()
+      .from(projectRubrics)
+      .where(eq(projectRubrics.id, id))
+      .get();
+    return row ? mapProjectRubric(row) : null;
+  }
+
+  listProjectRubrics(
+    projectId: string,
+    opts: { includeArchived?: boolean } = {},
+  ): ProjectRubric[] {
+    const rows = this.db
+      .select()
+      .from(projectRubrics)
+      .where(eq(projectRubrics.projectId, projectId))
+      .all()
+      .map(mapProjectRubric)
+      .filter((r) => (opts.includeArchived ? true : !r.archived));
+    return sortProjectRubrics(rows);
+  }
+
+  getDefaultProjectRubric(projectId: string): ProjectRubric | null {
+    return (
+      this.listProjectRubrics(projectId).find((r) => r.isDefault) ?? null
+    );
+  }
+
+  updateProjectRubric(
+    id: string,
+    patch: UpdateProjectRubricInput,
+  ): ProjectRubric {
+    const existing = this.getProjectRubric(id);
+    if (!existing) throw notFound("project rubric", id);
+    // A semantic rubric edit establishes a new comparison baseline; a rename or
+    // description tweak does not (same rule as task rubrics — plan/rubric.md).
+    const rubricChanged =
+      patch.rubric !== undefined && !rubricsEqual(existing.rubric, patch.rubric);
+    const nextVersion = rubricChanged
+      ? Math.max(existing.rubricVersion, patch.rubric?.version ?? 0) + 1
+      : existing.rubricVersion;
+    const nextRubric = patch.rubric ?? existing.rubric;
+    if (patch.isDefault) this.clearDefaultRubric(existing.projectId);
+    this.db
+      .update(projectRubrics)
+      .set({
+        name: patch.name ?? existing.name,
+        description:
+          patch.description !== undefined
+            ? patch.description
+            : existing.description,
+        rubricJson: JSON.stringify({ ...nextRubric, version: nextVersion }),
+        rubricVersion: nextVersion,
+        isDefault:
+          patch.isDefault !== undefined
+            ? patch.isDefault
+              ? 1
+              : 0
+            : existing.isDefault
+              ? 1
+              : 0,
+        updatedAt: nowIso(),
+      })
+      .where(eq(projectRubrics.id, id))
+      .run();
+    const row = this.getProjectRubric(id);
+    if (!row) throw notFound("project rubric", id);
+    return row;
+  }
+
+  archiveProjectRubric(id: string): ProjectRubric {
+    const existing = this.getProjectRubric(id);
+    if (!existing) throw notFound("project rubric", id);
+    this.db
+      .update(projectRubrics)
+      .set({ archived: 1, isDefault: 0, updatedAt: nowIso() })
+      .where(eq(projectRubrics.id, id))
+      .run();
+    const row = this.getProjectRubric(id);
+    if (!row) throw notFound("project rubric", id);
+    return row;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3452,6 +3661,7 @@ export class MemoryQueries implements QueryStore {
   private users = new Map<string, User>();
   private settings = new Map<string, SettingRow>();
   private checkResultsByRun = new Map<string, CheckResult[]>();
+  private projectRubrics = new Map<string, ProjectRubric>();
 
   constructor(private readonly dataDir: string) {}
 
@@ -4818,6 +5028,99 @@ export class MemoryQueries implements QueryStore {
   getCheckResults(runId: string): CheckResult[] {
     const stored = this.checkResultsByRun.get(runId);
     return stored ? stored.map((r) => ({ ...r })) : [];
+  }
+
+  // ---- project rubrics ----
+
+  createProjectRubric(input: CreateProjectRubricInput): ProjectRubric {
+    if (!this.projects.has(input.projectId)) {
+      throw notFound("project", input.projectId);
+    }
+    const ts = nowIso();
+    if (input.isDefault) this.clearDefaultRubric(input.projectId);
+    const row: ProjectRubric = {
+      id: input.id ?? newId(),
+      projectId: input.projectId,
+      name: input.name,
+      description: input.description ?? null,
+      rubric: input.rubric,
+      rubricVersion: input.rubric.version ?? 1,
+      isDefault: input.isDefault === true,
+      archived: false,
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    this.projectRubrics.set(row.id, row);
+    return { ...row };
+  }
+
+  /** Demote whichever rubric currently holds the default flag for a project. */
+  private clearDefaultRubric(projectId: string): void {
+    for (const [id, r] of this.projectRubrics) {
+      if (r.projectId === projectId && r.isDefault) {
+        this.projectRubrics.set(id, { ...r, isDefault: false });
+      }
+    }
+  }
+
+  getProjectRubric(id: string): ProjectRubric | null {
+    const row = this.projectRubrics.get(id);
+    return row ? { ...row } : null;
+  }
+
+  listProjectRubrics(
+    projectId: string,
+    opts: { includeArchived?: boolean } = {},
+  ): ProjectRubric[] {
+    const rows = [...this.projectRubrics.values()]
+      .filter((r) => r.projectId === projectId)
+      .filter((r) => (opts.includeArchived ? true : !r.archived))
+      .map((r) => ({ ...r }));
+    return sortProjectRubrics(rows);
+  }
+
+  getDefaultProjectRubric(projectId: string): ProjectRubric | null {
+    return this.listProjectRubrics(projectId).find((r) => r.isDefault) ?? null;
+  }
+
+  updateProjectRubric(
+    id: string,
+    patch: UpdateProjectRubricInput,
+  ): ProjectRubric {
+    const existing = this.projectRubrics.get(id);
+    if (!existing) throw notFound("project rubric", id);
+    const rubricChanged =
+      patch.rubric !== undefined && !rubricsEqual(existing.rubric, patch.rubric);
+    const nextVersion = rubricChanged
+      ? Math.max(existing.rubricVersion, patch.rubric?.version ?? 0) + 1
+      : existing.rubricVersion;
+    if (patch.isDefault) this.clearDefaultRubric(existing.projectId);
+    const base = this.projectRubrics.get(id)!;
+    const next: ProjectRubric = {
+      ...base,
+      name: patch.name ?? base.name,
+      description:
+        patch.description !== undefined ? patch.description : base.description,
+      rubric: { ...(patch.rubric ?? base.rubric), version: nextVersion },
+      rubricVersion: nextVersion,
+      isDefault: patch.isDefault !== undefined ? patch.isDefault : base.isDefault,
+      updatedAt: nowIso(),
+    };
+    this.projectRubrics.set(id, next);
+    return { ...next };
+  }
+
+  archiveProjectRubric(id: string): ProjectRubric {
+    const existing = this.projectRubrics.get(id);
+    if (!existing) throw notFound("project rubric", id);
+    const next: ProjectRubric = {
+      ...existing,
+      archived: true,
+      isDefault: false,
+      updatedAt: nowIso(),
+    };
+    this.projectRubrics.set(id, next);
+    return { ...next };
   }
 }
 

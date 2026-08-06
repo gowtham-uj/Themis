@@ -317,6 +317,23 @@ const DDL: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_check_results_run ON check_results(run_id)`,
 
+  // Project-scoped reusable rubrics (plan/rubric.md §6 profiles). A task may
+  // embed its own rubric_json OR reference one of these by id; the project
+  // rubric is the shared, versioned baseline that many tasks can point at.
+  `CREATE TABLE IF NOT EXISTS project_rubrics (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    description TEXT,
+    rubric_json TEXT NOT NULL,
+    rubric_version INTEGER NOT NULL DEFAULT 1,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_project_rubrics_project ON project_rubrics(project_id)`,
+
   // Version bookkeeping (in addition to PRAGMA user_version).
   `CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
