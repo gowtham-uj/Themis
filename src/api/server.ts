@@ -1041,6 +1041,17 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
       // ignore
     }
 
+    // Per-run adapter overrides (image pin, env, tool allowlist). Previously
+    // accepted and dropped; the image pin is recorded on the batch so every run
+    // in it launches from the requested image.
+    const runOverrides = body.adapterOverrides ?? body.adapter_overrides;
+    const pinnedImage =
+      runOverrides && typeof runOverrides.image === "string"
+        ? runOverrides.image
+        : runOverrides && typeof runOverrides.imageTag === "string"
+          ? runOverrides.imageTag
+          : undefined;
+
     const batch = app.queries.createBatch({
       taskId: task.id,
       projectId: project.id,
@@ -1051,6 +1062,7 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
       repeats,
       trigger: body.trigger,
       triggerRef: body.trigger_ref,
+      ...(pinnedImage ? { agentImage: pinnedImage } : {}),
     });
 
     const runs: Run[] = [];
@@ -1068,6 +1080,9 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
         startedAt: new Date().toISOString(),
         trigger: body.trigger,
         triggerRef: body.trigger_ref,
+        ...(pinnedImage
+          ? { agentImage: pinnedImage, agentImageSource: "run_override" }
+          : {}),
       });
       runs.push(r);
     }

@@ -66,7 +66,6 @@ export function renderVerdictReport(verdict: Verdict, ctx: ReportContext = {}): 
     renderImprovements(verdict, ctx),
     renderCriteria(verdict.criteria),
     renderDiagnostics(verdict.diagnostics),
-    renderNotableMoments(verdict.observations),
     renderPositiveFindings(sortedPositive),
     renderObservations(verdict.observations),
     renderMetaFindings(verdict.metaFindings),
@@ -198,7 +197,6 @@ function renderToc(): string {
     ["#improvements", "Improvements"],
     ["#criteria", "Criteria"],
     ["#diagnostics", "Diagnostics"],
-    ["#notable-moments", "Notable moments"],
     ["#positive-findings", "Keep"],
     ["#observations", "Observations"],
     ["#attribution", "Attribution"],
@@ -286,12 +284,21 @@ function renderFindingCard(f: Finding, positive: boolean): string {
   ].join("\n");
 }
 
+/**
+ * Render the optional fix block.
+ *
+ * Defensive about missing fields even though validateVerdict now rejects them:
+ * a report that renders slightly less is recoverable, a report that throws
+ * turns the whole judgement into a failure.
+ */
 function renderFix(fix: NonNullable<Finding["fix"]>): string {
-  const repro = fix.repro
-    ? [
-        `<pre class="repro"><code>$ ${escapeHtml(fix.repro.command)}\n# expected: ${escapeHtml(fix.repro.expected)}</code></pre>`,
-      ].join("")
-    : "";
+  if (!fix?.direction) return "";
+  const repro =
+    fix.repro?.command && fix.repro?.expected
+      ? [
+          `<pre class="repro"><code>$ ${escapeHtml(fix.repro.command)}\n# expected: ${escapeHtml(fix.repro.expected)}</code></pre>`,
+        ].join("")
+      : "";
   return [
     `<div class="fix-block">`,
     `<h4>Fix direction</h4>`,
@@ -471,7 +478,15 @@ function renderDiagTile(name: string, d: Diagnostic): string {
   const valueLabel = d.value ? "true" : "false";
   const icon = d.value ? "⚠" : "✓";
   const note = d.note ? `<p class="diag-note">${escapeHtml(d.note)}</p>` : "";
-  const refs = d.refs && d.refs.length ? renderRefList(d.refs) : `<p class="section-empty" style="margin:0">No refs</p>`;
+  // A negative diagnostic has nothing to point AT — "no refs" there is correct,
+  // not a gap. A positive one without refs is an unlocated claim, which is the
+  // thing this report exists to prevent, so it is called out as such.
+  const hasRefs = Boolean(d.refs && d.refs.length);
+  const refs = hasRefs
+    ? renderRefList(d.refs ?? [])
+    : d.value
+      ? `<p class="diag-unlocated" style="margin:0">⚠ asserted without evidence — treat as unverified</p>`
+      : `<p class="section-empty" style="margin:0">not observed</p>`;
   return [
     `<div class="diag-tile" data-value="${valueLabel}" data-diagnostic="${escapeHtml(name)}">`,
     `<h3 class="diag-name">${escapeHtml(name)}</h3>`,
@@ -485,28 +500,12 @@ function renderDiagTile(name: string, d: Diagnostic): string {
 // ── Notable moments / observations ───────────────────────────────────
 
 /**
- * Notable trajectory moments — derived from observations[] as bullet moments
- * (no fake trajectory mining). Same source as observations; framed for the
- * "notable moments" slot in the report structure.
+ * Observations — the judge's notes on the trajectory.
+ *
+ * This used to render twice (as "Notable trajectory moments" and again as
+ * "Observations") from the same `observations` array, which padded every report
+ * with a verbatim duplicate. One section, one source.
  */
-function renderNotableMoments(observations: string[]): string {
-  const items =
-    observations.length === 0
-      ? `<p class="section-empty">No notable moments noted.</p>`
-      : [
-          `<ul class="bullet-list">`,
-          ...observations.map((o) => `<li>${escapeHtml(o)}</li>`),
-          `</ul>`,
-        ].join("");
-  return [
-    `<section class="section" id="notable-moments" aria-labelledby="moments-heading">`,
-    `<h2 class="section-title" id="moments-heading">Notable trajectory moments</h2>`,
-    `<p class="section-lede">Moments drawn from the judge's observations of the run trajectory.</p>`,
-    items,
-    `</section>`,
-  ].join("\n");
-}
-
 function renderObservations(observations: string[]): string {
   const items =
     observations.length === 0

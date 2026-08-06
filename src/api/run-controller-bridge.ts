@@ -23,7 +23,7 @@ import { FakeContainerRuntime } from "../runner/fake-runtime.js";
 import { NetworkCutoff } from "../runner/network-control.js";
 import { redactEvent } from "../runner/redact.js";
 import { prepareWorkspace, ensureGitRepo } from "../runner/workspace.js";
-import type { ContainerHandle } from "../runner/runtime.js";
+import type { ContainerHandle, ContainerRuntime } from "../runner/runtime.js";
 import { runChecks } from "../runner/check-runner.js";
 import { captureDiff } from "../runner/diff.js";
 import {
@@ -111,8 +111,11 @@ export interface StartRunOptions {
    * tests stay fast + deterministic (no model calls).
    */
   adapter?: Adapter;
-  /** Override FakeContainerRuntime (tests). */
-  runtime?: FakeContainerRuntime;
+  /**
+   * Container backend for this run. Any {@link ContainerRuntime} — the fake
+   * (tests), or a real one such as PodmanRuntime. Defaults to the fake.
+   */
+  runtime?: ContainerRuntime;
   /** Hard wall-clock timeout for the child process (ms). */
   timeoutMs?: number;
   /** When true, skip spawning the agent process (events-only dry run). */
@@ -232,7 +235,11 @@ export async function startRun(
   // (plan/projects.md §82): image pin, project env, tool allowlist, network
   // policy. Absent config → undefined overrides → adapter defaults unchanged.
   const projectRow = queries.getProject(projectId);
-  const overrides = resolveAdapterOverrides(projectRow);
+  // A per-run image pin (POST /runs adapterOverrides.image, stored on the run/
+  // batch as agentImage) is more specific than the project's workspaceImage, so
+  // it layers on top.
+  const runOverrides = run.agentImage ? { image: run.agentImage } : undefined;
+  const overrides = resolveAdapterOverrides(projectRow, runOverrides);
   const networkMode = resolveRunNetwork(projectRow, overrides);
   // Per-project sandbox controls (caps, mounts, devices, tmpfs, ...). Passed
   // through the spec so real backends apply them; the fake ignores it.

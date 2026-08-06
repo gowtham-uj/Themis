@@ -353,3 +353,38 @@ describe("report renderer (P5a)", () => {
     expect(html).toContain('id="findings"');
   });
 });
+
+describe("report quality regressions (found by end-to-end run)", () => {
+  it("renders observations exactly once", () => {
+    // The renderer used to emit `observations` twice — once as "Notable
+    // trajectory moments" and again as "Observations" — so every report shipped
+    // a verbatim duplicate of the same list.
+    const v = cloneVerdict(sampleVerdict);
+    v.observations = ["a distinctive observation string"];
+    const html = renderVerdictReport(v, sampleCtx);
+    const occurrences = html.split("a distinctive observation string").length - 1;
+    expect(occurrences).toBe(1);
+    expect(html).not.toContain("Notable trajectory moments");
+  });
+
+  it("distinguishes a negative diagnostic from an unlocated positive one", () => {
+    const v = cloneVerdict(sampleVerdict);
+    v.diagnostics = {
+      // false + no refs is correct: there is nothing to point at.
+      looping: { value: false, refs: [], note: "no repetition" },
+      // true + no refs is an unlocated claim — the thing the report exists to
+      // prevent — so it must be called out rather than shown as a bare "No refs".
+      test_gaming: { value: true, refs: [], note: "asserted" },
+    };
+    const html = renderVerdictReport(v, sampleCtx);
+    expect(html).toContain("not observed");
+    expect(html).toContain("asserted without evidence");
+  });
+
+  it("does not throw on a fix whose optional repro is absent", () => {
+    const v = cloneVerdict(sampleVerdict);
+    v.findings[0]!.fix = { direction: "do the thing" };
+    expect(() => renderVerdictReport(v, sampleCtx)).not.toThrow();
+    expect(renderVerdictReport(v, sampleCtx)).toContain("do the thing");
+  });
+});

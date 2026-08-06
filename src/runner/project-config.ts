@@ -149,6 +149,7 @@ export function resolveAdapterOverrides(
   const ports = parsePorts(merged.ports);
   if (ports) out.ports = ports;
 
+
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

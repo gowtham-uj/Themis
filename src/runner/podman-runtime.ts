@@ -302,6 +302,10 @@ export class PodmanRuntime implements ContainerRuntime {
   private readonly prefix: string[];
   private readonly policy: SandboxPolicy;
   private readonly startTimeoutMs: number;
+  /** Cached host probe: does this cgroup delegate the memory controller? */
+  private memorySupported: boolean | undefined;
+  /** Warn once per process, not once per run. */
+  private static warnedNoMemoryCgroup = false;
 
   constructor(opts: PodmanRuntimeOptions = {}) {
     this.bin = opts.bin ?? process.env.AGENTEVAL_PODMAN_BIN ?? "podman";
@@ -338,7 +342,27 @@ export class PodmanRuntime implements ContainerRuntime {
       Math.random() * 1e6,
     ).toString(36)}`;
 
-    const args = buildPodmanRunArgs(spec, policy, { name });
+    // A memory limit the host cannot enforce is fatal, not advisory: crun fails
+    // the run with "opening file `memory.max`". Nested-container hosts commonly
+    // delegate only cpuset/cpu/pids. Drop the limit and warn rather than fail a
+    // run over a knob this host was never going to apply.
+    let effectiveSpec = spec;
+    if (spec.limits.memoryMiB !== undefined) {
+      this.memorySupported ??= await podmanSupportsMemoryLimits();
+      if (!this.memorySupported) {
+        const { memoryMiB: _dropped, ...limits } = spec.limits;
+        effectiveSpec = { ...spec, limits };
+        if (!PodmanRuntime.warnedNoMemoryCgroup) {
+          PodmanRuntime.warnedNoMemoryCgroup = true;
+          console.warn(
+            "[podman] host cgroup does not delegate the memory controller; " +
+              "ignoring limits.memoryMiB (cpus/pids still apply)",
+          );
+        }
+      }
+    }
+
+    const args = buildPodmanRunArgs(effectiveSpec, policy, { name });
     const created = await runCli([...this.cmd(), ...args], {
       timeoutMs: this.startTimeoutMs,
     });
@@ -364,7 +388,7 @@ export class PodmanRuntime implements ContainerRuntime {
 
     return new PodmanContainerHandle({
       id,
-      image: spec.image,
+      image: effectiveSpec.image,
       ports,
       podman: this.cmd(),
       timeoutMs: spec.timeoutMs,

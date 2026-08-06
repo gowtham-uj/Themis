@@ -333,3 +333,79 @@ describe("project config reaches the run (startRun wire)", () => {
     }
   }, 20_000);
 });
+
+describe("per-run adapterOverrides (POST /runs)", () => {
+  // Regression: the run-create route declared `adapterOverrides` in its body
+  // type and then never read it, so a per-run image pin was accepted with 202
+  // and silently ignored — the run launched from the project/adapter default.
+  // Found by trying to point a run at a specific pod image end to end.
+  it("records a per-run image pin and applies it at launch", async () => {
+    const fx = openFixture();
+    try {
+      const project = fx.queries.createProject({
+        name: "pin",
+        slug: "pin",
+        taskSource: { kind: "ui-builder" },
+        workspaceImage: "project/default:1",
+      });
+      const task = fx.queries.createTask(project.id, {
+        id: "ext-pin-1",
+        name: "t",
+        prompt: "p",
+        workspace: { source: "empty" },
+        agentCategory: "coding",
+        rubric: {
+          version: 1,
+          profile: "bugfix",
+          criteria: [
+            {
+              id: "A1",
+              axis: "A",
+              label: "correctness",
+              weight: 1,
+              appliesTo: "coding",
+              anchors: { full: "y", partial: "s", none: "n" },
+            },
+          ],
+        },
+      });
+      fx.queries.registerAgent({ id: "spy", displayName: "spy" });
+      const batch = fx.queries.createBatch({
+        projectId: project.id,
+        taskId: task.id,
+        agentId: "spy",
+        model: "m",
+        provider: "p",
+        repeats: 1,
+      });
+      const run = fx.queries.createRun({
+        batchId: batch.id,
+        taskId: task.id,
+        projectId: project.id,
+        agentId: "spy",
+        model: "m",
+        provider: "p",
+        repeatIndex: 0,
+        // What the route now stores when the body carries adapterOverrides.image.
+        agentImage: "run/pinned:9",
+        agentImageSource: "run_override",
+      });
+
+      const adapter = makeSpyAdapter();
+      const live = await startRun(
+        fx.dataDir,
+        fx.queries,
+        run.id,
+        createLiveRunsMap(),
+        { adapter, runtime: new FakeContainerRuntime(), timeoutMs: 10_000 },
+      );
+      await live.done;
+
+      // The run's own pin beats the project's workspaceImage.
+      expect(live.handle.image).toBe("run/pinned:9");
+      expect(adapter.seen[0]!.overrides?.image).toBe("run/pinned:9");
+    } finally {
+      fx.cleanup();
+    }
+  }, 20_000);
+});

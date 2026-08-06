@@ -158,3 +158,46 @@ describe("validateVerdict (three-layer contract)", () => {
     expect(() => validateVerdict(v2, { hasSourceArtifacts: false })).toThrow(/bad category/);
   });
 });
+
+describe("fix block validation (renderer contract)", () => {
+  // Regression: `fix` was never validated, so a fix missing `direction`
+  // validated cleanly and then threw inside the report renderer — producing a
+  // verdict the platform accepted but could never display. Found by running the
+  // full pipeline end to end.
+  it("accepts a well-formed fix, with and without repro", () => {
+    const v = baseVerdict({ hasSource: false });
+    v.findings[0]!.fix = { direction: "re-run the suite after the last edit" };
+    expect(() => validateVerdict(v, { hasSourceArtifacts: false })).not.toThrow();
+
+    v.findings[0]!.fix = {
+      direction: "re-run the suite",
+      repro: { command: "npm test", expected: "0 failures" },
+    };
+    expect(() => validateVerdict(v, { hasSourceArtifacts: false })).not.toThrow();
+  });
+
+  it("rejects a fix with no direction (the renderer reads it unconditionally)", () => {
+    const v = baseVerdict({ hasSource: false });
+    (v.findings[0] as unknown as { fix: unknown }).fix = { summary: "wrong key" };
+    expect(() => validateVerdict(v, { hasSourceArtifacts: false })).toThrow(
+      /fix missing direction/,
+    );
+  });
+
+  it("rejects a half-specified repro", () => {
+    const v = baseVerdict({ hasSource: false });
+    (v.findings[0] as unknown as { fix: unknown }).fix = {
+      direction: "d",
+      repro: { command: "npm test" },
+    };
+    expect(() => validateVerdict(v, { hasSourceArtifacts: false })).toThrow(
+      /fix\.repro missing expected/,
+    );
+  });
+
+  it("treats an absent fix as fine (it is optional)", () => {
+    const v = baseVerdict({ hasSource: false });
+    delete v.findings[0]!.fix;
+    expect(() => validateVerdict(v, { hasSourceArtifacts: false })).not.toThrow();
+  });
+});

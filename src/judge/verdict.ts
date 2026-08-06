@@ -294,7 +294,30 @@ function validateFindingIdsUnique(findings: Finding[], label: string): void {
       // Quality gate (plan/judge.md): a finding with no refs is dropped, not emitted.
       throw new VerdictValidationError(`${label} "${f.id}": finding must have ≥1 ref (drop it otherwise)`);
     f.refs.forEach((r, i) => assertRef(r, `${label} "${f.id}" ref[${i}]`));
+    assertFix(f.fix, `${label} "${f.id}"`);
   }
+}
+
+/**
+ * Validate an optional `fix` block.
+ *
+ * The report renderer reads `fix.direction` and `fix.repro.{command,expected}`
+ * unconditionally, so a fix that is present but missing `direction` used to
+ * validate cleanly and then crash rendering — a judge could produce a verdict
+ * the platform accepted but could never show. Reject it here instead.
+ */
+function assertFix(fix: unknown, ctx: string): void {
+  if (fix === undefined || fix === null) return;
+  if (!isObject(fix)) throw new VerdictValidationError(`${ctx}: fix must be an object`);
+  if (typeof fix.direction !== "string" || !fix.direction)
+    throw new VerdictValidationError(`${ctx}: fix missing direction`);
+  if (fix.repro === undefined || fix.repro === null) return;
+  if (!isObject(fix.repro))
+    throw new VerdictValidationError(`${ctx}: fix.repro must be an object`);
+  if (typeof fix.repro.command !== "string" || !fix.repro.command)
+    throw new VerdictValidationError(`${ctx}: fix.repro missing command`);
+  if (typeof fix.repro.expected !== "string" || !fix.repro.expected)
+    throw new VerdictValidationError(`${ctx}: fix.repro missing expected`);
 }
 
 /** Options for {@link validateVerdict}. */
