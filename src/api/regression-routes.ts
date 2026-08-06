@@ -107,6 +107,19 @@ export type ReleaseCompareApi = ReleaseCompare & {
 export interface RegressionAppCtx {
   queries: DbQueries;
   dataDir: string;
+  /**
+   * Optional outbound webhook dispatcher (P8c). When present, release.compared
+   * is emitted after a successful releaseCompare. No-ops when omitted.
+   */
+  outboundWebhooks?: {
+    dispatchEvent(event: {
+      type: string;
+      projectId: string;
+      resourceId: string;
+      data: Record<string, unknown>;
+      timestamp: string;
+    }): void | Promise<void>;
+  };
 }
 
 function appOf(ctx: RequestContext): RegressionAppCtx {
@@ -339,6 +352,28 @@ export function registerRegressionRoutes(router: Router): void {
       fromTasks: fromSide.taskResults.length,
       toTasks: toSide.taskResults.length,
     };
+
+    // P8c: emit release.compared once after a successful compare.
+    if (app.outboundWebhooks) {
+      try {
+        void app.outboundWebhooks.dispatchEvent({
+          type: "release.compared",
+          projectId,
+          resourceId: `${from}->${to}`,
+          data: {
+            suiteDelta: result.suiteDelta,
+            improved: result.suiteDelta.nImproved,
+            regressed: result.suiteDelta.nRegressed,
+            fromVersion: from,
+            toVersion: to,
+          },
+          timestamp: new Date().toISOString(),
+        });
+      } catch {
+        // never break the compare response for webhook delivery
+      }
+    }
+
     sendJson(res, 200, body);
   });
 }

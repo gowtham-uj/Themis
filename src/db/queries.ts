@@ -39,6 +39,7 @@ import {
   findingOccurrences,
   findings,
   judgements,
+  outboundSubscriptions,
   projects,
   queueEntries,
   runBatches,
@@ -47,6 +48,7 @@ import {
   tasks,
   watcherEvents,
   watcherRules,
+  webhookDeliveries,
   type Schema,
 } from "./schema.js";
 
@@ -601,6 +603,85 @@ export interface ListApiTokensOpts {
   includeRevoked?: boolean;
 }
 
+// ---- Outbound webhook subscriptions + deliveries (P8c) ----
+
+/** Event types an outbound subscription may filter on. Empty list = all. */
+export type OutboundEventType =
+  | "run.completed"
+  | "verdict.completed"
+  | "release.compared";
+
+/** Delivery attempt status. */
+export type WebhookDeliveryStatus = "pending" | "success" | "failed";
+
+/**
+ * Outbound webhook subscription. `secret` is present ONLY on create result;
+ * get/list/update always strip it to null.
+ */
+export interface OutboundSubscription {
+  id: string;
+  projectId: string;
+  url: string;
+  /** Plaintext signing secret; null after create (stripped). */
+  secret: string | null;
+  /** Parsed event type filter; empty array means match-all. */
+  eventTypes: string[];
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateOutboundSubscriptionInput {
+  url: string;
+  /** If absent, generated as newId()+"-"+newId() and returned once. */
+  secret?: string;
+  /** Empty / omitted = all event types. */
+  eventTypes?: string[];
+  enabled?: boolean;
+}
+
+export interface UpdateOutboundSubscriptionPatch {
+  url?: string;
+  eventTypes?: string[];
+  enabled?: boolean;
+}
+
+/** Recorded delivery attempt for an outbound webhook POST. */
+export interface WebhookDelivery {
+  id: string;
+  subscriptionId: string;
+  projectId: string;
+  eventType: string;
+  payload: unknown;
+  status: WebhookDeliveryStatus | string;
+  attempt: number;
+  responseStatus: number | null;
+  responseBody: string | null;
+  error: string | null;
+  deliveredAt: string | null;
+  createdAt: string;
+}
+
+export interface RecordWebhookDeliveryInput {
+  subscriptionId: string;
+  projectId: string;
+  eventType: string;
+  payload: unknown;
+  status: WebhookDeliveryStatus | string;
+  attempt: number;
+  responseStatus?: number | null;
+  responseBody?: string | null;
+  error?: string | null;
+  deliveredAt?: string | null;
+}
+
+export interface ListWebhookDeliveriesOpts {
+  subscriptionId?: string;
+  eventType?: string;
+  status?: string;
+  limit?: number;
+}
+
 /**
  * Shared query surface. Both SqliteQueries and MemoryQueries implement this.
  */
@@ -736,6 +817,39 @@ export interface QueryStore {
    * Excludes revoked by default.
    */
   listApiTokens(opts?: ListApiTokensOpts): ApiToken[];
+
+  // ---- Outbound webhooks (P8c) ----
+  /**
+   * Create an outbound subscription. Returns the sub WITH secret surfaced ONCE
+   * (only time). Auto-generates secret when input.secret is absent.
+   */
+  createOutboundSubscription(
+    projectId: string,
+    input: CreateOutboundSubscriptionInput,
+  ): OutboundSubscription;
+  /** Get a subscription with secret stripped to null. */
+  getOutboundSubscription(id: string): OutboundSubscription | null;
+  /**
+   * Return the raw signing secret for outbound HMAC. NEVER log the return value.
+   * Returns null when the subscription is missing.
+   */
+  getOutboundSubscriptionWithSecret(id: string): string | null;
+  /** List project subscriptions with secrets stripped. */
+  listOutboundSubscriptions(projectId: string): OutboundSubscription[];
+  /** Patch a subscription (secret never touchable). Secret stripped on return. */
+  updateOutboundSubscription(
+    id: string,
+    patch: UpdateOutboundSubscriptionPatch,
+  ): OutboundSubscription;
+  /** Hard-delete a subscription. */
+  deleteOutboundSubscription(id: string): void;
+  /** Insert a delivery log row. */
+  recordWebhookDelivery(input: RecordWebhookDeliveryInput): WebhookDelivery;
+  /** Newest-createdAt-first delivery list with optional filters. */
+  listWebhookDeliveries(
+    projectId: string,
+    opts?: ListWebhookDeliveriesOpts,
+  ): WebhookDelivery[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1339,59 @@ function mapApiTokenRow(row: typeof apiTokens.$inferSelect): ApiToken {
     readOnly: row.readOnly === 1,
     createdAt: row.createdAt,
     revokedAt: row.revokedAt ?? null,
+  };
+}
+
+/** Strip outbound subscription secret so it is never leaked after create. */
+function stripOutboundSecret(sub: OutboundSubscription): OutboundSubscription {
+  return { ...sub, secret: null };
+}
+
+/** Parse event_types_json (JSON array of strings; empty = match-all). */
+function parseEventTypes(raw: string | null | undefined): string[] {
+  const parsed = parseJson<unknown>(raw, []);
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter((x): x is string => typeof x === "string");
+}
+
+/** Truncate response body stored on delivery rows (cap at 2KB). */
+function truncateResponseBody(body: string | null | undefined): string | null {
+  if (body == null) return null;
+  if (body.length <= 2048) return body;
+  return body.slice(0, 2048);
+}
+
+function mapOutboundSubscriptionRow(
+  row: typeof outboundSubscriptions.$inferSelect,
+): OutboundSubscription {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    url: row.url,
+    secret: row.secret ?? null,
+    eventTypes: parseEventTypes(row.eventTypesJson),
+    enabled: row.enabled === 1,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function mapWebhookDeliveryRow(
+  row: typeof webhookDeliveries.$inferSelect,
+): WebhookDelivery {
+  return {
+    id: row.id,
+    subscriptionId: row.subscriptionId,
+    projectId: row.projectId,
+    eventType: row.eventType,
+    payload: parseJson<unknown>(row.payloadJson, null),
+    status: row.status,
+    attempt: row.attempt,
+    responseStatus: row.responseStatus ?? null,
+    responseBody: row.responseBody ?? null,
+    error: row.error ?? null,
+    deliveredAt: row.deliveredAt ?? null,
+    createdAt: row.createdAt,
   };
 }
 
@@ -2809,6 +2976,189 @@ export class SqliteQueries implements QueryStore {
     });
     return rows;
   }
+
+  // ---- Outbound webhooks (P8c) ----
+
+  createOutboundSubscription(
+    projectId: string,
+    input: CreateOutboundSubscriptionInput,
+  ): OutboundSubscription {
+    if (!this.getProject(projectId)) throw notFound("project", projectId);
+    const id = newId();
+    const ts = nowIso();
+    const secret =
+      input.secret !== undefined && input.secret !== ""
+        ? input.secret
+        : `${newId()}-${newId()}`;
+    const eventTypes = Array.isArray(input.eventTypes) ? input.eventTypes : [];
+    const enabled = input.enabled === false ? 0 : 1;
+    this.db
+      .insert(outboundSubscriptions)
+      .values({
+        id,
+        projectId,
+        url: input.url,
+        secret,
+        eventTypesJson: JSON.stringify(eventTypes),
+        enabled,
+        createdAt: ts,
+        updatedAt: ts,
+      })
+      .run();
+    const row = this.db
+      .select()
+      .from(outboundSubscriptions)
+      .where(eq(outboundSubscriptions.id, id))
+      .get();
+    if (!row) throw new Error("failed to create outbound subscription");
+    // Return WITH secret present — only create surfaces it.
+    return mapOutboundSubscriptionRow(row);
+  }
+
+  getOutboundSubscription(id: string): OutboundSubscription | null {
+    const row = this.db
+      .select()
+      .from(outboundSubscriptions)
+      .where(eq(outboundSubscriptions.id, id))
+      .get();
+    return row ? stripOutboundSecret(mapOutboundSubscriptionRow(row)) : null;
+  }
+
+  /**
+   * Raw signing secret for outbound HMAC. NEVER log the return value.
+   */
+  getOutboundSubscriptionWithSecret(id: string): string | null {
+    const row = this.db
+      .select()
+      .from(outboundSubscriptions)
+      .where(eq(outboundSubscriptions.id, id))
+      .get();
+    if (!row) return null;
+    const secret = row.secret;
+    if (secret == null || secret === "") return null;
+    return secret;
+  }
+
+  listOutboundSubscriptions(projectId: string): OutboundSubscription[] {
+    const rows = this.db
+      .select()
+      .from(outboundSubscriptions)
+      .where(eq(outboundSubscriptions.projectId, projectId))
+      .all();
+    return rows
+      .map(mapOutboundSubscriptionRow)
+      .map(stripOutboundSecret);
+  }
+
+  updateOutboundSubscription(
+    id: string,
+    patch: UpdateOutboundSubscriptionPatch,
+  ): OutboundSubscription {
+    const existing = this.db
+      .select()
+      .from(outboundSubscriptions)
+      .where(eq(outboundSubscriptions.id, id))
+      .get();
+    if (!existing) throw notFound("outbound subscription", id);
+    const next = {
+      url: patch.url !== undefined ? patch.url : existing.url,
+      eventTypesJson:
+        patch.eventTypes !== undefined
+          ? JSON.stringify(patch.eventTypes)
+          : existing.eventTypesJson,
+      enabled:
+        patch.enabled !== undefined
+          ? patch.enabled
+            ? 1
+            : 0
+          : existing.enabled,
+      updatedAt: nowIso(),
+    };
+    this.db
+      .update(outboundSubscriptions)
+      .set(next)
+      .where(eq(outboundSubscriptions.id, id))
+      .run();
+    const row = this.db
+      .select()
+      .from(outboundSubscriptions)
+      .where(eq(outboundSubscriptions.id, id))
+      .get();
+    if (!row) throw notFound("outbound subscription", id);
+    return stripOutboundSecret(mapOutboundSubscriptionRow(row));
+  }
+
+  deleteOutboundSubscription(id: string): void {
+    // Cascade-delete deliveries first so FK integrity holds.
+    this.db
+      .delete(webhookDeliveries)
+      .where(eq(webhookDeliveries.subscriptionId, id))
+      .run();
+    this.db
+      .delete(outboundSubscriptions)
+      .where(eq(outboundSubscriptions.id, id))
+      .run();
+  }
+
+  recordWebhookDelivery(input: RecordWebhookDeliveryInput): WebhookDelivery {
+    const id = newId();
+    const ts = nowIso();
+    this.db
+      .insert(webhookDeliveries)
+      .values({
+        id,
+        subscriptionId: input.subscriptionId,
+        projectId: input.projectId,
+        eventType: input.eventType,
+        payloadJson: JSON.stringify(input.payload ?? null),
+        status: input.status,
+        attempt: input.attempt,
+        responseStatus: input.responseStatus ?? null,
+        responseBody: truncateResponseBody(input.responseBody ?? null),
+        error: input.error ?? null,
+        deliveredAt: input.deliveredAt ?? null,
+        createdAt: ts,
+      })
+      .run();
+    const row = this.db
+      .select()
+      .from(webhookDeliveries)
+      .where(eq(webhookDeliveries.id, id))
+      .get();
+    if (!row) throw new Error("failed to record webhook delivery");
+    return mapWebhookDeliveryRow(row);
+  }
+
+  listWebhookDeliveries(
+    projectId: string,
+    opts: ListWebhookDeliveriesOpts = {},
+  ): WebhookDelivery[] {
+    let rows = this.db
+      .select()
+      .from(webhookDeliveries)
+      .where(eq(webhookDeliveries.projectId, projectId))
+      .all()
+      .map(mapWebhookDeliveryRow);
+    if (opts.subscriptionId !== undefined) {
+      rows = rows.filter((d) => d.subscriptionId === opts.subscriptionId);
+    }
+    if (opts.eventType !== undefined) {
+      rows = rows.filter((d) => d.eventType === opts.eventType);
+    }
+    if (opts.status !== undefined) {
+      rows = rows.filter((d) => d.status === opts.status);
+    }
+    // Newest first.
+    rows.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
+      return b.id.localeCompare(a.id);
+    });
+    const limit =
+      opts.limit != null && Number.isFinite(opts.limit)
+        ? Math.max(1, Math.min(200, Math.floor(opts.limit)))
+        : 50;
+    return rows.slice(0, limit);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2829,6 +3179,8 @@ export class MemoryQueries implements QueryStore {
   private watcherEvents = new Map<string, WatcherEvent>();
   private queueEntries = new Map<string, QueueEntry>();
   private apiTokens = new Map<string, ApiToken>();
+  private outboundSubscriptions = new Map<string, OutboundSubscription>();
+  private webhookDeliveries = new Map<string, WebhookDelivery>();
 
   constructor(private readonly dataDir: string) {}
 
@@ -3971,6 +4323,137 @@ export class MemoryQueries implements QueryStore {
       return b.id.localeCompare(a.id);
     });
     return rows;
+  }
+
+  // ---- Outbound webhooks (P8c) ----
+
+  createOutboundSubscription(
+    projectId: string,
+    input: CreateOutboundSubscriptionInput,
+  ): OutboundSubscription {
+    if (!this.projects.has(projectId)) throw notFound("project", projectId);
+    const ts = nowIso();
+    const secret =
+      input.secret !== undefined && input.secret !== ""
+        ? input.secret
+        : `${newId()}-${newId()}`;
+    const eventTypes = Array.isArray(input.eventTypes)
+      ? [...input.eventTypes]
+      : [];
+    const sub: OutboundSubscription = {
+      id: newId(),
+      projectId,
+      url: input.url,
+      secret,
+      eventTypes,
+      enabled: input.enabled === false ? false : true,
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    this.outboundSubscriptions.set(sub.id, sub);
+    // Return WITH secret present — only create surfaces it.
+    return { ...sub, eventTypes: [...sub.eventTypes] };
+  }
+
+  getOutboundSubscription(id: string): OutboundSubscription | null {
+    const s = this.outboundSubscriptions.get(id);
+    return s
+      ? stripOutboundSecret({ ...s, eventTypes: [...s.eventTypes] })
+      : null;
+  }
+
+  /**
+   * Raw signing secret for outbound HMAC. NEVER log the return value.
+   */
+  getOutboundSubscriptionWithSecret(id: string): string | null {
+    const s = this.outboundSubscriptions.get(id);
+    if (!s) return null;
+    if (s.secret == null || s.secret === "") return null;
+    return s.secret;
+  }
+
+  listOutboundSubscriptions(projectId: string): OutboundSubscription[] {
+    return [...this.outboundSubscriptions.values()]
+      .filter((s) => s.projectId === projectId)
+      .map((s) =>
+        stripOutboundSecret({ ...s, eventTypes: [...s.eventTypes] }),
+      );
+  }
+
+  updateOutboundSubscription(
+    id: string,
+    patch: UpdateOutboundSubscriptionPatch,
+  ): OutboundSubscription {
+    const existing = this.outboundSubscriptions.get(id);
+    if (!existing) throw notFound("outbound subscription", id);
+    const next: OutboundSubscription = {
+      ...existing,
+      url: patch.url !== undefined ? patch.url : existing.url,
+      eventTypes:
+        patch.eventTypes !== undefined
+          ? [...patch.eventTypes]
+          : [...existing.eventTypes],
+      enabled:
+        patch.enabled !== undefined ? patch.enabled : existing.enabled,
+      updatedAt: nowIso(),
+      // Secret is never touchable via update.
+      secret: existing.secret,
+    };
+    this.outboundSubscriptions.set(id, next);
+    return stripOutboundSecret({ ...next, eventTypes: [...next.eventTypes] });
+  }
+
+  deleteOutboundSubscription(id: string): void {
+    for (const [did, d] of this.webhookDeliveries) {
+      if (d.subscriptionId === id) this.webhookDeliveries.delete(did);
+    }
+    this.outboundSubscriptions.delete(id);
+  }
+
+  recordWebhookDelivery(input: RecordWebhookDeliveryInput): WebhookDelivery {
+    const delivery: WebhookDelivery = {
+      id: newId(),
+      subscriptionId: input.subscriptionId,
+      projectId: input.projectId,
+      eventType: input.eventType,
+      payload: input.payload ?? null,
+      status: input.status,
+      attempt: input.attempt,
+      responseStatus: input.responseStatus ?? null,
+      responseBody: truncateResponseBody(input.responseBody ?? null),
+      error: input.error ?? null,
+      deliveredAt: input.deliveredAt ?? null,
+      createdAt: nowIso(),
+    };
+    this.webhookDeliveries.set(delivery.id, delivery);
+    return { ...delivery };
+  }
+
+  listWebhookDeliveries(
+    projectId: string,
+    opts: ListWebhookDeliveriesOpts = {},
+  ): WebhookDelivery[] {
+    let rows = [...this.webhookDeliveries.values()].filter(
+      (d) => d.projectId === projectId,
+    );
+    if (opts.subscriptionId !== undefined) {
+      rows = rows.filter((d) => d.subscriptionId === opts.subscriptionId);
+    }
+    if (opts.eventType !== undefined) {
+      rows = rows.filter((d) => d.eventType === opts.eventType);
+    }
+    if (opts.status !== undefined) {
+      rows = rows.filter((d) => d.status === opts.status);
+    }
+    rows.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
+      return b.id.localeCompare(a.id);
+    });
+    const limit =
+      opts.limit != null && Number.isFinite(opts.limit)
+        ? Math.max(1, Math.min(200, Math.floor(opts.limit)))
+        : 50;
+    return rows.slice(0, limit).map((d) => ({ ...d }));
   }
 }
 

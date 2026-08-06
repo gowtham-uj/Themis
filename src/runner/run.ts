@@ -75,6 +75,17 @@ export interface RunOptions {
   workspaceSpec?: WorkspaceSpec;
   /** If true, skip spawning the agent (dry-run / fixture-only). */
   skipAgent?: boolean;
+  /**
+   * Optional outbound webhook callback (P8c). Invoked once after the run
+   * reaches a terminal status. No-ops when omitted so CLI/local runners
+   * without outbound webhooks stay unchanged.
+   */
+  onRunCompleted?: (info: {
+    runId: string;
+    projectId: string;
+    status: RunStatus;
+    endedAt: string;
+  }) => void | Promise<void>;
   /** Optional: inject a pre-built adapter (tests). */
   adapter?: Adapter;
   /** Optional: custom spawn (tests). */
@@ -142,6 +153,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
 
   const adapter = options.adapter ?? getAdapter(agentId);
   const runId = options.runId ?? randomUUID();
+  const projectId = options.projectId ?? "local";
   const dataDir = options.dataDir ?? defaultDataDir();
   const runDir = join(dataDir, "runs", runId);
   const eventsPath = join(runDir, "events.jsonl");
@@ -357,18 +369,33 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
   }
 
   const durationMs = Date.now() - started;
+  const endedAt = new Date().toISOString();
   if (!sawTerminal) {
     await record({
       v: 1,
       runId,
       seq: seq + 1,
-      ts: new Date().toISOString(),
+      ts: endedAt,
       type: "run.end",
       status,
       durationMs: agentDurationMs || durationMs,
       ...(diff ? { diffPath: diff.patchPath } : {}),
       ...(usageTotal ? { usageTotal } : {}),
     });
+  }
+
+  // P8c: optional outbound webhook hook (exactly once per termination).
+  if (options.onRunCompleted) {
+    try {
+      await options.onRunCompleted({
+        runId,
+        projectId,
+        status,
+        endedAt,
+      });
+    } catch {
+      // never break the runner for webhook delivery
+    }
   }
 
   return {

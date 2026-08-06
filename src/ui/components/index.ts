@@ -10,3 +10,14 @@ export { TasksList } from "./TasksList.js";
 export type { TasksListProps } from "./TasksList.js";
 export { TraceTimeline } from "./TraceTimeline.js";
 export type { TimelineEvent, TraceTimelineProps } from "./TraceTimeline.js";
+export { SecretOnceReveal, secretOnceRevealMeta } from "./SecretOnceReveal.js";
+export type { SecretOnceRevealProps } from "./SecretOnceReveal.js";
+export {
+  QueueRow,
+  formatQueueOrderLabel,
+  formatQueueTarget,
+  isQueueEntryActive,
+  queueStatusColor,
+  queueStatusLabel,
+} from "./QueueRow.js";
+export type { QueueRowProps } from "./QueueRow.js";

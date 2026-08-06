@@ -409,6 +409,60 @@ export const apiTokens = sqliteTable(
 );
 
 // ---------------------------------------------------------------------------
+// Outbound webhook subscriptions + delivery log (P8c)
+// ---------------------------------------------------------------------------
+
+export const outboundSubscriptions = sqliteTable(
+  "outbound_subscriptions",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    url: text("url").notNull(),
+    /** Per-subscription HMAC signing secret. NEVER returned after create. */
+    secret: text("secret").notNull(),
+    /** JSON array of event types; empty array = all events. */
+    eventTypesJson: text("event_types_json").notNull(),
+    enabled: integer("enabled").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (t) => [index("idx_outbound_subs_project").on(t.projectId)],
+);
+
+export const webhookDeliveries = sqliteTable(
+  "webhook_deliveries",
+  {
+    id: text("id").primaryKey(),
+    subscriptionId: text("subscription_id")
+      .notNull()
+      .references(() => outboundSubscriptions.id),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    eventType: text("event_type").notNull(),
+    payloadJson: text("payload_json").notNull(),
+    /** pending|success|failed */
+    status: text("status").notNull(),
+    attempt: integer("attempt").notNull().default(0),
+    responseStatus: integer("response_status"),
+    /** Truncated response body (≤2KB). */
+    responseBody: text("response_body"),
+    error: text("error"),
+    deliveredAt: text("delivered_at"),
+    createdAt: text("created_at").notNull(),
+  },
+  (t) => [
+    index("idx_webhook_deliveries_project_created").on(
+      t.projectId,
+      t.createdAt,
+    ),
+    index("idx_webhook_deliveries_sub").on(t.subscriptionId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Schema registry (for drizzle + openDb)
 // ---------------------------------------------------------------------------
 
@@ -428,6 +482,8 @@ export const schema = {
   checks,
   users,
   apiTokens,
+  outboundSubscriptions,
+  webhookDeliveries,
 };
 
 export type Schema = typeof schema;

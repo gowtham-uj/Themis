@@ -38,6 +38,36 @@ export function isTerminalStatus(status: string | null | undefined): boolean {
   return status != null && TERMINAL_RUN_STATUSES.has(status);
 }
 
+/**
+ * Emit run.completed once after a run reaches terminal status.
+ * No-ops when dispatcher is undefined (outbound webhooks off).
+ */
+function emitRunCompletedHook(
+  dispatcher: OutboundWebhookEmitter | undefined,
+  queries: DbQueries,
+  runId: string,
+  projectId: string,
+  status: string,
+): void {
+  if (!dispatcher) return;
+  try {
+    const run = queries.getRun(runId);
+    const endedAt = run?.endedAt ?? new Date().toISOString();
+    void dispatcher.dispatchEvent({
+      type: "run.completed",
+      projectId: run?.projectId ?? projectId,
+      resourceId: runId,
+      data: {
+        status: run?.status ?? status,
+        endedAt,
+      },
+      timestamp: endedAt,
+    });
+  } catch {
+    // never break the runner for webhook delivery
+  }
+}
+
 /** In-memory handle for a live (or recently finished) run. */
 export interface LiveRun {
   runId: string;
@@ -55,6 +85,20 @@ export interface LiveRun {
   finished: boolean;
 }
 
+/**
+ * Minimal outbound-webhook surface used by the runner at terminal finalization.
+ * Kept structural to avoid a hard cycle with the dispatcher module.
+ */
+export interface OutboundWebhookEmitter {
+  dispatchEvent(event: {
+    type: string;
+    projectId: string;
+    resourceId: string;
+    data: Record<string, unknown>;
+    timestamp: string;
+  }): void | Promise<void>;
+}
+
 /** Options for {@link startRun}. */
 export interface StartRunOptions {
   /**
@@ -68,6 +112,12 @@ export interface StartRunOptions {
   timeoutMs?: number;
   /** When true, skip spawning the agent process (events-only dry run). */
   skipAgent?: boolean;
+  /**
+   * Optional outbound webhook dispatcher (P8c). When present, emits
+   * run.completed exactly once after terminal finalize. No-ops when omitted
+   * so runner stays unchanged for callers that do not enable outbound webhooks.
+   */
+  outboundWebhooks?: OutboundWebhookEmitter;
 }
 
 /** Mutable in-memory registry of live runs (P8 will replace with a queue). */
@@ -373,6 +423,8 @@ export async function startRun(
           controlState: final.controlState === "aborted" ? "aborted" : "done",
         });
         live.finished = true;
+        // P8c: emit run.completed exactly once at terminal finalization.
+        emitRunCompletedHook(opts.outboundWebhooks, queries, runId, projectId, status);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -411,6 +463,8 @@ export async function startRun(
         // best-effort
       }
       live.finished = true;
+      // P8c: emit run.completed for the failed path too.
+      emitRunCompletedHook(opts.outboundWebhooks, queries, runId, projectId, "failed");
     } finally {
       try {
         await handle.remove();
@@ -487,6 +541,7 @@ export async function abortRun(
   runId: string,
   queries: DbQueries,
   liveRuns: LiveRunsMap,
+  outboundWebhooks?: OutboundWebhookEmitter,
 ): Promise<Run> {
   const run = queries.getRun(runId);
   if (!run) throw new Error(`run not found: ${runId}`);
@@ -496,6 +551,7 @@ export async function abortRun(
     });
   }
 
+  const projectId = run.projectId;
   const live = liveRuns.get(runId);
   if (live) {
     // Mark aborting in DB first so concurrent readers see it.
@@ -514,13 +570,25 @@ export async function abortRun(
         durationMs: live.controller.durationMs(),
       });
       live.finished = true;
+      // P8c: emit run.completed for the abort path too — "aborted" is terminal,
+      // so subscribers learn the run ended. No-ops when no dispatcher; never
+      // throws (emit helper swallows). Exactly-once: this only runs when we just
+      // set live.finished (the done pipeline's emit is guarded by !live.finished).
+      emitRunCompletedHook(
+        outboundWebhooks,
+        queries,
+        runId,
+        projectId,
+        "aborted",
+      );
     }
   } else {
     // No live handle (e.g. still queued) — mark aborted in DB.
-    return queries.finalizeRun(runId, {
+    queries.finalizeRun(runId, {
       status: "aborted",
       controlState: "aborted",
     });
+    emitRunCompletedHook(outboundWebhooks, queries, runId, projectId, "aborted");
   }
 
   return queries.getRun(runId)!;

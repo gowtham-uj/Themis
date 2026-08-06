@@ -1511,6 +1511,635 @@ export function isLikelyRegression(delta: number, spread: number): boolean {
   return Math.abs(delta) > spread;
 }
 
+// ---------------------------------------------------------------------------
+// P8 — Watchers / Eval queue / Outbound webhooks
+// ---------------------------------------------------------------------------
+
+export type WatcherRole = "agent" | "workspace";
+export type WatcherTrigger =
+  | "tag"
+  | "commit"
+  | "pr"
+  | "schedule"
+  | "manual"
+  | "webhook"
+  | string;
+
+export interface WatcherAction {
+  enqueue: "all" | "subset";
+  taskTags?: string[];
+  repeats?: number;
+  adapterOverrides?: Record<string, unknown>;
+  autoJudge?: boolean;
+  judgeModel?: string;
+  [key: string]: unknown;
+}
+
+/** Watcher rule as returned by the API. webhookSecret is present only on create. */
+export interface WatcherRule {
+  id: string;
+  projectId: string;
+  role: WatcherRole | string;
+  repo: string;
+  trigger: WatcherTrigger;
+  ref?: string | null;
+  semverFilter?: string | null;
+  action: WatcherAction;
+  /** Plaintext secret — only on create response; null/absent elsewhere. */
+  webhookSecret?: string | null;
+  enabled: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: unknown;
+}
+
+export interface CreateWatcherRuleBody {
+  role: WatcherRole | string;
+  repo: string;
+  trigger: WatcherTrigger;
+  ref?: string | null;
+  semverFilter?: string | null;
+  action: WatcherAction;
+  /** When true/string, request a secret (server always generates one if absent). */
+  webhookSecret?: string | boolean;
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
+export interface UpdateWatcherRuleBody {
+  ref?: string | null;
+  semverFilter?: string | null;
+  action?: WatcherAction;
+  enabled?: boolean;
+  repo?: string;
+  [key: string]: unknown;
+}
+
+export interface FireWatcherBody {
+  ref?: string;
+  agentId?: string;
+  model?: string;
+  provider?: string;
+  [key: string]: unknown;
+}
+
+export interface FireWatcherResult {
+  batchIds: string[];
+  watcherEventId?: string | null;
+  status?: string;
+  [key: string]: unknown;
+}
+
+export type QueueEntryStatus =
+  | "queued"
+  | "promoted"
+  | "running"
+  | "removed"
+  | "failed"
+  | string;
+
+export interface QueueEntry {
+  id: string;
+  projectId: string;
+  triggerRef?: string | null;
+  targetKind?: string;
+  taskId?: string | null;
+  taskTags?: string[] | null;
+  agentId: string;
+  model?: string | null;
+  provider?: string | null;
+  repeats?: number | null;
+  params?: Record<string, unknown> | null;
+  adapterOverrides?: Record<string, unknown> | null;
+  autoJudge?: boolean | null;
+  judgeModel?: string | null;
+  priority: number;
+  position: number;
+  status: QueueEntryStatus;
+  dedupKey?: string | null;
+  source?: string | null;
+  createdAt?: string;
+  promotedAt?: string | null;
+  promotedBatchId?: string | null;
+  runIds?: string[];
+  [key: string]: unknown;
+}
+
+export interface CreateQueueEntryBody {
+  ref?: string | null;
+  triggerRef?: string | null;
+  taskId?: string | null;
+  taskTags?: string[];
+  agent?: string;
+  agentId?: string;
+  model?: string | null;
+  provider?: string | null;
+  repeats?: number | null;
+  params?: Record<string, unknown> | null;
+  adapterOverrides?: Record<string, unknown> | null;
+  autoJudge?: boolean | null;
+  judgeModel?: string | null;
+  priority?: number;
+  after?: string;
+  before?: string;
+  position?: number;
+  dedupKey?: string | null;
+  source?: string | null;
+  [key: string]: unknown;
+}
+
+export interface ReorderQueueEntryBody {
+  position?: number;
+  after?: string;
+  before?: string;
+  priority?: number;
+  [key: string]: unknown;
+}
+
+export interface PromoteQueueResult {
+  batchId?: string;
+  batchIds?: string[];
+  runIds?: string[];
+  entry?: QueueEntry;
+  [key: string]: unknown;
+}
+
+export type OutboundEventType =
+  | "run.completed"
+  | "verdict.completed"
+  | "release.compared"
+  | string;
+
+export interface OutboundWebhook {
+  id: string;
+  projectId: string;
+  url: string;
+  eventTypes: string[];
+  enabled: boolean;
+  /** Present only on create response. */
+  secret?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: unknown;
+}
+
+export interface CreateOutboundWebhookBody {
+  url: string;
+  eventTypes?: string[];
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
+export interface UpdateOutboundWebhookBody {
+  url?: string;
+  eventTypes?: string[];
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
+export type WebhookDeliveryStatus = "success" | "failed" | string;
+
+export interface WebhookDelivery {
+  id: string;
+  subscriptionId: string;
+  eventType: string;
+  status: WebhookDeliveryStatus;
+  attempt?: number;
+  responseStatus?: number | null;
+  responseBody?: string | null;
+  error?: string | null;
+  deliveredAt?: string | null;
+  createdAt?: string;
+  [key: string]: unknown;
+}
+
+function asRecord(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  return {};
+}
+
+/** Normalize a watcher rule row from the API. */
+export function normalizeWatcherRule(raw: Record<string, unknown>): WatcherRule {
+  const actionRaw = raw.action;
+  let action: WatcherAction = { enqueue: "all" };
+  if (actionRaw && typeof actionRaw === "object" && !Array.isArray(actionRaw)) {
+    const a = actionRaw as Record<string, unknown>;
+    action = {
+      ...a,
+      enqueue: a.enqueue === "subset" ? "subset" : "all",
+    };
+  }
+  return {
+    ...raw,
+    id: String(raw.id ?? ""),
+    projectId: String(raw.projectId ?? raw.project_id ?? ""),
+    role: String(raw.role ?? "agent") as WatcherRole,
+    repo: String(raw.repo ?? ""),
+    trigger: String(raw.trigger ?? "manual"),
+    ref: (raw.ref as string | null | undefined) ?? null,
+    semverFilter:
+      (raw.semverFilter as string | null | undefined) ??
+      (raw.semver_filter as string | null | undefined) ??
+      null,
+    action,
+    webhookSecret:
+      (raw.webhookSecret as string | null | undefined) ??
+      (raw.webhook_secret as string | null | undefined) ??
+      null,
+    enabled: raw.enabled === false || raw.enabled === 0 ? false : true,
+    createdAt: (raw.createdAt as string | undefined) ?? (raw.created_at as string | undefined),
+    updatedAt: (raw.updatedAt as string | undefined) ?? (raw.updated_at as string | undefined),
+  };
+}
+
+/** Normalize a queue entry row from the API. */
+export function normalizeQueueEntry(raw: Record<string, unknown>): QueueEntry {
+  return {
+    ...raw,
+    id: String(raw.id ?? ""),
+    projectId: String(raw.projectId ?? raw.project_id ?? ""),
+    triggerRef:
+      (raw.triggerRef as string | null | undefined) ??
+      (raw.trigger_ref as string | null | undefined) ??
+      (raw.ref as string | null | undefined) ??
+      null,
+    targetKind: (raw.targetKind as string | undefined) ?? (raw.target_kind as string | undefined),
+    taskId: (raw.taskId as string | null | undefined) ?? (raw.task_id as string | null | undefined) ?? null,
+    taskTags:
+      (raw.taskTags as string[] | null | undefined) ??
+      (raw.task_tags as string[] | null | undefined) ??
+      null,
+    agentId: String(raw.agentId ?? raw.agent_id ?? raw.agent ?? ""),
+    model: (raw.model as string | null | undefined) ?? null,
+    provider: (raw.provider as string | null | undefined) ?? null,
+    repeats: typeof raw.repeats === "number" ? raw.repeats : raw.repeats == null ? null : Number(raw.repeats),
+    params: (raw.params as Record<string, unknown> | null | undefined) ?? null,
+    priority: typeof raw.priority === "number" ? raw.priority : Number(raw.priority ?? 0) || 0,
+    position: typeof raw.position === "number" ? raw.position : Number(raw.position ?? 0) || 0,
+    status: String(raw.status ?? "queued"),
+    dedupKey:
+      (raw.dedupKey as string | null | undefined) ??
+      (raw.dedup_key as string | null | undefined) ??
+      null,
+    source: (raw.source as string | null | undefined) ?? null,
+    createdAt: (raw.createdAt as string | undefined) ?? (raw.created_at as string | undefined),
+    promotedAt:
+      (raw.promotedAt as string | null | undefined) ??
+      (raw.promoted_at as string | null | undefined) ??
+      null,
+    promotedBatchId:
+      (raw.promotedBatchId as string | null | undefined) ??
+      (raw.promoted_batch_id as string | null | undefined) ??
+      null,
+    runIds: Array.isArray(raw.runIds)
+      ? (raw.runIds as string[])
+      : Array.isArray(raw.run_ids)
+        ? (raw.run_ids as string[])
+        : undefined,
+  };
+}
+
+/** Normalize an outbound webhook subscription. */
+export function normalizeOutboundWebhook(
+  raw: Record<string, unknown>,
+): OutboundWebhook {
+  const eventTypesRaw =
+    raw.eventTypes ?? raw.event_types ?? raw.events ?? [];
+  const eventTypes = Array.isArray(eventTypesRaw)
+    ? eventTypesRaw.map(String)
+    : [];
+  return {
+    ...raw,
+    id: String(raw.id ?? ""),
+    projectId: String(raw.projectId ?? raw.project_id ?? ""),
+    url: String(raw.url ?? ""),
+    eventTypes,
+    enabled: raw.enabled === false || raw.enabled === 0 ? false : true,
+    secret:
+      (raw.secret as string | null | undefined) ??
+      (raw.webhookSecret as string | null | undefined) ??
+      null,
+    createdAt: (raw.createdAt as string | undefined) ?? (raw.created_at as string | undefined),
+    updatedAt: (raw.updatedAt as string | undefined) ?? (raw.updated_at as string | undefined),
+  };
+}
+
+/** Normalize a webhook delivery row. */
+export function normalizeWebhookDelivery(
+  raw: Record<string, unknown>,
+): WebhookDelivery {
+  return {
+    ...raw,
+    id: String(raw.id ?? ""),
+    subscriptionId: String(
+      raw.subscriptionId ?? raw.subscription_id ?? raw.subId ?? "",
+    ),
+    eventType: String(raw.eventType ?? raw.event_type ?? ""),
+    status: String(raw.status ?? "failed"),
+    attempt:
+      typeof raw.attempt === "number"
+        ? raw.attempt
+        : raw.attempt == null
+          ? undefined
+          : Number(raw.attempt),
+    responseStatus:
+      (raw.responseStatus as number | null | undefined) ??
+      (raw.response_status as number | null | undefined) ??
+      null,
+    responseBody:
+      (raw.responseBody as string | null | undefined) ??
+      (raw.response_body as string | null | undefined) ??
+      null,
+    error: (raw.error as string | null | undefined) ?? null,
+    deliveredAt:
+      (raw.deliveredAt as string | null | undefined) ??
+      (raw.delivered_at as string | null | undefined) ??
+      null,
+    createdAt: (raw.createdAt as string | undefined) ?? (raw.created_at as string | undefined),
+  };
+}
+
+/** GET /api/projects/:id/watchers */
+export async function getWatcherRules(
+  projectId: string,
+  opts: ApiClientOptions = {},
+): Promise<WatcherRule[]> {
+  const raw = await apiRequest<unknown>(
+    `/api/projects/${encodeURIComponent(projectId)}/watchers`,
+    { ...opts, method: "GET" },
+  );
+  return unwrapList(raw, "watchers").map((w) =>
+    normalizeWatcherRule(asRecord(w)),
+  );
+}
+
+/** POST /api/projects/:id/watchers — secret surfaced once on create. */
+export async function createWatcherRule(
+  projectId: string,
+  body: CreateWatcherRuleBody,
+  opts: ApiClientOptions = {},
+): Promise<WatcherRule> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/watchers`,
+    { ...opts, method: "POST", body },
+  );
+  const watcher = asRecord(raw.watcher ?? raw);
+  return normalizeWatcherRule(watcher);
+}
+
+/** PATCH /api/projects/:id/watchers/:ruleId */
+export async function updateWatcherRule(
+  projectId: string,
+  ruleId: string,
+  body: UpdateWatcherRuleBody,
+  opts: ApiClientOptions = {},
+): Promise<WatcherRule> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/watchers/${encodeURIComponent(ruleId)}`,
+    { ...opts, method: "PATCH", body },
+  );
+  return normalizeWatcherRule(asRecord(raw.watcher ?? raw));
+}
+
+/** DELETE /api/projects/:id/watchers/:ruleId */
+export async function deleteWatcherRule(
+  projectId: string,
+  ruleId: string,
+  opts: ApiClientOptions = {},
+): Promise<void> {
+  await apiRequest(
+    `/api/projects/${encodeURIComponent(projectId)}/watchers/${encodeURIComponent(ruleId)}`,
+    { ...opts, method: "DELETE" },
+  );
+}
+
+/** POST /api/projects/:id/watchers/:ruleId/run — manual fire. */
+export async function fireWatcher(
+  projectId: string,
+  ruleId: string,
+  body: FireWatcherBody = {},
+  opts: ApiClientOptions = {},
+): Promise<FireWatcherResult> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/watchers/${encodeURIComponent(ruleId)}/run`,
+    { ...opts, method: "POST", body },
+  );
+  const batchIds = Array.isArray(raw.batchIds)
+    ? (raw.batchIds as string[])
+    : Array.isArray(raw.batch_ids)
+      ? (raw.batch_ids as string[])
+      : [];
+  return {
+    ...raw,
+    batchIds,
+    watcherEventId:
+      (raw.watcherEventId as string | null | undefined) ??
+      (raw.watcher_event_id as string | null | undefined) ??
+      null,
+    status: raw.status != null ? String(raw.status) : undefined,
+  };
+}
+
+/** GET /api/projects/:id/queue */
+export async function getQueue(
+  projectId: string,
+  opts: ApiClientOptions & { status?: string } = {},
+): Promise<QueueEntry[]> {
+  const { status, ...rest } = opts;
+  const raw = await apiRequest<unknown>(
+    `/api/projects/${encodeURIComponent(projectId)}/queue`,
+    {
+      ...rest,
+      method: "GET",
+      query: status ? { status } : undefined,
+    },
+  );
+  return unwrapList(raw, "queue").map((e) =>
+    normalizeQueueEntry(asRecord(e)),
+  );
+}
+
+/** POST /api/projects/:id/queue */
+export async function createQueueEntry(
+  projectId: string,
+  body: CreateQueueEntryBody,
+  opts: ApiClientOptions = {},
+): Promise<QueueEntry> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/queue`,
+    { ...opts, method: "POST", body },
+  );
+  return normalizeQueueEntry(asRecord(raw.entry ?? raw));
+}
+
+/** PATCH /api/projects/:id/queue/:entryId — reorder / priority. */
+export async function reorderQueueEntry(
+  projectId: string,
+  entryId: string,
+  body: ReorderQueueEntryBody,
+  opts: ApiClientOptions = {},
+): Promise<QueueEntry> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/queue/${encodeURIComponent(entryId)}`,
+    { ...opts, method: "PATCH", body },
+  );
+  return normalizeQueueEntry(asRecord(raw.entry ?? raw));
+}
+
+/** DELETE /api/projects/:id/queue/:entryId */
+export async function removeQueueEntry(
+  projectId: string,
+  entryId: string,
+  opts: ApiClientOptions = {},
+): Promise<void> {
+  await apiRequest(
+    `/api/projects/${encodeURIComponent(projectId)}/queue/${encodeURIComponent(entryId)}`,
+    { ...opts, method: "DELETE" },
+  );
+}
+
+/** POST /api/projects/:id/queue/:entryId/promote */
+export async function promoteQueue(
+  projectId: string,
+  entryId: string,
+  opts: ApiClientOptions = {},
+): Promise<PromoteQueueResult> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/queue/${encodeURIComponent(entryId)}/promote`,
+    { ...opts, method: "POST", body: {} },
+  );
+  const runIds = Array.isArray(raw.runIds)
+    ? (raw.runIds as string[])
+    : Array.isArray(raw.run_ids)
+      ? (raw.run_ids as string[])
+      : [];
+  const batchIds = Array.isArray(raw.batchIds)
+    ? (raw.batchIds as string[])
+    : Array.isArray(raw.batch_ids)
+      ? (raw.batch_ids as string[])
+      : undefined;
+  return {
+    ...raw,
+    batchId:
+      (raw.batchId as string | undefined) ??
+      (raw.batch_id as string | undefined) ??
+      batchIds?.[0],
+    batchIds,
+    runIds,
+    entry: raw.entry
+      ? normalizeQueueEntry(asRecord(raw.entry))
+      : undefined,
+  };
+}
+
+/** POST /api/projects/:id/queue/drain */
+export async function drainQueue(
+  projectId: string,
+  opts: ApiClientOptions = {},
+): Promise<{ removed: number }> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/queue/drain`,
+    { ...opts, method: "POST", body: {} },
+  );
+  const removed =
+    typeof raw.removed === "number"
+      ? raw.removed
+      : typeof raw.count === "number"
+        ? raw.count
+        : 0;
+  return { removed };
+}
+
+/** GET /api/projects/:id/webhooks */
+export async function getWebhooks(
+  projectId: string,
+  opts: ApiClientOptions = {},
+): Promise<OutboundWebhook[]> {
+  const raw = await apiRequest<unknown>(
+    `/api/projects/${encodeURIComponent(projectId)}/webhooks`,
+    { ...opts, method: "GET" },
+  );
+  return unwrapList(raw, "webhooks").map((w) =>
+    normalizeOutboundWebhook(asRecord(w)),
+  );
+}
+
+/** POST /api/projects/:id/webhooks — secret revealed once. */
+export async function createWebhook(
+  projectId: string,
+  body: CreateOutboundWebhookBody,
+  opts: ApiClientOptions = {},
+): Promise<OutboundWebhook> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/webhooks`,
+    { ...opts, method: "POST", body },
+  );
+  return normalizeOutboundWebhook(asRecord(raw.webhook ?? raw.subscription ?? raw));
+}
+
+/** PATCH /api/projects/:id/webhooks/:subId */
+export async function updateWebhook(
+  projectId: string,
+  subId: string,
+  body: UpdateOutboundWebhookBody,
+  opts: ApiClientOptions = {},
+): Promise<OutboundWebhook> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/webhooks/${encodeURIComponent(subId)}`,
+    { ...opts, method: "PATCH", body },
+  );
+  return normalizeOutboundWebhook(asRecord(raw.webhook ?? raw.subscription ?? raw));
+}
+
+/** DELETE /api/projects/:id/webhooks/:subId */
+export async function deleteWebhook(
+  projectId: string,
+  subId: string,
+  opts: ApiClientOptions = {},
+): Promise<void> {
+  await apiRequest(
+    `/api/projects/${encodeURIComponent(projectId)}/webhooks/${encodeURIComponent(subId)}`,
+    { ...opts, method: "DELETE" },
+  );
+}
+
+/** GET /api/projects/:id/webhooks/:subId/deliveries */
+export async function listWebhookDeliveries(
+  projectId: string,
+  subId: string,
+  opts: ApiClientOptions = {},
+): Promise<WebhookDelivery[]> {
+  const raw = await apiRequest<unknown>(
+    `/api/projects/${encodeURIComponent(projectId)}/webhooks/${encodeURIComponent(subId)}/deliveries`,
+    { ...opts, method: "GET" },
+  );
+  return unwrapList(raw, "deliveries").map((d) =>
+    normalizeWebhookDelivery(asRecord(d)),
+  );
+}
+
+/** POST /api/projects/:id/webhooks/:subId/test */
+export async function testWebhook(
+  projectId: string,
+  subId: string,
+  opts: ApiClientOptions = {},
+): Promise<{ deliveryId?: string; status?: string; [key: string]: unknown }> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/api/projects/${encodeURIComponent(projectId)}/webhooks/${encodeURIComponent(subId)}/test`,
+    { ...opts, method: "POST", body: {} },
+  );
+  return {
+    ...raw,
+    deliveryId:
+      (raw.deliveryId as string | undefined) ??
+      (raw.delivery_id as string | undefined) ??
+      (raw.id as string | undefined),
+    status: raw.status != null ? String(raw.status) : undefined,
+  };
+}
+
 /** Bundle of client methods for DI into components/tests. */
 export function createApiClient(opts: ApiClientOptions = {}) {
   return {
@@ -1559,6 +2188,49 @@ export function createApiClient(opts: ApiClientOptions = {}) {
       getRunCompare(projectId, a, b, opts),
     getReleaseCompare: (projectId: string, from: string, to: string) =>
       getReleaseCompare(projectId, from, to, opts),
+    getWatcherRules: (projectId: string) => getWatcherRules(projectId, opts),
+    createWatcherRule: (projectId: string, body: CreateWatcherRuleBody) =>
+      createWatcherRule(projectId, body, opts),
+    updateWatcherRule: (
+      projectId: string,
+      ruleId: string,
+      body: UpdateWatcherRuleBody,
+    ) => updateWatcherRule(projectId, ruleId, body, opts),
+    deleteWatcherRule: (projectId: string, ruleId: string) =>
+      deleteWatcherRule(projectId, ruleId, opts),
+    fireWatcher: (
+      projectId: string,
+      ruleId: string,
+      body?: FireWatcherBody,
+    ) => fireWatcher(projectId, ruleId, body, opts),
+    getQueue: (projectId: string, o?: { status?: string }) =>
+      getQueue(projectId, { ...opts, ...o }),
+    createQueueEntry: (projectId: string, body: CreateQueueEntryBody) =>
+      createQueueEntry(projectId, body, opts),
+    reorderQueueEntry: (
+      projectId: string,
+      entryId: string,
+      body: ReorderQueueEntryBody,
+    ) => reorderQueueEntry(projectId, entryId, body, opts),
+    removeQueueEntry: (projectId: string, entryId: string) =>
+      removeQueueEntry(projectId, entryId, opts),
+    promoteQueue: (projectId: string, entryId: string) =>
+      promoteQueue(projectId, entryId, opts),
+    drainQueue: (projectId: string) => drainQueue(projectId, opts),
+    getWebhooks: (projectId: string) => getWebhooks(projectId, opts),
+    createWebhook: (projectId: string, body: CreateOutboundWebhookBody) =>
+      createWebhook(projectId, body, opts),
+    updateWebhook: (
+      projectId: string,
+      subId: string,
+      body: UpdateOutboundWebhookBody,
+    ) => updateWebhook(projectId, subId, body, opts),
+    deleteWebhook: (projectId: string, subId: string) =>
+      deleteWebhook(projectId, subId, opts),
+    listWebhookDeliveries: (projectId: string, subId: string) =>
+      listWebhookDeliveries(projectId, subId, opts),
+    testWebhook: (projectId: string, subId: string) =>
+      testWebhook(projectId, subId, opts),
   };
 }
 

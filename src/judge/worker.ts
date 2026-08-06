@@ -67,6 +67,19 @@ export interface JudgeRunInput {
   maxTokens?: number;
   /** Bound for events preview first/last seq excerpts (default 5). */
   previewWindow?: number;
+  /**
+   * Optional outbound webhook callback (P8c). Invoked once when the
+   * verdict completes successfully (storeVerdict / emitRunEnd completed).
+   * No-ops when omitted.
+   */
+  onVerdictCompleted?: (info: {
+    judgementId: string;
+    projectId: string;
+    runId: string | null;
+    overallScore?: number | null;
+    verdictVersion?: string | null;
+    timestamp: string;
+  }) => void | Promise<void>;
 }
 
 export type JudgeRunStatus = "completed" | "failed";
@@ -285,6 +298,29 @@ export async function judgeRun(input: JudgeRunInput): Promise<JudgeRunResult> {
     }
 
     await emitRunEnd(emit, judgementId, "completed");
+
+    // P8c: optional outbound webhook hook (exactly once on success).
+    if (input.onVerdictCompleted) {
+      try {
+        const runIdFromMeta =
+          runMeta && typeof runMeta === "object" && "runId" in runMeta
+            ? String((runMeta as { runId?: unknown }).runId ?? "")
+            : null;
+        await input.onVerdictCompleted({
+          judgementId,
+          projectId,
+          runId: runIdFromMeta || null,
+          overallScore:
+            verdict.overall && typeof verdict.overall.score === "number"
+              ? verdict.overall.score
+              : null,
+          verdictVersion: systemPromptVersion,
+          timestamp: new Date().toISOString(),
+        });
+      } catch {
+        // never break the judge for webhook delivery
+      }
+    }
 
     return {
       judgementId,

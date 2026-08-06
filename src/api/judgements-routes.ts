@@ -93,6 +93,19 @@ export interface JudgementAppCtx {
   /** Default judge model / provider when the request omits them. */
   defaultJudgeModel?: string;
   defaultJudgeProvider?: string;
+  /**
+   * Optional outbound webhook dispatcher (P8c). After a successful judge run
+   * that leaves the judgement completed, emits verdict.completed once.
+   */
+  outboundWebhooks?: {
+    dispatchEvent(event: {
+      type: string;
+      projectId: string;
+      resourceId: string;
+      data: Record<string, unknown>;
+      timestamp: string;
+    }): void | Promise<void>;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +492,29 @@ export function registerJudgementRoutes(router: Router): void {
             // best-effort
           }
           await app.judgeRunner!(runnerCtx);
+
+          // P8c: emit verdict.completed once if the runner completed the judgement.
+          // No-ops when outbound webhooks are off or the judgement is not completed.
+          if (app.outboundWebhooks) {
+            try {
+              const done = app.queries.getJudgement(judgement.id);
+              if (done && done.status === "completed") {
+                void app.outboundWebhooks.dispatchEvent({
+                  type: "verdict.completed",
+                  projectId: run.projectId,
+                  resourceId: judgement.id,
+                  data: {
+                    runId: run.id,
+                    overallScore: done.overallScore ?? null,
+                    verdictVersion: done.systemPromptVersion,
+                  },
+                  timestamp: done.endedAt ?? new Date().toISOString(),
+                });
+              }
+            } catch {
+              // never break the judge path for webhook delivery
+            }
+          }
         })
         .catch((err) => {
           try {

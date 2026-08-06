@@ -26,6 +26,15 @@ export default async function ProjectLayout({
         <a href={`/projects/${id}/compare/releases`} className="font-medium">
           Release compare
         </a>
+        <a href={`/projects/${id}/watchers`} className="font-medium">
+          Watchers
+        </a>
+        <a href={`/projects/${id}/queue`} className="font-medium">
+          Queue
+        </a>
+        <a href={`/projects/${id}/webhooks`} className="font-medium">
+          Webhooks
+        </a>
         <a href={`/projects/${id}/runs/new`}>New run</a>
         <a href="/projects" className="text-slate-500">
           All projects

@@ -66,6 +66,12 @@ import { registerFindingsRoutes } from "./findings-routes.js";
 import { registerRegressionRoutes } from "./regression-routes.js";
 import { registerWatcherRoutes } from "./watcher-routes.js";
 import { registerQueueRoutes } from "./queue-routes.js";
+import { registerWebhooksRoutes } from "./webhooks-routes.js";
+import {
+  OutboundWebhookDispatcher,
+  RealDeliverySink,
+  type DeliverySink,
+} from "./webhooks/outbound.js";
 import type { RefResolver } from "../watcher/engine.js";
 import {
   gateRequest,
@@ -141,6 +147,12 @@ export interface AppCtx {
    * Used by queue promote so created runs actually begin.
    */
   enqueueStart: (runId: string) => void | Promise<void>;
+  /**
+   * Outbound webhook dispatcher (P8c). Undefined when outbound webhooks are
+   * explicitly disabled; otherwise a RealDeliverySink-backed dispatcher.
+   * Emit sites no-op cleanly when this is undefined.
+   */
+  outboundWebhooks?: OutboundWebhookDispatcher;
 }
 
 export interface CreateServerOptions {
@@ -178,6 +190,20 @@ export interface CreateServerOptions {
    * Defaults to a stub that throws "ref resolution not configured".
    */
   refResolver?: RefResolver;
+  /**
+   * Optional outbound webhook dispatcher (P8c). When omitted, createServer
+   * builds a default RealDeliverySink-backed dispatcher. Tests inject a
+   * dispatcher pre-bound to a FakeDeliverySink (backoffMs: [0,0,0]).
+   * Pass `null` to disable outbound webhooks entirely (hooks no-op).
+   */
+  outboundDispatcher?: OutboundWebhookDispatcher | null;
+  /**
+   * Optional delivery sink used when building the default dispatcher.
+   * Prefer `outboundDispatcher` for full control; this is a lighter seam.
+   */
+  outboundSink?: DeliverySink;
+  /** Override default backoff (ms) for the built-in dispatcher. */
+  outboundBackoffMs?: number[];
 }
 
 export interface ApiServer {
@@ -384,6 +410,26 @@ async function enqueueStart(app: AppCtx, runId: string): Promise<void> {
   void drainStartQueue(app);
 }
 
+/**
+ * Emit run.completed exactly once after a run reaches a terminal status.
+ * No-ops when outbound webhooks are not configured.
+ */
+function emitRunCompleted(app: AppCtx, runId: string): void {
+  if (!app.outboundWebhooks) return;
+  const run = app.queries.getRun(runId);
+  if (!run || !isTerminalStatus(run.status)) return;
+  void app.outboundWebhooks.dispatchEvent({
+    type: "run.completed",
+    projectId: run.projectId,
+    resourceId: runId,
+    data: {
+      status: run.status,
+      endedAt: run.endedAt,
+    },
+    timestamp: run.endedAt ?? new Date().toISOString(),
+  });
+}
+
 async function drainStartQueue(app: AppCtx): Promise<void> {
   while (app.activeStarts < app.concurrency && app.startQueue.length > 0) {
     const runId = app.startQueue.shift()!;
@@ -397,9 +443,17 @@ async function drainStartQueue(app: AppCtx): Promise<void> {
       const live = await startRun(app.dataDir, app.queries, runId, app.liveRuns, {
         ...(app.startOpts ?? {}),
         ...(app.adapter ? { adapter: app.adapter } : {}),
+        // Thread outbound dispatcher into the runner so run.completed fires
+        // exactly once at terminal finalization (not on status polls).
+        ...(app.outboundWebhooks
+          ? { outboundWebhooks: app.outboundWebhooks }
+          : {}),
       });
       // When the run finishes, free a slot and drain more.
       void live.done.finally(() => {
+        // Safety-net emit: if the runner path already emitted, the dispatcher
+        // will fan-out again only if called — the runner is the primary site.
+        // We do NOT re-emit here to keep exactly-once; the runner hook owns it.
         app.activeStarts = Math.max(0, app.activeStarts - 1);
         void drainStartQueue(app);
       });
@@ -411,6 +465,8 @@ async function drainStartQueue(app: AppCtx): Promise<void> {
           error: err instanceof Error ? err.message : String(err),
           controlState: "done",
         });
+        // Terminal via start-failure path — emit once here (runner never started).
+        emitRunCompleted(app, runId);
       } catch {
         // best-effort
       }
@@ -1063,7 +1119,12 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     const run = requireRun(app.queries, ctx.params.id!);
     assertNotTerminal(run);
     try {
-      const updated = await abortRun(run.id, app.queries, app.liveRuns);
+      const updated = await abortRun(
+        run.id,
+        app.queries,
+        app.liveRuns,
+        app.outboundWebhooks,
+      );
       sendJson(res, 200, runJson(updated));
     } catch (err) {
       mapControlError(err);
@@ -1128,7 +1189,12 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
       return;
     }
     if (action === "abort") {
-      const updated = await abortRun(run.id, app.queries, app.liveRuns);
+      const updated = await abortRun(
+        run.id,
+        app.queries,
+        app.liveRuns,
+        app.outboundWebhooks,
+      );
       sendJson(res, 200, runJson(updated));
       return;
     }
@@ -1292,6 +1358,22 @@ export function createServer(opts: CreateServerOptions): ApiServer {
 
   const liveRuns = createLiveRunsMap();
   const authEnabled = opts.authEnabled === true;
+
+  // Outbound webhooks (P8c): default RealDeliverySink dispatcher unless
+  // explicitly disabled (null) or a pre-built dispatcher is injected.
+  let outboundWebhooks: OutboundWebhookDispatcher | undefined;
+  if (opts.outboundDispatcher === null) {
+    outboundWebhooks = undefined;
+  } else if (opts.outboundDispatcher) {
+    outboundWebhooks = opts.outboundDispatcher;
+  } else {
+    outboundWebhooks = new OutboundWebhookDispatcher({
+      queries: opened.queries,
+      sink: opts.outboundSink ?? new RealDeliverySink(),
+      ...(opts.outboundBackoffMs ? { backoffMs: opts.outboundBackoffMs } : {}),
+    });
+  }
+
   const app: AppCtx = {
     queries: opened.queries,
     dataDir: opts.dataDir,
@@ -1310,6 +1392,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   // Wire the real start-pipeline seam (concurrency-limited).
   app.enqueueStart = (runId: string) => enqueueStart(app, runId);
   app.startOpts = opts.startOpts;
+  if (outboundWebhooks) app.outboundWebhooks = outboundWebhooks;
   if (opts.judgeRunner) app.judgeRunner = opts.judgeRunner;
   if (opts.defaultSystemPromptVersion) {
     app.defaultSystemPromptVersion = opts.defaultSystemPromptVersion;
@@ -1331,6 +1414,8 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerWatcherRoutes(router);
   // Eval queue (P8b) — add/peek/reorder/promote/drain.
   registerQueueRoutes(router);
+  // Outbound webhook subscriptions (P8c) — CRUD + deliveries + test fire.
+  registerWebhooksRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {
@@ -1413,3 +1498,16 @@ export {
   setNetwork,
 };
 export type { LiveRun, LiveRunsMap, StartRunOptions } from "./run-controller-bridge.js";
+export {
+  OutboundWebhookDispatcher,
+  RealDeliverySink,
+  FakeDeliverySink,
+  signPayload,
+  buildEventPayload,
+  dispatch,
+} from "./webhooks/outbound.js";
+export type {
+  DeliverySink,
+  OutboundEvent,
+  DispatchOpts,
+} from "./webhooks/outbound.js";

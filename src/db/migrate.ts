@@ -265,6 +265,37 @@ const DDL: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash)`,
 
+  // Outbound webhook subscriptions (P8c) — secret returned once at create.
+  `CREATE TABLE IF NOT EXISTS outbound_subscriptions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    url TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    event_types_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_outbound_subs_project ON outbound_subscriptions(project_id)`,
+
+  // Delivery attempt log for outbound webhooks.
+  `CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id TEXT PRIMARY KEY,
+    subscription_id TEXT NOT NULL REFERENCES outbound_subscriptions(id),
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    response_status INTEGER,
+    response_body TEXT,
+    error TEXT,
+    delivered_at TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_project_created ON webhook_deliveries(project_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_sub ON webhook_deliveries(subscription_id)`,
+
   // Version bookkeeping (in addition to PRAGMA user_version).
   `CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
