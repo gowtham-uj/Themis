@@ -11,15 +11,17 @@
 import { createServer as createHttpServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { existsSync, watch as fsWatch } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { Adapter } from "../adapters/types.js";
 import { openDb as defaultOpenDb, resolveProjectDir, type OpenDbResult } from "../db/index.js";
-import type {
-  DbQueries,
-  Project,
-  Run,
-  Task,
-  UpdateProjectInput,
-  UpdateTaskInput,
+import {
+  judgementDir,
+  type DbQueries,
+  type Project,
+  type Run,
+  type Task,
+  type UpdateProjectInput,
+  type UpdateTaskInput,
 } from "../db/queries.js";
 import type { ProjectCtx, TaskSpec } from "../domain.js";
 import {
@@ -55,6 +57,8 @@ import {
 } from "./run-controller-bridge.js";
 import {
   registerJudgementRoutes,
+  sanitizeFilenamePart,
+  serveHtmlFile,
   type JudgeRunner,
 } from "./judgements-routes.js";
 
@@ -930,18 +934,34 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     res.end(text);
   });
 
-  router.get("/api/runs/:id/report", (_req, res, ctx) => {
+  // GET /api/runs/:id/report — serve report.html from the latest completed judgement (P5b)
+  router.get("/api/runs/:id/report", async (_req, res, ctx) => {
     const app = appOf(ctx);
     const run = requireRun(app.queries, ctx.params.id!);
-    const partial = ctx.query.partial === "1" || ctx.query.partial === "true";
-    // Minimal envelope for P3; full report is P5.
-    sendJson(res, 200, {
-      run_id: run.id,
-      status: run.status,
-      control_state: run.controlState,
-      partial,
-      report: null,
-      note: "Full report generation lands in P5",
+    const list = app.queries.listJudgements({ runId: run.id });
+    // Prefer status=completed with a verdictPath; newest first by endedAt||createdAt.
+    const candidates = list.judgements
+      .filter((j) => j.status === "completed" && j.verdictPath)
+      .slice();
+    candidates.sort((a, b) => {
+      const ta = a.endedAt ?? a.createdAt ?? "";
+      const tb = b.endedAt ?? b.createdAt ?? "";
+      if (ta !== tb) return tb.localeCompare(ta);
+      return b.id.localeCompare(a.id);
+    });
+    const j = candidates[0];
+    if (!j) {
+      throw notFound(`report not available for run ${run.id}`);
+    }
+    const p = join(judgementDir(app.dataDir, j.projectId, j.id), "report.html");
+    if (!existsSync(p)) {
+      throw notFound(`report not available for run ${run.id}`);
+    }
+    const download =
+      ctx.query.download === "1" || ctx.query.download === "true";
+    await serveHtmlFile(res, p, {
+      download,
+      filename: `report-${sanitizeFilenamePart(run.id)}.html`,
     });
   });
 

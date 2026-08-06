@@ -24,6 +24,10 @@ import {
   VerdictValidationError,
   type Verdict,
 } from "./verdict.js";
+import {
+  renderVerdictReport,
+  type ReportContext,
+} from "./report/index.js";
 
 /** Task slice needed by the judge (prompt + rubric + category). */
 export interface JudgeTaskInput {
@@ -72,6 +76,8 @@ export interface JudgeRunResult {
   judgementId: string;
   judgementDir: string;
   verdictPath?: string;
+  /** On-disk report.html when render succeeded (completed only). */
+  reportPath?: string;
   eventsPath: string;
   status: JudgeRunStatus;
   /** Validated verdict when status is completed. */
@@ -248,12 +254,43 @@ export async function judgeRun(input: JudgeRunInput): Promise<JudgeRunResult> {
       "utf8",
     );
 
+    // P5b: render report.html after a validated verdict write. Render errors must
+    // not fail the judgement — verdict.json remains the source of truth.
+    let reportPath: string | undefined;
+    try {
+      const reportCtx = buildReportContext({
+        input,
+        runMeta,
+        systemPromptVersion,
+        judgedAt: new Date().toISOString(),
+      });
+      const reportHtml = renderVerdictReport(verdict, reportCtx);
+      const reportFile = join(judgementDir, "report.html");
+      await writeFile(reportFile, reportHtml, "utf8");
+      reportPath = reportFile;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Non-fatal: verdict.json is already written and is the source of truth.
+      await emit({
+        v: SCHEMA_VERSION,
+        runId: judgementId,
+        seq: 0,
+        ts: new Date().toISOString(),
+        type: "error",
+        message: `report render failed: ${message}`,
+        phase: "agent",
+        fatal: false,
+      });
+      // continue without reportPath
+    }
+
     await emitRunEnd(emit, judgementId, "completed");
 
     return {
       judgementId,
       judgementDir,
       verdictPath,
+      reportPath,
       eventsPath,
       status: "completed",
       verdict,
@@ -293,6 +330,55 @@ async function emitError(
     phase: "agent",
     fatal: true,
   });
+}
+
+/**
+ * Build ReportContext from worker-scoped inputs (run.json meta + JudgeRunInput).
+ * Pure-ish: no I/O; best-effort field extraction from unknown run metadata.
+ */
+function buildReportContext(args: {
+  input: JudgeRunInput;
+  runMeta: unknown;
+  systemPromptVersion: string;
+  judgedAt: string;
+}): ReportContext {
+  const { input, runMeta, systemPromptVersion, judgedAt } = args;
+  const meta =
+    runMeta && typeof runMeta === "object"
+      ? (runMeta as Record<string, unknown>)
+      : {};
+
+  const str = (v: unknown): string | undefined =>
+    typeof v === "string" && v.length > 0 ? v : undefined;
+
+  const runId = str(meta.runId) ?? str(meta.id);
+  const agent = str(meta.agent);
+  const model = str(meta.model);
+  const status = str(meta.status);
+  const durationMs =
+    typeof meta.durationMs === "number" ? meta.durationMs : undefined;
+
+  const runMetadata: Record<string, unknown> = {};
+  if (status !== undefined) runMetadata.status = status;
+  if (durationMs !== undefined) runMetadata.durationMs = durationMs;
+  if (typeof meta.startedAt === "string") runMetadata.startedAt = meta.startedAt;
+  if (typeof meta.endedAt === "string") runMetadata.endedAt = meta.endedAt;
+
+  return {
+    runId,
+    taskPrompt: input.task.prompt,
+    agentCategory:
+      typeof input.task.agentCategory === "string"
+        ? input.task.agentCategory
+        : undefined,
+    agent,
+    model,
+    judgeModel: input.judgeModel,
+    systemPromptVersion,
+    judgedAt,
+    hasSourceArtifacts: input.hasSourceArtifacts,
+    runMetadata: Object.keys(runMetadata).length > 0 ? runMetadata : undefined,
+  };
 }
 
 async function emitRunEnd(

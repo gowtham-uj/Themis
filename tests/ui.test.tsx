@@ -22,6 +22,7 @@ import {
   getProject,
   getRun,
   getRunDiff,
+  getRunReport,
   getRunEventsSSE,
   getRunEventsStream,
   listProjects,
@@ -30,6 +31,7 @@ import {
   pauseRun,
   resumeRun,
   runEventsUrl,
+  runReportUrl,
   setNetwork,
   startRun,
   syncTasks,
@@ -372,6 +374,46 @@ describe("api client (mocked fetch)", () => {
     });
     const patch = await getRunDiff("r1", { ...base, fetch: fetchFn });
     expect(patch).toContain("+hello");
+  });
+
+  it("runReportUrl builds GET /api/runs/:id/report (?download=1)", () => {
+    expect(runReportUrl("r1", { baseUrl: "http://api.test" })).toBe(
+      "http://api.test/api/runs/r1/report",
+    );
+    expect(
+      runReportUrl("r1", { baseUrl: "http://api.test", download: true }),
+    ).toBe("http://api.test/api/runs/r1/report?download=1");
+    expect(runReportUrl("a/b", { baseUrl: "" })).toBe(
+      `/api/runs/${encodeURIComponent("a/b")}/report`,
+    );
+  });
+
+  it("getRunReport GETs /api/runs/:id/report as html text", async () => {
+    const html = "<!doctype html><html><body>report</body></html>";
+    const fetchFn = mockFetch((c) => {
+      expect(c.method).toBe("GET");
+      expect(c.url).toBe("http://api.test/api/runs/r1/report");
+      expect(c.headers.accept).toBe("text/html");
+      return new Response(html, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    });
+    const body = await getRunReport("r1", { ...base, fetch: fetchFn });
+    expect(body).toContain("<!doctype html>");
+    expect(body).toContain("report");
+  });
+
+  it("getRunReport throws ApiError on !ok", async () => {
+    const fetchFn = mockFetch(() =>
+      new Response(JSON.stringify({ detail: "not found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await expect(
+      getRunReport("missing", { ...base, fetch: fetchFn }),
+    ).rejects.toMatchObject({ name: "ApiError", status: 404 });
   });
 
   it("pauseRun POSTs /api/runs/:id/pause?mode=", async () => {

@@ -11,10 +11,12 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { existsSync, watch as fsWatch } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Verdict } from "../judge/verdict.js";
 import {
   judgeEventsPath,
+  judgementDir,
   type Judgement,
   type JudgementWithVerdict,
   type DbQueries,
@@ -184,6 +186,44 @@ function requireJudgement(
 const DEFAULT_SYSTEM_PROMPT_VERSION = "v2";
 const DEFAULT_JUDGE_MODEL = "claude-sonnet-4-20250514";
 const DEFAULT_JUDGE_PROVIDER = "anthropic";
+
+// ---------------------------------------------------------------------------
+// HTML file serving (report.html)
+// ---------------------------------------------------------------------------
+
+/**
+ * Sanitize an id/name for use in a Content-Disposition filename.
+ * Replaces characters outside [A-Za-z0-9._-] with `_`.
+ */
+export function sanitizeFilenamePart(name: string): string {
+  return name.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+/**
+ * Serve a self-contained HTML file with security headers.
+ * Mirrors the raw style of GET /api/runs/:id/diff (no sendHtml helper).
+ */
+export async function serveHtmlFile(
+  res: ServerResponse,
+  fullPath: string,
+  opts: { download?: boolean; filename?: string } = {},
+): Promise<void> {
+  const text = await readFile(fullPath, "utf8");
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Length", Buffer.byteLength(text));
+  if (opts.download) {
+    const filename = opts.filename ?? "report.html";
+    res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+  }
+  res.end(text);
+}
+
+/** Truthy download query flag: `?download=1` or `?download=true`. */
+function isDownloadQuery(query: Record<string, string>): boolean {
+  return query.download === "1" || query.download === "true";
+}
 
 // ---------------------------------------------------------------------------
 // SSE / ndjson for judge.jsonl
@@ -504,6 +544,23 @@ export function registerJudgementRoutes(router: Router): void {
           : "sse";
 
     await streamJudgeEvents(req, res, app, j, sinceSeq, finalMode);
+  });
+
+  // GET /api/judgements/:id/report — serve report.html (P5b)
+  router.get("/api/judgements/:id/report", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const j = requireJudgement(app.queries, ctx.params.id!);
+    const p = join(
+      judgementDir(app.dataDir, j.projectId, j.id),
+      "report.html",
+    );
+    if (!existsSync(p)) {
+      throw notFound(`report not available for judgement ${j.id}`);
+    }
+    await serveHtmlFile(res, p, {
+      download: isDownloadQuery(ctx.query),
+      filename: `report-judgement-${sanitizeFilenamePart(j.id)}.html`,
+    });
   });
 }
 

@@ -700,6 +700,41 @@ export async function getRunDiff(
   return res.text();
 }
 
+/**
+ * Build the URL for a run's HTML verdict report.
+ * Pass `download: true` to request Content-Disposition attachment.
+ */
+export function runReportUrl(
+  runId: string,
+  opts: { download?: boolean; baseUrl?: string } = {},
+): string {
+  const base = opts.baseUrl !== undefined ? opts.baseUrl : getApiBaseUrl();
+  const path = `/api/runs/${encodeURIComponent(runId)}/report`;
+  const query = opts.download ? { download: "1" } : undefined;
+  return joinUrl(base, path) + buildQuery(query);
+}
+
+/** GET /api/runs/:id/report — returns self-contained report.html text. */
+export async function getRunReport(
+  runId: string,
+  opts: ApiClientOptions = {},
+): Promise<string> {
+  const base = opts.baseUrl !== undefined ? opts.baseUrl : getApiBaseUrl();
+  const fetchFn = opts.fetch ?? globalThis.fetch;
+  const url = runReportUrl(runId, { baseUrl: base });
+  const res = await fetchFn(url, {
+    method: "GET",
+    headers: { Accept: "text/html", ...opts.headers },
+  });
+  if (!res.ok) {
+    throw new ApiError(
+      res.status,
+      `API GET /api/runs/${runId}/report failed: ${res.status}`,
+    );
+  }
+  return res.text();
+}
+
 // ---------------------------------------------------------------------------
 // Run events — SSE URL + EventSource + fetch-stream reader
 // ---------------------------------------------------------------------------
@@ -925,6 +960,9 @@ export function createApiClient(opts: ApiClientOptions = {}) {
     getRun: (runId: string) => getRun(runId, opts),
     listRuns: (projectId: string) => listRuns(projectId, opts),
     getRunDiff: (runId: string) => getRunDiff(runId, opts),
+    getRunReport: (runId: string) => getRunReport(runId, opts),
+    runReportUrl: (runId: string, o?: { download?: boolean }) =>
+      runReportUrl(runId, { ...o, baseUrl: opts.baseUrl }),
     runEventsUrl: (runId: string, since?: number) =>
       runEventsUrl(runId, { since, baseUrl: opts.baseUrl }),
     getRunEventsSSE: (runId: string, since?: number) =>

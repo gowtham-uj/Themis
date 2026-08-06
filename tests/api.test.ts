@@ -448,7 +448,7 @@ describe("REST API (P3c)", () => {
     if (live) await live.done.catch(() => undefined);
   });
 
-  it("report partial envelope", async () => {
+  it("report is 404 when no completed judgement exists (P5b)", async () => {
     const { base, api } = await boot({ holdMs: 20 });
     const proj = await http(base, "POST", "/api/projects", {
       body: { name: "R", slug: "r" },
@@ -468,12 +468,9 @@ describe("REST API (P3c)", () => {
     });
     const runId = (start.json as { run_ids: string[] }).run_ids[0]!;
 
+    // Full HTML report is P5b: without a completed judgement + report.html → 404.
     const report = await http(base, "GET", `/api/runs/${runId}/report?partial=1`);
-    expect(report.status).toBe(200);
-    const body = report.json as { run_id: string; partial: boolean; report: null };
-    expect(body.run_id).toBe(runId);
-    expect(body.partial).toBe(true);
-    expect(body.report).toBeNull();
+    expect(report.status).toBe(404);
 
     const live = api.liveRuns.get(runId);
     if (live) await live.done.catch(() => undefined);
