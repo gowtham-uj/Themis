@@ -386,6 +386,29 @@ export const users = sqliteTable("users", {
 });
 
 // ---------------------------------------------------------------------------
+// API tokens (P8b-auth) — store hash only; plaintext returned once at create
+// ---------------------------------------------------------------------------
+
+export const apiTokens = sqliteTable(
+  "api_tokens",
+  {
+    id: text("id").primaryKey(),
+    /** Null = project-scoped system token (no user). */
+    userId: text("user_id"),
+    /** Null = all projects; set value scopes the token to one project. */
+    projectId: text("project_id"),
+    /** sha256 hex of the plaintext bearer token. NEVER store plaintext. */
+    tokenHash: text("token_hash").notNull(),
+    label: text("label"),
+    /** 1 = read-only (GET only). */
+    readOnly: integer("read_only").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+    revokedAt: text("revoked_at"),
+  },
+  (t) => [index("idx_api_tokens_hash").on(t.tokenHash)],
+);
+
+// ---------------------------------------------------------------------------
 // Schema registry (for drizzle + openDb)
 // ---------------------------------------------------------------------------
 
@@ -404,6 +427,7 @@ export const schema = {
   findingOccurrences,
   checks,
   users,
+  apiTokens,
 };
 
 export type Schema = typeof schema;

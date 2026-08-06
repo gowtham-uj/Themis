@@ -252,6 +252,19 @@ const DDL: string[] = [
     role TEXT
   )`,
 
+  // API tokens (P8b-auth). Plaintext is NEVER stored — only sha256 hex of bearer.
+  `CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    project_id TEXT,
+    token_hash TEXT NOT NULL,
+    label TEXT,
+    read_only INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash)`,
+
   // Version bookkeeping (in addition to PRAGMA user_version).
   `CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,

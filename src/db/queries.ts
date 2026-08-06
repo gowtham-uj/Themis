@@ -9,7 +9,7 @@
  * Judgement/score/finding write APIs are intentionally stubbed (P4/P6 fill them).
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { and, eq, desc } from "drizzle-orm";
@@ -35,6 +35,7 @@ import {
 } from "./findings.js";
 import {
   agents,
+  apiTokens,
   findingOccurrences,
   findings,
   judgements,
@@ -560,6 +561,46 @@ export interface PromoteQueueEntryResult {
   batchIds: string[];
 }
 
+// ---------------------------------------------------------------------------
+// API tokens (P8b-auth) — hash only; plaintext returned once at create
+// ---------------------------------------------------------------------------
+
+/** Durable token row. NEVER includes plaintext. */
+export interface ApiToken {
+  id: string;
+  /** Null = project-scoped system token (no user). */
+  userId: string | null;
+  /** Null = all projects; a value scopes the token. */
+  projectId: string | null;
+  /** sha256 hex of the plaintext bearer. */
+  tokenHash: string;
+  label: string | null;
+  readOnly: boolean;
+  createdAt: string;
+  /** ISO timestamp when revoked; null = active. */
+  revokedAt: string | null;
+}
+
+export interface CreateApiTokenInput {
+  userId?: string | null;
+  projectId?: string | null;
+  label?: string | null;
+  readOnly?: boolean;
+}
+
+/** createApiToken result — plaintext surfaces ONCE, never stored. */
+export interface CreatedApiToken extends ApiToken {
+  /** Plaintext bearer (`aev_` + 32 url-safe base64). Only on create. */
+  token: string;
+}
+
+export interface ListApiTokensOpts {
+  projectId?: string;
+  userId?: string;
+  /** When true, include revoked rows (default false). */
+  includeRevoked?: boolean;
+}
+
 /**
  * Shared query surface. Both SqliteQueries and MemoryQueries implement this.
  */
@@ -636,6 +677,12 @@ export interface QueryStore {
   createWatcherRule(projectId: string, input: CreateWatcherRuleInput): WatcherRule;
   /** Get a rule with webhookSecret stripped to null. */
   getWatcherRule(id: string): WatcherRule | null;
+  /**
+   * Return the raw webhook secret for HMAC verification (webhook ingress).
+   * NEVER log the return value. Returns null when the rule is missing or has
+   * no secret configured.
+   */
+  getRawWatcherSecret(ruleId: string): string | null;
   /** List project rules with secrets stripped. */
   listWatcherRules(
     projectId: string,
@@ -673,6 +720,22 @@ export interface QueryStore {
   removeQueueEntry(id: string): QueueEntry;
   /** Soft-remove all status=queued entries. Leaves promoted/running untouched. */
   drainQueue(projectId: string): { removed: number };
+
+  // ---- API tokens (P8b-auth) ----
+  /**
+   * Mint a token. Returns plaintext ONCE (`token`) + the durable row fields.
+   * Only the sha256 hash is stored — never the plaintext.
+   */
+  createApiToken(input?: CreateApiTokenInput): CreatedApiToken;
+  /** Lookup by token_hash. Returns null when missing. Includes revoked rows. */
+  getApiToken(tokenHash: string): ApiToken | null;
+  /** Soft-revoke by token_hash (sets revoked_at). No-op if already revoked/missing. */
+  revokeApiToken(tokenHash: string): void;
+  /**
+   * List tokens (hashes only — never plaintext). Filters optional.
+   * Excludes revoked by default.
+   */
+  listApiTokens(opts?: ListApiTokensOpts): ApiToken[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,6 +1213,29 @@ function mapWatcherEventRow(
     batchId: row.batchId ?? null,
     error: row.error ?? null,
   };
+}
+
+function mapApiTokenRow(row: typeof apiTokens.$inferSelect): ApiToken {
+  return {
+    id: row.id,
+    userId: row.userId ?? null,
+    projectId: row.projectId ?? null,
+    tokenHash: row.tokenHash,
+    label: row.label ?? null,
+    readOnly: row.readOnly === 1,
+    createdAt: row.createdAt,
+    revokedAt: row.revokedAt ?? null,
+  };
+}
+
+/**
+ * Generate plaintext `aev_` + 32 url-safe base64 chars and its sha256 hex.
+ * Plaintext must never be written to the DB.
+ */
+function mintApiTokenPair(): { token: string; tokenHash: string } {
+  const token = `aev_${randomBytes(24).toString("base64url")}`;
+  const tokenHash = createHash("sha256").update(token, "utf8").digest("hex");
+  return { token, tokenHash };
 }
 
 function mapQueueEntryRow(row: typeof queueEntries.$inferSelect): QueueEntry {
@@ -2228,6 +2314,21 @@ export class SqliteQueries implements QueryStore {
     return row ? stripWebhookSecret(mapWatcherRuleRow(row)) : null;
   }
 
+  /**
+   * Raw webhook secret for HMAC verify. NEVER log the return value.
+   */
+  getRawWatcherSecret(ruleId: string): string | null {
+    const row = this.db
+      .select()
+      .from(watcherRules)
+      .where(eq(watcherRules.id, ruleId))
+      .get();
+    if (!row) return null;
+    const secret = row.webhookSecret;
+    if (secret == null || secret === "") return null;
+    return secret;
+  }
+
   listWatcherRules(
     projectId: string,
     opts: { includeDisabled?: boolean } = {},
@@ -2640,6 +2741,74 @@ export class SqliteQueries implements QueryStore {
     }
     return { removed: queued.length };
   }
+
+  // ---- API tokens (P8b-auth) ----
+
+  createApiToken(input: CreateApiTokenInput = {}): CreatedApiToken {
+    const id = newId();
+    const ts = nowIso();
+    const { token, tokenHash } = mintApiTokenPair();
+    const readOnly = input.readOnly === true ? 1 : 0;
+    this.db
+      .insert(apiTokens)
+      .values({
+        id,
+        userId: input.userId ?? null,
+        projectId: input.projectId ?? null,
+        tokenHash,
+        label: input.label ?? null,
+        readOnly,
+        createdAt: ts,
+        revokedAt: null,
+      })
+      .run();
+    const row = this.db
+      .select()
+      .from(apiTokens)
+      .where(eq(apiTokens.id, id))
+      .get();
+    if (!row) throw new Error("failed to create api token");
+    return { ...mapApiTokenRow(row), token };
+  }
+
+  getApiToken(tokenHash: string): ApiToken | null {
+    const row = this.db
+      .select()
+      .from(apiTokens)
+      .where(eq(apiTokens.tokenHash, tokenHash))
+      .get();
+    return row ? mapApiTokenRow(row) : null;
+  }
+
+  revokeApiToken(tokenHash: string): void {
+    const existing = this.getApiToken(tokenHash);
+    if (!existing) return;
+    if (existing.revokedAt) return;
+    this.db
+      .update(apiTokens)
+      .set({ revokedAt: nowIso() })
+      .where(eq(apiTokens.tokenHash, tokenHash))
+      .run();
+  }
+
+  listApiTokens(opts: ListApiTokensOpts = {}): ApiToken[] {
+    let rows = this.db.select().from(apiTokens).all().map(mapApiTokenRow);
+    if (opts.projectId !== undefined) {
+      rows = rows.filter((t) => t.projectId === opts.projectId);
+    }
+    if (opts.userId !== undefined) {
+      rows = rows.filter((t) => t.userId === opts.userId);
+    }
+    if (!opts.includeRevoked) {
+      rows = rows.filter((t) => t.revokedAt == null);
+    }
+    // Newest first.
+    rows.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
+      return b.id.localeCompare(a.id);
+    });
+    return rows;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2659,6 +2828,7 @@ export class MemoryQueries implements QueryStore {
   private watcherRules = new Map<string, WatcherRule>();
   private watcherEvents = new Map<string, WatcherEvent>();
   private queueEntries = new Map<string, QueueEntry>();
+  private apiTokens = new Map<string, ApiToken>();
 
   constructor(private readonly dataDir: string) {}
 
@@ -3378,6 +3548,16 @@ export class MemoryQueries implements QueryStore {
     return r ? stripWebhookSecret({ ...r, action: { ...r.action } }) : null;
   }
 
+  /**
+   * Raw webhook secret for HMAC verify. NEVER log the return value.
+   */
+  getRawWatcherSecret(ruleId: string): string | null {
+    const r = this.watcherRules.get(ruleId);
+    if (!r) return null;
+    if (r.webhookSecret == null || r.webhookSecret === "") return null;
+    return r.webhookSecret;
+  }
+
   listWatcherRules(
     projectId: string,
     opts: { includeDisabled?: boolean } = {},
@@ -3740,6 +3920,57 @@ export class MemoryQueries implements QueryStore {
       });
     }
     return { removed: queued.length };
+  }
+
+  // ---- API tokens (P8b-auth) ----
+
+  createApiToken(input: CreateApiTokenInput = {}): CreatedApiToken {
+    const { token, tokenHash } = mintApiTokenPair();
+    const row: ApiToken = {
+      id: newId(),
+      userId: input.userId ?? null,
+      projectId: input.projectId ?? null,
+      tokenHash,
+      label: input.label ?? null,
+      readOnly: input.readOnly === true,
+      createdAt: nowIso(),
+      revokedAt: null,
+    };
+    this.apiTokens.set(tokenHash, row);
+    return { ...row, token };
+  }
+
+  getApiToken(tokenHash: string): ApiToken | null {
+    const row = this.apiTokens.get(tokenHash);
+    return row ? { ...row } : null;
+  }
+
+  revokeApiToken(tokenHash: string): void {
+    const existing = this.apiTokens.get(tokenHash);
+    if (!existing) return;
+    if (existing.revokedAt) return;
+    this.apiTokens.set(tokenHash, {
+      ...existing,
+      revokedAt: nowIso(),
+    });
+  }
+
+  listApiTokens(opts: ListApiTokensOpts = {}): ApiToken[] {
+    let rows = [...this.apiTokens.values()].map((t) => ({ ...t }));
+    if (opts.projectId !== undefined) {
+      rows = rows.filter((t) => t.projectId === opts.projectId);
+    }
+    if (opts.userId !== undefined) {
+      rows = rows.filter((t) => t.userId === opts.userId);
+    }
+    if (!opts.includeRevoked) {
+      rows = rows.filter((t) => t.revokedAt == null);
+    }
+    rows.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
+      return b.id.localeCompare(a.id);
+    });
+    return rows;
   }
 }
 

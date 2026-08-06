@@ -50,3 +50,30 @@ export {
   type CreateJudgementBody,
   type JudgementAppCtx,
 } from "./judgements-routes.js";
+
+export {
+  extractBearer,
+  hashToken,
+  generatePlaintextToken,
+  verifyToken,
+  authMiddleware,
+  gateRequest,
+  getRequestAuth,
+  setRequestAuth,
+  isPublicApiPath,
+  isLoopbackAddress,
+  type AuthInfo,
+  type AuthMiddlewareOpts,
+} from "./auth.js";
+
+export {
+  withIdempotency,
+  dedupStore,
+  IdempotencyStore,
+  header as readHeader,
+  idempotencyStoreKey,
+  IDEMPOTENCY_MAX_SIZE,
+  IDEMPOTENCY_TTL_MS,
+  type IdempotencyEntry,
+  type IdempotencyMapLike,
+} from "./middleware.js";

@@ -2,7 +2,8 @@
  * REST API server — project/task/run CRUD + run control + SSE events.
  *
  * Bootstraps a tiny zero-dep router with a shared AppCtx. Routes follow
- * plan/api.md (project-scoped). Auth is deferred (P8).
+ * plan/api.md (project-scoped). Auth is optional via CreateServerOptions.authEnabled
+ * (default false for local-dev + existing tests; see src/api/auth.ts).
  *
  * In this Dockerless env runs execute via FakeContainerRuntime (see
  * run-controller-bridge.ts). Concurrency cap is 1 for P3 (sequential starts).
@@ -63,10 +64,32 @@ import {
 } from "./judgements-routes.js";
 import { registerFindingsRoutes } from "./findings-routes.js";
 import { registerRegressionRoutes } from "./regression-routes.js";
+import { registerWatcherRoutes } from "./watcher-routes.js";
+import { registerQueueRoutes } from "./queue-routes.js";
+import type { RefResolver } from "../watcher/engine.js";
+import {
+  gateRequest,
+  getRequestAuth,
+  hashToken,
+} from "./auth.js";
+import {
+  IdempotencyStore,
+  type IdempotencyEntry,
+  withIdempotency,
+} from "./middleware.js";
 
 // ---------------------------------------------------------------------------
 // App context
 // ---------------------------------------------------------------------------
+
+/** Stub RefResolver used when createServer is not given a real/fake resolver. */
+function defaultRefResolver(): RefResolver {
+  return {
+    async resolveRef() {
+      throw new Error("ref resolution not configured");
+    },
+  };
+}
 
 export interface AppCtx {
   queries: DbQueries;
@@ -76,8 +99,15 @@ export interface AppCtx {
   adapter?: Adapter;
   /** Max concurrent live runs (P3 = 1). */
   concurrency: number;
-  /** In-memory Idempotency-Key → response body. */
-  idempotency: Map<string, { status: number; body: unknown; headers?: Record<string, string> }>;
+  /**
+   * In-memory Idempotency-Key → response body.
+   * Backed by {@link IdempotencyStore} (LRU + TTL); Map-compatible surface.
+   */
+  idempotency: {
+    has(key: string): boolean;
+    get(key: string): IdempotencyEntry | undefined;
+    set(key: string, value: IdempotencyEntry): unknown;
+  };
   /** FIFO of run ids waiting for a slot (concurrency). */
   startQueue: string[];
   /** Currently starting/running count. */
@@ -94,6 +124,23 @@ export interface AppCtx {
   defaultSystemPromptVersion?: string;
   defaultJudgeModel?: string;
   defaultJudgeProvider?: string;
+  /**
+   * When true, every /api/* route (except GET /api/health) requires a valid
+   * Bearer token. Default false so local-dev + the existing unauthenticated
+   * test suite keep working (loopback UI server-side fetch included).
+   */
+  authEnabled: boolean;
+  /**
+   * Resolve a git ref → sha (+ optional imageTag) for watcher manual fire /
+   * webhook ingress. Tests inject a fake; production wires git ls-remote.
+   * Defaults to a stub that throws "ref resolution not configured".
+   */
+  refResolver: RefResolver;
+  /**
+   * Enqueue a run into the concurrency-limited start pipeline.
+   * Used by queue promote so created runs actually begin.
+   */
+  enqueueStart: (runId: string) => void | Promise<void>;
 }
 
 export interface CreateServerOptions {
@@ -119,6 +166,18 @@ export interface CreateServerOptions {
   defaultSystemPromptVersion?: string;
   defaultJudgeModel?: string;
   defaultJudgeProvider?: string;
+  /**
+   * Gate /api/* behind Bearer tokens. Default **false** (local-dev path):
+   * existing tests that hit routes unauthenticated MUST keep working.
+   * When true, require a valid non-revoked token except GET /api/health.
+   * See src/api/auth.ts for the loopback/default-off contract.
+   */
+  authEnabled?: boolean;
+  /**
+   * Optional ref resolver for watcher routes. Tests inject a fake.
+   * Defaults to a stub that throws "ref resolution not configured".
+   */
+  refResolver?: RefResolver;
 }
 
 export interface ApiServer {
@@ -535,6 +594,14 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
   // Stash startOpts on a closure via app.startOpts (set at create time).
   void startOpts;
 
+  // ---- health (public even when authEnabled) ----
+  router.get("/api/health", (_req, res) => {
+    sendJson(res, 200, { ok: true });
+  });
+
+  // ---- API tokens (P8b-auth). Bootstrap first token via queries.createApiToken. ----
+  registerTokenRoutes(router);
+
   // ---- projects ----
 
   router.post("/api/projects", async (req, res, ctx) => {
@@ -756,35 +823,30 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
 
   // ---- runs (create under project) ----
 
-  router.post("/api/projects/:id/runs", async (req, res, ctx) => {
-    const app = appOf(ctx);
-    const project = requireProject(app.queries, ctx.params.id!);
+  router.post(
+    "/api/projects/:id/runs",
+    withIdempotency(async (req, res, ctx) => {
+      const app = appOf(ctx);
+      const project = requireProject(app.queries, ctx.params.id!);
 
-    const idemKey = header(req, "idempotency-key");
-    if (idemKey && app.idempotency.has(idemKey)) {
-      const cached = app.idempotency.get(idemKey)!;
-      sendJson(res, cached.status, cached.body, cached.headers);
-      return;
-    }
-
-    const body = await readJsonBody<{
-      taskId?: string;
-      task_id?: string;
-      taskTags?: string[];
-      task_tags?: string[];
-      agent?: string;
-      agentId?: string;
-      agent_id?: string;
-      model?: string;
-      provider?: string;
-      repeats?: number;
-      params?: Record<string, unknown>;
-      adapterOverrides?: Record<string, unknown>;
-      adapter_overrides?: Record<string, unknown>;
-      autoJudge?: boolean;
-      trigger?: string;
-      trigger_ref?: string;
-    }>(req);
+      const body = await readJsonBody<{
+        taskId?: string;
+        task_id?: string;
+        taskTags?: string[];
+        task_tags?: string[];
+        agent?: string;
+        agentId?: string;
+        agent_id?: string;
+        model?: string;
+        provider?: string;
+        repeats?: number;
+        params?: Record<string, unknown>;
+        adapterOverrides?: Record<string, unknown>;
+        adapter_overrides?: Record<string, unknown>;
+        autoJudge?: boolean;
+        trigger?: string;
+        trigger_ref?: string;
+      }>(req);
 
     const taskId = body.taskId ?? body.task_id;
     const taskTags = body.taskTags ?? body.task_tags ?? [];
@@ -869,12 +931,13 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
       Location: `/api/runs/${runs[0]!.id}`,
     };
 
-    if (idemKey) {
-      app.idempotency.set(idemKey, { status: 202, body: bodyOut, headers });
-    }
-
+    // Idempotency capture is handled by the withIdempotency wrapper around this
+    // handler (method+path scoped, TOCTOU-safe via store.reserve). The inline
+    // per-key cache was removed: it keyed on the raw header alone (cross-route
+    // collision risk) and used check-then-act (concurrent double-execute).
     sendJson(res, 202, bodyOut, headers);
-  });
+    }),
+  );
 
   router.get("/api/projects/:id/runs", (_req, res, ctx) => {
     const app = appOf(ctx);
@@ -1088,6 +1151,110 @@ function header(req: IncomingMessage, name: string): string | undefined {
   return v;
 }
 
+function apiTokenJson(t: {
+  id: string;
+  userId: string | null;
+  projectId: string | null;
+  tokenHash: string;
+  label: string | null;
+  readOnly: boolean;
+  createdAt: string;
+  revokedAt: string | null;
+  token?: string;
+}) {
+  // NEVER include plaintext unless it was just minted (create response).
+  const base = {
+    id: t.id,
+    user_id: t.userId,
+    project_id: t.projectId,
+    token_hash: t.tokenHash,
+    label: t.label,
+    read_only: t.readOnly,
+    created_at: t.createdAt,
+    revoked_at: t.revokedAt,
+  };
+  if (t.token !== undefined) {
+    return { ...base, token: t.token };
+  }
+  return base;
+}
+
+/**
+ * Token management routes. Always registered; when authEnabled the pre-dispatch
+ * gate requires a valid (non-read-only for writes) Bearer. Bootstrap the first
+ * token via `queries.createApiToken(...)` (CLI/seed) — there is no unauthenticated
+ * mint path when auth is on.
+ */
+function registerTokenRoutes(router: Router): void {
+  router.get("/api/tokens", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const projectId = ctx.query.project_id || ctx.query.projectId;
+    const userId = ctx.query.user_id || ctx.query.userId;
+    const list = app.queries.listApiTokens({
+      ...(projectId ? { projectId } : {}),
+      ...(userId ? { userId } : {}),
+    });
+    // Hashes only — never plaintext.
+    sendJson(res, 200, { tokens: list.map((t) => apiTokenJson(t)) });
+  });
+
+  router.post("/api/tokens", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    // Gate already rejects read-only tokens on POST when authEnabled.
+    // When auth is off (local), anyone can mint (dev convenience).
+    const auth = getRequestAuth(req);
+    if (auth?.readOnly) {
+      throw new HttpError(
+        403,
+        "Forbidden",
+        "read-only token cannot perform write operations",
+        { type: "https://agenteval.dev/errors/forbidden" },
+      );
+    }
+    const body = await readJsonBody<{
+      user_id?: string | null;
+      userId?: string | null;
+      project_id?: string | null;
+      projectId?: string | null;
+      label?: string | null;
+      read_only?: boolean;
+      readOnly?: boolean;
+    }>(req);
+    const created = app.queries.createApiToken({
+      userId: body.user_id ?? body.userId ?? null,
+      projectId: body.project_id ?? body.projectId ?? null,
+      label: body.label ?? null,
+      readOnly: body.read_only ?? body.readOnly ?? false,
+    });
+    // Plaintext returned ONCE.
+    sendJson(res, 201, apiTokenJson(created));
+  });
+
+  router.delete("/api/tokens/:tokenHash", (req, res, ctx) => {
+    const app = appOf(ctx);
+    const auth = getRequestAuth(req);
+    if (auth?.readOnly) {
+      throw new HttpError(
+        403,
+        "Forbidden",
+        "read-only token cannot perform write operations",
+        { type: "https://agenteval.dev/errors/forbidden" },
+      );
+    }
+    const tokenHash = ctx.params.tokenHash!;
+    // Accept either the hash itself or (defensive) a mistaken plaintext —
+    // if it looks like aev_*, hash it. Prefer hash-only clients.
+    const hash =
+      tokenHash.startsWith("aev_") && tokenHash.length > 10
+        ? hashToken(tokenHash)
+        : tokenHash;
+    const existing = app.queries.getApiToken(hash);
+    if (!existing) throw notFound(`token not found`);
+    app.queries.revokeApiToken(hash);
+    sendJson(res, 200, { revoked: true, token_hash: hash });
+  });
+}
+
 async function waitForLive(
   app: AppCtx,
   runId: string,
@@ -1124,16 +1291,24 @@ export function createServer(opts: CreateServerOptions): ApiServer {
     : open(opts.dataDir);
 
   const liveRuns = createLiveRunsMap();
+  const authEnabled = opts.authEnabled === true;
   const app: AppCtx = {
     queries: opened.queries,
     dataDir: opts.dataDir,
     liveRuns,
     adapter: opts.adapter,
     concurrency: opts.concurrency ?? 1,
-    idempotency: new Map(),
+    // LRU + TTL store; still Map-compatible for the inline run/judgement caches.
+    idempotency: new IdempotencyStore(),
     startQueue: [],
     activeStarts: 0,
+    authEnabled,
+    refResolver: opts.refResolver ?? defaultRefResolver(),
+    // Bound below after app is constructed so the closure sees the final object.
+    enqueueStart: () => undefined,
   };
+  // Wire the real start-pipeline seam (concurrency-limited).
+  app.enqueueStart = (runId: string) => enqueueStart(app, runId);
   app.startOpts = opts.startOpts;
   if (opts.judgeRunner) app.judgeRunner = opts.judgeRunner;
   if (opts.defaultSystemPromptVersion) {
@@ -1152,11 +1327,39 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerFindingsRoutes(router);
   // Regression views (P7b) — trend + two-run compare + release compare.
   registerRegressionRoutes(router);
+  // Watcher rules + webhook ingress (P8b) — modular mount.
+  registerWatcherRoutes(router);
+  // Eval queue (P8b) — add/peek/reorder/promote/drain.
+  registerQueueRoutes(router);
 
   const server = createHttpServer((req, res) => {
-    void router.handle(req, res, app).catch((err) => {
-      handleError(res, err);
-    });
+    void (async () => {
+      try {
+        const method = (req.method ?? "GET").toUpperCase();
+        const url = req.url ?? "/";
+        const qIdx = url.indexOf("?");
+        const path = qIdx === -1 ? url : url.slice(0, qIdx);
+
+        // Pre-dispatch auth gate. When authEnabled is false (default), this is a
+        // no-op — existing unauthenticated tests + local UI keep working.
+        // When true, every /api/* route (except GET /api/health) requires a
+        // valid Bearer token; read-only tokens cannot write; project-scoped
+        // tokens must match the path project.
+        const allowed = await gateRequest({
+          authEnabled: app.authEnabled,
+          queries: app.queries,
+          req,
+          res,
+          method,
+          path,
+        });
+        if (!allowed) return;
+
+        await router.handle(req, res, app);
+      } catch (err) {
+        handleError(res, err);
+      }
+    })();
   });
 
   return {
