@@ -28,6 +28,7 @@ function workspaceLabel(task: Task): string {
 export function TasksList(props: TasksListProps) {
   const {
     tasks,
+    projectId,
     onEdit,
     onDelete,
     onRun,
@@ -94,6 +95,15 @@ export function TasksList(props: TasksListProps) {
                       Run
                     </button>
                   )}
+                  {projectId ? (
+                    <a
+                      href={`/projects/${projectId}/trend/${encodeURIComponent(task.id)}`}
+                      data-testid={`task-trend-${task.id}`}
+                      className="rounded bg-slate-700 px-2 py-1 text-xs text-indigo-200"
+                    >
+                      Trend
+                    </a>
+                  ) : null}
                   {onEdit && (
                     <button
                       type="button"

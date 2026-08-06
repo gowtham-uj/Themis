@@ -290,6 +290,8 @@ export interface FinalizeRunInput {
 export interface ListRunsFilter {
   projectId?: string;
   batchId?: string;
+  /** Optional task scope (additive; AND-combined with projectId/batchId). */
+  taskId?: string;
 }
 
 export interface CreateTaskOptions {
@@ -1206,36 +1208,33 @@ export class SqliteQueries implements QueryStore {
   }
 
   listRuns(filter: ListRunsFilter): Run[] {
-    if (filter.batchId && filter.projectId) {
-      return this.db
-        .select()
-        .from(runs)
-        .where(
-          and(
-            eq(runs.batchId, filter.batchId),
-            eq(runs.projectId, filter.projectId),
-          ),
-        )
-        .all()
-        .map(mapRun);
+    const conditions = [];
+    if (filter.projectId) {
+      conditions.push(eq(runs.projectId, filter.projectId));
     }
     if (filter.batchId) {
+      conditions.push(eq(runs.batchId, filter.batchId));
+    }
+    if (filter.taskId) {
+      conditions.push(eq(runs.taskId, filter.taskId));
+    }
+    if (conditions.length === 0) {
+      return this.db.select().from(runs).all().map(mapRun);
+    }
+    if (conditions.length === 1) {
       return this.db
         .select()
         .from(runs)
-        .where(eq(runs.batchId, filter.batchId))
+        .where(conditions[0]!)
         .all()
         .map(mapRun);
     }
-    if (filter.projectId) {
-      return this.db
-        .select()
-        .from(runs)
-        .where(eq(runs.projectId, filter.projectId))
-        .all()
-        .map(mapRun);
-    }
-    return this.db.select().from(runs).all().map(mapRun);
+    return this.db
+      .select()
+      .from(runs)
+      .where(and(...conditions))
+      .all()
+      .map(mapRun);
   }
 
   updateRunControlState(id: string, update: ControlStateUpdate): Run {
@@ -2099,6 +2098,7 @@ export class MemoryQueries implements QueryStore {
       .filter((r) => {
         if (filter.projectId && r.projectId !== filter.projectId) return false;
         if (filter.batchId && r.batchId !== filter.batchId) return false;
+        if (filter.taskId && r.taskId !== filter.taskId) return false;
         return true;
       })
       .map((r) => ({ ...r }));

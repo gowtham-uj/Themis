@@ -1318,6 +1318,199 @@ export async function getIssue(
   return normalizeIssueDetail(raw);
 }
 
+// ---------------------------------------------------------------------------
+// Regression views (P7b) — trend / two-run compare / release compare
+// Spec: plan/ui.md §6 + §6c; backed by pure compute in src/regression/.
+// ---------------------------------------------------------------------------
+
+/** Wire shape of a finding instance used by trend/compare (JSON-serializable). */
+export interface FindingInstanceApi {
+  fingerprint: string;
+  category: string;
+  kind: string;
+  severity: string;
+  claim: string;
+  /** Decoded Ref objects from the verdict — pass through verbatim. */
+  refs: object[];
+  occurrenceStatus: "introduced" | "persisted" | "resolved" | string;
+  runId: string;
+  judgementId: string;
+}
+
+/** Optional batch mean±spread annotation on a trend point. */
+export interface TrendBatchStatsApi {
+  mean: number;
+  spread: number;
+  n: number;
+}
+
+/**
+ * One annotated point on a per-task score trend.
+ * GET /api/projects/:id/tasks/:taskId/trend → `{ points: TrendPointApi[] }`.
+ */
+export interface TrendPointApi {
+  order: number;
+  runId: string;
+  judgementId: string;
+  overallScore: number | null;
+  verdict: "pass" | "fail" | "partial" | string | null;
+  batchId?: string;
+  createdAt?: string;
+  findingDeltas: {
+    introduced: FindingInstanceApi[];
+    resolved: FindingInstanceApi[];
+  };
+  batchStats?: TrendBatchStatsApi;
+}
+
+/** Provenance for one side of a two-run compare. */
+export interface RunCompareProvenance {
+  runId: string;
+  judgementId: string;
+  agentCommit?: string | null;
+  triggerRef?: string | null;
+  overallScore: number | null;
+  verdict: "pass" | "fail" | "partial" | string | null;
+}
+
+/**
+ * Two-run compare result (compareTwoRuns) plus a/b provenance.
+ * GET /api/projects/:id/compare/runs?a=&b=
+ */
+export interface RunCompareApi {
+  deltaOverall: number | null;
+  perCriterion: Array<{
+    criterion: string;
+    axis: RubricAxis | string;
+    delta: number;
+    aScore: number;
+    bScore: number;
+  }>;
+  findingSetDiff: {
+    introduced: FindingInstanceApi[];
+    resolved: FindingInstanceApi[];
+    persisted: FindingInstanceApi[];
+  };
+  diagnosticDeltas: Array<{ key: string; a: boolean; b: boolean }>;
+  a: RunCompareProvenance;
+  b: RunCompareProvenance;
+}
+
+/**
+ * Suite-level release compare (releaseCompare) plus version provenance.
+ * GET /api/projects/:id/compare/releases?from=&to=
+ */
+export interface ReleaseCompareApi {
+  from: string;
+  to: string;
+  suiteDelta: {
+    deltaOverall: number;
+    spread: number;
+    nImproved: number;
+    nRegressed: number;
+    nFlat: number;
+    nNewTasks: number;
+    nRemovedTasks: number;
+  };
+  perAxisRollup: Array<{
+    axis: RubricAxis | string;
+    fromMean: number;
+    toMean: number;
+    delta: number;
+  }>;
+  findingCategoryDeltas: Array<{
+    category: string;
+    introduced: number;
+    resolved: number;
+    persisted: number;
+    deltaNet: number;
+  }>;
+  diagnosticRateDeltas: Array<{
+    key: string;
+    fromRate: number;
+    toRate: number;
+    delta: number;
+  }>;
+  perTaskBreakdown: Array<{
+    taskId: string;
+    deltaOverall: number;
+    perAxis: Array<{ axis: RubricAxis | string; delta: number }>;
+    findingsDelta: number;
+    presentInBoth: boolean;
+  }>;
+  /** Echo of the requested versions (may equal `from`/`to`). */
+  fromVersion: string;
+  toVersion: string;
+  fromTasks: number;
+  toTasks: number;
+}
+
+/**
+ * GET /api/projects/:id/tasks/:taskId/trend
+ * Unwraps the `{ points: [...] }` envelope via {@link unwrapList}.
+ */
+export async function getTaskTrend(
+  projectId: string,
+  taskId: string,
+  opts: ApiClientOptions = {},
+): Promise<TrendPointApi[]> {
+  const raw = await apiRequest<unknown>(
+    `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(taskId)}/trend`,
+    { ...opts, method: "GET" },
+  );
+  return unwrapList(raw, "points") as TrendPointApi[];
+}
+
+/**
+ * GET /api/projects/:id/compare/runs?a=&b=
+ * Returns compareTwoRuns result + a/b run provenance.
+ */
+export async function getRunCompare(
+  projectId: string,
+  a: string,
+  b: string,
+  opts: ApiClientOptions = {},
+): Promise<RunCompareApi> {
+  const raw = await apiRequest<RunCompareApi>(
+    `/api/projects/${encodeURIComponent(projectId)}/compare/runs`,
+    {
+      ...opts,
+      method: "GET",
+      query: { a, b },
+    },
+  );
+  return raw;
+}
+
+/**
+ * GET /api/projects/:id/compare/releases?from=&to=
+ * Returns releaseCompare result + version provenance counts.
+ */
+export async function getReleaseCompare(
+  projectId: string,
+  from: string,
+  to: string,
+  opts: ApiClientOptions = {},
+): Promise<ReleaseCompareApi> {
+  const raw = await apiRequest<ReleaseCompareApi>(
+    `/api/projects/${encodeURIComponent(projectId)}/compare/releases`,
+    {
+      ...opts,
+      method: "GET",
+      query: { from, to },
+    },
+  );
+  return raw;
+}
+
+/**
+ * Variance helper (mirrors compute.isLikelyRegression): a delta within the
+ * noise band is not a regression. True iff |delta| > spread.
+ */
+export function isLikelyRegression(delta: number, spread: number): boolean {
+  return Math.abs(delta) > spread;
+}
+
 /** Bundle of client methods for DI into components/tests. */
 export function createApiClient(opts: ApiClientOptions = {}) {
   return {
@@ -1360,6 +1553,12 @@ export function createApiClient(opts: ApiClientOptions = {}) {
       listIssuesUrl(projectId, { ...o, baseUrl: opts.baseUrl }),
     runIssuesUrl: (projectId: string, fingerprint: string) =>
       runIssuesUrl(projectId, fingerprint, { baseUrl: opts.baseUrl }),
+    getTaskTrend: (projectId: string, taskId: string) =>
+      getTaskTrend(projectId, taskId, opts),
+    getRunCompare: (projectId: string, a: string, b: string) =>
+      getRunCompare(projectId, a, b, opts),
+    getReleaseCompare: (projectId: string, from: string, to: string) =>
+      getReleaseCompare(projectId, from, to, opts),
   };
 }
 

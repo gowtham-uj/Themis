@@ -62,6 +62,7 @@ import {
   type JudgeRunner,
 } from "./judgements-routes.js";
 import { registerFindingsRoutes } from "./findings-routes.js";
+import { registerRegressionRoutes } from "./regression-routes.js";
 
 // ---------------------------------------------------------------------------
 // App context
@@ -1149,6 +1150,8 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerJudgementRoutes(router);
   // Findings / issues-log routes (P6b) — list + lifecycle detail + k/N.
   registerFindingsRoutes(router);
+  // Regression views (P7b) — trend + two-run compare + release compare.
+  registerRegressionRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void router.handle(req, res, app).catch((err) => {

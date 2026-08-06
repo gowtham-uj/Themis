@@ -41,11 +41,51 @@ export function RunDetailClient({
   initialEvents = [],
   initialDiff = "",
 }: RunDetailClientProps) {
+  // Honor deep-links from ref chips (+ issues/compare views): allow the initial
+  // tab + a trace seq-selection to be driven by the URL so a finding's
+  // #diff:file:hunk / #trace:start:end / #tool:... link jumps straight to the
+  // evidence, not the default Trace tab.
+  function tabFromQuery(): "trace" | "diff" | "report" {
+    if (typeof window === "undefined") return "trace";
+    const q = new URLSearchParams(window.location.search).get("tab");
+    return q === "diff" || q === "report" ? q : "trace";
+  }
   const [run, setRun] = useState<Run | null>(initialRun);
   const [events, setEvents] = useState<TimelineEvent[]>(initialEvents);
   const [diff, setDiff] = useState(initialDiff);
-  const [tab, setTab] = useState<"trace" | "diff" | "report">("trace");
+  const [tab, setTab] = useState<"trace" | "diff" | "report">(tabFromQuery);
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+
+  // On mount, act on the deep-link hash (#trace:start:end selects that seq range
+  // in the Trace tab; #diff:… / #tool:… only need the tab, set above).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const hash = window.location.hash.replace(/^#/, "");
+    if (!hash) return;
+    if (hash.startsWith("trace:")) {
+      const [, a, b] = hash.split(":");
+      const start = Number(a);
+      if (Number.isFinite(start)) setSelectedSeq(start);
+      setTab("trace");
+    } else if (hash.startsWith("diff:")) {
+      setTab("diff");
+    } else if (hash.startsWith("tool:")) {
+      const id = hash.slice("tool:".length);
+      // Best-effort: select the event whose tool call matches the id.
+      setEvents((prev) => {
+        const match = prev.find((e) => {
+          if (e.type !== "tool.call") return false;
+          const tcId = (e as unknown as { toolCallId?: unknown }).toolCallId;
+          return typeof tcId === "string" && tcId === id;
+        });
+        if (match && typeof match.seq === "number") {
+          setSelectedSeq(match.seq);
+        }
+        return prev;
+      });
+      setTab("trace");
+    }
+  }, []);
   const [live, setLive] = useState(false);
   const [reportHtml, setReportHtml] = useState<string | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
