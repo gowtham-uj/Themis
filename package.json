@@ -1,0 +1,23 @@
+{
+  "name": "agenteval",
+  "version": "0.0.0",
+  "private": true,
+  "description": "General agent evaluation platform — run autonomous agents against eval tasks, capture rich traces, judge with a three-layer verdict (scores + localized diagnostics + located findings) + two-lens improvements synthesis, and track regressions across versions.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "cli": "tsx src/cli/index.ts",
+    "lint": "eslint src --max-warnings 0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "tsx": "^4.19.0",
+    "vitest": "^2.1.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0"
+  }
+}
