@@ -8,6 +8,10 @@
  * constraint").
  */
 
+import { existsSync } from "node:fs";
+import { DockerSocketRuntime } from "./docker-socket.js";
+import { FakeContainerRuntime } from "./fake-runtime.js";
+
 /** A container that has been started and can be controlled. */
 export interface ContainerHandle {
   readonly id: string;
@@ -61,8 +65,45 @@ export interface ContainerRuntime {
   run(spec: RunContainerSpec): Promise<ContainerHandle>;
 }
 
-/** Resolved at app startup from env: real Docker socket if `DOCKER_HOST`/socket present, else fake. */
+/** Test/injection override; when set, {@link resolveRuntime} returns it. */
+let injectedRuntime: ContainerRuntime | undefined;
+
+/**
+ * Inject a ContainerRuntime for tests (or custom deploys). Pass `undefined` to clear.
+ * Prefer this over env mutation so parallel tests stay isolated.
+ */
+export function setRuntime(rt: ContainerRuntime | undefined): void {
+  injectedRuntime = rt;
+}
+
+/**
+ * True when a real Docker backend should be selected:
+ *  - `AGENTEVAL_DOCKER=1`, or
+ *  - `DOCKER_HOST` is set, or
+ *  - the default docker socket path exists on disk.
+ */
+export function isDockerEnvironment(): boolean {
+  if (process.env.AGENTEVAL_DOCKER === "1") return true;
+  if (process.env.DOCKER_HOST && process.env.DOCKER_HOST.length > 0) return true;
+  try {
+    if (existsSync("/var/run/docker.sock")) return true;
+  } catch {
+    // ignore fs errors
+  }
+  return false;
+}
+
+/**
+ * Resolved at app startup from env: real Docker socket if `DOCKER_HOST`/socket/
+ * AGENTEVAL_DOCKER present, else {@link FakeContainerRuntime}.
+ * Tests may inject via {@link setRuntime}.
+ */
 export function resolveRuntime(): ContainerRuntime {
-  // P2 implements both + the socket detection. Placeholder lands the seam + import path for P1.
-  throw new Error("ContainerRuntime not configured — implemented in Phase 2.");
+  if (injectedRuntime) return injectedRuntime;
+  if (isDockerEnvironment()) {
+    // DockerSocketRuntime.run() currently throws NotImplementedError in this build;
+    // live container smoke is deferred to a Docker+root environment (@needs-docker).
+    return new DockerSocketRuntime();
+  }
+  return new FakeContainerRuntime();
 }

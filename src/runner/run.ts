@@ -19,11 +19,38 @@ import { ADAPTER_STATUS as REAPER_STATUS } from "../adapters/reapercode.js";
 import type { CanonicalEvent, RunStatus, Usage } from "../schema/events.js";
 import { appendEvent } from "../schema/append.js";
 import { captureDiff, type CaptureDiffResult } from "./diff.js";
+import { redactEvent } from "./redact.js";
 import {
   ensureGitRepo,
   prepareWorkspace,
   type PreparedWorkspace,
 } from "./workspace.js";
+
+// Re-export reaper + redaction entry points so callers can hook a CrashReaper
+// without reaching into the individual modules (P2 in-process shape; P3 wires DB).
+export {
+  CrashReaper,
+  createCrashReaper,
+  DEFAULT_HEARTBEAT_WINDOW_MS,
+  type InFlightRun,
+  type ListInFlightRuns,
+  type ReapOptions,
+} from "./reaper.js";
+export {
+  redactEvent,
+  redactString,
+  redactEnv,
+  registerKnownSecrets,
+  clearKnownSecrets,
+  type RedactionKind,
+} from "./redact.js";
+export {
+  captureDiffByCategory,
+  categoryToDiffKind,
+  type AgentCategory,
+  type CategoryDiffResult,
+  type DiffKind,
+} from "./diff-category.js";
 
 export interface RunOptions {
   agent: string;
@@ -236,7 +263,9 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
       sawFatalError = true;
       lastErrorMessage = event.message;
     }
-    await appendEvent(eventsPath, event);
+    // Redaction pass on ingest — secrets must never reach events.jsonl.
+    // Spec: plan/execution.md § Secrets, CLAUDE.md quality gate.
+    await appendEvent(eventsPath, redactEvent(event));
   };
 
   // Emit harness-owned run.start so provenance is always present.
@@ -356,19 +385,28 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
 }
 
 /**
- * Derive run.end.status from exit code AND a fatal-error signal, optionally
- * letting the adapter's own self-reported terminal status win. Rules (plan/
- * adapters.md "Never trust clean exit alone"):
- *  - A fatal error event always → "failed" (crash mid-stream), even at exit 0.
- *  - A non-zero exit code → "failed".
- *  - Otherwise honor an adapter-reported terminal status if present; else "completed".
- * "aborted"/"paused" are run-control states set elsewhere, not derived here.
+ * Derive run.end.status from exit code, fatal-error, timeout, and abort signals,
+ * optionally letting the adapter's own self-reported terminal status win.
+ *
+ * Priority (plan/adapters.md "Never trust clean exit alone" + plan/execution.md
+ * run-control):
+ *  1. Operator abort → "aborted" (takes precedence; the operator cut the run short).
+ *  2. Wall-clock timeout → "timeout".
+ *  3. A fatal error event → "failed" (crash mid-stream), even at exit 0.
+ *  4. A non-zero exit code → "failed".
+ *  5. Otherwise honor an adapter-reported terminal status if present; else "completed".
+ *
+ * Shared by the local orchestrator and {@link RunController.finalize}.
  */
-function deriveRunStatus(input: {
+export function deriveRunStatus(input: {
   adapterStatus?: RunStatus;
   exitCode: number;
   sawFatalError: boolean;
+  timedOut?: boolean;
+  aborted?: boolean;
 }): RunStatus {
+  if (input.aborted) return "aborted";
+  if (input.timedOut) return "timeout";
   if (input.sawFatalError) return "failed";
   if (input.exitCode !== 0) return "failed";
   if (input.adapterStatus) return input.adapterStatus;
