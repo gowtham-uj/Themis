@@ -42,3 +42,11 @@ export {
   type ProblemDetails,
   type ApiErrorInput,
 } from "./errors.js";
+
+export {
+  registerJudgementRoutes,
+  type JudgeRunner,
+  type JudgeRunContext,
+  type CreateJudgementBody,
+  type JudgementAppCtx,
+} from "./judgements-routes.js";

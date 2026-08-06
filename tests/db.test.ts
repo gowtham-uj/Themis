@@ -342,10 +342,9 @@ describe("agents + batches + runs", () => {
   });
 });
 
-describe("stubs (P4/P6)", () => {
-  it("judgement/finding methods throw until later phases", async () => {
+describe("stubs (P6)", () => {
+  it("finding methods throw until later phases", async () => {
     const { queries } = open(await tempDataDir());
-    expect(() => queries.createJudgement()).toThrow(/not implemented/);
     expect(() => queries.createFinding()).toThrow(/not implemented/);
   });
 });

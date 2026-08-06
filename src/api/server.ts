@@ -53,6 +53,10 @@ import {
   type LiveRunsMap,
   type StartRunOptions,
 } from "./run-controller-bridge.js";
+import {
+  registerJudgementRoutes,
+  type JudgeRunner,
+} from "./judgements-routes.js";
 
 // ---------------------------------------------------------------------------
 // App context
@@ -74,6 +78,16 @@ export interface AppCtx {
   activeStarts: number;
   /** Extra startRun options forwarded from createServer. */
   startOpts?: Omit<StartRunOptions, "adapter">;
+  /**
+   * Injectable judge runner (P4c). Tests inject a fake that writes judge.jsonl
+   * + storeVerdict; production may wire the P4b worker. When omitted, POST
+   * /judgements only creates the queued row.
+   */
+  judgeRunner?: JudgeRunner;
+  /** Defaults for create-judgement when the request omits them. */
+  defaultSystemPromptVersion?: string;
+  defaultJudgeModel?: string;
+  defaultJudgeProvider?: string;
 }
 
 export interface CreateServerOptions {
@@ -91,6 +105,14 @@ export interface CreateServerOptions {
   concurrency?: number;
   /** Extra startRun options (timeout, skipAgent, …). */
   startOpts?: Omit<StartRunOptions, "adapter">;
+  /**
+   * Injectable judge runner. Prefer a fake in tests so no real LLM is called.
+   * See {@link JudgeRunner} in judgements-routes.ts.
+   */
+  judgeRunner?: JudgeRunner;
+  defaultSystemPromptVersion?: string;
+  defaultJudgeModel?: string;
+  defaultJudgeProvider?: string;
 }
 
 export interface ApiServer {
@@ -1091,9 +1113,19 @@ export function createServer(opts: CreateServerOptions): ApiServer {
     activeStarts: 0,
   };
   app.startOpts = opts.startOpts;
+  if (opts.judgeRunner) app.judgeRunner = opts.judgeRunner;
+  if (opts.defaultSystemPromptVersion) {
+    app.defaultSystemPromptVersion = opts.defaultSystemPromptVersion;
+  }
+  if (opts.defaultJudgeModel) app.defaultJudgeModel = opts.defaultJudgeModel;
+  if (opts.defaultJudgeProvider) {
+    app.defaultJudgeProvider = opts.defaultJudgeProvider;
+  }
 
   const router = new Router();
   registerRoutes(router, opts.startOpts);
+  // Judgement routes (P4c) — modular mount so this file stays focused on runs.
+  registerJudgementRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void router.handle(req, res, app).catch((err) => {

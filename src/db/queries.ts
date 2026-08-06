@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
@@ -21,11 +21,14 @@ import type {
   TaskSpec,
 } from "../domain.js";
 import type { WorkspaceSpec } from "../adapters/types.js";
+import type { Verdict } from "../judge/verdict.js";
 import {
   agents,
+  judgements,
   projects,
   runBatches,
   runs,
+  scores,
   tasks,
   type Schema,
 } from "./schema.js";
@@ -271,9 +274,85 @@ export interface CreateTaskOptions {
   id?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Judgements + scores (P4c)
+// ---------------------------------------------------------------------------
+
+export type JudgementStatus = "queued" | "running" | "completed" | "failed";
+
+/** pass|fail|partial — denormalized overall verdict level. */
+export type VerdictLevel = "pass" | "fail" | "partial";
+
+export interface Judgement {
+  id: string;
+  runId: string;
+  projectId: string;
+  judgeModel: string;
+  judgeProvider: string;
+  judgePrompt: string | null;
+  systemPromptVersion: string;
+  status: JudgementStatus | string;
+  overallScore: number | null;
+  /** Denormalized overall level: pass|fail|partial. */
+  verdict: VerdictLevel | string | null;
+  reportPath: string | null;
+  eventsPath: string | null;
+  verdictPath: string | null;
+  createdAt: string | null;
+  endedAt: string | null;
+}
+
+/** getJudgement: row + full verdict body loaded from verdict.json (when present). */
+export interface JudgementWithVerdict extends Judgement {
+  /** Structured verdict from disk; null until storeVerdict writes it. */
+  verdictBody: Verdict | null;
+}
+
+export interface CreateJudgementInput {
+  runId: string;
+  projectId: string;
+  judgeModel: string;
+  judgeProvider: string;
+  judgePrompt?: string;
+  systemPromptVersion: string;
+  status: JudgementStatus;
+  id?: string;
+}
+
+export interface ScoreRow {
+  id: string;
+  judgementId: string;
+  criterion: string;
+  weight: number;
+  score: number;
+  rationale: string | null;
+}
+
+export interface CreateScoreInput {
+  criterion: string;
+  weight: number;
+  score: number;
+  rationale?: string;
+}
+
+export interface ListJudgementsFilter {
+  projectId?: string;
+  runId?: string;
+  status?: string;
+  /** Max rows (default 50, cap 200). */
+  limit?: number;
+  /** Opaque cursor (offset as decimal string) for pagination. */
+  cursor?: string;
+}
+
+export interface ListJudgementsResult {
+  judgements: Judgement[];
+  nextCursor: string | null;
+}
+
 /**
  * Shared query surface. Both SqliteQueries and MemoryQueries implement this.
- * Judgement/score/finding methods are stubs (throw) until P4/P6.
+ * Finding methods are stubs (throw) until P6.
  */
 export interface QueryStore {
   createProject(input: CreateProjectInput): Project;
@@ -307,8 +386,27 @@ export interface QueryStore {
   updateRunStatus(id: string, status: RunStatus | string): Run;
   finalizeRun(id: string, result: FinalizeRunInput): Run;
 
-  /** P4/P6 stubs — not implemented yet. */
-  createJudgement(..._args: unknown[]): never;
+  /** Create a judgement row + on-disk judgement.json snapshot. */
+  createJudgement(input: CreateJudgementInput): Judgement;
+  /** Insert per-criterion score rows (for trend charts). */
+  createScores(judgementId: string, scores: CreateScoreInput[]): ScoreRow[];
+  /**
+   * Persist a completed verdict: write verdict.json, mirror overall + per-criterion
+   * scores into SQLite, mark judgement completed.
+   */
+  storeVerdict(judgementId: string, verdict: Verdict): JudgementWithVerdict;
+  /** Load judgement row + verdict.json body (if present). */
+  getJudgement(id: string): JudgementWithVerdict | null;
+  /** List judgements with optional filters + cursor pagination. */
+  listJudgements(filter?: ListJudgementsFilter): ListJudgementsResult;
+  /** Update judgement status (and optional ended_at). */
+  setJudgementStatus(
+    id: string,
+    status: JudgementStatus | string,
+    endedAt?: string | null,
+  ): Judgement;
+
+  /** P6 stub — not implemented yet. */
   createFinding(..._args: unknown[]): never;
 }
 
@@ -402,6 +500,61 @@ export function runSnapshotPath(
   runId: string,
 ): string {
   return join(dataDir, "projects", projectId, "runs", runId, "run.json");
+}
+
+/** On-disk dir for a judgement: <dataDir>/projects/<pid>/judgements/<jid>. */
+export function judgementDir(
+  dataDir: string,
+  projectId: string,
+  judgementId: string,
+): string {
+  return join(dataDir, "projects", projectId, "judgements", judgementId);
+}
+
+export function judgementSnapshotPath(
+  dataDir: string,
+  projectId: string,
+  judgementId: string,
+): string {
+  return join(judgementDir(dataDir, projectId, judgementId), "judgement.json");
+}
+
+export function verdictPath(
+  dataDir: string,
+  projectId: string,
+  judgementId: string,
+): string {
+  return join(judgementDir(dataDir, projectId, judgementId), "verdict.json");
+}
+
+export function judgeEventsPath(
+  dataDir: string,
+  projectId: string,
+  judgementId: string,
+): string {
+  return join(judgementDir(dataDir, projectId, judgementId), "judge.jsonl");
+}
+
+/**
+ * Read verdict.json from disk (null when missing / unparseable).
+ */
+export function readVerdictFromDisk(
+  dataDir: string,
+  projectId: string,
+  judgementId: string,
+  dbPath?: string | null,
+): Verdict | null {
+  const path =
+    dbPath && dbPath.length > 0
+      ? dbPath
+      : verdictPath(dataDir, projectId, judgementId);
+  if (!existsSync(path)) return null;
+  try {
+    const raw = readFileSync(path, "utf8");
+    return JSON.parse(raw) as Verdict;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +676,49 @@ function mapRun(row: typeof runs.$inferSelect): Run {
     diffPath: row.diffPath,
     error: row.error,
   };
+}
+
+function mapJudgement(row: typeof judgements.$inferSelect): Judgement {
+  return {
+    id: row.id,
+    runId: row.runId,
+    projectId: row.projectId,
+    judgeModel: row.judgeModel,
+    judgeProvider: row.judgeProvider,
+    judgePrompt: row.judgePrompt,
+    systemPromptVersion: row.systemPromptVersion,
+    status: row.status,
+    overallScore: row.overallScore,
+    verdict: row.verdict,
+    reportPath: row.reportPath,
+    eventsPath: row.eventsPath,
+    verdictPath: row.verdictPath,
+    createdAt: row.createdAt,
+    endedAt: row.endedAt,
+  };
+}
+
+function mapScore(row: typeof scores.$inferSelect): ScoreRow {
+  return {
+    id: row.id,
+    judgementId: row.judgementId,
+    criterion: row.criterion,
+    weight: row.weight,
+    score: row.score,
+    rationale: row.rationale,
+  };
+}
+
+function clampLimit(n: number | undefined): number {
+  const v = Number.isFinite(n) ? Number(n) : 50;
+  return Math.max(1, Math.min(200, Math.floor(v) || 50));
+}
+
+function parseCursorOffset(cursor: string | undefined): number {
+  if (cursor == null || cursor === "") return 0;
+  const n = Number(cursor);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.floor(n);
 }
 
 function notFound(kind: string, id: string): Error {
@@ -1047,8 +1243,231 @@ export class SqliteQueries implements QueryStore {
     return row;
   }
 
-  createJudgement(..._args: unknown[]): never {
-    return stub("createJudgement");
+  // ---- judgements + scores (P4c) ----
+
+  createJudgement(input: CreateJudgementInput): Judgement {
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    const eventsPath = judgeEventsPath(this.dataDir, input.projectId, id);
+    const jVerdictPath = verdictPath(this.dataDir, input.projectId, id);
+    this.db
+      .insert(judgements)
+      .values({
+        id,
+        runId: input.runId,
+        projectId: input.projectId,
+        judgeModel: input.judgeModel,
+        judgeProvider: input.judgeProvider,
+        judgePrompt: input.judgePrompt ?? null,
+        systemPromptVersion: input.systemPromptVersion,
+        status: input.status,
+        overallScore: null,
+        verdict: null,
+        reportPath: null,
+        eventsPath,
+        verdictPath: jVerdictPath,
+        createdAt: ts,
+        endedAt: null,
+      })
+      .run();
+    const row = this.db
+      .select()
+      .from(judgements)
+      .where(eq(judgements.id, id))
+      .get();
+    if (!row) throw new Error("failed to create judgement");
+    const mapped = mapJudgement(row);
+    writeSnapshot(
+      judgementSnapshotPath(this.dataDir, mapped.projectId, mapped.id),
+      mapped,
+    );
+    // Ensure the judgement dir exists so judge.jsonl can be appended later.
+    try {
+      mkdirSync(judgementDir(this.dataDir, mapped.projectId, mapped.id), {
+        recursive: true,
+      });
+    } catch {
+      // best-effort
+    }
+    return mapped;
+  }
+
+  createScores(
+    judgementId: string,
+    scoreInputs: CreateScoreInput[],
+  ): ScoreRow[] {
+    const existing = this.db
+      .select()
+      .from(judgements)
+      .where(eq(judgements.id, judgementId))
+      .get();
+    if (!existing) throw notFound("judgement", judgementId);
+    const out: ScoreRow[] = [];
+    for (const s of scoreInputs) {
+      const id = newId();
+      this.db
+        .insert(scores)
+        .values({
+          id,
+          judgementId,
+          criterion: s.criterion,
+          weight: s.weight,
+          score: s.score,
+          rationale: s.rationale ?? null,
+        })
+        .run();
+      const row = this.db
+        .select()
+        .from(scores)
+        .where(eq(scores.id, id))
+        .get();
+      if (row) out.push(mapScore(row));
+    }
+    return out;
+  }
+
+  storeVerdict(judgementId: string, verdict: Verdict): JudgementWithVerdict {
+    const existing = this.db
+      .select()
+      .from(judgements)
+      .where(eq(judgements.id, judgementId))
+      .get();
+    if (!existing) throw notFound("judgement", judgementId);
+    const projectId = existing.projectId;
+    const jVerdictPath =
+      existing.verdictPath ??
+      verdictPath(this.dataDir, projectId, judgementId);
+    const eventsPath =
+      existing.eventsPath ??
+      judgeEventsPath(this.dataDir, projectId, judgementId);
+
+    // Write verdict.json first (source of truth on disk).
+    writeSnapshot(jVerdictPath, verdict);
+
+    // Replace any existing per-criterion scores with the verdict's criteria.
+    this.db.delete(scores).where(eq(scores.judgementId, judgementId)).run();
+    const scoreInputs: CreateScoreInput[] = (verdict.criteria ?? []).map(
+      (c) => ({
+        criterion: c.criterion,
+        weight: c.weight,
+        score: c.score,
+        rationale: c.feedback,
+      }),
+    );
+    this.createScores(judgementId, scoreInputs);
+
+    const endedAt = nowIso();
+    this.db
+      .update(judgements)
+      .set({
+        status: "completed",
+        overallScore: verdict.overall?.score ?? null,
+        verdict: verdict.overall?.verdict ?? null,
+        verdictPath: jVerdictPath,
+        eventsPath,
+        endedAt,
+      })
+      .where(eq(judgements.id, judgementId))
+      .run();
+
+    const row = this.db
+      .select()
+      .from(judgements)
+      .where(eq(judgements.id, judgementId))
+      .get();
+    if (!row) throw notFound("judgement", judgementId);
+    const mapped = mapJudgement(row);
+    writeSnapshot(
+      judgementSnapshotPath(this.dataDir, mapped.projectId, mapped.id),
+      mapped,
+    );
+    return { ...mapped, verdictBody: verdict };
+  }
+
+  getJudgement(id: string): JudgementWithVerdict | null {
+    const row = this.db
+      .select()
+      .from(judgements)
+      .where(eq(judgements.id, id))
+      .get();
+    if (!row) return null;
+    const mapped = mapJudgement(row);
+    const body = readVerdictFromDisk(
+      this.dataDir,
+      mapped.projectId,
+      mapped.id,
+      mapped.verdictPath,
+    );
+    return { ...mapped, verdictBody: body };
+  }
+
+  listJudgements(filter: ListJudgementsFilter = {}): ListJudgementsResult {
+    const limit = clampLimit(filter.limit);
+    const offset = parseCursorOffset(filter.cursor);
+
+    // Filter in-app so MemoryQueries and Sqlite stay aligned without
+    // complex dynamic WHERE composition for every filter combo.
+    let rows = this.db.select().from(judgements).all().map(mapJudgement);
+    if (filter.projectId) {
+      rows = rows.filter((j) => j.projectId === filter.projectId);
+    }
+    if (filter.runId) {
+      rows = rows.filter((j) => j.runId === filter.runId);
+    }
+    if (filter.status) {
+      rows = rows.filter((j) => j.status === filter.status);
+    }
+    // Newest first (createdAt desc, then id).
+    rows.sort((a, b) => {
+      const ca = a.createdAt ?? "";
+      const cb = b.createdAt ?? "";
+      if (ca !== cb) return cb.localeCompare(ca);
+      return b.id.localeCompare(a.id);
+    });
+    const page = rows.slice(offset, offset + limit);
+    const nextOffset = offset + page.length;
+    const nextCursor =
+      nextOffset < rows.length ? String(nextOffset) : null;
+    return { judgements: page, nextCursor };
+  }
+
+  setJudgementStatus(
+    id: string,
+    status: JudgementStatus | string,
+    endedAt?: string | null,
+  ): Judgement {
+    const existing = this.db
+      .select()
+      .from(judgements)
+      .where(eq(judgements.id, id))
+      .get();
+    if (!existing) throw notFound("judgement", id);
+    const patch: {
+      status: string;
+      endedAt?: string | null;
+    } = { status };
+    if (endedAt !== undefined) {
+      patch.endedAt = endedAt;
+    } else if (status === "completed" || status === "failed") {
+      patch.endedAt = existing.endedAt ?? nowIso();
+    }
+    this.db
+      .update(judgements)
+      .set(patch)
+      .where(eq(judgements.id, id))
+      .run();
+    const row = this.db
+      .select()
+      .from(judgements)
+      .where(eq(judgements.id, id))
+      .get();
+    if (!row) throw notFound("judgement", id);
+    const mapped = mapJudgement(row);
+    writeSnapshot(
+      judgementSnapshotPath(this.dataDir, mapped.projectId, mapped.id),
+      mapped,
+    );
+    return mapped;
   }
 
   createFinding(..._args: unknown[]): never {
@@ -1066,6 +1485,8 @@ export class MemoryQueries implements QueryStore {
   private agents = new Map<string, Agent>();
   private batches = new Map<string, RunBatch>();
   private runs = new Map<string, Run>();
+  private judgements = new Map<string, Judgement>();
+  private scores = new Map<string, ScoreRow>();
 
   constructor(private readonly dataDir: string) {}
 
@@ -1439,8 +1860,173 @@ export class MemoryQueries implements QueryStore {
     return { ...next };
   }
 
-  createJudgement(..._args: unknown[]): never {
-    return stub("createJudgement");
+  // ---- judgements + scores (P4c) ----
+
+  createJudgement(input: CreateJudgementInput): Judgement {
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    const eventsPath = judgeEventsPath(this.dataDir, input.projectId, id);
+    const jVerdictPath = verdictPath(this.dataDir, input.projectId, id);
+    const j: Judgement = {
+      id,
+      runId: input.runId,
+      projectId: input.projectId,
+      judgeModel: input.judgeModel,
+      judgeProvider: input.judgeProvider,
+      judgePrompt: input.judgePrompt ?? null,
+      systemPromptVersion: input.systemPromptVersion,
+      status: input.status,
+      overallScore: null,
+      verdict: null,
+      reportPath: null,
+      eventsPath,
+      verdictPath: jVerdictPath,
+      createdAt: ts,
+      endedAt: null,
+    };
+    this.judgements.set(id, j);
+    writeSnapshot(
+      judgementSnapshotPath(this.dataDir, j.projectId, j.id),
+      j,
+    );
+    try {
+      mkdirSync(judgementDir(this.dataDir, j.projectId, j.id), {
+        recursive: true,
+      });
+    } catch {
+      // best-effort
+    }
+    return { ...j };
+  }
+
+  createScores(
+    judgementId: string,
+    scoreInputs: CreateScoreInput[],
+  ): ScoreRow[] {
+    if (!this.judgements.has(judgementId)) {
+      throw notFound("judgement", judgementId);
+    }
+    const out: ScoreRow[] = [];
+    for (const s of scoreInputs) {
+      const row: ScoreRow = {
+        id: newId(),
+        judgementId,
+        criterion: s.criterion,
+        weight: s.weight,
+        score: s.score,
+        rationale: s.rationale ?? null,
+      };
+      this.scores.set(row.id, row);
+      out.push({ ...row });
+    }
+    return out;
+  }
+
+  storeVerdict(judgementId: string, verdict: Verdict): JudgementWithVerdict {
+    const existing = this.judgements.get(judgementId);
+    if (!existing) throw notFound("judgement", judgementId);
+    const jVerdictPath =
+      existing.verdictPath ??
+      verdictPath(this.dataDir, existing.projectId, judgementId);
+    const eventsPath =
+      existing.eventsPath ??
+      judgeEventsPath(this.dataDir, existing.projectId, judgementId);
+
+    writeSnapshot(jVerdictPath, verdict);
+
+    // Replace prior scores for this judgement.
+    for (const [sid, s] of [...this.scores.entries()]) {
+      if (s.judgementId === judgementId) this.scores.delete(sid);
+    }
+    this.createScores(
+      judgementId,
+      (verdict.criteria ?? []).map((c) => ({
+        criterion: c.criterion,
+        weight: c.weight,
+        score: c.score,
+        rationale: c.feedback,
+      })),
+    );
+
+    const next: Judgement = {
+      ...existing,
+      status: "completed",
+      overallScore: verdict.overall?.score ?? null,
+      verdict: verdict.overall?.verdict ?? null,
+      verdictPath: jVerdictPath,
+      eventsPath,
+      endedAt: nowIso(),
+    };
+    this.judgements.set(judgementId, next);
+    writeSnapshot(
+      judgementSnapshotPath(this.dataDir, next.projectId, next.id),
+      next,
+    );
+    return { ...next, verdictBody: verdict };
+  }
+
+  getJudgement(id: string): JudgementWithVerdict | null {
+    const j = this.judgements.get(id);
+    if (!j) return null;
+    const body = readVerdictFromDisk(
+      this.dataDir,
+      j.projectId,
+      j.id,
+      j.verdictPath,
+    );
+    return { ...j, verdictBody: body };
+  }
+
+  listJudgements(filter: ListJudgementsFilter = {}): ListJudgementsResult {
+    const limit = clampLimit(filter.limit);
+    const offset = parseCursorOffset(filter.cursor);
+    let rows = [...this.judgements.values()];
+    if (filter.projectId) {
+      rows = rows.filter((j) => j.projectId === filter.projectId);
+    }
+    if (filter.runId) {
+      rows = rows.filter((j) => j.runId === filter.runId);
+    }
+    if (filter.status) {
+      rows = rows.filter((j) => j.status === filter.status);
+    }
+    rows.sort((a, b) => {
+      const ca = a.createdAt ?? "";
+      const cb = b.createdAt ?? "";
+      if (ca !== cb) return cb.localeCompare(ca);
+      return b.id.localeCompare(a.id);
+    });
+    const page = rows.slice(offset, offset + limit).map((j) => ({ ...j }));
+    const nextOffset = offset + page.length;
+    const nextCursor =
+      nextOffset < rows.length ? String(nextOffset) : null;
+    return { judgements: page, nextCursor };
+  }
+
+  setJudgementStatus(
+    id: string,
+    status: JudgementStatus | string,
+    endedAt?: string | null,
+  ): Judgement {
+    const existing = this.judgements.get(id);
+    if (!existing) throw notFound("judgement", id);
+    let nextEnded = existing.endedAt;
+    if (endedAt !== undefined) {
+      nextEnded = endedAt;
+    } else if (status === "completed" || status === "failed") {
+      nextEnded = existing.endedAt ?? nowIso();
+    }
+    const next: Judgement = {
+      ...existing,
+      status,
+      endedAt: nextEnded,
+    };
+    this.judgements.set(id, next);
+    writeSnapshot(
+      judgementSnapshotPath(this.dataDir, next.projectId, next.id),
+      next,
+    );
+    return { ...next };
   }
 
   createFinding(..._args: unknown[]): never {
