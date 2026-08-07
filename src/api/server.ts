@@ -1070,7 +1070,7 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     const agentId =
       body.agent ?? body.agentId ?? body.agent_id ?? project.defaultAgentId ?? "fixture";
     const model =
-      body.model ?? project.defaultModel ?? "claude-sonnet-4-20250514";
+      body.model ?? project.defaultModel ?? "claude-opus-4-6";
     const provider =
       body.provider ?? project.defaultProvider ?? "anthropic";
     const repeats = Math.max(1, Math.min(100, Number(body.repeats ?? 1) || 1));

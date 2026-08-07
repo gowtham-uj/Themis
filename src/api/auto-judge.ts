@@ -94,7 +94,7 @@ export async function judgeRunNow(
   const judgeModel =
     project?.defaultJudgeModel ??
     deps.defaultJudgeModel ??
-    "claude-sonnet-4-20250514";
+    "claude-opus-4-6";
   const judgeProvider = deps.defaultJudgeProvider ?? "anthropic";
   const systemPromptVersion = deps.defaultSystemPromptVersion ?? "v2";
 

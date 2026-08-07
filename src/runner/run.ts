@@ -188,7 +188,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
   const model =
     options.model ??
     process.env.AGENTEVAL_MODEL ??
-    "claude-sonnet-4-20250514";
+    "claude-opus-4-6";
 
   const ctx: RunContext = {
     runId,

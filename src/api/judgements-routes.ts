@@ -234,7 +234,7 @@ function requireJudgement(
 }
 
 const DEFAULT_SYSTEM_PROMPT_VERSION = "v2";
-const DEFAULT_JUDGE_MODEL = "claude-sonnet-4-20250514";
+const DEFAULT_JUDGE_MODEL = "claude-opus-4-6";
 const DEFAULT_JUDGE_PROVIDER = "anthropic";
 
 // ---------------------------------------------------------------------------

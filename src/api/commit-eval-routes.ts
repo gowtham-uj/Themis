@@ -237,7 +237,7 @@ export function registerCommitEvalRoutes(router: Router): void {
         "agentId is required (or set the project's default agent)",
       );
     }
-    const model = body.model ?? project.defaultModel ?? "claude-sonnet-4-20250514";
+    const model = body.model ?? project.defaultModel ?? "claude-opus-4-6";
     const provider = body.provider ?? project.defaultProvider ?? "anthropic";
     const repeats = Math.max(1, Math.min(20, Number(body.repeats ?? 1) || 1));
     const overrides = body.adapterOverrides ?? body.adapter_overrides;
