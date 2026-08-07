@@ -465,50 +465,60 @@ describe("POST /api/evaluations/:id/verify", () => {
 // the all-in-one report
 // ---------------------------------------------------------------------------
 
-describe("GET /api/evaluations/:id/report — the single output", () => {
-  it("serves one document carrying everything, in both forms", async () => {
+describe("GET /api/evaluations/:id/report — the analysis, not the evidence", () => {
+  it("ships themes and techniques, and LINKS to traces rather than inlining them", async () => {
     const ctx = await boot();
     try {
       const { batchId } = await seedPlan(ctx, "one-report");
 
-      // JSON: what a consuming agent reads.
       const json = await http(
         ctx.base,
         "GET",
         `/api/evaluations/${batchId}/report?format=json`,
       );
       expect(json.status).toBe(200);
-      // Everything in one object — no follow-up fetches.
+
+      // The payload is analysis: patterns, techniques, and how to prove them.
       for (const key of [
-        "improvementPlan",
-        "subsystemLoad",
+        "themes",
+        "strengths",
         "reliability",
-        "rankedDefects",
-        "recurringDefects",
-        "explainedRegressions",
+        "regressions",
         "evals",
         "summary",
+        "nextEvaluation",
       ]) {
         expect(json.json).toHaveProperty(key);
       }
-      // Each eval carries its own full record.
+
+      // Traces are the judge's INPUT — shipping them would move the analysis
+      // burden onto the next agent, which is the work the judge exists to do.
       const evals = json.json.evals as Array<Record<string, unknown>>;
       expect(evals.length).toBeGreaterThan(0);
-      for (const key of ["prompt", "trace", "findings", "artifacts", "status"]) {
-        expect(evals[0]!).toHaveProperty(key);
-      }
+      expect(evals[0]).not.toHaveProperty("trace");
+      expect(evals[0]).not.toHaveProperty("diff");
+      expect(evals[0]).not.toHaveProperty("findings");
+      // Instead: an outcome line plus links to the evidence.
+      expect(evals[0]).toHaveProperty("headline");
+      expect(evals[0]).toHaveProperty("evidence");
+      const evidence = evals[0]!.evidence as Record<string, unknown>;
+      expect(evidence).toHaveProperty("traceUrl");
 
-      // HTML: what a person reads — and it embeds the same object, so the two
-      // cannot drift apart.
-      const html = await fetch(
-        `${ctx.base}/api/evaluations/${batchId}/report`,
-      );
+      // And the loop closes: one call to run the next evaluation.
+      const next = json.json.nextEvaluation as {
+        request: { method: string; path: string };
+      };
+      expect(next.request.method).toBe("POST");
+      expect(next.request.path).toContain("/evaluate");
+
+      const html = await fetch(`${ctx.base}/api/evaluations/${batchId}/report`);
       expect(html.status).toBe(200);
       const text = await html.text();
       expect(text).toContain("<!DOCTYPE html");
+      expect(text).toContain("What to improve");
+      expect(text).toContain("Per-eval outcomes");
+      // Same object rendered twice — the two forms cannot drift apart.
       expect(text).toContain('id="eval-report-data"');
-      expect(text).toContain("What to change");
-      expect(text).toContain("Every eval, in full");
     } finally {
       await ctx.api.close();
       rmSync(ctx.dataDir, { recursive: true, force: true });
@@ -560,10 +570,11 @@ describe("GET /api/evaluations/:id/report — the single output", () => {
         `/api/evaluations/${batch.id}/report?format=json`,
       );
       expect(res.status).toBe(200);
-      expect((res.json.evals as unknown[]).length).toBe(1);
-      expect((res.json.evals as Array<{ prompt: string }>)[0]!.prompt).toBe(
-        "do the thing",
-      );
+      const evals = res.json.evals as Array<{ name: string; headline: string }>;
+      expect(evals).toHaveLength(1);
+      expect(evals[0]!.name).toBe("eval one");
+      // An unjudged run says so plainly rather than looking like a pass.
+      expect(evals[0]!.headline).toContain("never judged");
     } finally {
       await ctx.api.close();
       rmSync(ctx.dataDir, { recursive: true, force: true });

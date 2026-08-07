@@ -10,7 +10,7 @@
  * stylesheet so both pages read as one product.
  */
 
-import type { EvalReport, EvalReportEntry } from "../eval-report.js";
+import type { EvalReport, EvalOutcome, Theme } from "../eval-report.js";
 import type {
   RecurringDefect,
   ReleaseComparison,
@@ -46,12 +46,6 @@ const RELEASE_STYLES = /* css */ `
 .verify-block { margin-top:.4rem; font-size:.85rem; opacity:.9; }
 `;
 
-/** Styles for the per-eval detail sections. */
-const EVAL_STYLES = /* css */ `
-.eval-detail { border:1px solid var(--border,#2a3140); border-radius:8px; padding:.6rem .9rem; margin:.5rem 0; }
-.eval-detail > summary { cursor:pointer; font-size:.95rem; }
-.eval-detail pre.repro { max-height:24rem; overflow:auto; }
-`;
 
 /** Format a 0..1 score as a 2dp string, or an em dash when unscored. */
 function fmtScore(score: number | null): string {
@@ -434,70 +428,114 @@ export function renderReleaseReport(v: ReleaseVerdict): string {
 }
 
 // ---------------------------------------------------------------------------
-// The all-in-one eval report
+// The eval report — analysis, not evidence
 // ---------------------------------------------------------------------------
 
-/** Per-eval detail: prompt, environment, findings, diff, artifacts. */
-function renderEvalDetail(e: EvalReportEntry): string {
-  const envLine = e.environment?.error
-    ? `<p class="dp-gap"><strong>Environment failed:</strong> ${escapeHtml(e.environment.error)} — this is not an agent failure.</p>`
-    : e.envKind
-      ? `<p class="dp-gap">${escapeHtml(e.envKind)} environment${e.environment?.baselineCommit ? `, baseline ${escapeHtml(e.environment.baselineCommit.slice(0, 8))}` : ""}</p>`
-      : "";
+/** Styles for the theme-oriented report. */
+const EVAL_STYLES = /* css */ `
+.theme { border:1px solid var(--border,#2a3140); border-left-width:4px; border-radius:8px; padding:.9rem 1.1rem; margin:.8rem 0; }
+.theme[data-severity="blocker"], .theme[data-severity="major"] { border-left-color:var(--sev-major,#d97706); }
+.theme-head { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; margin-bottom:.4rem; }
+.theme-title { font-size:1.05rem; font-weight:700; }
+.technique { border-left:3px solid var(--ok,#16a34a); padding:.5rem .8rem; margin:.6rem 0; }
+.technique h4 { margin:0 0 .25rem; font-size:.8rem; text-transform:uppercase; letter-spacing:.03em; opacity:.75; }
+.example { font-size:.88rem; opacity:.9; margin:.3rem 0 .3rem .8rem; padding-left:.6rem; border-left:2px solid var(--border,#2a3140); }
+.outcome-row td { vertical-align:top; }
+.next-call { border:1px solid var(--ok,#16a34a); border-radius:8px; padding:.8rem 1rem; }
+.next-call pre { margin:.4rem 0 0; overflow:auto; }
+`;
 
-  const findings = e.findings.length
-    ? e.findings
-        .map((f) =>
-          [
-            `<div class="recur-card">`,
-            `<div><strong>${escapeHtml(f.severity)}</strong> · ${escapeHtml(f.category)}`,
-            f.subsystem ? ` · <span class="subsystem-chip">${escapeHtml(f.subsystem)}</span>` : "",
-            `</div>`,
-            `<p>${escapeHtml(f.claim)}</p>`,
-            f.decisionPoint
-              ? `<p class="dp-counterfactual">seq ${f.decisionPoint.seq}: ${escapeHtml(f.decisionPoint.whatHappened)} — instead: ${escapeHtml(f.decisionPoint.counterfactual)}</p>`
-              : "",
-            f.verification?.targetTaskIds?.length
-              ? `<p class="recur-tasks">Verify with: <code>${f.verification.targetTaskIds.map((t) => escapeHtml(t)).join(", ")}</code></p>`
-              : "",
-            `</div>`,
-          ].join(""),
+/** One theme: the pattern, why it happened, and the technique that fixes it. */
+function renderTheme(t: Theme): string {
+  const examples = t.examples.length
+    ? t.examples
+        .map(
+          (e) =>
+            `<div class="example"><strong>${escapeHtml(e.evalName)}</strong>${e.seq !== null ? ` (seq ${e.seq})` : ""}: ${escapeHtml(e.whatHappened)}${e.insteadShouldHave ? ` — <em>instead:</em> ${escapeHtml(e.insteadShouldHave)}` : ""}</div>`,
         )
         .join("")
-    : `<p class="section-empty">No findings.</p>`;
-
-  const toolSeq = e.trace.summary?.toolSequence?.length
-    ? `<p class="recur-tasks">Tools: ${e.trace.summary.toolSequence.map((t) => escapeHtml(t)).join(" → ")}</p>`
     : "";
-
-  const artifacts = e.artifacts.length
-    ? `<p class="recur-tasks">Artifacts: ${e.artifacts.map((a) => `<a href="${escapeHtml(a.url)}">${escapeHtml(a.path)}</a>`).join(", ")}</p>`
-    : "";
-
-  const diff = e.diff
-    ? `<details><summary>Diff (${e.diff.bytes} bytes${e.diff.truncated ? ", truncated" : ""})</summary><pre class="repro"><code>${escapeHtml(e.diff.text)}</code></pre></details>`
-    : `<p class="section-empty">No diff.</p>`;
 
   return [
-    `<details class="eval-detail" data-task="${escapeHtml(e.taskId)}">`,
-    `<summary><strong>${escapeHtml(e.name)}</strong> — ${e.score === null ? "unscored" : e.score.toFixed(2)} (${escapeHtml(e.status)})</summary>`,
-    envLine,
-    `<p class="dp-gap"><strong>Prompt:</strong> ${escapeHtml(e.prompt)}</p>`,
-    `<p class="recur-tasks">${e.trace.eventCount} trace event(s)</p>`,
-    toolSeq,
-    artifacts,
-    findings,
-    diff,
-    `</details>`,
+    `<div class="theme" data-severity="${escapeHtml(t.severity)}" data-theme="${escapeHtml(t.id)}">`,
+    `<div class="theme-head">`,
+    `<span class="theme-title">${escapeHtml(t.title)}</span>`,
+    `<span class="subsystem-chip">${escapeHtml(t.subsystem)}</span>`,
+    `<span class="badge">${escapeHtml(t.severity)}</span>`,
+    t.chronic
+      ? `<span class="chronic-badge">chronic — survived ${t.evaluationsSurvived} evaluations</span>`
+      : "",
+    `</div>`,
+    `<p>${escapeHtml(t.whatWentWrong)}</p>`,
+    `<p class="section-lede">${escapeHtml(t.why)}</p>`,
+    examples,
+    `<div class="technique">`,
+    `<h4>Technique</h4>`,
+    `<p>${escapeHtml(t.technique)}</p>`,
+    `</div>`,
+    `<p class="recur-tasks">Affects ${t.affectedEvals.length} eval(s): ${t.affectedEvals.map((e) => escapeHtml(e.name)).join(", ")}`,
+    t.impact.estimatedScoreGain > 0
+      ? ` · worth about +${t.impact.estimatedScoreGain.toFixed(3)} mean score`
+      : "",
+    `</p>`,
+    `<p class="recur-tasks"><strong>Verify:</strong> re-run <code>${t.verification.reRunTaskIds.map((x) => escapeHtml(x)).join(", ")}</code>`,
+    t.verification.mustKeepPassingTaskIds.length > 0
+      ? ` · must keep passing: <code>${t.verification.mustKeepPassingTaskIds.map((x) => escapeHtml(x)).join(", ")}</code>`
+      : "",
+    `</p>`,
+    `</div>`,
+  ].join("\n");
+}
+
+/** Per-eval outcomes — a line each, with links to the evidence. */
+function renderOutcomes(evals: readonly EvalOutcome[]): string {
+  const rows = evals
+    .map((e) => {
+      const outcome =
+        e.score === null ? "unjudged" : e.score >= 0.7 ? "pass" : "fail";
+      const links = [
+        e.evidence.reportUrl
+          ? `<a href="${escapeHtml(e.evidence.reportUrl)}">report</a>`
+          : "",
+        e.evidence.traceUrl
+          ? `<a href="${escapeHtml(e.evidence.traceUrl)}">trace (${e.evidence.traceEventCount})</a>`
+          : "",
+        e.evidence.diffUrl
+          ? `<a href="${escapeHtml(e.evidence.diffUrl)}">diff</a>`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      const headline = e.environmentError
+        ? `<strong>Environment failed:</strong> ${escapeHtml(e.environmentError)}`
+        : escapeHtml(e.headline);
+      return [
+        `<tr class="outcome-row" data-outcome="${outcome}">`,
+        `<td>${escapeHtml(e.name)}</td>`,
+        `<td class="score-cell">${e.score === null ? "—" : e.score.toFixed(2)}</td>`,
+        `<td>${headline}</td>`,
+        `<td>${links}</td>`,
+        `</tr>`,
+      ].join("");
+    })
+    .join("");
+
+  return [
+    `<section class="section" id="outcomes" aria-labelledby="out-heading">`,
+    `<h2 class="section-title" id="out-heading">Per-eval outcomes</h2>`,
+    `<p class="section-lede">One line each. Full traces and diffs are linked rather than inlined — the analysis above is what they were read to produce.</p>`,
+    `<table class="task-table">`,
+    `<thead><tr><th>Eval</th><th>Score</th><th>What happened</th><th>Evidence</th></tr></thead>`,
+    `<tbody>${rows}</tbody></table>`,
+    `</section>`,
   ].join("\n");
 }
 
 /**
- * Render the complete evaluation report: one self-contained document carrying
- * everything a consuming agent needs.
+ * Render the evaluation report.
  *
- * The machine-readable form is embedded verbatim in a script tag, so the HTML
- * and the JSON can never disagree — they are the same object.
+ * Themes first — they are what the consuming agent acts on. The JSON form is
+ * embedded verbatim so the two cannot disagree.
  */
 export function renderEvalReport(r: EvalReport): string {
   const kpi = (value: string, label: string): string =>
@@ -511,38 +549,87 @@ export function renderEvalReport(r: EvalReport): string {
     `<div class="release-kpis">`,
     kpi(r.summary.score.toFixed(2), "mean score"),
     kpi(`${r.summary.evalsPassed}/${r.summary.evalsTotal}`, "evals passed"),
-    kpi(String(r.improvementPlan.length), "actions"),
-    r.summary.evalsUnjudged > 0 ? kpi(String(r.summary.evalsUnjudged), "unjudged") : "",
+    kpi(String(r.themes.length), "themes"),
     `</div>`,
     `</header>`,
   ].join("\n");
 
-  // Reuse the release sections — same data, same rendering, one definition.
-  const asRelease = r as unknown as ReleaseVerdict;
+  const themes = [
+    `<section class="section" id="themes" aria-labelledby="themes-heading">`,
+    `<h2 class="section-title" id="themes-heading">What to improve</h2>`,
+    `<p class="section-lede">Patterns across evals, each with the technique that addresses it and how to prove it worked.</p>`,
+    r.themes.length > 0
+      ? r.themes.map(renderTheme).join("\n")
+      : `<p class="section-empty">No recurring problems found.</p>`,
+    `</section>`,
+  ].join("\n");
 
-  const evalSection = [
-    `<section class="section" id="evals" aria-labelledby="evals-heading">`,
-    `<h2 class="section-title" id="evals-heading">Every eval, in full</h2>`,
-    `<p class="section-lede">Prompt, environment, trace shape, findings and diff for each — inline, so nothing needs fetching separately.</p>`,
-    ...r.evals.map(renderEvalDetail),
+  const strengths =
+    r.strengths.length > 0
+      ? [
+          `<section class="section" id="strengths" aria-labelledby="str-heading">`,
+          `<h2 class="section-title" id="str-heading">Keep doing</h2>`,
+          `<p class="section-lede">Behaviours a refactor should not lose.</p>`,
+          `<ul class="bullet-list">`,
+          ...r.strengths.map(
+            (s) =>
+              `<li><strong>${escapeHtml(s.title)}</strong> — ${escapeHtml(s.detail)} <span class="recur-tasks">(${s.evalNames.length} eval(s))</span></li>`,
+          ),
+          `</ul>`,
+          `</section>`,
+        ].join("\n")
+      : "";
+
+  const reliability =
+    r.reliability.length > 0
+      ? [
+          `<section class="section" id="reliability" aria-labelledby="rel-heading">`,
+          `<h2 class="section-title" id="rel-heading">Reliability</h2>`,
+          `<p class="section-lede">A flaky eval needs determinism work; one that fails every time needs capability work.</p>`,
+          `<table class="task-table"><thead><tr><th>Eval</th><th>Kind</th><th>Passed</th><th>Range</th></tr></thead><tbody>`,
+          ...r.reliability.map(
+            (x) =>
+              `<tr><td>${escapeHtml(x.evalName)}</td><td>${x.kind === "flaky" ? `<span class="flaky-badge">flaky</span>` : `<span class="fail-badge">consistent failure</span>`}</td><td class="score-cell">${x.passes}/${x.attempts}</td><td class="score-cell">${x.scoreRange ? `${x.scoreRange[0].toFixed(2)}–${x.scoreRange[1].toFixed(2)}` : "—"}</td></tr>`,
+          ),
+          `</tbody></table></section>`,
+        ].join("\n")
+      : "";
+
+  const regressions =
+    r.regressions.length > 0
+      ? [
+          `<section class="section" id="regressions" aria-labelledby="reg-heading">`,
+          `<h2 class="section-title" id="reg-heading">Regressions</h2>`,
+          ...r.regressions.map(
+            (x) =>
+              `<div class="recur-card"><div><strong>${escapeHtml(x.evalName)}</strong> — ${x.before.toFixed(2)} → ${x.after.toFixed(2)}</div><p>${escapeHtml(x.explanation)}</p></div>`,
+          ),
+          `</section>`,
+        ].join("\n")
+      : "";
+
+  const next = [
+    `<section class="section" id="next" aria-labelledby="next-heading">`,
+    `<h2 class="section-title" id="next-heading">Next</h2>`,
+    `<div class="next-call">`,
+    `<p>${escapeHtml(r.nextEvaluation.description)}</p>`,
+    `<pre><code>${escapeHtml(`${r.nextEvaluation.request.method} ${r.nextEvaluation.request.path}\n${JSON.stringify(r.nextEvaluation.request.body, null, 2)}`)}</code></pre>`,
+    `</div>`,
     `</section>`,
   ].join("\n");
 
   const body = [
     `<main class="report" id="top">`,
     header,
-    renderImprovementPlan(asRelease),
-    renderSubsystemLoad(asRelease),
-    renderReliability(asRelease),
-    renderExplainedRegressions(asRelease),
-    renderRecurring(r.recurringDefects),
-    renderComparison(r.comparison),
-    evalSection,
+    themes,
+    strengths,
+    reliability,
+    regressions,
+    renderOutcomes(r.evals),
+    next,
     `</main>`,
   ].join("\n");
 
-  // The same object a machine consumer would fetch — embedded so this single
-  // file serves both readers and they cannot drift apart.
   const embedded = JSON.stringify(r).replace(/</g, "\\u003c");
 
   return [
