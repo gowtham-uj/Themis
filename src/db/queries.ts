@@ -148,6 +148,8 @@ export interface Task {
   profile: TaskProfile | null;
   referenceSolution: string | null;
   checks: unknown[] | null;
+  /** Env this eval needs (greenfield/brownfield, image, setup script). */
+  env: Record<string, unknown> | null;
   tags: string[] | null;
   sourceKind: string | null;
   archived: boolean;
@@ -164,6 +166,8 @@ export interface UpdateTaskInput {
   profile?: TaskProfile | null;
   referenceSolution?: string | null;
   checks?: unknown[] | null;
+  /** Env this eval needs (greenfield/brownfield, image, setup script). */
+  env?: Record<string, unknown> | null;
   tags?: string[] | null;
   externalId?: string | null;
   sourceKind?: string | null;
@@ -1212,6 +1216,7 @@ function mapTask(row: typeof tasks.$inferSelect): Task {
     profile: (row.profile as TaskProfile | null) ?? null,
     referenceSolution: row.referenceSolution,
     checks: parseJson(row.checksJson, null),
+    env: parseJson(row.envJson, null),
     tags: parseJson(row.tags, null),
     sourceKind: row.sourceKind,
     archived: row.archived === 1,
@@ -1831,6 +1836,7 @@ export class SqliteQueries implements QueryStore {
         profile: spec.profile ?? spec.rubric.profile ?? null,
         referenceSolution: spec.referenceSolution ?? null,
         checksJson: stringifyJson(checks),
+        envJson: stringifyJson(spec.env ?? null),
         tags: stringifyJson(spec.tags ?? null),
         sourceKind: opts.sourceKind ?? null,
         createdAt: ts,
@@ -1911,6 +1917,10 @@ export class SqliteQueries implements QueryStore {
           patch.checks !== undefined
             ? stringifyJson(patch.checks)
             : stringifyJson(existing.checks),
+        envJson:
+          patch.env !== undefined
+            ? stringifyJson(patch.env)
+            : stringifyJson(existing.env),
         tags:
           patch.tags !== undefined
             ? stringifyJson(patch.tags)
@@ -3819,6 +3829,7 @@ export class MemoryQueries implements QueryStore {
       profile: spec.profile ?? spec.rubric.profile ?? null,
       referenceSolution: spec.referenceSolution ?? null,
       checks: (spec.checks ?? spec.rubric.checks ?? null) as unknown[] | null,
+      env: (spec.env ?? null) as Record<string, unknown> | null,
       tags: spec.tags ?? null,
       sourceKind: opts.sourceKind ?? null,
       archived: false,
@@ -3881,6 +3892,7 @@ export class MemoryQueries implements QueryStore {
           ? patch.referenceSolution
           : existing.referenceSolution,
       checks: patch.checks !== undefined ? patch.checks : existing.checks,
+      env: patch.env !== undefined ? patch.env : existing.env,
       tags: patch.tags !== undefined ? patch.tags : existing.tags,
       externalId:
         patch.externalId !== undefined

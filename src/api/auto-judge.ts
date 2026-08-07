@@ -29,6 +29,10 @@ import {
   type BuildReleaseVerdictOptions,
 } from "../judge/release-judge.js";
 import { renderReleaseReport } from "../judge/report/release-render.js";
+import {
+  collectBatchBundles,
+  summarizeBundles,
+} from "../judge/eval-bundle.js";
 import type { ReleaseVerdict } from "../judge/release-verdict.js";
 import type { JudgeRunContext, JudgeRunner } from "./judgements-routes.js";
 
@@ -137,6 +141,28 @@ export async function runReleaseRollup(
 
   const dir = releaseDir(deps.dataDir, projectId, batchId);
   await mkdir(dir, { recursive: true });
+
+  // Every eval's evidence, keyed by EVAL NAME rather than run id — this is what
+  // the release judge reads, and what makes "which eval regressed" answerable.
+  const bundles = await collectBatchBundles(deps.queries, deps.dataDir, batchId);
+  await writeFile(
+    join(dir, "bundles.json"),
+    `${JSON.stringify(
+      {
+        batchId,
+        summary: summarizeBundles(bundles),
+        // Traces themselves stay on disk; the bundle records where they are.
+        evals: bundles.map((b) => ({
+          ...b,
+          diff: b.diff ? { path: b.diff.path, bytes: b.diff.text.length } : null,
+        })),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
   await writeFile(
     join(dir, "release.json"),
     `${JSON.stringify(verdict, null, 2)}\n`,

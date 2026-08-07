@@ -17,6 +17,7 @@ import type {
   TaskSpec,
 } from "../domain.js";
 import type { WorkspaceSpec } from "../adapters/types.js";
+import { parseEvalEnvSpec } from "../runner/env-provision.js";
 
 const AGENT_CATEGORIES = new Set<AgentCategory>([
   "coding",
@@ -196,6 +197,9 @@ export function coerceTaskSpec(
     defaults.defaultAgentCategory,
   );
   const checks = coerceChecks(obj.checks) ?? rubric.checks;
+  // Env spec is normalized by the provisioner, which drops malformed fields
+  // rather than handing a half-configured environment to the container.
+  const env = parseEvalEnvSpec(obj.env);
 
   const spec: TaskSpec = {
     id: externalId,
@@ -207,6 +211,7 @@ export function coerceTaskSpec(
     agentCategory,
     ...(tags !== undefined ? { tags } : {}),
     ...(checks !== undefined ? { checks } : {}),
+    ...(env !== undefined ? { env } : {}),
     ...(typeof obj.referenceSolution === "string"
       ? { referenceSolution: obj.referenceSolution }
       : typeof obj.reference_solution === "string"

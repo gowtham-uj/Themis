@@ -175,6 +175,8 @@ export const tasks = sqliteTable(
     referenceSolution: text("reference_solution"),
     /** Deterministic hooks (rubric §5). */
     checksJson: text("checks_json"),
+    /** Env this eval needs: greenfield/brownfield, image, setup script. */
+    envJson: text("env_json"),
     /** csv/json */
     tags: text("tags"),
     /** Which task source created this. */

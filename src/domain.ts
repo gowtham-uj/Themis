@@ -12,6 +12,7 @@
  */
 
 import type { WorkspaceSpec } from "./adapters/types.js";
+import type { EvalEnvSpec } from "./runner/env-provision.js";
 
 /** Pre-defined agent category — gates rubric axes, withSource lens, diff kind. */
 export type AgentCategory =
@@ -119,6 +120,7 @@ export interface Rubric {
 
 /** Workspace provenance (reused; see src/adapters/types.ts). */
 export type { WorkspaceSpec };
+export type { EvalEnvSpec };
 
 /**
  * A task as yielded by a TaskSource before persistence (plan/projects.md).
@@ -139,6 +141,11 @@ export interface TaskSpec {
   checks?: Check[];
   /** Category the task targets (defaults from project). */
   agentCategory?: AgentCategory;
+  /**
+   * Environment this eval needs: greenfield vs brownfield, image, and a setup
+   * script run in the pod before the agent starts. See runner/env-provision.ts.
+   */
+  env?: EvalEnvSpec;
 }
 
 /** Result of a TaskSource.validate call. */

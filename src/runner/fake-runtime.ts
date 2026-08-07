@@ -19,6 +19,9 @@ import type {
   RunContainerSpec,
 } from "./runtime.js";
 
+/** Where a real backend bind-mounts the workspace inside the sandbox. */
+const WORKSPACE_MOUNT = "/workspace";
+
 /** Default grace between SIGTERM and SIGKILL on stop / timeout. */
 const DEFAULT_STOP_GRACE_MS = 2_000;
 
@@ -434,9 +437,20 @@ export class FakeContainerRuntime implements ContainerRuntime {
       portEnv[`AGENTEVAL_PORT_${key}`] = String(p.hostPort);
     }
 
+    // A real backend bind-mounts workspaceDir at /workspace, so scripts written
+    // for the sandbox say `cd /workspace`. On the host that path does not exist
+    // and `cd` fails silently, making a setup script look like it ran and did
+    // nothing. Rewrite the mount point to the real directory so the double
+    // behaves like the thing it doubles.
+    const rewritten = args.map((a) =>
+      a.includes(WORKSPACE_MOUNT)
+        ? a.split(WORKSPACE_MOUNT).join(spec.workspaceDir)
+        : a,
+    );
+
     // Limits (cpus/memory/pids) and network policy are recorded only — host has no
     // cgroup enforcement in this double. See handle.record.
-    const child = spawn(file, args, {
+    const child = spawn(file, rewritten, {
       cwd: spec.workspaceDir,
       env: { ...process.env, ...spec.env, ...portEnv },
       stdio: ["ignore", "pipe", "pipe"],

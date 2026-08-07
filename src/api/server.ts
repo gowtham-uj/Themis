@@ -73,6 +73,7 @@ import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerRubricRoutes } from "./rubric-routes.js";
 import { registerArtifactRoutes } from "./artifact-routes.js";
 import { registerSandboxRoutes } from "./sandbox-routes.js";
+import { parseEvalEnvSpec } from "../runner/env-provision.js";
 import { registerReleaseRoutes } from "./release-routes.js";
 import { handleRunFinalized, type AutoJudgeDeps } from "./auto-judge.js";
 import { createBatchClaimStore } from "../judge/batch-completion.js";
@@ -290,6 +291,7 @@ function taskToSpec(t: Task): TaskSpec {
     agentCategory: t.agentCategory,
     ...(t.referenceSolution ? { referenceSolution: t.referenceSolution } : {}),
     ...(t.checks ? { checks: t.checks as TaskSpec["checks"] } : {}),
+    ...(t.env ? { env: parseEvalEnvSpec(t.env) } : {}),
   };
 }
 
@@ -335,6 +337,7 @@ function taskJson(t: Task) {
     profile: t.profile,
     reference_solution: t.referenceSolution,
     checks: t.checks,
+    env: t.env,
     tags: t.tags,
     source_kind: t.sourceKind,
     archived: t.archived,

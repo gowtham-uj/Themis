@@ -10,6 +10,7 @@
  */
 
 import { readdir, readFile, stat } from "node:fs/promises";
+import { parseEvalEnvSpec } from "../runner/env-provision.js";
 import { join } from "node:path";
 import type {
   Anchors,
@@ -211,6 +212,8 @@ export interface BuildTaskSpecInput {
   agentCategory?: TaskSpec["agentCategory"];
   referenceSolution?: string;
   checks?: Check[];
+  /** Env this eval needs: greenfield/brownfield, image, setup script. */
+  env?: unknown;
   /** Optional external id (stable key for upsert). */
   id?: string;
 }
@@ -260,6 +263,12 @@ export function buildTaskSpec(input: BuildTaskSpecInput): TaskSpec {
       : input.rubric.checks !== undefined
         ? { checks: input.rubric.checks }
         : {}),
+    // Env the eval needs (greenfield/brownfield, image, setup script). Parsed
+    // through the provisioner so malformed fields drop rather than reaching a
+    // container invocation.
+    ...(parseEvalEnvSpec(input.env) !== undefined
+      ? { env: parseEvalEnvSpec(input.env)! }
+      : {}),
   };
 
   const result = validateTaskSpec(spec);

@@ -30,6 +30,12 @@ import {
   resolveAdapterOverrides,
   resolveRunNetwork,
 } from "../runner/project-config.js";
+import {
+  cleanupEnv,
+  parseEvalEnvSpec,
+  provisionEnv,
+  ProvisionError,
+} from "../runner/env-provision.js";
 
 /** Terminal run statuses (control actions return 409). */
 export const TERMINAL_RUN_STATUSES = new Set([
@@ -269,6 +275,14 @@ export async function startRun(
   }
 
   const runtime = opts.runtime ?? new FakeContainerRuntime();
+
+  // ---- eval environment ----
+  // The eval declares what it needs (greenfield scaffold or brownfield repo
+  // prep) via a setup script. It runs INSIDE the pod, and its output becomes
+  // the git baseline, so nothing setup produced is later attributed to the
+  // agent. A failed setup aborts the run: judging an agent in a broken
+  // environment produces a result that looks like agent failure but isn't.
+  const envSpec = parseEvalEnvSpec(task.env);
   const timeoutMs = opts.timeoutMs ?? 120_000;
   const network = new NetworkCutoff();
 
@@ -305,6 +319,44 @@ export async function startRun(
     apiKeys: collectApiKeys(),
     ...(overrides ? { overrides } : {}),
   };
+
+  if (envSpec && (envSpec.setupScript || envSpec.commitBaseline !== false)) {
+    try {
+      const provision = await provisionEnv(runtime, envSpec, {
+        // The AGENT's image — setup builds the environment in the same
+        // toolchain the agent will work in, not a separate one.
+        image: adapter.image(ctx),
+        workspaceDir,
+        network: networkMode,
+        ...(sandbox ? { sandbox } : {}),
+      });
+      await writeFile(
+        join(runDir, "provision.json"),
+        `${JSON.stringify(provision, null, 2)}\n`,
+        "utf8",
+      );
+      workspaceCommit = provision.baselineCommit ?? workspaceCommit;
+    } catch (err) {
+      const result =
+        err instanceof ProvisionError
+          ? err.result
+          : { error: err instanceof Error ? err.message : String(err) };
+      await writeFile(
+        join(runDir, "provision.json"),
+        `${JSON.stringify(result, null, 2)}\n`,
+        "utf8",
+      );
+      queries.finalizeRun(runId, {
+        status: "failed",
+        error: `environment provisioning failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        eventsPath,
+      });
+      throw err;
+    }
+  }
+
 
   // Snapshot run.json for provenance (alongside DB row).
   await writeFile(
@@ -542,6 +594,24 @@ export async function startRun(
           } catch {
             // a check-runner failure must not affect run finalization
           }
+        }
+
+        // Tear down the eval's environment so the next eval starts clean.
+        // Deliberately AFTER the diff, checks and traces are captured —
+        // cleanup that ran earlier would delete the evidence the judge needs.
+        // Never affects the run's recorded status.
+        if (envSpec?.cleanupScript) {
+          const cleanup = await cleanupEnv(runtime, envSpec, {
+            image: adapter.image(ctx),
+            workspaceDir,
+            network: networkMode,
+            ...(sandbox ? { sandbox } : {}),
+          });
+          await writeFile(
+            join(runDir, "cleanup.json"),
+            `${JSON.stringify(cleanup, null, 2)}\n`,
+            "utf8",
+          ).catch(() => undefined);
         }
 
         // P8c: emit run.completed exactly once at terminal finalization.

@@ -19,6 +19,10 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DbQueries } from "../db/queries.js";
 import { batchProgress } from "../judge/batch-completion.js";
+import {
+  collectBatchBundles,
+  summarizeBundles,
+} from "../judge/eval-bundle.js";
 import { releaseDir, runReleaseRollup, type AutoJudgeDeps } from "./auto-judge.js";
 import { badRequest, notFound } from "./errors.js";
 import { sendJson, type RequestContext, type Router } from "./router.js";
@@ -142,6 +146,40 @@ export function registerReleaseRoutes(router: Router): void {
     await serveHtmlFile(res, path, {
       download,
       filename: `release-${batchId}.html`,
+    });
+  });
+
+  // Every eval's evidence for this release, keyed by eval name. This is what
+  // the judge consumed; exposing it makes a release report auditable.
+  router.get("/api/batches/:batchId/bundles", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const batchId = ctx.params.batchId!;
+    const runs = requireBatchRuns(app.queries, batchId);
+    const path = join(
+      releaseDir(app.dataDir, runs[0]!.projectId, batchId),
+      "bundles.json",
+    );
+    if (existsSync(path)) {
+      const text = await readFile(path, "utf8");
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Length", Buffer.byteLength(text));
+      res.end(text);
+      return;
+    }
+    // Not rolled up yet — assemble live so a running batch is still inspectable.
+    const bundles = await collectBatchBundles(
+      app.queries,
+      app.dataDir,
+      batchId,
+    );
+    sendJson(res, 200, {
+      batch_id: batchId,
+      summary: summarizeBundles(bundles),
+      evals: bundles.map((b) => ({
+        ...b,
+        diff: b.diff ? { path: b.diff.path, bytes: b.diff.text.length } : null,
+      })),
     });
   });
 
