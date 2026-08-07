@@ -457,3 +457,77 @@ describe("judgeRun (FakeJudgeProvider)", () => {
     ).not.toThrow();
   });
 });
+
+describe("what the judge is shown (regressions from a real run)", () => {
+  it("includes the diff in the user prompt", async () => {
+    // The judge was told source artifacts existed and then never shown them,
+    // so a real code change read as "the agent did nothing" — confidently the
+    // opposite of the truth. Found by running the real judge for the first
+    // time against a run that HAD edited a file.
+    const { assembleJudgeUserPrompt } = await import("../src/judge/prompt.ts");
+    const prompt = assembleJudgeUserPrompt({
+      taskPrompt: "fix it",
+      rubric: { version: 1, profile: "bugfix", criteria: [] },
+      runMetadata: {},
+      eventsPreview: "{}",
+      hasSourceArtifacts: true,
+      diff: "diff --git a/src/range.js b/src/range.js\n-  i < end\n+  i <= end\n",
+    });
+    expect(prompt).toContain("i <= end");
+    expect(prompt).toContain("what the agent actually changed");
+  });
+
+  it("says so explicitly when the diff is empty", async () => {
+    // "No diff section" and "an empty diff" mean different things; silence
+    // invites the judge to assume the former.
+    const { assembleJudgeUserPrompt } = await import("../src/judge/prompt.ts");
+    const prompt = assembleJudgeUserPrompt({
+      taskPrompt: "fix it",
+      rubric: { version: 1, profile: "bugfix", criteria: [] },
+      runMetadata: {},
+      eventsPreview: "{}",
+      hasSourceArtifacts: true,
+    });
+    expect(prompt).toContain("changed no tracked files");
+  });
+
+  it("gives the judge the COMPLETE ordered action timeline", async () => {
+    // first/last windows hid the middle of the run — where the work happens.
+    // Without ordering the judge cannot tell verified work from unverified.
+    const { buildEventsPreview } = await import("../src/judge/worker.ts");
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+
+    const dir = mkdtempSync(join(tmpdir(), "agenteval-preview-"));
+    try {
+      const events = [
+        { seq: 0, type: "run.start" },
+        ...Array.from({ length: 12 }, (_, i) => ({
+          seq: i + 1,
+          type: i % 2 === 0 ? "tool.call" : "tool.result",
+          name: i < 6 ? "read_file" : "edit_file",
+          isError: false,
+        })),
+        { seq: 13, type: "tool.call", name: "bash", args: { command: "npm test" } },
+        { seq: 14, type: "run.end", status: "completed" },
+      ];
+      writeFileSync(
+        join(dir, "events.jsonl"),
+        events.map((e) => JSON.stringify(e)).join("\n"),
+        "utf8",
+      );
+
+      const preview = await buildEventsPreview(dir, 5);
+      const parsed = JSON.parse(preview) as { actionTimeline: string[] };
+      // Every action, not just the ends.
+      expect(parsed.actionTimeline.length).toBeGreaterThan(10);
+      // And in order, so "did the test run come after the last edit?" is answerable.
+      const lastEdit = parsed.actionTimeline.findLastIndex((l) => l.includes("edit_file"));
+      const lastTest = parsed.actionTimeline.findLastIndex((l) => l.includes("bash"));
+      expect(lastTest).toBeGreaterThan(lastEdit);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -30,6 +30,8 @@ import { judgeRun } from "../src/judge/worker.js";
 import type { JudgeRunContext } from "../src/api/judgements-routes.js";
 import { buildEvalReport } from "../src/judge/eval-report.js";
 import { renderEvalReport } from "../src/judge/report/release-render.js";
+import { startMockGateway, bugfixPolicy, type MockGateway } from "./fixtures/mock-model-gateway.js";
+import { combinedPolicy } from "./fixtures/judge-policy.js";
 
 /** The model under test AND the judge model. */
 const MODEL = process.env.AGENTEVAL_MODEL ?? "claude-opus-4-6";
@@ -115,8 +117,10 @@ function rubric(): Record<string, unknown> {
  * not "no", and losing a completed eval's judgement to a transient limit would
  * waste the whole run.
  */
-function makeRealJudge(): (ctx: JudgeRunContext) => Promise<void> {
-  const provider = new AnthropicJudgeProvider();
+function makeRealJudge(baseUrl: string): (ctx: JudgeRunContext) => Promise<void> {
+  // The REAL provider — real HTTP, real Messages API, real JSON extraction.
+  // Only the endpoint differs: the model behind it is the gateway.
+  const provider = new AnthropicJudgeProvider({ baseUrl, authToken: "gateway" });
   return async (ctx: JudgeRunContext) => {
     const runDir = join(ctx.dataDir, "projects", ctx.projectId, "runs", ctx.runId);
     const maxAttempts = 8;
@@ -182,6 +186,16 @@ async function main(): Promise<void> {
   const dataDir = await mkdtemp(join(tmpdir(), "agenteval-realrun-"));
   log(`data dir: ${dataDir}`);
 
+  // One gateway serves BOTH the agent in the pod and the judge — they speak the
+  // same Messages API, and the policy tells them apart by whether tools were
+  // advertised.
+  const gateway: MockGateway = await startMockGateway({
+    policy: combinedPolicy(bugfixPolicy()),
+  });
+  const gatewayPort = new URL(gateway.baseUrl).port;
+  const containerGatewayUrl = `http://host.containers.internal:${gatewayPort}/v1`;
+  log(`gateway: ${gateway.baseUrl}`);
+
   const runtime = new PodmanRuntime({
     prefix: process.env.AGENTEVAL_PODMAN_SUDO === "1" ? ["sudo", "-n"] : [],
   });
@@ -191,7 +205,7 @@ async function main(): Promise<void> {
     adapter: reaperCodeAdapter,
     concurrency: 1,
     startOpts: { runtime, timeoutMs: 600_000 },
-    judgeRunner: makeRealJudge(),
+    judgeRunner: makeRealJudge(gateway.baseUrl.replace(/\/v1$/, "")),
     defaultJudgeModel: MODEL,
   });
   const port = await api.listen(0);
@@ -269,18 +283,22 @@ async function main(): Promise<void> {
 
     // ---- 4. evaluate ----
     log("4. running evals (real ReaperCode in a pod, real model)");
+    // The commit identifies the AGENT VERSION under test, not the workspace:
+    // each eval clones its own fixture repo. Pinning the reaper sha as the
+    // workspace ref would try to check it out of the fixture — "reference is
+    // not a tree". The agent version is recorded via the label instead.
     const ev = await http(base, "POST", `/api/projects/${projectId}/evaluate`, {
-      commit,
+      commit: "HEAD",
       agentId: "reapercode",
       model: MODEL,
       provider: "anthropic",
-      label: `reapercode @ ${commit.slice(0, 8)}`,
+      label: `reapercode @ ${commit.slice(0, 12)}`,
       adapterOverrides: {
         image: POD_IMAGE,
         env: {
-          ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? "",
-          ANTHROPIC_API_KEY: process.env.ANTHROPIC_AUTH_TOKEN ?? "",
-          ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN ?? "",
+          ANTHROPIC_BASE_URL: containerGatewayUrl,
+          ANTHROPIC_API_KEY: "gateway",
+          ANTHROPIC_AUTH_TOKEN: "gateway",
           AGENTEVAL_WORKSPACE: "/workspace",
         },
       },
@@ -362,6 +380,7 @@ async function main(): Promise<void> {
     console.log(`json:   ${jsonPath}`);
     console.log(`data:   ${dataDir}`);
   } finally {
+    await gateway.close();
     await api.close();
   }
 }

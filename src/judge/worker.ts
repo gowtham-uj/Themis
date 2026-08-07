@@ -165,6 +165,10 @@ export async function judgeRun(input: JudgeRunInput): Promise<JudgeRunResult> {
   try {
     const runMeta = await readRunJson(runDir);
     const eventsPreview = await buildEventsPreview(runDir, input.previewWindow ?? 5);
+    // The diff is primary evidence for whether the work was done at all.
+    const diffText = await readFile(join(runDir, "diff.patch"), "utf8").catch(
+      () => "",
+    );
 
     // Category profile: filter rubric criteria (plan/categories.md + rubric §7)
     // so the prompt lists only applicable criteria and the verdict is validated
@@ -204,6 +208,7 @@ export async function judgeRun(input: JudgeRunInput): Promise<JudgeRunResult> {
       agentCategory: category,
       runMetadata: runMeta,
       eventsPreview,
+      ...(diffText ? { diff: diffText } : {}),
       judgePrompt: input.judgePrompt,
       referenceSolution: input.task.referenceSolution,
       hasSourceArtifacts,
@@ -577,6 +582,8 @@ export async function buildEventsPreview(
   let total = 0;
   let minSeq: number | undefined;
   let maxSeq: number | undefined;
+  const actions: string[] = [];
+  let timelineTruncated = false;
 
   try {
     await access(eventsPath);
@@ -598,6 +605,20 @@ export async function buildEventsPreview(
     if (first.length < window) first.push(summarizeEvent(e));
     last.push(summarizeEvent(e));
     if (last.length > window) last.shift();
+
+    // Every action, in order — the spine of what the agent actually did.
+    if (
+      type === "turn.start" ||
+      type === "tool.call" ||
+      type === "tool.result" ||
+      type === "run.end"
+    ) {
+      if (actions.length < MAX_TIMELINE_ACTIONS) {
+        actions.push(compactAction(e));
+      } else {
+        timelineTruncated = true;
+      }
+    }
   }
 
   const body = {
@@ -606,8 +627,50 @@ export async function buildEventsPreview(
     seqRange: { min: minSeq ?? null, max: maxSeq ?? null },
     first,
     last,
+    // The COMPLETE sequence of actions the agent took, in order.
+    //
+    // first/last windows alone hide the middle of the run — which is where the
+    // work happens. A judge that cannot see that an edit came after the last
+    // test run cannot tell verified work from unverified work, and will report
+    // a real change as "did nothing". Actions only (turns, tool calls and
+    // results, run end), so this stays bounded even on long runs.
+    actionTimeline: actions,
+    ...(timelineTruncated
+      ? { actionTimelineTruncated: `only the first ${MAX_TIMELINE_ACTIONS} actions are shown` }
+      : {}),
   };
   return redactPreview(JSON.stringify(body, null, 2));
+}
+
+/** Cap on timeline entries, so a pathological run cannot flood the prompt. */
+const MAX_TIMELINE_ACTIONS = 300;
+
+/**
+ * One action as a single line: `seq · type · detail`.
+ *
+ * Compact because ORDER is what matters here — whether the last test run came
+ * before or after the last edit is the whole question, and that reads better as
+ * a list than as nested JSON.
+ */
+function compactAction(e: Record<string, unknown>): string {
+  const seq = typeof e.seq === "number" ? e.seq : "?";
+  const type = String(e.type ?? "unknown");
+  if (type === "turn.start") return `${seq} · turn ${String(e.turn ?? "")} begins`;
+  if (type === "tool.call") {
+    const args = e.args && typeof e.args === "object" ? JSON.stringify(e.args) : "";
+    return `${seq} · CALL ${String(e.name ?? "?")}${args ? ` ${args.slice(0, 160)}` : ""}`;
+  }
+  if (type === "tool.result") {
+    const out =
+      typeof e.output === "string"
+        ? e.output
+        : e.output
+          ? JSON.stringify(e.output)
+          : "";
+    return `${seq} · RESULT ${String(e.name ?? "?")} ${e.isError ? "ERROR" : "ok"}${out ? `: ${out.slice(0, 200)}` : ""}`;
+  }
+  if (type === "run.end") return `${seq} · run.end status=${String(e.status ?? "?")}`;
+  return `${seq} · ${type}`;
 }
 
 function summarizeEvent(e: Record<string, unknown>): Record<string, unknown> {

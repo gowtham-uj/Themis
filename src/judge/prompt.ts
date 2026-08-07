@@ -32,6 +32,15 @@ export interface JudgePromptVars {
    */
   hasSourceArtifacts: boolean;
   /**
+   * The unified diff of what the agent changed.
+   *
+   * Without this the judge is told source artifacts exist and then never shown
+   * them — so a real code change is invisible and reads as "did nothing", which
+   * is the worst kind of wrong verdict: confidently the opposite of the truth.
+   * Bounded, because one runaway diff must not crowd out the trace.
+   */
+  diff?: string;
+  /**
    * Deterministic check results (P9) for the judge to reconcile with.
    * When present, the prompt instructs the model to ground/flag criteria
    * linked via Criterion.checkId — without auto-failing purely on a check.
@@ -236,6 +245,24 @@ not exist.
  * The model should respond with verdict JSON only.
  */
 export function assembleJudgeUserPrompt(vars: JudgePromptVars): string {
+  // The diff is the primary evidence for whether the work was actually done.
+  // Bounded so one runaway change cannot crowd out the trace.
+  const MAX_DIFF_CHARS = 24_000;
+  const diffText = (vars.diff ?? "").trim();
+  const diffSection = diffText
+    ? [
+        "",
+        "### Diff (what the agent actually changed)",
+        "```diff",
+        diffText.length > MAX_DIFF_CHARS
+          ? `${diffText.slice(0, MAX_DIFF_CHARS)}\n… [diff truncated at ${MAX_DIFF_CHARS} chars] …`
+          : diffText,
+        "```",
+      ].join("\n")
+    : vars.hasSourceArtifacts
+      ? "\n### Diff\n(empty — the agent changed no tracked files)"
+      : "";
+
   const sourceNote = vars.hasSourceArtifacts
     ? "A diff.patch is available for this run — include improvements.withSource when you have source-level recommendations (empty array is allowed)."
     : "No source/diff artifacts for this run — OMIT improvements.withSource entirely.";
@@ -264,6 +291,7 @@ export function assembleJudgeUserPrompt(vars: JudgePromptVars): string {
     "",
     "### Events preview (bounded; not the full trace)",
     vars.eventsPreview,
+    diffSection,
     checksSection,
     "",
     "### Lens gate",
