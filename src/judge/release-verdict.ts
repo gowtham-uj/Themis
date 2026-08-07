@@ -389,6 +389,14 @@ export function validateReleaseVerdict(
         `improvementPlan[${i}]: missing verifyTaskIds (a step that cannot be verified is not actionable)`,
       );
     }
+    // Every step must name the defect it addresses, verbatim from the judge.
+    // The `change` may be null — that means the judge supplied no fix
+    // direction, and an honest gap is required over a synthesized one.
+    if (typeof step.defect !== "string" || !step.defect) {
+      throw new ReleaseVerdictValidationError(
+        `improvementPlan[${i}]: missing defect (the judge's own claim)`,
+      );
+    }
   }
   for (const d of rv.recurringDefects ?? []) {
     if (!Array.isArray(d.taskIds) || d.taskIds.length < 2) {

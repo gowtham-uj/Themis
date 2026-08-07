@@ -94,6 +94,7 @@ function planJson(
       rank: s.rank,
       subsystem: s.subsystem,
       change: s.change,
+      defect: s.defect,
       rationale: s.rationale,
       evals_blocked: s.evalsBlocked,
       estimated_score_gain: s.estimatedScoreGain,
@@ -110,7 +111,7 @@ function planJson(
             commit: v.releaseRef,
             taskIds: [...s.verifyTaskIds, ...s.regressionTaskIds],
             agentId: v.agentId,
-            label: `verify: ${s.change.slice(0, 60)}`,
+            label: `verify: ${(s.change ?? s.defect).slice(0, 60)}`,
           },
         },
       },
@@ -285,6 +286,7 @@ export function registerImprovementRoutes(router: Router): void {
       project_id: projectId,
       step: rank,
       change: step.change,
+      defect: step.defect,
       // Deliberately does NOT start the run itself: the consumer chose the
       // commit, and it should be the thing that triggers work against it.
       next: {
@@ -294,7 +296,7 @@ export function registerImprovementRoutes(router: Router): void {
           commit,
           taskIds: [...step.verifyTaskIds, ...step.regressionTaskIds],
           agentId: body.agentId ?? body.agent_id ?? verdict.agentId,
-          label: `verify step ${rank}: ${step.change.slice(0, 60)}`,
+          label: `verify step ${rank}: ${(step.change ?? step.defect).slice(0, 60)}`,
         },
       },
       success_criterion: {

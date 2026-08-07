@@ -280,10 +280,16 @@ function renderImprovementPlan(v: ReleaseVerdict): string {
         ? `<span class="chronic-badge">chronic — previous fixes did not work</span>`
         : "";
       return [
-        `<li class="plan-step" data-subsystem="${escapeHtml(s.subsystem)}">`,
+        `<li class="plan-step"${s.subsystem ? ` data-subsystem="${escapeHtml(s.subsystem)}"` : ""}>`,
         `<div class="plan-head">`,
-        `<span class="subsystem-chip">${escapeHtml(s.subsystem)}</span>`,
-        `<strong>${escapeHtml(s.change)}</strong>`,
+        s.subsystem
+          ? `<span class="subsystem-chip">${escapeHtml(s.subsystem)}</span>`
+          : "",
+        // No change instruction means the judge gave none. Say that, rather
+        // than restating the defect in the imperative and calling it advice.
+        s.change
+          ? `<strong>${escapeHtml(s.change)}</strong>`
+          : `<strong>${escapeHtml(s.defect)}</strong> <span class="section-empty">(no fix direction recorded)</span>`,
         chronic,
         `</div>`,
         `<p class="section-lede">${escapeHtml(s.rationale)}</p>`,
@@ -313,7 +319,7 @@ function renderSubsystemLoad(v: ReleaseVerdict): string {
   const rows = v.subsystemLoad
     .map(
       (s) =>
-        `<tr><td><span class="subsystem-chip">${escapeHtml(s.subsystem)}</span></td><td>${s.defectCount}</td><td>${s.evalsAffected}</td><td>${escapeHtml(s.topDefect ?? "—")}</td></tr>`,
+        `<tr><td>${s.subsystem ? `<span class="subsystem-chip">${escapeHtml(s.subsystem)}</span>` : `<span class="section-empty">not routed</span>`}</td><td>${s.defectCount}</td><td>${s.evalsAffected}</td><td>${escapeHtml(s.topDefect ?? "—")}</td></tr>`,
     )
     .join("");
   return [
@@ -457,22 +463,30 @@ function renderTheme(t: Theme): string {
     : "";
 
   return [
-    `<div class="theme" data-severity="${escapeHtml(t.severity)}" data-theme="${escapeHtml(t.id)}">`,
+    `<div class="theme" data-severity="${escapeHtml(t.severity)}" data-theme="${escapeHtml(t.id)}"${t.subsystem ? ` data-subsystem="${escapeHtml(t.subsystem)}"` : ""}>`,
     `<div class="theme-head">`,
     `<span class="theme-title">${escapeHtml(t.title)}</span>`,
-    `<span class="subsystem-chip">${escapeHtml(t.subsystem)}</span>`,
+    // No chip when the judge did not attribute one — an "unattributed" label
+    // would read as a routing decision it never made.
+    t.subsystem ? `<span class="subsystem-chip">${escapeHtml(t.subsystem)}</span>` : "",
     `<span class="badge">${escapeHtml(t.severity)}</span>`,
     t.chronic
       ? `<span class="chronic-badge">chronic — survived ${t.evaluationsSurvived} evaluations</span>`
       : "",
     `</div>`,
     `<p>${escapeHtml(t.whatWentWrong)}</p>`,
-    `<p class="section-lede">${escapeHtml(t.why)}</p>`,
+    t.why ? `<p class="section-lede">${escapeHtml(t.why)}</p>` : "",
     examples,
-    `<div class="technique">`,
-    `<h4>Technique</h4>`,
-    `<p>${escapeHtml(t.technique)}</p>`,
-    `</div>`,
+    // Say plainly when the judge supplied no remedy. Inventing one from the
+    // category name would look like advice and contain none.
+    t.technique
+      ? [
+          `<div class="technique">`,
+          `<h4>Technique</h4>`,
+          `<p>${escapeHtml(t.technique)}</p>`,
+          `</div>`,
+        ].join("")
+      : `<p class="section-empty">The judge recorded no fix direction for this theme.</p>`,
     `<p class="recur-tasks">Affects ${t.affectedEvals.length} eval(s): ${t.affectedEvals.map((e) => escapeHtml(e.name)).join(", ")}`,
     t.impact.estimatedScoreGain > 0
       ? ` · worth about +${t.impact.estimatedScoreGain.toFixed(3)} mean score`

@@ -45,14 +45,23 @@ export interface Theme {
   /** What went wrong, across the evals where it appeared. */
   whatWentWrong: string;
   /**
-   * Why it happened — the diagnosis that makes the technique follow. Without
-   * this the technique is a guess the consumer cannot evaluate.
+   * Why it happened, in the judge's own words. Null when the judge anchored no
+   * decision point — the platform does not manufacture a diagnosis, because a
+   * consuming agent cannot tell a fabricated one from a real one.
    */
-  why: string;
-  /** The concrete change to make. */
-  technique: string;
-  /** Where to make it. */
-  subsystem: Subsystem | "unattributed";
+  why: string | null;
+  /**
+   * The concrete change to make — the judge's fix direction. Null when it gave
+   * none: a sentence assembled from the category name looks like advice and
+   * contains none.
+   */
+  technique: string | null;
+  /**
+   * Where to make it. Null when the judge did not attribute a subsystem —
+   * routing is exactly the field a guess does the most damage in, since a
+   * tool-schema bug routed to "prompt" collects patches that cannot fix it.
+   */
+  subsystem: Subsystem | null;
   severity: "blocker" | "major" | "minor" | "nit";
   /** Evals exhibiting this pattern. */
   affectedEvals: Array<{ taskId: string; name: string }>;
@@ -224,7 +233,7 @@ function buildThemes(
   const nameByTask = new Map(bundles.map((b) => [b.taskId, b.evalName]));
 
   interface Group {
-    subsystem: Subsystem | "unattributed";
+    subsystem: Subsystem | null;
     category: string;
     severity: string;
     findings: Array<{ taskId: string; finding: Finding }>;
@@ -236,8 +245,8 @@ function buildThemes(
   for (const bundle of bundles) {
     const verdict = bundle.verdict as Verdict | null;
     for (const f of verdict?.findings ?? []) {
-      const subsystem = (f.subsystem ?? "unattributed") as Group["subsystem"];
-      const key = `${subsystem}::${f.category}`;
+      const subsystem = (f.subsystem ?? null) as Group["subsystem"];
+      const key = `${subsystem ?? "null"}::${f.category}`;
       const existing = groups.get(key);
       if (existing) {
         existing.findings.push({ taskId: bundle.taskId, finding: f });
@@ -262,7 +271,7 @@ function buildThemes(
   // ranked defects the release verdict already computed.
   const rankedBySubsystemCategory = new Map<string, (typeof release.rankedDefects)[number]>();
   for (const d of release.rankedDefects) {
-    const key = `${d.subsystem ?? "unattributed"}::${d.category}`;
+    const key = `${d.subsystem ?? "null"}::${d.category}`;
     const prev = rankedBySubsystemCategory.get(key);
     if (!prev || d.impactScore > prev.impactScore) {
       rankedBySubsystemCategory.set(key, d);
@@ -280,11 +289,13 @@ function buildThemes(
     const affectedTaskIds = [...new Set(g.findings.map((f) => f.taskId))];
     const ranked = rankedBySubsystemCategory.get(key);
 
-    // The technique: prefer the judge's own fix direction; several findings
-    // usually agree, so take the most detailed rather than concatenating.
-    const technique =
-      [...g.techniques].sort((a, b) => b.length - a.length)[0] ??
-      `Address the ${g.category.replace(/_/g, " ")} pattern in ${g.subsystem}.`;
+    // The technique is the judge's own fix direction. When several findings
+    // agree, take the most detailed; when NONE supplied one, the theme carries
+    // no technique rather than a restatement of the category. A sentence
+    // assembled from the category name looks like advice and contains none —
+    // worse than an honest gap, because a consuming agent cannot tell it apart
+    // from real analysis.
+    const technique = [...g.techniques].sort((a, b) => b.length - a.length)[0] ?? null;
 
     // Examples make a theme credible without shipping the trace. Cap at three:
     // a fourth example rarely changes what the consumer does.
@@ -299,24 +310,20 @@ function buildThemes(
         insteadShouldHave: f.finding.decisionPoint?.counterfactual ?? "",
       }));
 
-    // Fall back to claims when no decision points were recorded — a theme with
-    // no examples reads as an assertion.
-    if (examples.length === 0) {
-      for (const f of g.findings.slice(0, 3)) {
-        examples.push({
-          taskId: f.taskId,
-          evalName: nameByTask.get(f.taskId) ?? f.taskId,
-          seq: null,
-          whatHappened: f.finding.claim,
-          insteadShouldHave: f.finding.fix?.direction ?? "",
-        });
-      }
-    }
+    // No fallback: an example exists only where the judge anchored one. A claim
+    // reshaped to look like a decision point would give a consuming agent a
+    // seq-less "moment" that never happened.
 
+    // The diagnosis is the judge's account of WHAT the agent did at the moment
+    // it went wrong — not the counterfactual, which is already shown as the
+    // remedy in each example. Repeating the counterfactual here would pad the
+    // theme with the same sentence twice. Null when no decision point was
+    // anchored: breadth ("seen in 3 evals") is a COUNT, reported separately in
+    // affectedEvals, and dressing it up as a causal explanation would put words
+    // in the model's mouth.
     const why =
-      g.findings.length > 1
-        ? `Seen in ${affectedTaskIds.length} eval(s), so this is a systematic pattern rather than a one-off slip.`
-        : `Seen once, in ${nameByTask.get(affectedTaskIds[0] ?? "") ?? "one eval"}.`;
+      g.findings.map((f) => f.finding.decisionPoint?.whatHappened).find(Boolean) ??
+      null;
 
     themes.push({
       id: `theme-${n}`,

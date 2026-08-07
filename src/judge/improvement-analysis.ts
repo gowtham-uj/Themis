@@ -225,7 +225,8 @@ export function rankDefectsByImpact(input: RankDefectsInput): RankedDefect[] {
 
 /** Defect load per subsystem. */
 export interface SubsystemLoad {
-  subsystem: Subsystem | "unattributed";
+  /** Null groups the defects the judge declined to route. */
+  subsystem: Subsystem | null;
   defectCount: number;
   evalsAffected: number;
   totalImpact: number;
@@ -245,7 +246,7 @@ export function rollupBySubsystem(
 ): SubsystemLoad[] {
   const groups = new Map<string, RankedDefect[]>();
   for (const d of ranked) {
-    const key = d.subsystem ?? "unattributed";
+    const key = d.subsystem ?? "";
     const list = groups.get(key);
     if (list) list.push(d);
     else groups.set(key, [d]);
@@ -256,7 +257,7 @@ export function rollupBySubsystem(
     const evals = new Set<string>();
     for (const d of defects) for (const t of d.taskIds) evals.add(t);
     out.push({
-      subsystem: subsystem as SubsystemLoad["subsystem"],
+      subsystem: (subsystem || null) as SubsystemLoad["subsystem"],
       defectCount: defects.length,
       evalsAffected: evals.size,
       totalImpact: Number(
@@ -276,9 +277,11 @@ export function rollupBySubsystem(
 /** One actionable step for the agent consuming this report. */
 export interface ImprovementStep {
   rank: number;
-  subsystem: Subsystem | "unattributed";
-  /** What to change. */
-  change: string;
+  subsystem: Subsystem | null;
+  /** The judge's fix direction; null when it gave none. */
+  change: string | null;
+  /** The defect this step addresses, verbatim from the judge's finding. */
+  defect: string;
   /** Why, grounded in the defect it comes from. */
   rationale: string;
   /** Evals that should start passing. */
@@ -311,15 +314,18 @@ export function buildImprovementPlan(
   const limit = opts.limit ?? 10;
   return ranked.slice(0, limit).map((d, i) => ({
     rank: i + 1,
-    subsystem: d.subsystem ?? "unattributed",
-    change:
-      opts.fixDirections?.get(d.fingerprint) ??
-      // No fix direction from the judge — name the defect rather than inventing
-      // a remedy the evidence does not support.
-      `Address: ${d.claim}`,
+    subsystem: d.subsystem ?? null,
+    // The judge's fix direction, or null. Naming the defect back at the reader
+    // ("Address: <claim>") is not a change instruction — it looks like one,
+    // which is worse than an honest gap.
+    change: opts.fixDirections?.get(d.fingerprint) ?? null,
+    defect: d.claim,
+    // Counts and deltas the PLATFORM computed — arithmetic, not judgement.
+    // Kept distinct from anything the model said so a reader can tell them
+    // apart at a glance.
     rationale: d.persistence?.chronic
-      ? `Blocks ${d.evalsBlocked} eval(s) and has survived ${d.persistence.evaluationCount} evaluations — previous fixes have not worked, so change approach rather than patch again.`
-      : `Blocks ${d.evalsBlocked} eval(s); fixing it is worth about +${d.estimatedScoreGain.toFixed(3)} mean score.`,
+      ? `Blocks ${d.evalsBlocked} eval(s); has appeared in ${d.persistence.evaluationCount} evaluations.`
+      : `Blocks ${d.evalsBlocked} eval(s); estimated +${d.estimatedScoreGain.toFixed(3)} mean score if fixed.`,
     verifyTaskIds: [...d.taskIds],
     // Guard set excludes the evals being fixed — they are expected to change.
     regressionTaskIds: opts.passingTaskIds.filter(

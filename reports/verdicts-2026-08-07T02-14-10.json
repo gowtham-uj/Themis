@@ -1,0 +1,216 @@
+[
+  {
+    "runId": "2172d89f-f410-4d62-8554-8cbd91d47c6d",
+    "taskId": "d903bd49-b318-4b5b-af57-ce32dd5d92a1",
+    "verdict": {
+      "schemaVersion": 1,
+      "overall": {
+        "score": 0.57,
+        "verdict": "partial",
+        "summary": "The change was made, but the agent never re-ran the check afterwards, so its correctness is unestablished."
+      },
+      "criteria": [],
+      "findings": [
+        {
+          "id": "f-unverified",
+          "category": "verification_skipped",
+          "severity": "major",
+          "confidence": 0.9,
+          "claim": "The agent did not run the test command after its final edit, so nothing in the trace establishes that the code it left behind works.",
+          "refs": [
+            {
+              "kind": "trace",
+              "runId": "r",
+              "seqs": [
+                15,
+                22
+              ]
+            }
+          ],
+          "subsystem": "prompt",
+          "decisionPoint": {
+            "seq": 22,
+            "whatHappened": "the run concluded after the final edit with no subsequent test execution",
+            "counterfactual": "run the test command as the terminal action, and only report success if it passed",
+            "evidenceAvailableAtSeq": 15
+          },
+          "fix": {
+            "direction": "Make the last action of any edit loop a fresh run of the task's verification command, and gate the success message on that run passing.",
+            "repro": {
+              "command": "node test/range.test.js",
+              "expected": "all tests passed"
+            }
+          }
+        }
+      ],
+      "positiveFindings": [],
+      "metaFindings": [],
+      "diagnostics": {
+        "verification_performed": {
+          "value": false,
+          "refs": [
+            {
+              "kind": "trace",
+              "runId": "r",
+              "seqs": [
+                1,
+                22
+              ]
+            }
+          ],
+          "note": "no check ran after the last edit"
+        }
+      },
+      "attribution": {
+        "agent_vs_environment": "agent"
+      },
+      "observations": [
+        "0 edit action(s) and 0 check action(s) in the trace."
+      ],
+      "improvements": {
+        "summary": "One ordering change closes the gap: verify last, not first.",
+        "withoutSource": [
+          {
+            "area": "verification",
+            "priority": "high",
+            "change": "Make a fresh verification run the terminal action of the edit loop.",
+            "why": "The trace shows edits after the last check, so the reported outcome describes a state the agent never observed.",
+            "refs": [
+              {
+                "kind": "trace",
+                "runId": "r",
+                "seqs": [
+                  15,
+                  22
+                ]
+              }
+            ],
+            "linkedFindings": [
+              "f-unverified"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "027091ff-0add-460c-80dd-ecacc8c8aa30",
+    "taskId": "43e45136-8e80-49f3-a56e-2205a1eb1e4f",
+    "verdict": {
+      "schemaVersion": 1,
+      "overall": {
+        "score": 0.23,
+        "verdict": "partial",
+        "summary": "No change was made to the target file."
+      },
+      "criteria": [],
+      "findings": [
+        {
+          "id": "f-no-change",
+          "category": "task_incomplete",
+          "severity": "blocker",
+          "confidence": 0.95,
+          "claim": "The agent produced no change to the target file, so the requested fix was never made.",
+          "refs": [
+            {
+              "kind": "trace",
+              "runId": "r",
+              "seqs": [
+                1,
+                10
+              ]
+            }
+          ],
+          "subsystem": "scaffold",
+          "decisionPoint": {
+            "seq": 10,
+            "whatHappened": "the run ended with the workspace unmodified",
+            "counterfactual": "before ending, confirm at least one edit was applied and re-read the file to prove it"
+          },
+          "fix": {
+            "direction": "Require the loop to assert that an edit landed — re-read the target file and compare — before it is allowed to terminate."
+          }
+        },
+        {
+          "id": "f-unverified",
+          "category": "verification_skipped",
+          "severity": "major",
+          "confidence": 0.9,
+          "claim": "The agent did not run the test command after its final edit, so nothing in the trace establishes that the code it left behind works.",
+          "refs": [
+            {
+              "kind": "trace",
+              "runId": "r",
+              "seqs": [
+                7,
+                10
+              ]
+            }
+          ],
+          "subsystem": "prompt",
+          "decisionPoint": {
+            "seq": 10,
+            "whatHappened": "the run concluded after the final edit with no subsequent test execution",
+            "counterfactual": "run the test command as the terminal action, and only report success if it passed",
+            "evidenceAvailableAtSeq": 7
+          },
+          "fix": {
+            "direction": "Make the last action of any edit loop a fresh run of the task's verification command, and gate the success message on that run passing.",
+            "repro": {
+              "command": "node test/range.test.js",
+              "expected": "all tests passed"
+            }
+          }
+        }
+      ],
+      "positiveFindings": [],
+      "metaFindings": [],
+      "diagnostics": {
+        "verification_performed": {
+          "value": false,
+          "refs": [
+            {
+              "kind": "trace",
+              "runId": "r",
+              "seqs": [
+                1,
+                10
+              ]
+            }
+          ],
+          "note": "no check ran after the last edit"
+        }
+      },
+      "attribution": {
+        "agent_vs_environment": "agent"
+      },
+      "observations": [
+        "0 edit action(s) and 0 check action(s) in the trace."
+      ],
+      "improvements": {
+        "summary": "One ordering change closes the gap: verify last, not first.",
+        "withoutSource": [
+          {
+            "area": "verification",
+            "priority": "high",
+            "change": "Make a fresh verification run the terminal action of the edit loop.",
+            "why": "The trace shows edits after the last check, so the reported outcome describes a state the agent never observed.",
+            "refs": [
+              {
+                "kind": "trace",
+                "runId": "r",
+                "seqs": [
+                  7,
+                  10
+                ]
+              }
+            ],
+            "linkedFindings": [
+              "f-unverified"
+            ]
+          }
+        ]
+      }
+    }
+  }
+]

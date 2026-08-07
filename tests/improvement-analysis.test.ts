@@ -231,14 +231,16 @@ describe("rollupBySubsystem", () => {
     expect(prompt.evalsAffected).toBe(2);
   });
 
-  it("groups unattributed defects rather than dropping them", () => {
+  it("groups un-routed defects under null rather than labelling them", () => {
+    // "unattributed" reads as a routing decision the judge never made. Null is
+    // the honest representation of "it declined to route this".
     const ranked = rankDefectsByImpact({
       defects: [
         { fingerprint: "a", category: "c", claim: "x", severity: "major", taskIds: ["t1"] },
       ],
       scoresByTask: new Map([["t1", 0.1]]),
     });
-    expect(rollupBySubsystem(ranked)[0]!.subsystem).toBe("unattributed");
+    expect(rollupBySubsystem(ranked)[0]!.subsystem).toBeNull();
   });
 });
 
@@ -277,7 +279,10 @@ describe("buildImprovementPlan", () => {
     expect(plan[0]!.regressionTaskIds).toEqual(["t3"]);
   });
 
-  it("names the defect rather than inventing a remedy when none was given", () => {
+  it("leaves `change` null when the judge gave no fix direction", () => {
+    // Restating the defect in the imperative would LOOK like advice and
+    // contain none — a consuming agent cannot tell it apart from real
+    // analysis. The defect is reported separately, verbatim.
     const ranked = rankDefectsByImpact({
       defects: [
         { fingerprint: "d", category: "c", claim: "the thing is broken", severity: "major", taskIds: ["t1"] },
@@ -285,7 +290,8 @@ describe("buildImprovementPlan", () => {
       scoresByTask: new Map([["t1", 0.1]]),
     });
     const plan = buildImprovementPlan(ranked, { passingTaskIds: [] });
-    expect(plan[0]!.change).toContain("the thing is broken");
+    expect(plan[0]!.change).toBeNull();
+    expect(plan[0]!.defect).toBe("the thing is broken");
   });
 
   it("tells a consuming agent to change approach on a chronic defect", () => {
@@ -304,7 +310,9 @@ describe("buildImprovementPlan", () => {
     });
     const plan = buildImprovementPlan(ranked, { passingTaskIds: [] });
     expect(plan[0]!.chronic).toBe(true);
-    expect(plan[0]!.rationale).toMatch(/change approach/i);
+    // The rationale reports the COUNT the platform computed. "Change approach"
+    // is a recommendation, and recommendations come from the judge.
+    expect(plan[0]!.rationale).toMatch(/3 evaluations/);
   });
 });
 
