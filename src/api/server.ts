@@ -77,6 +77,7 @@ import { parseEvalEnvSpec } from "../runner/env-provision.js";
 import { registerReleaseRoutes } from "./release-routes.js";
 import { registerCommitEvalRoutes } from "./commit-eval-routes.js";
 import { registerGitHubRoutes } from "./github-routes.js";
+import { registerImprovementRoutes } from "./improvement-routes.js";
 import type { GitHubClient } from "./github.js";
 import { handleRunFinalized, type AutoJudgeDeps } from "./auto-judge.js";
 import { createBatchClaimStore } from "../judge/batch-completion.js";
@@ -1590,6 +1591,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerReleaseRoutes(router);
   registerCommitEvalRoutes(router);
   registerGitHubRoutes(router);
+  registerImprovementRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {
