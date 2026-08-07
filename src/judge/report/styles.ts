@@ -846,4 +846,11 @@ a:focus-visible {
   white-space: nowrap;
   border: 0;
 }
+.decision-point { border-left:3px solid var(--sev-major,#d97706); padding:.4rem .8rem; margin:.6rem 0; }
+.decision-point h4, .verify-block h4 { margin:0 0 .3rem; font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; opacity:.8; }
+.dp-counterfactual { font-weight:600; }
+.dp-gap { font-size:.85rem; opacity:.8; }
+.verify-block { border-left:3px solid var(--ok,#16a34a); padding:.4rem .8rem; margin:.6rem 0; font-size:.9rem; }
+.badge.subsystem { border:1px solid currentColor; opacity:.9; text-transform:uppercase; font-size:.7rem; letter-spacing:.03em; }
+.badge.chronic { color:var(--sev-critical,#dc2626); font-weight:600; }
 `.trim();

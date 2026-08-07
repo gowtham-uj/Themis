@@ -58,8 +58,93 @@ export interface Finding {
   refs: Ref[];
   /** Optional fix direction + a repro command/expected pair. */
   fix?: { direction: string; repro?: { command: string; expected: string } };
+  /**
+   * WHICH SUBSYSTEM to change. A defect's symptom and its remedy live in
+   * different places: "the agent never re-ran the tests" might be a missing
+   * instruction, a tool whose description does not say it can be re-run, a
+   * scaffold that ends the loop too early, or a model that cannot hold the
+   * plan. Without this, a consuming agent guesses — and guessing wrong is how
+   * a tool-schema bug collects five prompt patches.
+   */
+  subsystem?: Subsystem;
+  /**
+   * WHERE the run went wrong, and what would have avoided it.
+   *
+   * A finding that says "should have verified" is interpretive. One that says
+   * "at seq 15 the agent claimed success; the last test ran at seq 5;
+   * inserting a test run between them would have surfaced the failure" is a
+   * testable hypothesis. That difference is what makes a report actionable.
+   */
+  decisionPoint?: DecisionPoint;
+  /**
+   * Which evals to re-run to prove a fix for this finding worked.
+   *
+   * Turns the report into a closed loop: apply the change, run exactly these,
+   * see whether the finding is gone — without the consuming agent having to
+   * decide what re-running even means.
+   */
+  verification?: VerificationSet;
   /** Set by the platform on fingerprint match — not by the judge. */
   recurring?: { firstSeenRun: string; lastSeenRun: string; count: number };
+  /**
+   * Set by the platform: how many EVALUATIONS this defect has survived.
+   * A defect that persists across several fix attempts is a signal to change
+   * approach rather than keep patching — which no single report can show.
+   */
+  persistence?: DefectPersistence;
+}
+
+/** Which part of the system a defect should be fixed in. */
+export type Subsystem =
+  | "prompt"
+  | "tool_description"
+  | "scaffold"
+  | "model_capability"
+  | "task_definition"
+  | "environment";
+
+export const SUBSYSTEMS: readonly Subsystem[] = [
+  "prompt",
+  "tool_description",
+  "scaffold",
+  "model_capability",
+  "task_definition",
+  "environment",
+];
+
+/** The moment a run went wrong, plus what would have avoided it. */
+export interface DecisionPoint {
+  /** Trace seq where the wrong decision was made or committed to. */
+  seq: number;
+  /** What the agent did there. */
+  whatHappened: string;
+  /** The concrete alternative action that would have avoided the defect. */
+  counterfactual: string;
+  /**
+   * Optional earlier seq where the correct information was already available —
+   * the gap between the two is usually the whole story.
+   */
+  evidenceAvailableAtSeq?: number;
+}
+
+/** How to prove a fix worked. */
+export interface VerificationSet {
+  /** Evals that exercise this defect — they should flip to passing. */
+  targetTaskIds: string[];
+  /** Evals that currently pass and must keep passing. */
+  regressionTaskIds?: string[];
+  /** One line: what a successful fix looks like when these are re-run. */
+  successCriterion?: string;
+}
+
+/** Platform-computed history of a defect across evaluations. */
+export interface DefectPersistence {
+  /** Number of distinct evaluations (batches) this defect appeared in. */
+  evaluationCount: number;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+  /** True when it survived multiple evaluations — stop patching, rethink. */
+  chronic: boolean;
 }
 
 /**
@@ -295,6 +380,97 @@ function validateFindingIdsUnique(findings: Finding[], label: string): void {
       throw new VerdictValidationError(`${label} "${f.id}": finding must have ≥1 ref (drop it otherwise)`);
     f.refs.forEach((r, i) => assertRef(r, `${label} "${f.id}" ref[${i}]`));
     assertFix(f.fix, `${label} "${f.id}"`);
+    assertSubsystem(f.subsystem, `${label} "${f.id}"`);
+    assertDecisionPoint(f.decisionPoint, `${label} "${f.id}"`);
+    assertVerification(f.verification, `${label} "${f.id}"`);
+  }
+}
+
+/** Validate the optional subsystem attribution. */
+function assertSubsystem(v: unknown, ctx: string): void {
+  if (v === undefined || v === null) return;
+  if (typeof v !== "string" || !SUBSYSTEMS.includes(v as Subsystem)) {
+    throw new VerdictValidationError(
+      `${ctx}: subsystem must be one of ${SUBSYSTEMS.join("|")} (got ${String(v)})`,
+    );
+  }
+}
+
+/**
+ * Validate an optional decision point.
+ *
+ * A decision point without a counterfactual is just a timestamp on a
+ * complaint — the counterfactual is the part a consuming agent can act on and
+ * test, so it is required whenever the block is present at all.
+ */
+function assertDecisionPoint(v: unknown, ctx: string): void {
+  if (v === undefined || v === null) return;
+  if (!isObject(v)) {
+    throw new VerdictValidationError(`${ctx}: decisionPoint must be an object`);
+  }
+  if (typeof v.seq !== "number" || !Number.isFinite(v.seq) || v.seq < 0) {
+    throw new VerdictValidationError(
+      `${ctx}: decisionPoint.seq must be a non-negative trace seq`,
+    );
+  }
+  if (typeof v.whatHappened !== "string" || !v.whatHappened) {
+    throw new VerdictValidationError(
+      `${ctx}: decisionPoint missing whatHappened`,
+    );
+  }
+  if (typeof v.counterfactual !== "string" || !v.counterfactual) {
+    throw new VerdictValidationError(
+      `${ctx}: decisionPoint missing counterfactual (a decision point without one is not actionable)`,
+    );
+  }
+  if (v.evidenceAvailableAtSeq !== undefined) {
+    const e = v.evidenceAvailableAtSeq;
+    if (typeof e !== "number" || !Number.isFinite(e) || e < 0) {
+      throw new VerdictValidationError(
+        `${ctx}: decisionPoint.evidenceAvailableAtSeq must be a trace seq`,
+      );
+    }
+    // Evidence available AFTER the decision explains nothing about it.
+    if (e > v.seq) {
+      throw new VerdictValidationError(
+        `${ctx}: decisionPoint.evidenceAvailableAtSeq (${e}) is after the decision (${v.seq})`,
+      );
+    }
+  }
+}
+
+/**
+ * Validate an optional verification set.
+ *
+ * An empty target list means "re-run nothing to check this", which defeats the
+ * purpose: the whole value is telling a consuming agent exactly what proves the
+ * fix.
+ */
+function assertVerification(v: unknown, ctx: string): void {
+  if (v === undefined || v === null) return;
+  if (!isObject(v)) {
+    throw new VerdictValidationError(`${ctx}: verification must be an object`);
+  }
+  const targets = v.targetTaskIds;
+  if (!Array.isArray(targets) || targets.length === 0) {
+    throw new VerdictValidationError(
+      `${ctx}: verification.targetTaskIds must be a non-empty array`,
+    );
+  }
+  if (!targets.every((t) => typeof t === "string" && t)) {
+    throw new VerdictValidationError(
+      `${ctx}: verification.targetTaskIds must be task id strings`,
+    );
+  }
+  if (v.regressionTaskIds !== undefined) {
+    if (
+      !Array.isArray(v.regressionTaskIds) ||
+      !v.regressionTaskIds.every((t) => typeof t === "string" && t)
+    ) {
+      throw new VerdictValidationError(
+        `${ctx}: verification.regressionTaskIds must be task id strings`,
+      );
+    }
   }
 }
 

@@ -154,7 +154,10 @@ Emit a SINGLE valid JSON object matching this shape (schemaVersion must be 1):
     { "id": "<stable-id>", "category": "<vocab>", "severity": "blocker"|"major"|"minor"|"nit",
       "confidence": <0..1>, "criterion": "<optional>", "claim": "<one line>",
       "refs": [ {"kind":"diff","file":"...","hunk":<n>} | {"kind":"trace","runId":"...","seqs":[a,b]} | {"kind":"tool","toolCallId":"..."} | {"kind":"artifact","path":"outputs/...","sha256":"<optional>"} ],
-      "fix": { "direction": "...", "repro": { "command": "...", "expected": "..." } } }
+      "fix": { "direction": "...", "repro": { "command": "...", "expected": "..." } },
+      "subsystem": "prompt"|"tool_description"|"scaffold"|"model_capability"|"task_definition"|"environment",
+      "decisionPoint": { "seq": <trace seq>, "whatHappened": "...", "counterfactual": "...", "evidenceAvailableAtSeq": <optional earlier seq> },
+      "verification": { "targetTaskIds": ["<task id>"], "regressionTaskIds": ["<task id>"], "successCriterion": "..." } }
   ],
   "positiveFindings": [ /* same shape as findings */ ],
   "metaFindings": [ { "id":"...", "category":"rubric_unverifiable"|"prompt_ambiguous"|"evidence_missing", "claim":"...", "note":"..." } ],
@@ -188,6 +191,43 @@ HARD RULES:
 - withSource present ONLY when the SOURCE / LENS GATE says source artifacts are present.
 - Ground every score in cited evidence. Prefer absolute standards over relative ranking.
 - STEP 1 must be valid JSON only. No prose before/after. Do not emit HTML.
+
+WRITING FINDINGS A CONSUMING AGENT CAN ACT ON:
+
+This report is read by an agent whose job is to IMPROVE the agent under test.
+It needs three things a symptom description does not give it: where to change,
+what exactly to change, and how it will know the change worked.
+
+- "subsystem" — WHERE the fix belongs. Ask what would have to be different for
+  this not to recur:
+    prompt            an instruction is missing/ambiguous/contradicted
+    tool_description  the tool exists but its description misleads or omits
+    scaffold          the harness ended the loop, lost context, or mis-ordered steps
+    model_capability  the instruction was clear and the model still could not do it
+    task_definition   the eval itself is ambiguous or unverifiable (also emit a metaFinding)
+    environment       missing dependency, broken service, provisioning failure
+  Do NOT default to "prompt". A tool-schema bug attributed to prompt collects
+  patches that cannot fix it. If genuinely unsure, omit the field rather than
+  guess — a wrong route is worse than none.
+
+- "decisionPoint" — WHEN it went wrong, and what would have avoided it.
+  Give the exact trace seq where the agent committed to the wrong course, what
+  it did there, and the concrete alternative. If the information it needed was
+  already visible earlier, cite that seq too: the gap between "knew" and "acted"
+  is usually the whole defect.
+  Weak:   "the agent should have verified its work"
+  Strong: seq 15, "emitted 'all tests pass' with no run since seq 5",
+          counterfactual "run the suite between the final edit (seq 12) and the
+          success claim", evidenceAvailableAtSeq 5.
+
+- "verification" — HOW to prove a fix worked. List the eval task ids that
+  exercise this defect (they should flip to passing) and, when you can tell,
+  the ones that currently pass and must keep passing. Use the task ids given in
+  RUN METADATA / the rubric — do not invent them.
+
+Omit any of these three rather than fabricate one. An invented seq or task id is
+worse than a missing field: it sends the consuming agent to a place that does
+not exist.
 `.trim();
 }
 

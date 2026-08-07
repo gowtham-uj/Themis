@@ -14,6 +14,19 @@
 
 import type { DbQueries, Run } from "../db/queries.js";
 import { fingerprintOf } from "../db/findings.js";
+import type { Subsystem } from "./verdict.js";
+import {
+  buildImprovementPlan,
+  computeReliability,
+  rankDefectsByImpact,
+  rollupBySubsystem,
+  type AttemptRecord,
+} from "./improvement-analysis.js";
+import {
+  diffTrajectories,
+  toTraceSteps,
+  type ExplainedRegression,
+} from "./trajectory-diff.js";
 import type { Verdict } from "./verdict.js";
 import {
   compareToPrevious,
@@ -43,6 +56,11 @@ export interface BuildReleaseVerdictOptions {
   narrate?: (draft: ReleaseVerdict) => ReleaseNarration | Promise<ReleaseNarration>;
   /** Override "now" for deterministic tests. */
   now?: string;
+  /**
+   * Data directory, needed to read event traces for contrastive regression
+   * explanation. Omitted → regressions are reported without trajectory diffs.
+   */
+  dataDir?: string;
 }
 
 /** Newest completed judgement for a run, with its verdict body. */
@@ -132,12 +150,16 @@ export async function buildReleaseVerdict(
   if (runs.length === 0) {
     throw new Error(`buildReleaseVerdict: batch has no runs: ${batchId}`);
   }
+  const dataDir = opts.dataDir;
 
   const first = runs[0]!;
   const projectId = first.projectId;
   const agentId = first.agentId;
 
   const tasks: TaskOutcome[] = [];
+  const attempts: AttemptRecord[] = [];
+  const subsystemByFingerprint = new Map<string, Subsystem>();
+  const fixByFingerprint = new Map<string, string>();
   const perRunFindings: Array<{
     taskId: string;
     runId: string;
@@ -181,9 +203,23 @@ export async function buildReleaseVerdict(
           claim: f.claim,
           severity: f.severity,
         });
+        // Keep the judge's routing + fix direction so the plan can use them.
+        if (f.subsystem) subsystemByFingerprint.set(fingerprint, f.subsystem);
+        if (f.fix?.direction) fixByFingerprint.set(fingerprint, f.fix.direction);
       }
     }
     perRunFindings.push({ taskId: run.taskId, runId: run.id, findings });
+
+    // Every attempt, so repeats become a pass rate rather than one score.
+    attempts.push({
+      taskId: run.taskId,
+      evalName: task?.name ?? run.taskId,
+      runId: run.id,
+      score:
+        typeof judged?.verdict.overall?.score === "number"
+          ? judged.verdict.overall.score
+          : null,
+    });
   }
 
   // Stable order so the report reads the same way each time.
@@ -196,6 +232,58 @@ export async function buildReleaseVerdict(
     batchId,
   );
 
+  // ---- analysis the consuming agent needs ----
+  const reliability = computeReliability(attempts);
+
+  // Cross-evaluation persistence: how many evaluations each defect survived.
+  // A defect that outlives several fix attempts means the approach is wrong,
+  // which no single evaluation can reveal.
+  const persistenceByFingerprint = computePersistence(
+    queries,
+    projectId,
+    perRunFindings,
+  );
+
+  const recurring = findRecurringDefects(perRunFindings).map((d) => ({
+    ...d,
+    subsystem: subsystemByFingerprint.get(d.fingerprint) ?? null,
+    persistence: persistenceByFingerprint.get(d.fingerprint) ?? null,
+  }));
+
+  // Rank by what fixing buys, over ALL defects — not just recurring ones, since
+  // a single-eval blocker can still be the highest-value fix.
+  const allDefects = new Map<string, (typeof recurring)[number]>();
+  for (const d of recurring) allDefects.set(d.fingerprint, d);
+  for (const run of perRunFindings) {
+    for (const f of run.findings) {
+      if (allDefects.has(f.fingerprint)) continue;
+      allDefects.set(f.fingerprint, {
+        ...f,
+        subsystem: subsystemByFingerprint.get(f.fingerprint) ?? null,
+        persistence: persistenceByFingerprint.get(f.fingerprint) ?? null,
+        taskIds: [run.taskId],
+        runIds: [run.runId],
+        occurrences: 1,
+      });
+    }
+  }
+
+  const scoresByTask = new Map<string, number | null>(
+    tasks.map((t) => [t.taskId, t.score]),
+  );
+  const rankedDefects = rankDefectsByImpact({
+    defects: [...allDefects.values()],
+    scoresByTask,
+  });
+  const subsystemLoad = rollupBySubsystem(rankedDefects);
+  const passingTaskIds = tasks
+    .filter((t) => (t.score ?? 0) >= 0.7)
+    .map((t) => t.taskId);
+  const improvementPlan = buildImprovementPlan(rankedDefects, {
+    passingTaskIds,
+    fixDirections: fixByFingerprint,
+  });
+
   const draft: ReleaseVerdict = {
     schemaVersion: RELEASE_VERDICT_SCHEMA_VERSION,
     batchId,
@@ -206,7 +294,20 @@ export async function buildReleaseVerdict(
     provider: first.provider,
     overall: summarizeOutcomes(tasks),
     tasks,
-    recurringDefects: findRecurringDefects(perRunFindings),
+    recurringDefects: recurring,
+    reliability,
+    rankedDefects,
+    subsystemLoad,
+    improvementPlan,
+    explainedRegressions: await explainRegressions(
+      queries,
+      dataDir,
+      tasks,
+      prevScores,
+      projectId,
+      agentId,
+      batchId,
+    ),
     comparison:
       prevScores.size > 0
         ? compareToPrevious(tasks, prevScores, prevRef)
@@ -249,4 +350,141 @@ export async function buildReleaseVerdict(
 
   validateReleaseVerdict(draft);
   return draft;
+}
+
+/**
+ * How many EVALUATIONS each defect has survived.
+ *
+ * The findings table tracks occurrences per run; what an improving agent needs
+ * is coarser and more damning: how many separate evaluations — i.e. how many
+ * fix attempts — this defect has outlived. Two or more means the current
+ * approach is not working.
+ */
+function computePersistence(
+  queries: DbQueries,
+  projectId: string,
+  perRunFindings: ReadonlyArray<{
+    taskId: string;
+    findings: ReadonlyArray<{ fingerprint: string; category: string; claim: string }>;
+  }>,
+): Map<string, { evaluationCount: number; chronic: boolean; firstSeenAt: string | null; lastSeenAt: string | null }> {
+  const out = new Map<
+    string,
+    { evaluationCount: number; chronic: boolean; firstSeenAt: string | null; lastSeenAt: string | null }
+  >();
+
+  // Map each cross-task fingerprint back to the stored (task-scoped) rows so we
+  // can read their occurrence history.
+  for (const run of perRunFindings) {
+    for (const f of run.findings) {
+      if (out.has(f.fingerprint)) continue;
+      const batches = new Set<string>();
+      let firstSeenAt: string | null = null;
+      let lastSeenAt: string | null = null;
+
+      try {
+        for (const row of queries.listFindings({ projectId })) {
+          // Stored fingerprints are task-scoped; match on the semantic key.
+          if (row.category !== f.category || row.claim !== f.claim) continue;
+          for (const occ of queries.listOccurrences(row.fingerprint)) {
+            const occRun = queries.getRun(occ.runId);
+            if (occRun) batches.add(occRun.batchId);
+          }
+          if (row.firstSeenAt && (!firstSeenAt || row.firstSeenAt < firstSeenAt)) {
+            firstSeenAt = row.firstSeenAt;
+          }
+          if (row.lastSeenAt && (!lastSeenAt || row.lastSeenAt > lastSeenAt)) {
+            lastSeenAt = row.lastSeenAt;
+          }
+        }
+      } catch {
+        // Persistence is enrichment; never fail a rollup over it.
+      }
+
+      const evaluationCount = Math.max(1, batches.size);
+      out.set(f.fingerprint, {
+        evaluationCount,
+        chronic: evaluationCount >= 2,
+        firstSeenAt,
+        lastSeenAt,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Explain regressions by diffing trajectories against the previous evaluation.
+ *
+ * A score drop says an eval broke. The divergence point says where — and that
+ * is the part someone can act on. Best-effort: an unreadable trace yields no
+ * explanation rather than failing the rollup.
+ */
+async function explainRegressions(
+  queries: DbQueries,
+  dataDir: string | undefined,
+  tasks: readonly TaskOutcome[],
+  prevScores: ReadonlyMap<string, number>,
+  projectId: string,
+  agentId: string,
+  batchId: string,
+): Promise<ExplainedRegression[]> {
+  if (!dataDir || prevScores.size === 0) return [];
+
+  const { readFile } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+
+  const readSteps = async (runId: string): Promise<unknown[]> => {
+    try {
+      const raw = await readFile(
+        join(dataDir, "projects", projectId, "runs", runId, "events.jsonl"),
+        "utf8",
+      );
+      return raw
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as unknown);
+    } catch {
+      return [];
+    }
+  };
+
+  // Previous run per task, for the same agent, from an earlier batch.
+  const previousRunByTask = new Map<string, string>();
+  for (const r of queries.listRuns({ projectId })) {
+    if (r.agentId !== agentId || r.batchId === batchId) continue;
+    const existing = previousRunByTask.get(r.taskId);
+    if (!existing) previousRunByTask.set(r.taskId, r.id);
+  }
+
+  const out: ExplainedRegression[] = [];
+  for (const t of tasks) {
+    const before = prevScores.get(t.taskId);
+    if (before === undefined || t.score === null) continue;
+    // Only explain material regressions — noise is not worth a trace read.
+    if (t.score >= before - 0.1) continue;
+
+    const baselineRunId = previousRunByTask.get(t.taskId);
+    if (!baselineRunId) continue;
+
+    const [baselineEvents, candidateEvents] = await Promise.all([
+      readSteps(baselineRunId),
+      readSteps(t.runId),
+    ]);
+    if (baselineEvents.length === 0 || candidateEvents.length === 0) continue;
+
+    out.push({
+      taskId: t.taskId,
+      evalName: t.taskName,
+      baselineRunId,
+      candidateRunId: t.runId,
+      baselineScore: before,
+      candidateScore: t.score,
+      divergence: diffTrajectories(
+        toTraceSteps(baselineEvents),
+        toTraceSteps(candidateEvents),
+      ),
+    });
+  }
+  return out;
 }

@@ -14,7 +14,14 @@
  * per-run consumer handle fields that never apply to it.
  */
 
-import type { Severity, Verdict } from "./verdict.js";
+import type { Severity, Subsystem, Verdict } from "./verdict.js";
+import type {
+  EvalReliability,
+  ImprovementStep,
+  RankedDefect,
+  SubsystemLoad,
+} from "./improvement-analysis.js";
+import type { ExplainedRegression } from "./trajectory-diff.js";
 
 export const RELEASE_VERDICT_SCHEMA_VERSION = 1 as const;
 
@@ -41,6 +48,10 @@ export interface RecurringDefect {
   category: string;
   claim: string;
   severity: Severity;
+  /** Which subsystem to fix it in, when the judge attributed one. */
+  subsystem?: Subsystem | null;
+  /** Evaluations this defect has survived — chronic means change approach. */
+  persistence?: { evaluationCount: number; chronic: boolean } | null;
   /** Tasks this defect appeared in (≥2 by construction). */
   taskIds: string[];
   runIds: string[];
@@ -83,6 +94,28 @@ export interface ReleaseVerdict {
   tasks: TaskOutcome[];
   recurringDefects: RecurringDefect[];
   comparison: ReleaseComparison | null;
+  /**
+   * Per-eval reliability across repeats. A 3/5 pass rate is a RELIABILITY
+   * problem; 0/5 is a CAPABILITY problem, and they need different fixes.
+   */
+  reliability: EvalReliability[];
+  /**
+   * Defects ordered by what fixing them buys, not by how bad they look.
+   * Severity describes a symptom; this answers "what do I do first".
+   */
+  rankedDefects: RankedDefect[];
+  /** Where the work is: defect load grouped by subsystem. */
+  subsystemLoad: SubsystemLoad[];
+  /**
+   * The ordered plan for the agent consuming this report: apply step 1, re-run
+   * its verify set, see whether it worked.
+   */
+  improvementPlan: ImprovementStep[];
+  /**
+   * Regressions explained by comparing trajectories against the previous
+   * evaluation — where the runs diverged, not just that the score dropped.
+   */
+  explainedRegressions: ExplainedRegression[];
   /** Cross-task observations the judge wants surfaced. */
   observations: string[];
   /** Release-level recommendations, grounded in the recurring defects. */
@@ -336,6 +369,26 @@ export function validateReleaseVerdict(
   }
   if (rv.overall.score < 0 || rv.overall.score > 1) {
     throw new ReleaseVerdictValidationError("overall.score must be 0..1");
+  }
+  for (const arrField of [
+    "reliability",
+    "rankedDefects",
+    "subsystemLoad",
+    "improvementPlan",
+    "explainedRegressions",
+  ] as const) {
+    if (!Array.isArray(rv[arrField])) {
+      throw new ReleaseVerdictValidationError(`${arrField} must be an array`);
+    }
+  }
+  // An improvement step with no verification set cannot be proven to have
+  // worked — which defeats the point of emitting a plan at all.
+  for (const [i, step] of (rv.improvementPlan ?? []).entries()) {
+    if (!Array.isArray(step.verifyTaskIds) || step.verifyTaskIds.length === 0) {
+      throw new ReleaseVerdictValidationError(
+        `improvementPlan[${i}]: missing verifyTaskIds (a step that cannot be verified is not actionable)`,
+      );
+    }
   }
   for (const d of rv.recurringDefects ?? []) {
     if (!Array.isArray(d.taskIds) || d.taskIds.length < 2) {

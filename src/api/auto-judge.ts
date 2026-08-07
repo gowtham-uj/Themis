@@ -136,6 +136,8 @@ export async function runReleaseRollup(
   batchId: string,
 ): Promise<ReleaseVerdict> {
   const verdict = await buildReleaseVerdict(deps.queries, batchId, {
+    // Needed to read traces for contrastive regression explanation.
+    dataDir: deps.dataDir,
     ...(deps.narrateRelease ? { narrate: deps.narrateRelease } : {}),
   });
 

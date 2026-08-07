@@ -275,12 +275,66 @@ function renderFindingCard(f: Finding, positive: boolean): string {
     cat,
     crit,
     recurring,
+    // WHERE to fix it — the difference between patching a prompt and accepting
+    // a model limit.
+    f.subsystem
+      ? `<span class="badge subsystem">${escapeHtml(f.subsystem)}</span>`
+      : "",
+    // Survived previous fix attempts → stop patching, change approach.
+    f.persistence?.chronic
+      ? `<span class="badge chronic">chronic · ${f.persistence.evaluationCount} evaluations</span>`
+      : "",
     `</div>`,
     `<h3 class="finding-claim">${escapeHtml(f.claim)}</h3>`,
     renderRefList(f.refs),
+    renderDecisionPoint(f.decisionPoint),
     fix,
+    renderVerification(f.verification),
     `<div class="meta-row"><span class="badge meta">id ${escapeHtml(f.id)}</span></div>`,
     `</article>`,
+  ].join("\n");
+}
+
+/**
+ * Where the run went wrong, and what would have avoided it.
+ *
+ * The counterfactual is the part a consuming agent can act on and test — a
+ * decision point without one would just be a timestamped complaint, which is
+ * why validation requires it whenever this block is present.
+ */
+function renderDecisionPoint(dp: Finding["decisionPoint"]): string {
+  if (!dp?.counterfactual) return "";
+  const gap =
+    dp.evidenceAvailableAtSeq !== undefined
+      ? `<p class="dp-gap">The information needed was already available at seq ${dp.evidenceAvailableAtSeq} — ${dp.seq - dp.evidenceAvailableAtSeq} step(s) before the decision.</p>`
+      : "";
+  return [
+    `<div class="decision-point">`,
+    `<h4>Where it went wrong</h4>`,
+    `<p><strong>seq ${dp.seq}:</strong> ${escapeHtml(dp.whatHappened)}</p>`,
+    `<p class="dp-counterfactual"><strong>Instead:</strong> ${escapeHtml(dp.counterfactual)}</p>`,
+    gap,
+    `</div>`,
+  ].join("\n");
+}
+
+/** How to prove a fix worked — the closing half of the loop. */
+function renderVerification(v: Finding["verification"]): string {
+  if (!v?.targetTaskIds?.length) return "";
+  const regression =
+    v.regressionTaskIds && v.regressionTaskIds.length > 0
+      ? `<div><strong>Must not regress:</strong> <code>${v.regressionTaskIds.map((t) => escapeHtml(t)).join(", ")}</code></div>`
+      : "";
+  const criterion = v.successCriterion
+    ? `<div class="dp-gap">${escapeHtml(v.successCriterion)}</div>`
+    : "";
+  return [
+    `<div class="verify-block">`,
+    `<h4>How to verify a fix</h4>`,
+    `<div><strong>Re-run:</strong> <code>${v.targetTaskIds.map((t) => escapeHtml(t)).join(", ")}</code></div>`,
+    regression,
+    criterion,
+    `</div>`,
   ].join("\n");
 }
 
