@@ -460,3 +460,113 @@ describe("POST /api/evaluations/:id/verify", () => {
     }
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// the all-in-one report
+// ---------------------------------------------------------------------------
+
+describe("GET /api/evaluations/:id/report — the single output", () => {
+  it("serves one document carrying everything, in both forms", async () => {
+    const ctx = await boot();
+    try {
+      const { batchId } = await seedPlan(ctx, "one-report");
+
+      // JSON: what a consuming agent reads.
+      const json = await http(
+        ctx.base,
+        "GET",
+        `/api/evaluations/${batchId}/report?format=json`,
+      );
+      expect(json.status).toBe(200);
+      // Everything in one object — no follow-up fetches.
+      for (const key of [
+        "improvementPlan",
+        "subsystemLoad",
+        "reliability",
+        "rankedDefects",
+        "recurringDefects",
+        "explainedRegressions",
+        "evals",
+        "summary",
+      ]) {
+        expect(json.json).toHaveProperty(key);
+      }
+      // Each eval carries its own full record.
+      const evals = json.json.evals as Array<Record<string, unknown>>;
+      expect(evals.length).toBeGreaterThan(0);
+      for (const key of ["prompt", "trace", "findings", "artifacts", "status"]) {
+        expect(evals[0]!).toHaveProperty(key);
+      }
+
+      // HTML: what a person reads — and it embeds the same object, so the two
+      // cannot drift apart.
+      const html = await fetch(
+        `${ctx.base}/api/evaluations/${batchId}/report`,
+      );
+      expect(html.status).toBe(200);
+      const text = await html.text();
+      expect(text).toContain("<!DOCTYPE html");
+      expect(text).toContain('id="eval-report-data"');
+      expect(text).toContain("What to change");
+      expect(text).toContain("Every eval, in full");
+    } finally {
+      await ctx.api.close();
+      rmSync(ctx.dataDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("builds the report live when the rollup has not run yet", async () => {
+    // A consumer must never be blocked on an artifact that only exists as a
+    // side effect of something else having happened first.
+    const ctx = await boot();
+    try {
+      const proj = await http(ctx.base, "POST", "/api/projects", {
+        name: "live",
+        slug: "one-report-live",
+      });
+      const projectId = proj.json.id as string;
+      const queries = ctx.api.app.queries;
+      queries.registerAgent({ id: "a", displayName: "a" });
+      const task = queries.createTask(projectId, {
+        id: "e1",
+        name: "eval one",
+        prompt: "do the thing",
+        workspace: { source: "empty" },
+        agentCategory: "coding",
+        rubric: rubric as never,
+      });
+      const batch = queries.createBatch({
+        projectId,
+        taskId: task.id,
+        agentId: "a",
+        model: "m",
+        provider: "p",
+        repeats: 1,
+      });
+      queries.createRun({
+        batchId: batch.id,
+        taskId: task.id,
+        projectId,
+        agentId: "a",
+        model: "m",
+        provider: "p",
+        repeatIndex: 0,
+        status: "completed",
+      });
+
+      const res = await http(
+        ctx.base,
+        "GET",
+        `/api/evaluations/${batch.id}/report?format=json`,
+      );
+      expect(res.status).toBe(200);
+      expect((res.json.evals as unknown[]).length).toBe(1);
+      expect((res.json.evals as Array<{ prompt: string }>)[0]!.prompt).toBe(
+        "do the thing",
+      );
+    } finally {
+      await ctx.api.close();
+      rmSync(ctx.dataDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+});

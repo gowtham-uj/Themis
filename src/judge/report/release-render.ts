@@ -10,6 +10,7 @@
  * stylesheet so both pages read as one product.
  */
 
+import type { EvalReport, EvalReportEntry } from "../eval-report.js";
 import type {
   RecurringDefect,
   ReleaseComparison,
@@ -43,6 +44,13 @@ const RELEASE_STYLES = /* css */ `
 .flaky-badge { color:var(--sev-major,#d97706); font-weight:600; }
 .fail-badge { color:var(--sev-critical,#dc2626); font-weight:600; }
 .verify-block { margin-top:.4rem; font-size:.85rem; opacity:.9; }
+`;
+
+/** Styles for the per-eval detail sections. */
+const EVAL_STYLES = /* css */ `
+.eval-detail { border:1px solid var(--border,#2a3140); border-radius:8px; padding:.6rem .9rem; margin:.5rem 0; }
+.eval-detail > summary { cursor:pointer; font-size:.95rem; }
+.eval-detail pre.repro { max-height:24rem; overflow:auto; }
 `;
 
 /** Format a 0..1 score as a 2dp string, or an em dash when unscored. */
@@ -419,6 +427,136 @@ export function renderReleaseReport(v: ReleaseVerdict): string {
     `</head>`,
     `<body>`,
     body,
+    `</body>`,
+    `</html>`,
+    ``,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// The all-in-one eval report
+// ---------------------------------------------------------------------------
+
+/** Per-eval detail: prompt, environment, findings, diff, artifacts. */
+function renderEvalDetail(e: EvalReportEntry): string {
+  const envLine = e.environment?.error
+    ? `<p class="dp-gap"><strong>Environment failed:</strong> ${escapeHtml(e.environment.error)} — this is not an agent failure.</p>`
+    : e.envKind
+      ? `<p class="dp-gap">${escapeHtml(e.envKind)} environment${e.environment?.baselineCommit ? `, baseline ${escapeHtml(e.environment.baselineCommit.slice(0, 8))}` : ""}</p>`
+      : "";
+
+  const findings = e.findings.length
+    ? e.findings
+        .map((f) =>
+          [
+            `<div class="recur-card">`,
+            `<div><strong>${escapeHtml(f.severity)}</strong> · ${escapeHtml(f.category)}`,
+            f.subsystem ? ` · <span class="subsystem-chip">${escapeHtml(f.subsystem)}</span>` : "",
+            `</div>`,
+            `<p>${escapeHtml(f.claim)}</p>`,
+            f.decisionPoint
+              ? `<p class="dp-counterfactual">seq ${f.decisionPoint.seq}: ${escapeHtml(f.decisionPoint.whatHappened)} — instead: ${escapeHtml(f.decisionPoint.counterfactual)}</p>`
+              : "",
+            f.verification?.targetTaskIds?.length
+              ? `<p class="recur-tasks">Verify with: <code>${f.verification.targetTaskIds.map((t) => escapeHtml(t)).join(", ")}</code></p>`
+              : "",
+            `</div>`,
+          ].join(""),
+        )
+        .join("")
+    : `<p class="section-empty">No findings.</p>`;
+
+  const toolSeq = e.trace.summary?.toolSequence?.length
+    ? `<p class="recur-tasks">Tools: ${e.trace.summary.toolSequence.map((t) => escapeHtml(t)).join(" → ")}</p>`
+    : "";
+
+  const artifacts = e.artifacts.length
+    ? `<p class="recur-tasks">Artifacts: ${e.artifacts.map((a) => `<a href="${escapeHtml(a.url)}">${escapeHtml(a.path)}</a>`).join(", ")}</p>`
+    : "";
+
+  const diff = e.diff
+    ? `<details><summary>Diff (${e.diff.bytes} bytes${e.diff.truncated ? ", truncated" : ""})</summary><pre class="repro"><code>${escapeHtml(e.diff.text)}</code></pre></details>`
+    : `<p class="section-empty">No diff.</p>`;
+
+  return [
+    `<details class="eval-detail" data-task="${escapeHtml(e.taskId)}">`,
+    `<summary><strong>${escapeHtml(e.name)}</strong> — ${e.score === null ? "unscored" : e.score.toFixed(2)} (${escapeHtml(e.status)})</summary>`,
+    envLine,
+    `<p class="dp-gap"><strong>Prompt:</strong> ${escapeHtml(e.prompt)}</p>`,
+    `<p class="recur-tasks">${e.trace.eventCount} trace event(s)</p>`,
+    toolSeq,
+    artifacts,
+    findings,
+    diff,
+    `</details>`,
+  ].join("\n");
+}
+
+/**
+ * Render the complete evaluation report: one self-contained document carrying
+ * everything a consuming agent needs.
+ *
+ * The machine-readable form is embedded verbatim in a script tag, so the HTML
+ * and the JSON can never disagree — they are the same object.
+ */
+export function renderEvalReport(r: EvalReport): string {
+  const kpi = (value: string, label: string): string =>
+    `<div class="kpi"><div class="kpi-value">${escapeHtml(value)}</div><div class="kpi-label">${escapeHtml(label)}</div></div>`;
+
+  const header = [
+    `<header class="verdict-header">`,
+    `<h1>Evaluation${r.commit ? ` · ${escapeHtml(r.commit.slice(0, 12))}` : ""}</h1>`,
+    `<p class="verdict-summary">${escapeHtml(r.summary.text)}</p>`,
+    `<p class="section-lede">agent <strong>${escapeHtml(r.agentId)}</strong> · model ${escapeHtml(r.model)} · ${escapeHtml(r.generatedAt)}</p>`,
+    `<div class="release-kpis">`,
+    kpi(r.summary.score.toFixed(2), "mean score"),
+    kpi(`${r.summary.evalsPassed}/${r.summary.evalsTotal}`, "evals passed"),
+    kpi(String(r.improvementPlan.length), "actions"),
+    r.summary.evalsUnjudged > 0 ? kpi(String(r.summary.evalsUnjudged), "unjudged") : "",
+    `</div>`,
+    `</header>`,
+  ].join("\n");
+
+  // Reuse the release sections — same data, same rendering, one definition.
+  const asRelease = r as unknown as ReleaseVerdict;
+
+  const evalSection = [
+    `<section class="section" id="evals" aria-labelledby="evals-heading">`,
+    `<h2 class="section-title" id="evals-heading">Every eval, in full</h2>`,
+    `<p class="section-lede">Prompt, environment, trace shape, findings and diff for each — inline, so nothing needs fetching separately.</p>`,
+    ...r.evals.map(renderEvalDetail),
+    `</section>`,
+  ].join("\n");
+
+  const body = [
+    `<main class="report" id="top">`,
+    header,
+    renderImprovementPlan(asRelease),
+    renderSubsystemLoad(asRelease),
+    renderReliability(asRelease),
+    renderExplainedRegressions(asRelease),
+    renderRecurring(r.recurringDefects),
+    renderComparison(r.comparison),
+    evalSection,
+    `</main>`,
+  ].join("\n");
+
+  // The same object a machine consumer would fetch — embedded so this single
+  // file serves both readers and they cannot drift apart.
+  const embedded = JSON.stringify(r).replace(/</g, "\\u003c");
+
+  return [
+    `<!DOCTYPE html>`,
+    `<html lang="en">`,
+    `<head>`,
+    `<meta charset="utf-8">`,
+    `<meta name="viewport" content="width=device-width, initial-scale=1">`,
+    `<title>Evaluation ${escapeHtml(r.commit?.slice(0, 12) ?? r.evaluationId)}</title>`,
+    `<style>${REPORT_STYLES}${RELEASE_STYLES}${EVAL_STYLES}</style>`,
+    `</head>`,
+    `<body>`,
+    body,
+    `<script type="application/json" id="eval-report-data">${embedded}</script>`,
     `</body>`,
     `</html>`,
     ``,

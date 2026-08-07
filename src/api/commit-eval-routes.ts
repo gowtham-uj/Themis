@@ -19,6 +19,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DbQueries, Run, Task } from "../db/queries.js";
 import { batchProgress } from "../judge/batch-completion.js";
@@ -28,6 +29,8 @@ import { badRequest, notFound } from "./errors.js";
 import { readJsonBody, sendJson, type RequestContext, type Router } from "./router.js";
 import { serveHtmlFile } from "./judgements-routes.js";
 import { GitHubClient, parseRepoRef } from "./github.js";
+import { buildEvalReport } from "../judge/eval-report.js";
+import { renderEvalReport } from "../judge/report/release-render.js";
 
 /** Minimal AppCtx surface these routes need. */
 export interface CommitEvalAppCtx {
@@ -362,28 +365,75 @@ export function registerCommitEvalRoutes(router: Router): void {
     });
   });
 
-  // The evaluation's HTML report.
+  /**
+   * The evaluation's report — the single self-contained output.
+   *
+   * `?format=json` returns the same content as a machine-readable object. The
+   * HTML embeds that object verbatim, so the two can never disagree: a
+   * consumer reading either sees the same evaluation.
+   */
   router.get("/api/evaluations/:batchId/report", async (_req, res, ctx) => {
     const app = appOf(ctx);
     const batchId = ctx.params.batchId!;
     const runs = requireBatchRuns(app.queries, batchId);
-    const path = join(
-      releaseDir(app.dataDir, runs[0]!.projectId, batchId),
-      "release.html",
-    );
-    if (!existsSync(path)) {
-      const p = batchProgress(runs, batchId);
-      throw notFound(
-        p.done
-          ? `no report for evaluation ${batchId} yet`
-          : `evaluation ${batchId} is still running (${p.terminal}/${p.total} evals finished)`,
+    const dir = releaseDir(app.dataDir, runs[0]!.projectId, batchId);
+
+    const wantsJson =
+      ctx.query.format === "json" || ctx.query.json === "1";
+    if (wantsJson) {
+      const jsonPath = join(dir, "report.json");
+      if (existsSync(jsonPath)) {
+        const text = await readFile(jsonPath, "utf8");
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.setHeader("Content-Length", Buffer.byteLength(text));
+        res.end(text);
+        return;
+      }
+      // Not rolled up yet — build it live so a consumer is never blocked on
+      // an artifact that only exists as a side effect of something else.
+      const report = await buildEvalReport(
+        app.queries,
+        app.dataDir,
+        batchId,
       );
+      sendJson(res, 200, report);
+      return;
     }
+
+    // Prefer the stored all-in-one report; fall back to the older release page
+    // for evaluations rolled up before it existed; otherwise render live.
+    const stored = existsSync(join(dir, "report.html"))
+      ? join(dir, "report.html")
+      : existsSync(join(dir, "release.html"))
+        ? join(dir, "release.html")
+        : null;
+
     const download =
       ctx.query.download === "1" || ctx.query.download === "true";
-    await serveHtmlFile(res, path, {
-      download,
-      filename: `evaluation-${batchId}.html`,
-    });
+
+    if (stored) {
+      await serveHtmlFile(res, stored, {
+        download,
+        filename: `evaluation-${batchId}.html`,
+      });
+      return;
+    }
+
+    // Rendering live keeps the report available the moment the evals finish,
+    // rather than only after a rollup happened to run.
+    const report = await buildEvalReport(app.queries, app.dataDir, batchId);
+    const html = renderEvalReport(report);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Length", Buffer.byteLength(html));
+    if (download) {
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="evaluation-${batchId}.html"`,
+      );
+    }
+    res.end(html);
   });
 }

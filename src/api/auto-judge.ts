@@ -28,7 +28,11 @@ import {
   buildReleaseVerdict,
   type BuildReleaseVerdictOptions,
 } from "../judge/release-judge.js";
-import { renderReleaseReport } from "../judge/report/release-render.js";
+import {
+  renderEvalReport,
+  renderReleaseReport,
+} from "../judge/report/release-render.js";
+import { buildEvalReport } from "../judge/eval-report.js";
 import {
   collectBatchBundles,
   summarizeBundles,
@@ -175,6 +179,24 @@ export async function runReleaseRollup(
     renderReleaseReport(verdict),
     "utf8",
   );
+
+  // The all-in-one artifact: everything a consuming agent needs, in one file.
+  // Written last because it composes the others; a failure here leaves the
+  // release verdict intact rather than losing the whole rollup.
+  try {
+    const report = await buildEvalReport(deps.queries, deps.dataDir, batchId);
+    await writeFile(
+      join(dir, "report.json"),
+      `${JSON.stringify(report, null, 2)}\n`,
+      "utf8",
+    );
+    await writeFile(join(dir, "report.html"), renderEvalReport(report), "utf8");
+  } catch (err) {
+    if (process.env.AGENTEVAL_JUDGE_DEBUG) {
+      console.error("[eval-report] failed:", err);
+    }
+  }
+
   return verdict;
 }
 
