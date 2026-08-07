@@ -65,7 +65,7 @@ export async function prepareWorkspace(
   await assertEmptyOrMissing(targetDir);
 
   const ref = spec.ref;
-  await gitClone(repo, targetDir, ref, options.env);
+  await gitClone(normalizeRepoUrl(repo), targetDir, ref, options.env);
   const commit = await gitRevParse(targetDir, "HEAD", options.env);
 
   const prepared: PreparedWorkspace = {
@@ -142,6 +142,39 @@ async function gitInit(
  * Shallow clone. When `ref` is set we try `--branch` first (works for branches/tags);
  * on failure (e.g. bare sha on a full local repo) fall back to full clone + checkout.
  */
+/**
+ * Turn a repo reference into something `git clone` accepts.
+ *
+ * The rest of the platform accepts `owner/name` — it is what task definitions,
+ * watcher rules and the evaluate API all use — but git only understands URLs
+ * and paths, and fails with "repository does not exist" on the short form.
+ * Local paths and anything already URL-shaped are passed through untouched, so
+ * fixture repos and self-hosted remotes keep working.
+ */
+export function normalizeRepoUrl(repo: string): string {
+  const raw = repo.trim();
+  if (!raw) return raw;
+  // Already a URL, an SSH remote, or a filesystem path.
+  if (
+    /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ||
+    raw.startsWith("git@") ||
+    raw.startsWith("/") ||
+    raw.startsWith(".") ||
+    raw.startsWith("~")
+  ) {
+    return raw;
+  }
+  // `owner/name` → the GitHub URL. GITHUB_SERVER_URL supports Enterprise.
+  if (/^[^/\s]+\/[^/\s]+$/.test(raw)) {
+    const server = (process.env.GITHUB_SERVER_URL ?? "https://github.com").replace(
+      /\/$/,
+      "",
+    );
+    return `${server}/${raw.replace(/\.git$/, "")}.git`;
+  }
+  return raw;
+}
+
 async function gitClone(
   repo: string,
   targetDir: string,

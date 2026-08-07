@@ -247,6 +247,10 @@ export const runs = sqliteTable("runs", {
   agentImageSource: text("agent_image_source"),
   /** Per-run adapter overrides as submitted (image, env, params, tools). */
   adapterOverridesJson: text("adapter_overrides_json"),
+  /** Repo this run evaluates, overriding the task's workspace repo. */
+  workspaceRepo: text("workspace_repo"),
+  /** Commit/ref this run evaluates, overriding the task's workspace ref. */
+  workspaceRef: text("workspace_ref"),
   trigger: text("trigger"),
   triggerRef: text("trigger_ref"),
   triggerRuleId: text("trigger_rule_id"),

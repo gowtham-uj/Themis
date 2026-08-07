@@ -360,6 +360,9 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE runs ADD COLUMN adapter_overrides_json TEXT",
     // Per-eval environment spec (greenfield/brownfield, image, setup script).
     "ALTER TABLE tasks ADD COLUMN env_json TEXT",
+    // Commit/ref this run evaluates, overriding the task's own workspace ref.
+    "ALTER TABLE runs ADD COLUMN workspace_ref TEXT",
+    "ALTER TABLE runs ADD COLUMN workspace_repo TEXT",
   ];
   for (const sql of alters) {
     try {

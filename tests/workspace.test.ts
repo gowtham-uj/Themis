@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import {
   ensureGitRepo,
   prepareWorkspace,
+  normalizeRepoUrl,
 } from "../src/runner/workspace.ts";
 
 const execFileAsync = promisify(execFile);
@@ -121,5 +122,47 @@ describe("ensureGitRepo", () => {
     // Second call is a no-op (still a repo).
     await ensureGitRepo(dir);
     await access(join(dir, ".git"));
+  });
+});
+
+describe("normalizeRepoUrl", () => {
+  // Regression: `owner/name` was passed straight to `git clone`, which only
+  // understands URLs and paths — every evaluation of a repo written the short
+  // way failed with "repository does not exist". The rest of the platform
+  // accepts the short form, so cloning has to as well. Found by evaluating a
+  // real commit end to end.
+  it("expands owner/name to a clone URL", () => {
+    expect(normalizeRepoUrl("octocat/Hello-World")).toBe(
+      "https://github.com/octocat/Hello-World.git",
+    );
+    expect(normalizeRepoUrl("acme/app.git")).toBe(
+      "https://github.com/acme/app.git",
+    );
+  });
+
+  it("passes through anything git already understands", () => {
+    for (const raw of [
+      "https://github.com/acme/app.git",
+      "http://internal/git/app",
+      "git@github.com:acme/app.git",
+      "ssh://git@host/acme/app.git",
+      "/tmp/local-fixture-repo",
+      "./relative-repo",
+    ]) {
+      expect(normalizeRepoUrl(raw)).toBe(raw);
+    }
+  });
+
+  it("honors GITHUB_SERVER_URL for Enterprise", () => {
+    const prev = process.env.GITHUB_SERVER_URL;
+    process.env.GITHUB_SERVER_URL = "https://github.acme.internal";
+    try {
+      expect(normalizeRepoUrl("team/svc")).toBe(
+        "https://github.acme.internal/team/svc.git",
+      );
+    } finally {
+      if (prev === undefined) delete process.env.GITHUB_SERVER_URL;
+      else process.env.GITHUB_SERVER_URL = prev;
+    }
   });
 });

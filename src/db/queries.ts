@@ -290,6 +290,9 @@ export interface Run {
   agentImageSource: string | null;
   /** Per-run adapter overrides as submitted; null when the run set none. */
   adapterOverrides: Record<string, unknown> | null;
+  workspaceRepo: string | null;
+  /** Commit/ref this run evaluates; null → use the task's own ref. */
+  workspaceRef: string | null;
   trigger: string | null;
   triggerRef: string | null;
   triggerRuleId: string | null;
@@ -323,6 +326,10 @@ export interface CreateRunInput {
   agentCommit?: string;
   agentImageSource?: string;
   adapterOverrides?: Record<string, unknown> | null;
+  /** Repo this run evaluates, overriding the task workspace repo. */
+  workspaceRepo?: string | null;
+  /** Commit/ref this run evaluates, overriding the task workspace ref. */
+  workspaceRef?: string | null;
   trigger?: string;
   triggerRef?: string;
   /** Watcher rule that enqueued this run (null for ad-hoc / queue promote). */
@@ -1268,6 +1275,8 @@ function mapRun(row: typeof runs.$inferSelect): Run {
     agentCommit: row.agentCommit,
     agentImageSource: row.agentImageSource,
     adapterOverrides: parseJson(row.adapterOverridesJson, null),
+    workspaceRepo: row.workspaceRepo ?? null,
+    workspaceRef: row.workspaceRef ?? null,
     trigger: row.trigger,
     triggerRef: row.triggerRef,
     triggerRuleId: row.triggerRuleId,
@@ -2052,6 +2061,8 @@ export class SqliteQueries implements QueryStore {
         agentCommit: input.agentCommit ?? null,
         agentImageSource: input.agentImageSource ?? null,
         adapterOverridesJson: stringifyJson(input.adapterOverrides ?? null),
+        workspaceRepo: input.workspaceRepo ?? null,
+        workspaceRef: input.workspaceRef ?? null,
         trigger: input.trigger ?? null,
         triggerRef: input.triggerRef ?? null,
         triggerRuleId: input.triggerRuleId ?? null,
@@ -3979,6 +3990,8 @@ export class MemoryQueries implements QueryStore {
       agentCommit: input.agentCommit ?? null,
       agentImageSource: input.agentImageSource ?? null,
       adapterOverrides: input.adapterOverrides ?? null,
+      workspaceRepo: input.workspaceRepo ?? null,
+      workspaceRef: input.workspaceRef ?? null,
       trigger: input.trigger ?? null,
       triggerRef: input.triggerRef ?? null,
       triggerRuleId: input.triggerRuleId ?? null,

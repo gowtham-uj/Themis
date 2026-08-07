@@ -263,12 +263,35 @@ export async function startRun(
   const adapter: Adapter =
     opts.adapter ?? defaultAdapter ?? getAdapter(run.agentId);
 
-  // Prepare workspace from the task's WorkspaceSpec.
+  // Prepare the workspace.
+  //
+  // A run may PIN the commit it evaluates, overriding the task's own ref. That
+  // is the "evaluate this commit" flow: the same eval suite, aimed at whichever
+  // revision you want to measure — a PR head, a release tag, a specific sha —
+  // without editing every task definition.
+  //
+  // The repo may also be overridden, so one suite can be pointed at a fork.
   let workspaceCommit: string | undefined;
-  if (task.workspace.source === "git") {
-    const prepared = await prepareWorkspace(task.workspace, {
-      targetDir: workspaceDir,
-    });
+  const pinnedRepo = run.workspaceRepo ?? null;
+  const pinnedRef = run.workspaceRef ?? null;
+  const taskRepo =
+    task.workspace.source === "git" ? task.workspace.repo : undefined;
+  const effectiveRepo = pinnedRepo ?? taskRepo;
+
+  if (effectiveRepo) {
+    const prepared = await prepareWorkspace(
+      {
+        source: "git",
+        repo: effectiveRepo,
+        // Explicit pin wins; otherwise the task's own ref.
+        ...(pinnedRef
+          ? { ref: pinnedRef }
+          : task.workspace.source === "git" && task.workspace.ref
+            ? { ref: task.workspace.ref }
+            : {}),
+      },
+      { targetDir: workspaceDir },
+    );
     workspaceCommit = prepared.commit;
   } else {
     await ensureGitRepo(workspaceDir);

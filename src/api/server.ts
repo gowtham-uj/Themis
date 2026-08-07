@@ -75,6 +75,9 @@ import { registerArtifactRoutes } from "./artifact-routes.js";
 import { registerSandboxRoutes } from "./sandbox-routes.js";
 import { parseEvalEnvSpec } from "../runner/env-provision.js";
 import { registerReleaseRoutes } from "./release-routes.js";
+import { registerCommitEvalRoutes } from "./commit-eval-routes.js";
+import { registerGitHubRoutes } from "./github-routes.js";
+import type { GitHubClient } from "./github.js";
 import { handleRunFinalized, type AutoJudgeDeps } from "./auto-judge.js";
 import { createBatchClaimStore } from "../judge/batch-completion.js";
 import {
@@ -168,6 +171,12 @@ export interface AppCtx {
    * produce exactly one release rollup.
    */
   batchClaims: ReturnType<typeof createBatchClaimStore>;
+  /**
+   * Read-only GitHub client for browsing live repo state (commits, refs, PRs)
+   * and resolving a ref to a concrete sha. Tests inject a stubbed transport;
+   * production builds one from settings/env on first use.
+   */
+  githubClient?: GitHubClient;
 }
 
 export interface CreateServerOptions {
@@ -219,6 +228,11 @@ export interface CreateServerOptions {
   outboundSink?: DeliverySink;
   /** Override default backoff (ms) for the built-in dispatcher. */
   outboundBackoffMs?: number[];
+  /**
+   * Read-only GitHub client. Inject a stubbed transport in tests so browsing
+   * live repo state never depends on the network.
+   */
+  githubClient?: GitHubClient;
 }
 
 export interface ApiServer {
@@ -1538,6 +1552,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
     // Bound below after app is constructed so the closure sees the final object.
     enqueueStart: () => undefined,
     batchClaims: createBatchClaimStore(),
+    ...(opts.githubClient ? { githubClient: opts.githubClient } : {}),
   };
   // Wire the real start-pipeline seam (concurrency-limited).
   app.enqueueStart = (runId: string) => enqueueStart(app, runId);
@@ -1573,6 +1588,8 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerArtifactRoutes(router);
   registerSandboxRoutes(router);
   registerReleaseRoutes(router);
+  registerCommitEvalRoutes(router);
+  registerGitHubRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {
