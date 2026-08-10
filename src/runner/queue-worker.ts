@@ -1023,10 +1023,12 @@ async function copyRetainedEvidence(
       continue;
     }
     try {
+      // A required child path (e.g. ".reaper/runs") may already have been
+      // copied as part of a parent path (".reaper"). force:true + no
+      // errorOnExist so overlapping entries copy idempotently.
       await cp(source, join(retainedRoot, "agent", relativePath), {
         recursive: true,
-        errorOnExist: true,
-        force: false,
+        force: true,
       });
       copied.push(relativePath);
     } catch {
