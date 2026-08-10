@@ -272,6 +272,72 @@ export interface PassRates {
 export const VERDICT_SCHEMA_VERSION = 1;
 
 /**
+ * Extract a JSON object from model text that may include prose and/or fenced
+ * ```json blocks. Prefers the first fenced JSON block; falls back to the first
+ * balanced `{...}` object in the text. Pure utility — no model dependency.
+ */
+export function extractJsonObject(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new Error("empty model response; cannot extract JSON verdict");
+  }
+  const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed);
+  if (fence?.[1]) {
+    const inner = fence[1].trim();
+    if (inner.startsWith("{") || inner.startsWith("[")) {
+      try {
+        JSON.parse(inner);
+        return inner;
+      } catch {
+        // fall through
+      }
+    }
+  }
+  if (trimmed.startsWith("{")) {
+    try {
+      JSON.parse(trimmed);
+      return trimmed;
+    } catch {
+      // fall through
+    }
+  }
+  const start = trimmed.indexOf("{");
+  if (start < 0) {
+    throw new Error("no JSON object found in model response");
+  }
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < trimmed.length; i++) {
+    const ch = trimmed[i]!;
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const candidate = trimmed.slice(start, i + 1);
+        JSON.parse(candidate);
+        return candidate;
+      }
+    }
+  }
+  throw new Error("unbalanced JSON object in model response");
+}
+
+/**
  * The structured verdict — the judge's three-layer output. Mirrored into SQLite
  * (overall + per-criterion scores for trends, findings for the issues log in P6).
  */
