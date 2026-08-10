@@ -10,7 +10,20 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Agent, setGlobalDispatcher } from "undici";
 import { createServer } from "../src/api/server.js";
+
+// The queue-container spawn endpoint blocks while it starts the persistent
+// Podman container and runs the real adapter connection check (real reaper +
+// real NeuralWatt model). That can exceed undici's default ~300s headers
+// timeout, so give every E2E fetch a long headers/body timeout.
+setGlobalDispatcher(
+  new Agent({
+    headersTimeout: 60 * 60_000,
+    bodyTimeout: 60 * 60_000,
+    connectTimeout: 60_000,
+  }),
+);
 
 const MODEL = "deepseek-v4-flash";
 const PROVIDER = "nuralwatt";
