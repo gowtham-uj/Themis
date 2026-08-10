@@ -359,10 +359,10 @@ function reaperContainerfile(): string {
 RUN apt-get update && apt-get install -y --no-install-recommends bash git sudo procps ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/reapercode
 COPY . .
-RUN sed -i '/id: "nuralwatt"/,/id: "nuralwatt2"/ s/models: \[/models: ["deepseek-v4-flash", /' src/model/provider/catalog.ts \\
- && npm ci \\
- && npm run build \\
- && ln -s /opt/reapercode/bin/reaper /usr/local/bin/reaper
+# The nuralwatt provider catalog does not list deepseek-v4-flash; register it
+# as the first model of that provider before building so reaper can select it.
+RUN node -e "const fs=require('fs');const p='src/model/provider/catalog.ts';let s=fs.readFileSync(p,'utf8');s=s.replace(/(id: \"nuralwatt\"[\\s\\S]*?models: \\[)/,'$1\"deepseek-v4-flash\", ');fs.writeFileSync(p,s);"
+RUN npm ci && npm run build && ln -s /opt/reapercode/bin/reaper /usr/local/bin/reaper
 CMD ["reaper", "--help"]
 `;
 }
