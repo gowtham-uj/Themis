@@ -176,9 +176,9 @@ describe("CiArtifactSource — single manifest.json", () => {
   });
 });
 
-describe("CiArtifactSource — redaction + sync", () => {
-  it("redacts secret-looking content in prompt", async () => {
-    const root = await mkdtemp(join(tmpdir(), "agenteval-ci-redact-"));
+describe("CiArtifactSource — verbatim ingest + sync", () => {
+  it("preserves prompt content verbatim", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenteval-ci-verbatim-"));
     const dir = join(root, "ci-artifacts");
     await mkdir(dir, { recursive: true });
     await writeFile(
@@ -197,8 +197,9 @@ describe("CiArtifactSource — redaction + sync", () => {
       source.list(ctx({ projectDir: root, workspaceDir: root })),
     );
     expect(tasks).toHaveLength(1);
-    // redactString replaces known secret patterns with placeholders
-    expect(tasks[0]!.prompt).not.toMatch(/sk-ant-api03-/);
+    expect(tasks[0]!.prompt).toBe(
+      "use key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP",
+    );
   });
 
   it("syncTasks upserts into the memory store", async () => {

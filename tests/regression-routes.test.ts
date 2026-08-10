@@ -3,7 +3,7 @@
  *
  * Boots the real ApiServer on a temp dataDir. Seeds a project + 2-criteria
  * rubric task + two batches (agentCommit v1/v2) with storeVerdict directly.
- * OFFLINE — no real LLM.
+ * Seeds already-validated historical verdict rows directly; no agent or judge execution is involved.
  *
  * Asserts: trend finding deltas, two-run set-diff, release suite compare,
  * listRuns taskId filter (additive).
@@ -12,11 +12,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  createFixtureAdapter,
-  createServer,
-  type ApiServer,
-} from "../src/api/server.ts";
+import { createServer, type ApiServer } from "../src/api/server.ts";
 import { fingerprintOf } from "../src/db/findings.ts";
 import type { Rubric, TaskSpec } from "../src/domain.ts";
 import {
@@ -213,10 +209,7 @@ interface SeededWorld {
  */
 async function seedWorld(): Promise<SeededWorld> {
   const dataDir = await tempDataDir();
-  const api = createServer({
-    dataDir,
-    adapter: createFixtureAdapter(),
-  });
+  const api = createServer({ dataDir });
   servers.push(api);
   const port = await api.listen(0);
   const base = `http://127.0.0.1:${port}`;

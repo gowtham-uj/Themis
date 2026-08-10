@@ -14,9 +14,6 @@
  * (or a pre-step) must unpack the artifact into a directory first and point
  * `artifactDir` at it. Documented so plan/code stay honest.
  *
- * Secrets never reach the store: ingested `prompt` (and any string leaves of
- * free-form params) are scrubbed with {@link redactString}.
- *
  * Semantics:
  * - Missing artifact dir → empty yield (not an error).
  * - Bad JSON / non-object entries → skipped with a recorded reason (via
@@ -31,7 +28,6 @@ import type {
   TaskSpec,
   ValidationResult,
 } from "../domain.js";
-import { redactString } from "../runner/redact.js";
 import { coerceTaskSpec } from "./coerce-spec.js";
 import { validateTaskSpec } from "./ui-builder.js";
 
@@ -202,14 +198,14 @@ export class CiArtifactSource implements TaskSource {
         });
         continue;
       }
-      const redacted = redactTaskObject(item as Record<string, unknown>);
+      const taskObject = item as Record<string, unknown>;
       const fallbackId =
-        typeof redacted.id === "string"
-          ? redacted.id
+        typeof taskObject.id === "string"
+          ? taskObject.id
           : pathLabel.replace(/\.json$/i, "").replace(/[\\/]/g, "__") +
             (items.length > 1 ? `_${i + 1}` : "");
       out.push(
-        coerceTaskSpec(redacted, {
+        coerceTaskSpec(taskObject, {
           id: fallbackId,
           defaultAgentCategory: ctx.defaultAgentCategory,
         }),
@@ -217,46 +213,6 @@ export class CiArtifactSource implements TaskSource {
     }
     return out;
   }
-}
-
-/**
- * Redact string leaves of a task object (prompt + free-form params) before
- * coerce. Mutates a shallow clone so the original parse stays untouched.
- */
-export function redactTaskObject(
-  obj: Record<string, unknown>,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...obj };
-  if (typeof out.prompt === "string") {
-    out.prompt = redactString(out.prompt);
-  }
-  if (typeof out.name === "string") {
-    out.name = redactString(out.name);
-  }
-  if (out.params && typeof out.params === "object" && !Array.isArray(out.params)) {
-    out.params = redactStringLeaves(out.params as Record<string, unknown>);
-  }
-  // Also scrub reference solution paths/text if present.
-  if (typeof out.referenceSolution === "string") {
-    out.referenceSolution = redactString(out.referenceSolution);
-  }
-  if (typeof out.reference_solution === "string") {
-    out.reference_solution = redactString(out.reference_solution);
-  }
-  return out;
-}
-
-function redactStringLeaves(
-  obj: Record<string, unknown>,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (typeof v === "string") out[k] = redactString(v);
-    else if (v && typeof v === "object" && !Array.isArray(v)) {
-      out[k] = redactStringLeaves(v as Record<string, unknown>);
-    } else out[k] = v;
-  }
-  return out;
 }
 
 function extractTaskObjects(parsed: unknown): unknown[] | null {

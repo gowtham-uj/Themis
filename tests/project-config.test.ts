@@ -26,7 +26,7 @@ import type { Adapter, RunContext } from "../src/adapters/types.ts";
 import type { CanonicalEvent } from "../src/schema/events.ts";
 import { openDb } from "../src/db/index.ts";
 import { startRun, createLiveRunsMap } from "../src/api/run-controller-bridge.ts";
-import { FakeContainerRuntime } from "../src/runner/fake-runtime.ts";
+import { PodmanRuntime } from "../src/runner/podman-runtime.ts";
 
 // ---------------------------------------------------------------------------
 // 1. pure resolver
@@ -153,6 +153,16 @@ describe("resolveRunNetwork", () => {
 // ---------------------------------------------------------------------------
 
 /** Adapter that records the ctx it was handed, so we can assert the wire. */
+const DEFAULT_REAL_IMAGE = "docker.io/library/alpine:3.19";
+const PROJECT_REAL_IMAGE = "docker.io/library/alpine:3.20";
+const RUN_REAL_IMAGE = "docker.io/library/alpine:3.18";
+
+function realRuntime(): PodmanRuntime {
+  return new PodmanRuntime({
+    prefix: process.env.AGENTEVAL_PODMAN_SUDO === "0" ? [] : ["sudo", "-n"],
+  });
+}
+
 function makeSpyAdapter(): Adapter & { seen: RunContext[] } {
   const seen: RunContext[] = [];
   return {
@@ -160,12 +170,12 @@ function makeSpyAdapter(): Adapter & { seen: RunContext[] } {
     seen,
     image(ctx: RunContext): string {
       seen.push(ctx);
-      return ctx.overrides?.image ?? "default/image:0";
+      return ctx.overrides?.image ?? DEFAULT_REAL_IMAGE;
     },
     command(ctx: RunContext) {
       seen.push(ctx);
       return {
-        argv: ["node", "-e", "process.exit(0)"],
+        argv: ["sh", "-c", "exit 0"],
         env: { ...(ctx.overrides?.env ?? {}) },
       };
     },
@@ -245,7 +255,7 @@ async function runWithProject(
   });
 
   const adapter = makeSpyAdapter();
-  const runtime = new FakeContainerRuntime();
+  const runtime = realRuntime();
   const live = await startRun(dataDir, queries, run.id, createLiveRunsMap(), {
     adapter,
     runtime,
@@ -272,51 +282,53 @@ describe("project config reaches the run (startRun wire)", () => {
     } finally {
       fx.cleanup();
     }
-  }, 20_000);
+  }, 180_000);
 
   it("pins the container image from the project's workspaceImage", async () => {
     const fx = openFixture();
     try {
       const { live } = await runWithProject(fx, {
-        workspaceImage: "acme/rust-toolchain:1",
+        workspaceImage: PROJECT_REAL_IMAGE,
       });
-      expect(live.handle.image).toBe("acme/rust-toolchain:1");
+      expect(live.handle.image).toBe(PROJECT_REAL_IMAGE);
     } finally {
       fx.cleanup();
     }
-  }, 20_000);
+  }, 180_000);
 
   it("applies the project's network policy to the container spec", async () => {
     const fx = openFixture();
     try {
-      const { live } = await runWithProject(fx, { networkPolicy: "offline" });
-      const record = (live.handle as unknown as { record: { network: string } })
-        .record;
-      expect(record.network).toBe("offline");
+      const { project, run } = await runWithProject(fx, { networkPolicy: "offline" });
+      const execJson = JSON.parse(
+        readFileSync(join(fx.dataDir, "projects", project.id, "runs", run.id, "exec.json"), "utf8"),
+      ) as { network: string };
+      expect(execJson.network).toBe("offline");
     } finally {
       fx.cleanup();
     }
-  }, 20_000);
+  }, 180_000);
 
   it("defaults to network=allow and the adapter's own image with no project config", async () => {
     const fx = openFixture();
     try {
-      const { live, adapter } = await runWithProject(fx, {});
-      const record = (live.handle as unknown as { record: { network: string } })
-        .record;
-      expect(record.network).toBe("allow");
-      expect(live.handle.image).toBe("default/image:0");
+      const { live, adapter, project, run } = await runWithProject(fx, {});
+      const execJson = JSON.parse(
+        readFileSync(join(fx.dataDir, "projects", project.id, "runs", run.id, "exec.json"), "utf8"),
+      ) as { network: string };
+      expect(execJson.network).toBe("allow");
+      expect(live.handle.image).toBe(DEFAULT_REAL_IMAGE);
       expect(adapter.seen[0]!.overrides).toBeUndefined();
     } finally {
       fx.cleanup();
     }
-  }, 20_000);
+  }, 180_000);
 
   it("records the resolved image/network/overrides in exec.json provenance", async () => {
     const fx = openFixture();
     try {
       const { project, run } = await runWithProject(fx, {
-        workspaceImage: "acme/base:9",
+        workspaceImage: PROJECT_REAL_IMAGE,
         networkPolicy: "offline",
       });
       const execJson = JSON.parse(
@@ -325,13 +337,13 @@ describe("project config reaches the run (startRun wire)", () => {
           "utf8",
         ),
       ) as { image: string; network: string; adapterOverrides?: unknown };
-      expect(execJson.image).toBe("acme/base:9");
+      expect(execJson.image).toBe(PROJECT_REAL_IMAGE);
       expect(execJson.network).toBe("offline");
-      expect(execJson.adapterOverrides).toEqual({ image: "acme/base:9" });
+      expect(execJson.adapterOverrides).toEqual({ image: PROJECT_REAL_IMAGE });
     } finally {
       fx.cleanup();
     }
-  }, 20_000);
+  }, 180_000);
 });
 
 describe("per-run adapterOverrides (POST /runs)", () => {
@@ -346,7 +358,7 @@ describe("per-run adapterOverrides (POST /runs)", () => {
         name: "pin",
         slug: "pin",
         taskSource: { kind: "ui-builder" },
-        workspaceImage: "project/default:1",
+        workspaceImage: PROJECT_REAL_IMAGE,
       });
       const task = fx.queries.createTask(project.id, {
         id: "ext-pin-1",
@@ -387,7 +399,7 @@ describe("per-run adapterOverrides (POST /runs)", () => {
         provider: "p",
         repeatIndex: 0,
         // What the route now stores when the body carries adapterOverrides.image.
-        agentImage: "run/pinned:9",
+        agentImage: RUN_REAL_IMAGE,
         agentImageSource: "run_override",
       });
 
@@ -397,17 +409,17 @@ describe("per-run adapterOverrides (POST /runs)", () => {
         fx.queries,
         run.id,
         createLiveRunsMap(),
-        { adapter, runtime: new FakeContainerRuntime(), timeoutMs: 10_000 },
+        { adapter, runtime: realRuntime(), timeoutMs: 10_000 },
       );
       await live.done;
 
       // The run's own pin beats the project's workspaceImage.
-      expect(live.handle.image).toBe("run/pinned:9");
-      expect(adapter.seen[0]!.overrides?.image).toBe("run/pinned:9");
+      expect(live.handle.image).toBe(RUN_REAL_IMAGE);
+      expect(adapter.seen[0]!.overrides?.image).toBe(RUN_REAL_IMAGE);
     } finally {
       fx.cleanup();
     }
-  }, 20_000);
+  }, 180_000);
 });
 
 describe("adapter env precedence (gateway/proxy pinning)", () => {

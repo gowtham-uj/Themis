@@ -1,17 +1,50 @@
 /**
  * The container-runtime seam.
  *
- * Domain code (the runner, run-control, diff capture) never calls `docker` directly. It goes through
- * this interface so the container-execution path is unit-testable in this Dockerless build environment
- * against a fake implementation, and switchable to a real Docker-socket-backed implementation in a
- * deployment that has Docker + root. See plan/execution.md and CLAUDE.md ("Execution environment
- * constraint").
+ * Domain code (the runner, run-control, diff capture) never calls `podman`/`docker` directly. It goes
+ * through this interface so every execution path uses a real container backend while remaining
+ * switchable between Podman and a future Docker-socket implementation. See plan/execution.md.
  */
 
 import { existsSync } from "node:fs";
 import { DockerSocketRuntime } from "./docker-socket.js";
-import { FakeContainerRuntime } from "./fake-runtime.js";
 import { PodmanRuntime } from "./podman-runtime.js";
+
+/** One command executed inside an already-running container. */
+export interface ContainerExecSpec {
+  /** Exact argv passed to the container runtime. */
+  argv: string[];
+  /** Working directory inside the container (default `/workspace`). */
+  cwd?: string;
+  /** Additional environment variables for this command only. */
+  env?: Record<string, string>;
+  /** Container user for this command, e.g. `root`. */
+  user?: string;
+  /** Hard wall-clock limit for this command. */
+  timeoutMs?: number;
+  /** Combined stdout/stderr bytes retained in the result before truncation. */
+  maxOutputBytes?: number;
+}
+
+/** A streaming command session inside an already-running container. */
+export interface ContainerExecHandle {
+  readonly id: string;
+  stdout(): AsyncIterable<Buffer>;
+  stderr(): AsyncIterable<Buffer>;
+  wait(): Promise<{ exitCode: number; timedOut: boolean; durationMs: number }>;
+  /** Stop this command session without stopping the queue container. */
+  stop(graceMs?: number): Promise<void>;
+}
+
+/** Captured result of a command run through {@link ContainerHandle.exec}. */
+export interface ContainerExecResult {
+  exitCode: number;
+  timedOut: boolean;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+  outputTruncated: boolean;
+}
 
 /** A container that has been started and can be controlled. */
 export interface ContainerHandle {
@@ -28,6 +61,10 @@ export interface ContainerHandle {
   resume(): Promise<void>;
   /** Graceful stop: SIGTERM then SIGKILL after `graceMs`. Returns once stopped (not removed). */
   stop(graceMs?: number): Promise<void>;
+  /** Start a streaming command session inside this same live container. */
+  startExec(spec: ContainerExecSpec): Promise<ContainerExecHandle>;
+  /** Execute argv inside this same live container and collect bounded output. */
+  exec(spec: ContainerExecSpec): Promise<ContainerExecResult>;
   /** Attach to stdout/stderr as an async stream of bytes/chunks. */
   stdout(): AsyncIterable<Buffer>;
   stderr(): AsyncIterable<Buffer>;
@@ -68,7 +105,7 @@ export interface RunContainerSpec {
   workspaceDir: string;
   /** argv to launch the agent headlessly inside the container. */
   argv: string[];
-  /** Env injected at launch; secrets are redacted from logs by the runner, never here unsanitized. */
+  /** Environment injected at container launch. */
   env: Record<string, string>;
   /** Resource limits — pinned for reproducibility (plan/execution.md). */
   limits: { cpus?: number; memoryMiB?: number; pids?: number };
@@ -92,17 +129,35 @@ export interface RunContainerSpec {
   sandbox?: unknown;
 }
 
+export interface BuildImageSpec {
+  /** Host directory used as the OCI build context. */
+  contextDir: string;
+  /** Containerfile/Dockerfile path inside the context directory. */
+  containerfilePath: string;
+  /** Resulting local image tag or fully-qualified name. */
+  image: string;
+  /** Hard build timeout. */
+  timeoutMs?: number;
+}
+
+export interface BuildImageResult {
+  image: string;
+  imageId: string;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+}
+
 export interface ContainerRuntime {
+  /** Build a real CLI-agent image from a connected source repository. */
+  buildImage(spec: BuildImageSpec): Promise<BuildImageResult>;
   /**
    * Pull the image if missing (registry policy), then launch and return a handle. The caller owns the
    * lifecycle: stream stdout via the handle, then `wait()`, then `remove()`.
    *
    * Implementations:
-   *  - `DockerSocketRuntime` (real; used where Docker exists) — builds the `docker run` argv from
-   *    `spec` and drives the daemon over the socket.
-   *  - `FakeContainerRuntime` (tests; this build) — simulates a process: runs `argv` as a local
-   *    child process honoring `pause`/`stop`/`timeoutMs`, so runner + redaction + diff + run-control
-   *    logic are exercised without a daemon.
+   *  - `PodmanRuntime` (real, default) — daemonless OCI containers through the Podman CLI.
+   *  - `DockerSocketRuntime` (future real backend) — selected only when explicitly configured.
    */
   run(spec: RunContainerSpec): Promise<ContainerHandle>;
 }
@@ -119,16 +174,15 @@ export function setRuntime(rt: ContainerRuntime | undefined): void {
 }
 
 /**
- * True when the podman backend should be selected.
+ * True when the real Podman backend is selected.
  *
- * Explicit opt-in via `AGENTEVAL_PODMAN=1` (or `AGENTEVAL_RUNTIME=podman`).
- * Deliberately not auto-detected from the binary being present: a developer
- * box may have podman installed without wanting every unit test to launch real
- * containers.
+ * Podman is the default. `AGENTEVAL_PODMAN=1` and
+ * `AGENTEVAL_RUNTIME=podman` make that choice explicit.
  */
 export function isPodmanEnvironment(): boolean {
   if (process.env.AGENTEVAL_PODMAN === "1") return true;
-  return (process.env.AGENTEVAL_RUNTIME ?? "").toLowerCase() === "podman";
+  const selected = (process.env.AGENTEVAL_RUNTIME ?? "").toLowerCase();
+  return selected === "" || selected === "podman";
 }
 
 /**
@@ -149,19 +203,21 @@ export function isDockerEnvironment(): boolean {
 }
 
 /**
- * Resolved at app startup from env: real Docker socket if `DOCKER_HOST`/socket/
- * AGENTEVAL_DOCKER present, else {@link FakeContainerRuntime}.
- * Tests may inject via {@link setRuntime}.
+ * Resolve the configured real container backend.
+ *
+ * Podman is the operational and test default. There is deliberately no local
+ * process fallback: a missing container runtime is a hard configuration error,
+ * not permission to run agent code on the host.
  */
 export function resolveRuntime(): ContainerRuntime {
   if (injectedRuntime) return injectedRuntime;
-  // Podman is the preferred real backend: daemonless, rootless-capable, and
-  // the same OCI images. Checked first so a host with both picks it.
-  if (isPodmanEnvironment()) return new PodmanRuntime();
-  if (isDockerEnvironment()) {
-    // DockerSocketRuntime.run() currently throws NotImplementedError in this build;
-    // live container smoke is deferred to a Docker+root environment (@needs-docker).
+  const selected = (process.env.AGENTEVAL_RUNTIME ?? "").toLowerCase();
+  if (process.env.AGENTEVAL_PODMAN === "1" || selected === "podman") {
+    return new PodmanRuntime();
+  }
+  if (selected === "docker" || isDockerEnvironment()) {
     return new DockerSocketRuntime();
   }
-  return new FakeContainerRuntime();
+  if (selected === "") return new PodmanRuntime();
+  throw new Error(`unsupported AGENTEVAL_RUNTIME=${selected}; use podman`);
 }

@@ -6,10 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RunController } from "../src/runner/control.ts";
-import {
-  FakeContainerRuntime,
-  asFakeHandle,
-} from "../src/runner/fake-runtime.ts";
+import { PodmanRuntime } from "../src/runner/podman-runtime.ts";
 import { deriveRunStatus } from "../src/runner/run.ts";
 import type { RunContainerSpec } from "../src/runner/runtime.ts";
 import { parseJsonl } from "../src/schema/jsonl.ts";
@@ -20,7 +17,7 @@ async function tempDir(prefix: string): Promise<string> {
 
 function baseSpec(workspaceDir: string, overrides: Partial<RunContainerSpec> = {}): RunContainerSpec {
   return {
-    image: "agenteval/fake:test",
+    image: "docker.io/library/node:22-bookworm-slim",
     workspaceDir,
     argv: ["node", "-e", "setTimeout(() => process.exit(0), 5_000);"],
     env: {},
@@ -91,19 +88,17 @@ describe("deriveRunStatus (shared helper)", () => {
   });
 });
 
-describe("RunController", () => {
-  const runtime = new FakeContainerRuntime();
+describe("RunController (real Podman)", () => {
+  const runtime = new PodmanRuntime({
+    prefix: process.env.AGENTEVAL_PODMAN_SUDO === "0" ? [] : ["sudo", "-n"],
+  });
   const live: Array<{ remove: () => Promise<void> }> = [];
 
   afterEach(async () => {
     for (const h of live.splice(0)) {
       await h.remove().catch(() => undefined);
     }
-    for (const h of runtime.handles) {
-      await h.remove().catch(() => undefined);
-    }
-    runtime.handles.length = 0;
-  });
+  }, 60_000);
 
   it("hard pause → resume → abort keeps partial events and records fatal error", async () => {
     const ws = await tempDir("agenteval-ctrl-ws-");
@@ -158,7 +153,6 @@ describe("RunController", () => {
     await ctrl.pause("hard");
     expect(ctrl.controlState()).toBe("paused-hard");
     expect(ctrl.pauseCount()).toBe(1);
-    expect(asFakeHandle(handle).isPaused()).toBe(true);
 
     // Stay paused long enough that pausedMs > 0 is unambiguous.
     await new Promise((r) => setTimeout(r, 150));
@@ -167,7 +161,6 @@ describe("RunController", () => {
     // --- resume ---
     await ctrl.resume();
     expect(ctrl.controlState()).toBe("running");
-    expect(asFakeHandle(handle).isPaused()).toBe(false);
     // Accumulated pause time retained after resume.
     expect(ctrl.pausedMs()).toBeGreaterThan(0);
 
@@ -175,7 +168,6 @@ describe("RunController", () => {
     await ctrl.pause("soft");
     expect(ctrl.controlState()).toBe("paused-soft");
     expect(ctrl.pauseCount()).toBe(2);
-    expect(asFakeHandle(handle).isPaused()).toBe(false);
     expect(ctrl.isSoftPaused()).toBe(true);
     await ctrl.resume();
     expect(ctrl.controlState()).toBe("running");
@@ -243,7 +235,6 @@ describe("RunController", () => {
 
     await ctrl.pause("soft");
     expect(ctrl.controlState()).toBe("paused-soft");
-    expect(asFakeHandle(handle).isPaused()).toBe(false);
 
     // Soft pause does not accumulate pausedMs (clock keeps running for in-flight).
     await new Promise((r) => setTimeout(r, 50));

@@ -1,19 +1,14 @@
 /**
  * P8b-auth — API token store + Bearer gate.
  *
- * Boots createServer({ authEnabled: true }) with a fixture adapter.
- * Offline: no real git / model.
+ * Boots the real API server with authentication enabled; no agent run is involved.
  */
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  createFixtureAdapter,
-  createServer,
-  type ApiServer,
-} from "../src/api/server.ts";
+import { createServer, type ApiServer } from "../src/api/server.ts";
 import { hashToken } from "../src/api/auth.ts";
 import type { Rubric } from "../src/domain.ts";
 
@@ -102,13 +97,7 @@ async function bootAuth(authEnabled: boolean): Promise<{
   base: string;
 }> {
   const dataDir = await tempDataDir();
-  const api = createServer({
-    dataDir,
-    adapter: createFixtureAdapter({ holdMs: 30, messages: ["fixture"] }),
-    concurrency: 1,
-    authEnabled,
-    startOpts: { timeoutMs: 10_000 },
-  });
+  const api = createServer({ dataDir, authEnabled });
   servers.push(api);
   const port = await api.listen(0);
   return { api, base: `http://127.0.0.1:${port}` };

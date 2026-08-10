@@ -877,17 +877,16 @@ export function buildPiCommand(
   ctx: RunContext,
   options: { agentDir?: string; noSession?: boolean; piBin?: string } = {},
 ): AdapterCommand {
-  // Precedence: explicit option > project override (`piBin`, for containerized
-  // images that ship pi elsewhere) > host resolution.
+  // Queue adapters execute inside the agent image, where `pi` is the stable CLI
+  // entrypoint. An explicit override remains available for custom real images.
   const overridePiBin = ctx.overrides?.env?.AGENTEVAL_PI_BIN;
   const piBin =
     options.piBin ??
     (typeof overridePiBin === "string" && overridePiBin.trim()
       ? overridePiBin.trim()
-      : resolvePiBin());
-  // Always launch via node + absolute cli.js when we resolved a .js path.
+      : "pi");
   const useNode = piBin.endsWith(".js") || piBin.includes(`${join("dist", "cli")}`);
-  const argv: string[] = useNode ? [process.execPath, piBin] : [piBin];
+  const argv: string[] = useNode ? ["node", piBin] : [piBin];
 
   argv.push(
     "--mode",
@@ -1127,8 +1126,31 @@ export const piAdapter: Adapter = {
   image(ctx: RunContext): string {
     return ctx.overrides?.image ?? DEFAULT_IMAGE;
   },
+  connectionCheck(ctx: RunContext) {
+    const checkCtx: RunContext = {
+      ...ctx,
+      task: {
+        prompt: "Reply with exactly AGENTEVAL_CONNECTION_OK. Do not use tools.",
+        workspace: { source: "empty" },
+      },
+      params: {
+        ...ctx.params,
+        tools: [],
+        noSession: true,
+        systemPrompt: "Return exactly AGENTEVAL_CONNECTION_OK and nothing else.",
+      },
+    };
+    return {
+      command: buildPiCommand(checkCtx, { noSession: true }),
+      cwd: "/workspace",
+      timeoutMs: 60_000,
+    };
+  },
   command(ctx: RunContext): AdapterCommand {
     return buildPiCommand(ctx);
+  },
+  evidence() {
+    return { paths: [".pi"] };
   },
   parse(streams: AgentStreams, ctx: RunContext): AsyncIterable<CanonicalEvent> {
     // Defer run.end until exitCode is known so crash mid-stream → failed.

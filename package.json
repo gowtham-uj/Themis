@@ -10,8 +10,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=1 vitest run",
+    "test:watch": "AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=1 vitest",
     "cli": "tsx src/cli/index.ts",
     "lint": "eslint src --max-warnings 0",
     "ui:dev": "next dev src/ui",

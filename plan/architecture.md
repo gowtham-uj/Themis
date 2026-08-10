@@ -2,52 +2,42 @@
 
 ## Tech stack
 
-- **Web app**: Next.js (App Router) + TypeScript + Tailwind. Server Components for pages, Route
-  Handlers for the API, **SSE** (Server-Sent Events) for live log streaming to the browser.
-- **Datastore**: SQLite (via `better-sqlite3` or Drizzle ORM) for metadata; raw JSONL logs + HTML
-  reports + workspace diffs stored on disk under a data directory.
-- **Run workers**: Node processes that own the Docker lifecycle for a run and ingest the agent's
-  canonical event stream. Runs can be triggered in-process (small scale) or via a lightweight job
-  queue table in SQLite (polling workers). Start in-process; graduate to a queue if needed.
-- **Containers**: Docker Engine on the host. One container per run (agent) and per judgement (judge).
+- **Backend/API**: Node 22 + TypeScript HTTP server. Every project, adapter, eval, queue, persistent
+  container, run, archive, judgement, and report operation is exposed through APIs. Frontend work is
+  deferred and is not part of the current acceptance surface.
+- **Datastore**: SQLite/Drizzle for metadata; raw JSONL traces, immutable eval archives, PI judge
+  transcripts, verdict JSON, and HTML reports stored under the data directory.
+- **Queue workers**: Node services own one persistent real Podman container per active eval queue and
+  execute its ordered evals sequentially through adapter connection check, setup, agent execution,
+  evidence capture, cleanup, reset, and archive sealing.
+- **Judge worker**: one isolated PI SDK agent session with the versioned custom judge system prompt and
+  restricted archive/submission tools. It uses the configured real provider/model and never a direct
+  canned or mocked model path.
 - **Auth**: single shared login / small user table (self-hosted, few users). No org model.
-- **Multi-project**: every domain artifact is project-scoped. A **project** = one independently-evolving
-  eval program (its own tasks/runs/judgements/findings/issues-log) plus its **own way of adding evals**
-  via a pluggable **task source**. Adapters and judge prompt versions are **global** (shared), refined
-  per project via overrides. See [projects.md](projects.md). (Multi-*project*, not multi-*tenant*.)
+- **Multi-project**: every domain artifact is project-scoped; each project owns exactly one configured
+  CLI agent adapter and any number of eval queues.
 
 ## Components
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  Next.js app (UI + API)                                                    │
-│                                                                            │
-│  Pages: Projects · Tasks · Runs · Run detail (live) · Judgements (live) ·  │
-│         Reports · Findings/Issues · Compare · Project settings · Settings   │
-│                                                                            │
-│  API:   /api/projects  /api/projects/:id/tasks  /api/projects/:id/runs    │
-│         /api/runs/:id/events(SSE)  /api/judgements/:id/events(SSE)          │
-│         /api/projects/:id/findings  /api/reports                            │
-└───────────────┬───────────────────────────────┬───────────────────────────┘
-                │ enqueue                        │ enqueue
-        ┌───────▼────────┐               ┌───────▼─────────┐
-        │  Run Worker    │               │  Judge Worker   │
-        │  (per run)     │               │  (per judgement)│
-        └───────┬────────┘               └───────┬─────────┘
-                │ spawn                           │ spawn
-        ┌───────▼────────────┐          ┌─────────▼───────────────┐
-        │ Docker: agent      │          │ Docker: pi (judge)      │
-        │  - workspace vol    │          │  - read-only logs vol   │
-        │  - ReaperCode / pi  │          │  - report skill mounted │
-        └───────┬────────────┘          └─────────┬───────────────┘
-                │ canonical events (JSONL)         │ judge events + HTML report
-        ┌───────▼─────────────────────────────────▼───────────────┐
-        │ Data dir (disk):  projects/<pid>/runs/<id>/events.jsonl,  │
-        │   diff.patch, judgements/<id>/judge.jsonl, report.html    │
-        │ SQLite: projects, tasks, runs, judgements, scores,        │
-        │         findings (all project-scoped; agents + judge      │
-        │         prompt versions global)                           │
-        └──────────────────────────────────────────────────────────┘
+API client
+    │
+    ▼
+Node HTTP API ───────────────► SQLite + project data directory
+    │                              ▲
+    ├─ adapter/eval/queue CRUD     │ runs, canonical traces, immutable archives
+    ├─ queue container control     │ PI judge events/transcript, verdicts, HTML
+    ├─ root exec byte stream       │
+    └─ queue analysis/rejudge      │
+           │                       │
+           ├──────────────┐        │
+           ▼              ▼        │
+   Queue Worker       PI Judge Worker
+           │          (SDK custom tools)
+           ▼              │
+   persistent Podman      └────────┘
+   queue container
+   (project CLI agent)
 ```
 
 ## Multi-project model (the project is the unit of eval ownership)
@@ -96,20 +86,22 @@ author task ──► trigger run(agent, model, repeats=N)
 ## Judge lifecycle (decoupled)
 
 ```
-judgement(run_id, judge_prompt?, judge_model) ──► Judge Worker
-   gather: task.prompt + task.rubric + run.events.jsonl + run.diff.patch
-   docker run pi (judge) with:
-       - global judge system prompt (tuned)
-       - user judge prompt (from UI, optional)
-       - report-generation skill mounted
-       - logs mounted read-only
-   stream pi's own events ─► judgements/<id>/judge.jsonl + SSE (live judge log)
-   judge writes structured verdict (scores per rubric criterion) + report.html
-   persist scores ─► SQLite (for trends) ; report.html ─► disk
+POST queue analysis/rejudge ──► Judge Worker
+   verify selected immutable eval archives and their content hashes
+   create isolated PI SDK session with:
+       - versioned custom judge system prompt
+       - optional operator steer
+       - selected real provider/model
+       - built-in tools/extensions/skills/context discovery disabled
+       - custom list/read/submit tools only
+   PI reads every required archive byte; early submit is rejected
+   terminating submit tool emits one validated Verdict per eval + queue-wide analysis
+   persist PI events + transcript + verdict revision + findings
+   platform renders self-contained report.html and exposes it through the API
 ```
 
-Because judging only reads immutable run logs, you can re-judge the same run any number of times with
-a different prompt or model — each is a new `judgement` row.
+Judging never mutates or reruns the evaluated agent. Re-judging the same immutable archive set creates
+an append-only analysis revision with its own prompt/model/provider provenance.
 
 ## Live streaming
 
@@ -123,5 +115,5 @@ a different prompt or model — each is a new `judgement` row.
 - Agents execute arbitrary code → **always in a container**, non-root user, no host mounts except the
   run's workspace, resource limits (cpus, memory, pids), and a run **timeout**.
 - Network: default allow (agents install deps); optionally restrict to an allowlist per task.
-- API keys are injected into the container as env vars at launch and never written to logs
-  (redaction pass on ingested events). See [execution.md](execution.md).
+- API keys are injected into the container as environment variables at launch. Traces and artifacts
+  are currently stored verbatim; redaction is deferred. See [execution.md](execution.md).

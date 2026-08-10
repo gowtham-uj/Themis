@@ -18,7 +18,13 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type {
+  BuildImageResult,
+  BuildImageSpec,
+  ContainerExecHandle,
+  ContainerExecResult,
+  ContainerExecSpec,
   ContainerHandle,
   ContainerRuntime,
   ResolvedPort,
@@ -145,6 +151,131 @@ export function parsePortOutput(
   return out2;
 }
 
+/** One streaming `podman exec` session inside a queue container. */
+class PodmanExecHandle implements ContainerExecHandle {
+  readonly id = `exec-${randomUUID()}`;
+  private readonly child: ChildProcess;
+  private readonly startedAt = Date.now();
+  private readonly waitPromise: Promise<{
+    exitCode: number;
+    timedOut: boolean;
+    durationMs: number;
+  }>;
+  private timedOut = false;
+  private settled = false;
+  private timeoutTimer: NodeJS.Timeout | undefined;
+
+  constructor(child: ChildProcess, timeoutMs: number) {
+    this.child = child;
+    this.waitPromise = new Promise((resolve) => {
+      const finish = (exitCode: number): void => {
+        if (this.settled) return;
+        this.settled = true;
+        if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+        resolve({
+          exitCode,
+          timedOut: this.timedOut,
+          durationMs: Math.max(0, Date.now() - this.startedAt),
+        });
+      };
+      child.once("error", () => finish(127));
+      child.once("close", (code, signal) => {
+        finish(
+          typeof code === "number"
+            ? code
+            : this.timedOut
+              ? 137
+              : signal
+                ? 128 + (signal === "SIGTERM" ? 15 : 9)
+                : 1,
+        );
+      });
+    });
+    if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+      this.timeoutTimer = setTimeout(() => {
+        this.timedOut = true;
+        this.killGroup("SIGKILL");
+      }, timeoutMs);
+      this.timeoutTimer.unref?.();
+    }
+  }
+
+  private killGroup(signal: NodeJS.Signals): void {
+    const pid = this.child.pid;
+    if (pid === undefined) return;
+    try {
+      if (process.platform !== "win32") process.kill(-pid, signal);
+      else this.child.kill(signal);
+    } catch {
+      try {
+        this.child.kill(signal);
+      } catch {
+        // already gone
+      }
+    }
+  }
+
+  stdout(): AsyncIterable<Buffer> {
+    return streamOf(this.child, "stdout");
+  }
+
+  stderr(): AsyncIterable<Buffer> {
+    return streamOf(this.child, "stderr");
+  }
+
+  wait(): Promise<{ exitCode: number; timedOut: boolean; durationMs: number }> {
+    return this.waitPromise;
+  }
+
+  async stop(graceMs = 2_000): Promise<void> {
+    if (this.settled) return;
+    this.killGroup("SIGTERM");
+    const done = await Promise.race([
+      this.waitPromise.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), graceMs)),
+    ]);
+    if (!done) this.killGroup("SIGKILL");
+    await this.waitPromise;
+  }
+}
+
+/** Collect a streaming exec session without ever stopping pipe drainage. */
+async function collectExecSession(
+  session: ContainerExecHandle,
+  maxOutputBytes: number,
+): Promise<ContainerExecResult> {
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  let retained = 0;
+  let outputTruncated = false;
+  const collect = async (
+    stream: AsyncIterable<Buffer>,
+    target: Buffer[],
+  ): Promise<void> => {
+    for await (const chunk of stream) {
+      const remaining = Math.max(0, maxOutputBytes - retained);
+      if (remaining > 0) {
+        const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
+        target.push(Buffer.from(kept));
+        retained += kept.length;
+      }
+      if (chunk.length > remaining) outputTruncated = true;
+    }
+  };
+  const drains = Promise.all([
+    collect(session.stdout(), stdout),
+    collect(session.stderr(), stderr),
+  ]);
+  const result = await session.wait();
+  await drains;
+  return {
+    ...result,
+    stdout: Buffer.concat(stdout).toString("utf8"),
+    stderr: Buffer.concat(stderr).toString("utf8"),
+    outputTruncated,
+  };
+}
+
 /** A running podman container. */
 class PodmanContainerHandle implements ContainerHandle {
   readonly id: string;
@@ -212,6 +343,39 @@ class PodmanContainerHandle implements ContainerHandle {
     // podman's -t is seconds; it sends SIGTERM then SIGKILL after the grace.
     const seconds = Math.max(0, Math.ceil(graceMs / 1000));
     await this.cli(["stop", "-t", String(seconds), this.id], graceMs + 15_000);
+  }
+
+  /** Start a streaming argv session in this exact live container. */
+  async startExec(spec: ContainerExecSpec): Promise<ContainerExecHandle> {
+    if (this.removed) {
+      throw Object.assign(new Error(`container ${this.id} has been removed`), {
+        code: "NOT_RUNNING",
+      });
+    }
+    if (spec.argv.length === 0) throw new Error("container exec requires argv");
+    const args = ["exec"];
+    if (spec.cwd) args.push("--workdir", spec.cwd);
+    if (spec.user) args.push("--user", spec.user);
+    for (const [name, value] of Object.entries(spec.env ?? {})) {
+      args.push("--env", `${name}=${value}`);
+    }
+    args.push(this.id, ...spec.argv);
+    const [file, ...spawnArgs] = [
+      ...this.podman,
+      "--log-level=error",
+      ...args,
+    ];
+    const child = spawn(file!, spawnArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    return new PodmanExecHandle(child, spec.timeoutMs ?? 30_000);
+  }
+
+  /** Execute argv and collect bounded stdout/stderr. */
+  async exec(spec: ContainerExecSpec): Promise<ContainerExecResult> {
+    const session = await this.startExec(spec);
+    return collectExecSession(session, spec.maxOutputBytes ?? 1024 * 1024);
   }
 
   stdout(): AsyncIterable<Buffer> {
@@ -322,6 +486,45 @@ export class PodmanRuntime implements ContainerRuntime {
     return [...this.prefix, this.bin];
   }
 
+  /** Build an OCI image from a connected real agent CLI repository. */
+  async buildImage(spec: BuildImageSpec): Promise<BuildImageResult> {
+    const started = Date.now();
+    const built = await runCli(
+      [
+        ...this.cmd(),
+        "--log-level=error",
+        "build",
+        "-t",
+        spec.image,
+        "-f",
+        spec.containerfilePath,
+        spec.contextDir,
+      ],
+      { timeoutMs: spec.timeoutMs ?? 1_800_000 },
+    );
+    if (built.code !== 0) {
+      throw new Error(
+        `podman build failed (exit ${built.code}): ${built.stderr.trim() || built.stdout.trim()}`,
+      );
+    }
+    const inspected = await runCli(
+      [...this.cmd(), "image", "inspect", spec.image, "--format", "{{.Id}}"],
+      { timeoutMs: 30_000 },
+    );
+    if (inspected.code !== 0 || !inspected.stdout.trim()) {
+      throw new Error(
+        `podman image inspect failed for ${spec.image}: ${inspected.stderr.trim()}`,
+      );
+    }
+    return {
+      image: spec.image,
+      imageId: inspected.stdout.trim(),
+      stdout: built.stdout,
+      stderr: built.stderr,
+      durationMs: Date.now() - started,
+    };
+  }
+
   /**
    * Launch a container for `spec`.
    *
@@ -378,11 +581,19 @@ export class PodmanRuntime implements ContainerRuntime {
     let ports: ResolvedPort[] = [];
     const wanted = [...(spec.ports ?? []), ...policy.ports];
     if (wanted.length > 0) {
-      const portRes = await runCli([...this.cmd(), "port", id], {
-        timeoutMs: 30_000,
-      });
-      if (portRes.code === 0) {
-        ports = parsePortOutput(portRes.stdout, wanted);
+      // Port publication can lag container creation very briefly. Retry rather
+      // than returning an empty mapping that makes a real published port
+      // undiscoverable to the queue worker/operator.
+      for (let attempt = 0; attempt < 20 && ports.length === 0; attempt++) {
+        const portRes = await runCli([...this.cmd(), "port", id], {
+          timeoutMs: 30_000,
+        });
+        if (portRes.code === 0) {
+          ports = parsePortOutput(portRes.stdout, wanted);
+        }
+        if (ports.length === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
       }
     }
 

@@ -176,6 +176,10 @@ export interface UsageEvent extends EventEnvelope {
 /** A command the sandbox executed — captured by exec instrumentation, not model-authored. Spec: event-schema.md §exec. */
 export interface ExecEvent extends EventEnvelope {
   type: "exec";
+  /** Who initiated the command; absent on legacy instrumentation events. */
+  actor?: "agent" | "operator" | "harness";
+  /** Capture channel, so operator introspection is never attributed to the agent. */
+  source?: "instrumentation" | "introspection";
   /** The exact argv as exec'd in the sandbox. */
   argv: string[];
   /** Working dir inside the container. */
@@ -668,6 +672,26 @@ export function validateCanonicalEvent(value: unknown): CanonicalEvent {
       }
       const durationMs = requireNumber(value, "durationMs", type);
       const event: ExecEvent = { ...base, type, argv, cwd, user, exitCode, durationMs };
+      const actor = optionalString(value, "actor", type);
+      if (actor !== undefined) {
+        if (actor !== "agent" && actor !== "operator" && actor !== "harness") {
+          throw new EventValidationError(
+            "actor must be agent|operator|harness",
+            type,
+          );
+        }
+        event.actor = actor;
+      }
+      const source = optionalString(value, "source", type);
+      if (source !== undefined) {
+        if (source !== "instrumentation" && source !== "introspection") {
+          throw new EventValidationError(
+            "source must be instrumentation|introspection",
+            type,
+          );
+        }
+        event.source = source;
+      }
       const blocked = optionalBoolean(value, "blocked", type);
       if (blocked !== undefined) event.blocked = blocked;
       const blockedReason = optionalString(value, "blockedReason", type);

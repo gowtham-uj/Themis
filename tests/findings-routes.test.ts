@@ -3,17 +3,13 @@
  *
  * Boots the real ApiServer on a temp dataDir. Seeds a project + task + a batch
  * of N=2 runs, then storeVerdicts the SAME finding on both so occurrenceCount=2.
- * OFFLINE — no real LLM.
+ * Seeds already-validated verdict rows directly; no agent or judge execution is involved.
  */
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  createFixtureAdapter,
-  createServer,
-  type ApiServer,
-} from "../src/api/server.ts";
+import { createServer, type ApiServer } from "../src/api/server.ts";
 import { fingerprintOf } from "../src/db/findings.ts";
 import type { Rubric, TaskSpec } from "../src/domain.ts";
 import {
@@ -182,10 +178,7 @@ interface SeededWorld {
  */
 async function seedRecurringFinding(): Promise<SeededWorld> {
   const dataDir = await tempDataDir();
-  const api = createServer({
-    dataDir,
-    adapter: createFixtureAdapter(),
-  });
+  const api = createServer({ dataDir });
   servers.push(api);
   const port = await api.listen(0);
   const base = `http://127.0.0.1:${port}`;
@@ -433,10 +426,7 @@ describe("findings routes (P6b-api)", () => {
   it("pagination: limit=1 returns nextCursor; next page returns the rest", async () => {
     // Seed two DISTINCT findings so we have 2 list items.
     const dataDir = await tempDataDir();
-    const api = createServer({
-      dataDir,
-      adapter: createFixtureAdapter(),
-    });
+    const api = createServer({ dataDir });
     servers.push(api);
     const port = await api.listen(0);
     const base = `http://127.0.0.1:${port}`;
@@ -569,10 +559,7 @@ describe("findings routes (P6b-api)", () => {
 
   it("GET list is sorted newest-lastSeenAt-first", async () => {
     const dataDir = await tempDataDir();
-    const api = createServer({
-      dataDir,
-      adapter: createFixtureAdapter(),
-    });
+    const api = createServer({ dataDir });
     servers.push(api);
     const port = await api.listen(0);
     const base = `http://127.0.0.1:${port}`;

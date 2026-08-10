@@ -62,6 +62,82 @@ export const projects = sqliteTable("projects", {
 });
 
 // ---------------------------------------------------------------------------
+// Project agent adapters — declarative integrations for real CLI agents
+// ---------------------------------------------------------------------------
+
+export const projectAgentAdapters = sqliteTable(
+  "project_agent_adapters",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    agentId: text("agent_id")
+      .notNull()
+      .references(() => agents.id),
+    name: text("name").notNull(),
+    description: text("description"),
+    formatVersion: integer("format_version").notNull().default(1),
+    image: text("image").notNull(),
+    commandJson: text("command_json").notNull(),
+    connectionCheckJson: text("connection_check_json").notNull(),
+    evidenceJson: text("evidence_json").notNull(),
+    parserKind: text("parser_kind").notNull(),
+    parserConfigJson: text("parser_config_json"),
+    providerConfigJson: text("provider_config_json"),
+    sourceRepo: text("source_repo"),
+    sourceRef: text("source_ref"),
+    containerfile: text("containerfile"),
+    buildStatus: text("build_status").notNull().default("unbuilt"),
+    builtImageId: text("built_image_id"),
+    builtCommit: text("built_commit"),
+    buildLogPath: text("build_log_path"),
+    lastBuiltAt: text("last_built_at"),
+    enabled: integer("enabled").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (t) => [
+    unique("uq_project_agent_adapter").on(t.projectId),
+    index("idx_project_agent_adapters_project").on(t.projectId, t.enabled),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Eval queues — persistent definitions, one live container per active queue
+// ---------------------------------------------------------------------------
+
+export const evalQueues = sqliteTable(
+  "eval_queues",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    name: text("name").notNull(),
+    description: text("description"),
+    agentId: text("agent_id")
+      .notNull()
+      .references(() => agents.id),
+    model: text("model").notNull(),
+    provider: text("provider").notNull(),
+    adapterOverridesJson: text("adapter_overrides_json"),
+    sandboxJson: text("sandbox_json"),
+    networkPolicy: text("network_policy").notNull().default("allow"),
+    portsJson: text("ports_json"),
+    judgeModel: text("judge_model"),
+    judgeProvider: text("judge_provider"),
+    autoJudge: integer("auto_judge").notNull().default(1),
+    status: text("status").notNull().default("draft"),
+    activeBatchId: text("active_batch_id"),
+    revision: integer("revision").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (t) => [index("idx_eval_queues_project_status").on(t.projectId, t.status)],
+);
+
+// ---------------------------------------------------------------------------
 // Watcher rules + events (schema only for P8)
 // ---------------------------------------------------------------------------
 
@@ -166,6 +242,8 @@ export const tasks = sqliteTable(
     workspaceRef: text("workspace_ref"),
     /** Per-task rubric (criteria, weights, checks, anchors, profile). */
     rubricJson: text("rubric_json").notNull(),
+    /** Bumps on any eval definition edit; queue executions snapshot this version. */
+    version: integer("version").notNull().default(1),
     /** Bumps on rubric edit → new comparison baseline. */
     rubricVersion: integer("rubric_version").notNull().default(1),
     /** coding|research|general|browser|data|conversational */
@@ -186,6 +264,29 @@ export const tasks = sqliteTable(
     archived: integer("archived").notNull().default(0),
   },
   (t) => [unique("tasks_project_external_id").on(t.projectId, t.externalId)],
+);
+
+export const evalQueueItems = sqliteTable(
+  "eval_queue_items",
+  {
+    id: text("id").primaryKey(),
+    queueId: text("queue_id")
+      .notNull()
+      .references(() => evalQueues.id),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    taskId: text("task_id")
+      .notNull()
+      .references(() => tasks.id),
+    position: real("position").notNull(),
+    repeats: integer("repeats").notNull().default(1),
+    enabled: integer("enabled").notNull().default(1),
+    overridesJson: text("overrides_json"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (t) => [index("idx_eval_queue_items_order").on(t.queueId, t.position)],
 );
 
 // ---------------------------------------------------------------------------
@@ -215,8 +316,38 @@ export const runBatches = sqliteTable("run_batches", {
   triggerRef: text("trigger_ref"),
   agentImage: text("agent_image"),
   agentCommit: text("agent_commit"),
+  /** Queue definition that created this immutable execution snapshot. */
+  queueId: text("queue_id").references(() => evalQueues.id),
+  queueRevision: integer("queue_revision"),
   createdAt: text("created_at").notNull(),
 });
+
+export const queueContainers = sqliteTable(
+  "queue_containers",
+  {
+    id: text("id").primaryKey(),
+    queueId: text("queue_id")
+      .notNull()
+      .references(() => evalQueues.id),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    batchId: text("batch_id")
+      .notNull()
+      .references(() => runBatches.id),
+    runtimeContainerId: text("runtime_container_id"),
+    image: text("image").notNull(),
+    state: text("state").notNull(),
+    portsJson: text("ports_json"),
+    workspaceDir: text("workspace_dir").notNull(),
+    startedAt: text("started_at"),
+    stoppedAt: text("stopped_at"),
+    error: text("error"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (t) => [index("idx_queue_containers_queue_state").on(t.queueId, t.state)],
+);
 
 export const runs = sqliteTable("runs", {
   id: text("id").primaryKey(),
@@ -230,6 +361,11 @@ export const runs = sqliteTable("runs", {
   projectId: text("project_id")
     .notNull()
     .references(() => projects.id),
+  queueId: text("queue_id").references(() => evalQueues.id),
+  queueItemId: text("queue_item_id").references(() => evalQueueItems.id),
+  queueContainerId: text("queue_container_id").references(
+    () => queueContainers.id,
+  ),
   agentId: text("agent_id")
     .notNull()
     .references(() => agents.id),
@@ -237,6 +373,9 @@ export const runs = sqliteTable("runs", {
   provider: text("provider").notNull(),
   /** k of N */
   repeatIndex: integer("repeat_index").notNull(),
+  /** Exact eval-store version and full definition used by this execution. */
+  evalVersion: integer("eval_version"),
+  evalSnapshotJson: text("eval_snapshot_json"),
   /** queued|running|paused|resuming|completed|failed|aborted|timeout */
   status: text("status").notNull(),
   /** Resolved workspace sha (reproducibility). */
@@ -273,6 +412,61 @@ export const runs = sqliteTable("runs", {
 });
 
 // ---------------------------------------------------------------------------
+// Immutable eval archives + append-only queue judgement revisions
+// ---------------------------------------------------------------------------
+
+export const evalArchives = sqliteTable("eval_archives", {
+  runId: text("run_id")
+    .primaryKey()
+    .references(() => runs.id),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id),
+  queueId: text("queue_id").references(() => evalQueues.id),
+  batchId: text("batch_id")
+    .notNull()
+    .references(() => runBatches.id),
+  manifestPath: text("manifest_path").notNull(),
+  manifestSha256: text("manifest_sha256").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  sealedAt: text("sealed_at").notNull(),
+});
+
+export const queueAnalyses = sqliteTable(
+  "queue_analyses",
+  {
+    id: text("id").primaryKey(),
+    queueId: text("queue_id")
+      .notNull()
+      .references(() => evalQueues.id),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    batchId: text("batch_id")
+      .notNull()
+      .references(() => runBatches.id),
+    selectedRunIdsJson: text("selected_run_ids_json").notNull(),
+    evidenceHashesJson: text("evidence_hashes_json").notNull(),
+    judgeModel: text("judge_model").notNull(),
+    judgeProvider: text("judge_provider").notNull(),
+    judgeParamsJson: text("judge_params_json"),
+    judgePrompt: text("judge_prompt"),
+    systemPromptVersion: text("system_prompt_version").notNull(),
+    parentAnalysisId: text("parent_analysis_id"),
+    status: text("status").notNull(),
+    verdictPath: text("verdict_path"),
+    reportPath: text("report_path"),
+    eventsPath: text("events_path"),
+    rawResponsePath: text("raw_response_path"),
+    createdAt: text("created_at").notNull(),
+    startedAt: text("started_at"),
+    endedAt: text("ended_at"),
+    error: text("error"),
+  },
+  (t) => [index("idx_queue_analyses_queue_batch").on(t.queueId, t.batchId)],
+);
+
+// ---------------------------------------------------------------------------
 // Judgements + scores (schema only; queries stubbed until P4)
 // ---------------------------------------------------------------------------
 
@@ -284,6 +478,7 @@ export const judgements = sqliteTable("judgements", {
   projectId: text("project_id")
     .notNull()
     .references(() => projects.id),
+  queueAnalysisId: text("queue_analysis_id").references(() => queueAnalyses.id),
   judgeModel: text("judge_model").notNull(),
   judgeProvider: text("judge_provider").notNull(),
   judgePrompt: text("judge_prompt"),
@@ -538,12 +733,18 @@ export const projectRubrics = sqliteTable(
 export const schema = {
   agents,
   projects,
+  projectAgentAdapters,
+  evalQueues,
   watcherRules,
   watcherEvents,
   queueEntries,
   tasks,
+  evalQueueItems,
   runBatches,
+  queueContainers,
   runs,
+  evalArchives,
+  queueAnalyses,
   judgements,
   scores,
   findings,
@@ -561,4 +762,4 @@ export const schema = {
 export type Schema = typeof schema;
 
 /** Migration version stamped into pragma user_version / migrations table. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;

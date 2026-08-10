@@ -1,9 +1,9 @@
 # REST API — for other applications to consume
 
-The entire platform is **API-first**: every feature the UI exposes, an external application can drive.
-Programmatic clients create projects, CRUD eval tasks, start/pause/resume/abort runs, request
-judgements, fetch verdicts + findings + reports, and stream live events — so a CI bot, dashboard, or
-companion tool can run evals and consume results without the web UI.
+The current product surface is **backend/API-only**; the frontend is deferred. Programmatic clients
+create projects, CRUD project CLI adapters and eval definitions, manage ordered queues and persistent
+Podman containers, stream privileged exec output, request PI-agent judgement revisions, and fetch
+immutable archives, verdicts, findings, and HTML reports without any UI dependency.
 
 ## Auth
 
@@ -66,51 +66,108 @@ POST   /api/projects/:id/tasks/sync               pull the project's task source
 > the sense that their source of truth is the repo; edits round-trip through the source (PATCH returns
 > 409 with a pointer). `ui-builder` and `http-push` tasks are fullymutable through the API.
 
-### Eval queue — add / remove / reorder (per project)
+### Project agent adapter — one real CLI agent per project
 
-A project has an **eval queue**: pending evals (ref + task set + repeats + params) awaiting a runner
-slot, distinct from runs already executing. Adding to the queue schedules an eval without immediately
-consuming a container; removing cancels it **before** it executes (no partial logs, unlike aborting a
-running run). This is the right surface for CI bots that enqueue many evals and let the host throttle
-them, and for "add this eval to the queue, I'll start the batch later."
+Each project is bound to exactly one agent under test. Its adapter is a CRUD-able declarative CLI
+integration (see [agent-adapter-sdk.md](agent-adapter-sdk.md)). It records the real git source/ref,
+Containerfile build recipe, image, provider/model credential mapping, eval command, real connection
+check, parser kind, and native evidence paths.
 
 ```
-POST   /api/projects/:id/queue                    add eval to queue — body: { ref|taskId|taskTags[],
-                                                   agent, model, repeats, params, adapterOverrides?,
-                                                   priority?, after? } → 202 + queue_entry id + position
-GET    /api/projects/:id/queue                    peek the queue (ordered; filters by tag/ref/status)
-PATCH  /api/projects/:id/queue/:entryId           reorder: { position?, priority?, before?, after? }
-DELETE /api/projects/:id/queue/:entryId           remove from queue (cancel before it starts)
-POST   /api/projects/:id/queue/drain              remove all queued entries (does not touch running runs)
-POST   /api/projects/:id/queue/:entryId/promote   move an entry to next-in-line (start as soon as a slot frees)
+POST   /api/projects/:id/adapters
+GET    /api/projects/:id/adapters
+GET    /api/projects/:id/adapters/:adapterId
+PATCH  /api/projects/:id/adapters/:adapterId
+POST   /api/projects/:id/adapters/:adapterId/build   clone pinned source + real Podman image build
+DELETE /api/projects/:id/adapters/:adapterId
 ```
 
-Notes:
+A project may have only one adapter. Adapter edits/build/deletion are rejected while any project queue
+container is active. Tests and production use the same real CLI/provider path; missing model access is a
+blocker, never a reason to substitute a fake.
 
-- **Add (`POST .../queue`)** is idempotent under `Idempotency-Key`; re-adding the same `(ref, taskSet)`
-  within a de-dup window **collapses** onto the existing entry (configurable: `dedup=collapse|reject|allow`).
-- A queued entry **promotes to a batch/runs automatically** when (a) a runner slot frees *and* (b) it's
-  at the head and the project isn't soft-paused; or immediately via `promote`. The transition
-  `queued → running` is recorded on the resulting `run_batches`/`runs`.
-- **Remove (`DELETE`)** cancels only entries still `queued`; it **does not** abort running runs (use
-  `/runs/:id/abort` for those). Returns the freed position so callers can reorder the remainder.
-- The queue is the **backpressure + dedup surface**: burst pushes from a watcher collapse onto earlier
-  queued entries for the same ref rather than spawning redundant batches (see watcher.md).
-- Outbound webhooks fire `queue.entry_added`, `queue.entry_promoted`, `queue.entry_removed` so external
-  schedulers can mirror the queue.
+### Eval store
 
-### Runs + batches — start / control
+`tasks` remains the storage table; `/evals` is the preferred product API and `/tasks` is compatibility.
+Every edit bumps the eval version. Queue execution snapshots the exact version and definition.
+
 ```
-POST   /api/projects/:id/runs                     start evals: { taskId | taskTags[], agent, model,
-                                                   repeats, params, adapterOverrides?, autoJudge? }
-                                                   → 202 + batch id + run ids (enqueue N repeats)
-POST   /api/projects/:id/runs/start               legacy alias / explicit "start evals for a task set"
-GET    /api/runs                                   list (cross-project with filters; project-scoped via /projects/:id/runs)
-GET    /api/runs/:id                               detail (status, control_state, usage, provenance)
-GET    /api/runs/:id/events                        SSE / ndjson live+replay (since=<seq>)
-GET    /api/runs/:id/diff                          diff.patch (hunk-numbered)
-GET    /api/runs/:id/report?partial=1             partial results while running/aborted
+POST   /api/projects/:id/evals
+GET    /api/projects/:id/evals
+GET    /api/projects/:id/evals/:evalId
+PATCH  /api/projects/:id/evals/:evalId
+DELETE /api/projects/:id/evals/:evalId
 ```
+
+Eval definitions include prompt, workspace, category, rubric, deterministic checks, setup script,
+cleanup script, cleanup verification, timeouts, reference solution, and tags.
+
+### Persistent eval queues and queue-owned containers
+
+A project may define any number of named queues for its one agent. Each active queue owns one persistent
+Podman container and processes its ordered eval references sequentially. Different queues provide
+parallelism. No eval creates its own container.
+
+```
+POST   /api/projects/:id/queues
+GET    /api/projects/:id/queues
+GET    /api/projects/:id/queues/:queueId
+PATCH  /api/projects/:id/queues/:queueId
+DELETE /api/projects/:id/queues/:queueId
+
+POST   /api/projects/:id/queues/:queueId/items
+GET    /api/projects/:id/queues/:queueId/items
+PATCH  /api/projects/:id/queues/:queueId/items/:itemId
+DELETE /api/projects/:id/queues/:queueId/items/:itemId
+
+PUT    /api/projects/:id/queues/:queueId/container   snapshot queue + spawn/start worker
+GET    /api/projects/:id/queues/:queueId/container
+PATCH  /api/projects/:id/queues/:queueId/container   {action:"pause"|"resume"}
+DELETE /api/projects/:id/queues/:queueId/container   stop and remove
+GET    /api/projects/:id/containers                  list live queue containers
+```
+
+Spawn runs a real adapter/provider/model connection check before any eval setup. Each eval then follows
+setup → real CLI agent → raw/canonical/native evidence extraction → checks → cleanup → cleanup verify →
+process kill/reset → immutable archive. A cleanup/evidence/archive failure taints the queue and stops it
+before the next eval.
+
+### Privileged streaming introspection bridge
+
+```
+POST /api/projects/:id/queues/:queueId/container/exec
+     {command,cwd?,env?,timeout_ms?}
+```
+
+The bridge never spawns a container: absent/stopped containers return 409. It executes `/bin/bash -lc`
+as container user `root`, giving operator-level read/write control over the exact queue pod. stdout and
+stderr stream live as exact bytes in `application/vnd.agenteval.exec-stream` frames: channel byte
+(1 stdout, 2 stderr, 3 exit JSON, 4 stream error), 4-byte big-endian payload length, then payload.
+Operator commands append `exec{actor:"operator",source:"introspection"}` to the current eval trace.
+When auth is disabled the bridge is loopback-only; read-only tokens cannot invoke it.
+
+### Immutable evidence and queue judgement revisions
+
+```
+GET  /api/evals/:runId/archive
+POST /api/projects/:id/queues/:queueId/analyses
+     {batch_id,all:true|run_ids[],judge_model,judge_provider,judge_prompt?,judge_params?}
+GET  /api/projects/:id/queues/:queueId/analyses
+GET  /api/projects/:id/queues/:queueId/analyses/:analysisId
+GET  /api/projects/:id/queues/:queueId/analyses/:analysisId/events
+GET  /api/projects/:id/queues/:queueId/analyses/:analysisId/transcript
+GET  /api/projects/:id/queues/:queueId/analyses/:analysisId/verdict
+GET  /api/projects/:id/queues/:queueId/analyses/:analysisId/report
+```
+
+One real PI SDK judge-agent session uses the versioned custom judge system prompt and restricted
+archive/submission tools. It must list and completely read every file in every selected immutable
+archive before its terminating submit tool is accepted. It emits one standard Verdict per eval plus cross-eval
+themes, reliability, ranked defects, subsystem attribution, regressions, and a verification-oriented
+improvement plan. Rejudging creates an append-only revision and never reruns the evaluated agent.
+
+### Legacy runs + batches — compatibility/control
+
 Run **control** (task #11 semantics):
 ```
 POST   /api/runs/:id/pause?mode=soft|hard          pause (soft = stop dequeuing; hard = cgroup freeze)

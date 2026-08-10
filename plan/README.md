@@ -5,7 +5,11 @@ capture rich execution traces (thinking, messages, tool calls, results, tokens),
 **LLM judge** grade each run against a per-task rubric and produce a polished **HTML report** —
 so you can tell whether an agent has **regressed or progressed** over time.
 
-> Working name: `agenteval` (codename TBD). Everything here is a plan; no code is built yet.
+> Working name: `agenteval` (codename TBD).
+>
+> **Current delivery scope:** backend workers and server APIs only. The frontend is deferred; no backend
+> capability may depend on UI code, and the complete eval/queue/container/judge/report flow must be
+> driveable and inspectable through APIs.
 
 ## Documents
 
@@ -16,6 +20,7 @@ so you can tell whether an agent has **regressed or progressed** over time.
 | [watcher.md](watcher.md) | Per-project repo watchers — trigger eval batches on new tags/commits/PRs/schedule/manual |
 | [event-schema.md](event-schema.md) | The canonical event schema (the "standard protocol") + mappings |
 | [adapters.md](adapters.md) | Agent adapter interface, pi adapter, ReaperCode adapter, per-project task sources |
+| [agent-adapter-sdk.md](agent-adapter-sdk.md) | Detailed project-scoped CLI adapter format, CRUD API, provider/model connection checks, evidence extraction, registration, and real acceptance testing |
 | [categories.md](categories.md) | Pre-defined agent categories (coding is one; also research, general, browser, data, conversational) |
 | [api.md](api.md) | REST API — projects, tasks CRUD, run control, judgements/findings, release compare, webhooks |
 | [reapercode-changes.md](reapercode-changes.md) | Exact changes you add to ReaperCode |
@@ -86,12 +91,12 @@ presets the rubric axes, checks, and whether the run has source artifacts.
 | Deployment | Self-hosted, few users, basic auth |
 | Scope | **General agent eval** — pre-defined categories (coding/research/general/browser/data/conversational); coding is one category |
 | Organization | **Multi-project** (each project = its own eval results store + task-ingest method); not multi-tenant |
-| Agent integration | **Custom adapter interface** → canonical event schema |
+| Agent integration | **One project-bound real CLI agent**, configured by a CRUD-able adapter → canonical event schema |
 | First agents | **ReaperCode** (your own) + **pi** |
-| Isolation | **Docker container per run** (reproducible, sandboxed) |
-| Stack | **Next.js + TypeScript** (Tailwind UI), Node workers |
+| Isolation | **One persistent Podman container per active eval queue**; ordered evals share it with enforced cleanup/reset boundaries |
+| Stack | **Node + TypeScript backend/API workers** now; Next.js/Tailwind frontend deferred |
 | Datastore | **SQLite + files** (JSONL logs on disk) |
-| Judge engine | **opencode** (coding agent) run as the judge — its **system prompt replaced** with the judge prompt + **custom judge tools**; swappable provider/model |
+| Judge engine | **PI SDK agent** with the versioned custom judge system prompt + restricted custom evidence/submission tools; swappable real provider/model |
 | Judge coupling | **Decoupled & repeatable** (re-judge immutable logs) |
 | Success criteria | **Per-task rubric + tuned global judge system prompt** |
 | Feedback surface | **Three-layer verdict**: scores (trends) + localized diagnostics (yes/no w/ location) + **findings** (located, fixable, fingerprinted issues → issues log) |

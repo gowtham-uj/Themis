@@ -9,7 +9,7 @@
  * cross-phase contract holds across the public REST surface:
  *
  *  P3  project + task CRUD; rubric carries checks + a criterion.checkId link.
- *  P2  run (FakeContainerRuntime) → reaches `completed`; run control present.
+ *  P2  run (real Podman container) → reaches `completed`; run control present.
  *  P9  on completion: deterministic checks.json written (judge loads + folds).
  *  P4  judgement → verdict persisted; GET returns folded checkResults/passRates.
  *  P8  watcher CRUD (secret returned once then stripped) + queue add.
@@ -171,7 +171,7 @@ describe("developer end-to-end flow (P2-P9 via REST)", () => {
     expect(taskRes.status).toBe(201);
     const taskId = (taskRes.json as { id: string }).id;
 
-    // ---- P2: start a run (FakeContainerRuntime) ----
+    // ---- P2: start a run (real Podman container) ----
     const start = await http(base, "POST", `/api/projects/${projectId}/runs`, {
       body: { taskId, agent: "fixture", model: "m", provider: "p" },
     });

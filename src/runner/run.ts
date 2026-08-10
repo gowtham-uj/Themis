@@ -19,15 +19,14 @@ import { ADAPTER_STATUS as REAPER_STATUS } from "../adapters/reapercode.js";
 import type { CanonicalEvent, RunStatus, Usage } from "../schema/events.js";
 import { appendEvent } from "../schema/append.js";
 import { captureDiff, type CaptureDiffResult } from "./diff.js";
-import { redactEvent } from "./redact.js";
 import {
   ensureGitRepo,
   prepareWorkspace,
   type PreparedWorkspace,
 } from "./workspace.js";
 
-// Re-export reaper + redaction entry points so callers can hook a CrashReaper
-// without reaching into the individual modules (P2 in-process shape; P3 wires DB).
+// Re-export reaper entry points so callers can hook a CrashReaper without
+// reaching into the individual module (P2 in-process shape; P3 wires DB).
 export {
   CrashReaper,
   createCrashReaper,
@@ -36,14 +35,6 @@ export {
   type ListInFlightRuns,
   type ReapOptions,
 } from "./reaper.js";
-export {
-  redactEvent,
-  redactString,
-  redactEnv,
-  registerKnownSecrets,
-  clearKnownSecrets,
-  type RedactionKind,
-} from "./redact.js";
 export {
   captureDiffByCategory,
   categoryToDiffKind,
@@ -275,9 +266,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
       sawFatalError = true;
       lastErrorMessage = event.message;
     }
-    // Redaction pass on ingest — secrets must never reach events.jsonl.
-    // Spec: plan/execution.md § Secrets, CLAUDE.md quality gate.
-    await appendEvent(eventsPath, redactEvent(event));
+    await appendEvent(eventsPath, event);
   };
 
   // Emit harness-owned run.start so provenance is always present.

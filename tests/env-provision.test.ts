@@ -26,12 +26,8 @@ import {
   ProvisionError,
 } from "../src/runner/env-provision.ts";
 import { captureDiff } from "../src/runner/diff.ts";
-import { FakeContainerRuntime } from "../src/runner/fake-runtime.ts";
-import type {
-  ContainerHandle,
-  ContainerRuntime,
-  RunContainerSpec,
-} from "../src/runner/runtime.ts";
+import { PodmanRuntime } from "../src/runner/podman-runtime.ts";
+import type { ContainerRuntime } from "../src/runner/runtime.ts";
 
 // ---------------------------------------------------------------------------
 // spec parsing
@@ -147,17 +143,15 @@ describe("buildSetupCommand", () => {
 });
 
 // ---------------------------------------------------------------------------
-// provisioning against the fake runtime
+// provisioning against real Podman
 // ---------------------------------------------------------------------------
 
-/** Runtime that runs the setup script on the host (no container needed). */
-function hostRuntime(): ContainerRuntime {
-  const fake = new FakeContainerRuntime();
-  return {
-    run(spec: RunContainerSpec): Promise<ContainerHandle> {
-      return fake.run(spec);
-    },
-  };
+const ENV_IMAGE = "docker.io/library/node:22-bookworm";
+
+function realRuntime(): ContainerRuntime {
+  return new PodmanRuntime({
+    prefix: process.env.AGENTEVAL_PODMAN_SUDO === "0" ? [] : ["sudo", "-n"],
+  });
 }
 
 function wsWithGit(): string {
@@ -172,8 +166,8 @@ describe("provisionEnv", () => {
         kind: "greenfield",
         setupScript: "mkdir -p src && echo 'const a=1' > src/a.js",
       })!;
-      const res = await provisionEnv(hostRuntime(), spec, {
-        image: "ignored",
+      const res = await provisionEnv(realRuntime(), spec, {
+        image: ENV_IMAGE,
         workspaceDir: ws,
         network: "allow",
       });
@@ -191,7 +185,7 @@ describe("provisionEnv", () => {
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 
   it("keeps setup output OUT of the agent's diff", async () => {
     const ws = wsWithGit();
@@ -203,8 +197,8 @@ describe("provisionEnv", () => {
           "for i in 1 2 3 4 5 6 7 8 9 10; do echo x > node_modules/dep/f$i.js; done && " +
           "echo 'v1' > app.js",
       })!;
-      await provisionEnv(hostRuntime(), spec, {
-        image: "ignored",
+      await provisionEnv(realRuntime(), spec, {
+        image: ENV_IMAGE,
         workspaceDir: ws,
         network: "allow",
       });
@@ -225,7 +219,7 @@ describe("provisionEnv", () => {
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 
   it("throws ProvisionError when setup fails (do not judge a broken env)", async () => {
     const ws = wsWithGit();
@@ -235,8 +229,8 @@ describe("provisionEnv", () => {
         setupScript: "echo 'starting' && exit 3",
       })!;
       await expect(
-        provisionEnv(hostRuntime(), spec, {
-          image: "ignored",
+        provisionEnv(realRuntime(), spec, {
+          image: ENV_IMAGE,
           workspaceDir: ws,
           network: "allow",
         }),
@@ -244,7 +238,7 @@ describe("provisionEnv", () => {
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 
   it("carries the failing setup log on the error, for diagnosis", async () => {
     const ws = wsWithGit();
@@ -254,8 +248,8 @@ describe("provisionEnv", () => {
         setupScript: "echo 'MISSING DEPENDENCY' >&2 && exit 1",
       })!;
       try {
-        await provisionEnv(hostRuntime(), spec, {
-          image: "ignored",
+        await provisionEnv(realRuntime(), spec, {
+          image: ENV_IMAGE,
           workspaceDir: ws,
           network: "allow",
         });
@@ -270,7 +264,7 @@ describe("provisionEnv", () => {
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 
   it("passes setupEnv to the script but not beyond it", async () => {
     const ws = wsWithGit();
@@ -280,8 +274,8 @@ describe("provisionEnv", () => {
         setupScript: "echo \"token=$EVAL_SETUP_TOKEN\" > marker.txt",
         setupEnv: { EVAL_SETUP_TOKEN: "s3cret" },
       })!;
-      await provisionEnv(hostRuntime(), spec, {
-        image: "ignored",
+      await provisionEnv(realRuntime(), spec, {
+        image: ENV_IMAGE,
         workspaceDir: ws,
         network: "allow",
       });
@@ -290,22 +284,22 @@ describe("provisionEnv", () => {
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 
   it("is a no-op when the eval declares no setup and no baseline", async () => {
     const ws = wsWithGit();
     try {
       const res = await provisionEnv(
-        hostRuntime(),
+        realRuntime(),
         { kind: "brownfield", commitBaseline: false },
-        { image: "ignored", workspaceDir: ws, network: "allow" },
+        { image: ENV_IMAGE, workspaceDir: ws, network: "allow" },
       );
       expect(res.ran).toBe(false);
       expect(res.baselineCommit).toBeNull();
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -321,12 +315,12 @@ describe("cleanupEnv", () => {
       writeFileSync(join(ws, "keep.txt"), "keep");
 
       const res = await cleanupEnv(
-        hostRuntime(),
+        realRuntime(),
         parseEvalEnvSpec({
           kind: "greenfield",
           cleanupScript: "rm -rf .scratch",
         })!,
-        { image: "ignored", workspaceDir: ws, network: "allow" },
+        { image: ENV_IMAGE, workspaceDir: ws, network: "allow" },
       );
       expect(res.ran).toBe(true);
       expect(res.exitCode).toBe(0);
@@ -336,16 +330,16 @@ describe("cleanupEnv", () => {
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 
   it("records a cleanup failure WITHOUT throwing", async () => {
     // A passing eval must not be reported as failed because teardown was flaky.
     const ws = wsWithGit();
     try {
       const res = await cleanupEnv(
-        hostRuntime(),
+        realRuntime(),
         parseEvalEnvSpec({ kind: "greenfield", cleanupScript: "exit 7" })!,
-        { image: "ignored", workspaceDir: ws, network: "allow" },
+        { image: ENV_IMAGE, workspaceDir: ws, network: "allow" },
       );
       expect(res.ran).toBe(true);
       expect(res.exitCode).toBe(7);
@@ -353,40 +347,40 @@ describe("cleanupEnv", () => {
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 
   it("attempts every step even when one fails (no set -e)", async () => {
     const ws = wsWithGit();
     try {
       mkdirSync(join(ws, "b"), { recursive: true });
       await cleanupEnv(
-        hostRuntime(),
+        realRuntime(),
         parseEvalEnvSpec({
           kind: "greenfield",
           // Stopping a service that already died must not skip dropping the DB.
           cleanupScript: "false\nrm -rf b",
         })!,
-        { image: "ignored", workspaceDir: ws, network: "allow" },
+        { image: ENV_IMAGE, workspaceDir: ws, network: "allow" },
       );
       expect(existsSync(join(ws, "b"))).toBe(false);
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 
   it("is a no-op when the eval declares no cleanup", async () => {
     const ws = wsWithGit();
     try {
       const res = await cleanupEnv(
-        hostRuntime(),
+        realRuntime(),
         { kind: "greenfield" },
-        { image: "ignored", workspaceDir: ws, network: "allow" },
+        { image: ENV_IMAGE, workspaceDir: ws, network: "allow" },
       );
       expect(res.ran).toBe(false);
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -513,7 +507,7 @@ describe("eval bundles", () => {
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 
   it("surfaces a provisioning failure as its own signal", async () => {
     const { openDb } = await import("../src/db/index.ts");
@@ -594,5 +588,5 @@ describe("eval bundles", () => {
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 180_000);
 });

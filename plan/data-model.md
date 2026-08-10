@@ -94,41 +94,65 @@ CREATE TABLE watcher_events (
   error TEXT
 );
 
--- Eval queue: pending evals awaiting a runner slot (project-scoped). Adding schedules without running;
--- removing cancels BEFORE execution (no partial logs, unlike aborting a running run). See api.md.
-CREATE TABLE queue_entries (
+-- Persistent queue definitions. A project may define many queues; one active queue owns one
+-- long-lived container and consumes its referenced evals sequentially.
+CREATE TABLE eval_queues (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
-  -- what to run (resolved at promote time, so a queued entry can bind a ref before its image exists)
-  trigger_ref TEXT,                  -- tag/branch/pr being evaluated (e.g. "v2.3.0")
-  target_kind TEXT NOT NULL,         -- "task" | "task_set"
-  task_id TEXT REFERENCES tasks(id),  -- when target_kind="task"
-  task_tags_json TEXT,               -- when target_kind="task_set"
+  name TEXT NOT NULL, description TEXT,
   agent_id TEXT NOT NULL REFERENCES agents(id),
-  model TEXT, provider TEXT,
-  repeats INTEGER,
-  params_json TEXT,
-  adapter_overrides_json TEXT,
-  auto_judge INTEGER,
-  judge_model TEXT,
-  -- ordering + lifecycle
-  priority INTEGER NOT NULL DEFAULT 0,   -- higher = sooner; tie broken by position
-  position REAL NOT NULL,                 -- fractional indexing for stable reorder (à la spreadsheet rows)
-  status TEXT NOT NULL DEFAULT 'queued',  -- queued|promoted|running|removed|failed
-  dedup_key TEXT,                         -- (ref + target) for collapse; null = no dedup
-  source TEXT,                        -- watcher|api|manual|ci
-  created_at TEXT NOT NULL,
-  promoted_at TEXT, promoted_batch_id TEXT REFERENCES run_batches(id),
-  removed_at TEXT
+  model TEXT NOT NULL, provider TEXT NOT NULL,
+  adapter_overrides_json TEXT, sandbox_json TEXT,
+  network_policy TEXT NOT NULL DEFAULT 'allow', ports_json TEXT,
+  judge_model TEXT, judge_provider TEXT, auto_judge INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'draft', -- draft|starting|running|paused|judging|completed|tainted|stopped|failed
+  active_batch_id TEXT,
+  revision INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
-CREATE INDEX idx_queue_project_status ON queue_entries(project_id, status);
+
+-- Ordered references into the project eval store. The same eval may appear in many queues.
+CREATE TABLE eval_queue_items (
+  id TEXT PRIMARY KEY,
+  queue_id TEXT NOT NULL REFERENCES eval_queues(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  position REAL NOT NULL, repeats INTEGER NOT NULL DEFAULT 1,
+  enabled INTEGER NOT NULL DEFAULT 1, overrides_json TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+
+-- Historical `queue_entries` backlog rows remain in existing databases for audit. Migration converts
+-- every unstarted row into an equivalent persistent queue; no new product flow writes that table.
 
 -- Agents available (registered adapters) — GLOBAL, shared across projects
 CREATE TABLE agents (
-  id TEXT PRIMARY KEY,              -- "reapercode" | "pi"
+  id TEXT PRIMARY KEY,
   display_name TEXT NOT NULL,
   default_model TEXT,
   default_provider TEXT
+);
+
+-- Exactly one real CLI agent adapter may be configured per project. The definition is CRUD-able and
+-- includes the connected git source/build recipe, provider/model wiring, command templates, parser,
+-- and native evidence locations. Build metadata pins the exact source commit and OCI image id.
+CREATE TABLE project_agent_adapters (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL UNIQUE REFERENCES projects(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  name TEXT NOT NULL, description TEXT,
+  format_version INTEGER NOT NULL DEFAULT 1,
+  image TEXT NOT NULL,
+  command_json TEXT NOT NULL,
+  connection_check_json TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  parser_kind TEXT NOT NULL, parser_config_json TEXT,
+  provider_config_json TEXT,
+  source_repo TEXT, source_ref TEXT, containerfile TEXT,
+  build_status TEXT NOT NULL DEFAULT 'unbuilt',
+  built_image_id TEXT, built_commit TEXT, build_log_path TEXT, last_built_at TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 
 -- Task sources are pluggable per project (see projects.md). The core persists whatever TaskSpec they
@@ -145,12 +169,14 @@ CREATE TABLE tasks (
   workspace_source TEXT NOT NULL,   -- "git" | "empty"
   workspace_repo TEXT,              -- when git
   workspace_ref TEXT,               -- branch/tag/sha requested
-  rubric_json TEXT NOT NULL,        -- per-task rubric (criteria, weights, checks, anchors, profile)
+  rubric_json TEXT NOT NULL,        -- per-eval rubric (criteria, weights, checks, anchors, profile)
+  version INTEGER NOT NULL DEFAULT 1, -- bumps on every eval-definition edit; queue snapshots pin it
   rubric_version INTEGER NOT NULL DEFAULT 1,  -- bumps on rubric edit → new comparison baseline
   agent_category TEXT NOT NULL DEFAULT 'coding',  -- coding|research|general|browser|data|conversational (categories.md)
   profile TEXT,                     -- bugfix|feature|refactor|research|general | browser | etl | conversational
   reference_solution TEXT,
   checks_json TEXT,                 -- deterministic hooks (rubric §5)
+  env_json TEXT,                    -- setup/cleanup/cleanup-verification scripts and timeouts
   tags TEXT,                        -- csv/json
   source_kind TEXT,                 -- which task source created this
   created_at TEXT NOT NULL,
@@ -171,8 +197,22 @@ CREATE TABLE run_batches (
   repeats INTEGER NOT NULL,
   trigger TEXT,                     -- tag|commit|pr|schedule|manual|webhook (null for ad-hoc)
   trigger_ref TEXT,                 -- the tag/branch/pr that fired (release-compare grouping)
-  agent_image TEXT, agent_commit TEXT,   -- pinned by watcher for this whole batch
+  agent_image TEXT, agent_commit TEXT,   -- pinned for this whole batch
+  queue_id TEXT REFERENCES eval_queues(id),
+  queue_revision INTEGER,                -- immutable queue definition revision at spawn
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE queue_containers (
+  id TEXT PRIMARY KEY,
+  queue_id TEXT NOT NULL REFERENCES eval_queues(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  batch_id TEXT NOT NULL REFERENCES run_batches(id),
+  runtime_container_id TEXT, image TEXT NOT NULL,
+  state TEXT NOT NULL,                    -- starting|running|idle|paused|stopping|stopped|failed
+  ports_json TEXT, workspace_dir TEXT NOT NULL,
+  started_at TEXT, stopped_at TEXT, error TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 
 CREATE TABLE runs (
@@ -180,10 +220,15 @@ CREATE TABLE runs (
   batch_id TEXT NOT NULL REFERENCES run_batches(id),
   task_id TEXT NOT NULL REFERENCES tasks(id),
   project_id TEXT NOT NULL REFERENCES projects(id),  -- denormalized for fast project filtering
+  queue_id TEXT REFERENCES eval_queues(id),
+  queue_item_id TEXT REFERENCES eval_queue_items(id),
+  queue_container_id TEXT REFERENCES queue_containers(id),
   agent_id TEXT NOT NULL REFERENCES agents(id),
   model TEXT NOT NULL,
   provider TEXT NOT NULL,
   repeat_index INTEGER NOT NULL,    -- k of N
+  eval_version INTEGER,             -- exact eval-store version used
+  eval_snapshot_json TEXT,          -- full immutable eval definition used by this run
   status TEXT NOT NULL,             -- queued|running|paused|resuming|completed|failed|aborted|timeout
   workspace_commit TEXT,            -- resolved workspace sha (reproducibility)
   -- agent provenance (set by the watcher; see watcher.md)
@@ -205,11 +250,36 @@ CREATE TABLE runs (
   error TEXT
 );
 
+-- Sealed evidence bundle produced before the shared queue workspace is reused.
+CREATE TABLE eval_archives (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  queue_id TEXT REFERENCES eval_queues(id),
+  batch_id TEXT NOT NULL REFERENCES run_batches(id),
+  manifest_path TEXT NOT NULL, manifest_sha256 TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL, sealed_at TEXT NOT NULL
+);
+
+-- One append-only revision per queue-judge invocation (all evals or a selected subset).
+CREATE TABLE queue_analyses (
+  id TEXT PRIMARY KEY,
+  queue_id TEXT NOT NULL REFERENCES eval_queues(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  batch_id TEXT NOT NULL REFERENCES run_batches(id),
+  selected_run_ids_json TEXT NOT NULL, evidence_hashes_json TEXT NOT NULL,
+  judge_model TEXT NOT NULL, judge_provider TEXT NOT NULL,
+  judge_params_json TEXT, judge_prompt TEXT, system_prompt_version TEXT NOT NULL,
+  parent_analysis_id TEXT, status TEXT NOT NULL,
+  verdict_path TEXT, report_path TEXT, events_path TEXT, raw_response_path TEXT,
+  created_at TEXT NOT NULL, started_at TEXT, ended_at TEXT, error TEXT
+);
+
 -- Judging is decoupled and repeatable: many judgements per run (project-scoped via run)
 CREATE TABLE judgements (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id),
   project_id TEXT NOT NULL REFERENCES projects(id),  -- denormalized for fast project filtering
+  queue_analysis_id TEXT REFERENCES queue_analyses(id), -- common single-agent queue judgement revision
   judge_model TEXT NOT NULL,
   judge_provider TEXT NOT NULL,
   judge_prompt TEXT,                -- ad-hoc prompt from UI (optional)

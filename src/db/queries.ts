@@ -21,6 +21,7 @@ import type {
   TaskSpec,
 } from "../domain.js";
 import type { WorkspaceSpec } from "../adapters/types.js";
+import type { PortMapping, ResolvedPort } from "../runner/runtime.js";
 import type { CheckResult, Verdict } from "../judge/verdict.js";
 import {
   applyRecurrenceToVerdict,
@@ -37,12 +38,18 @@ import {
   agents,
   apiTokens,
   checkResults,
+  evalArchives,
+  evalQueueItems,
+  evalQueues,
   findingOccurrences,
   findings,
   judgements,
   outboundSubscriptions,
+  projectAgentAdapters,
   projectRubrics,
   projects,
+  queueAnalyses,
+  queueContainers,
   queueEntries,
   runBatches,
   runs,
@@ -143,6 +150,8 @@ export interface Task {
   prompt: string;
   workspace: WorkspaceSpec;
   rubric: Rubric;
+  /** Bumps on every eval definition edit. */
+  version: number;
   rubricVersion: number;
   agentCategory: AgentCategory;
   profile: TaskProfile | null;
@@ -223,6 +232,96 @@ export interface RegisterAgentInput {
   defaultProvider?: string;
 }
 
+export type CliAdapterParserKind =
+  | "canonical-jsonl"
+  | "pi-jsonl"
+  | "reapercode-jsonl";
+
+export interface CliCommandTemplate {
+  argv: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  timeoutMs?: number;
+}
+
+export interface CliAdapterEvidenceConfig {
+  paths: string[];
+  requiredPaths?: string[];
+}
+
+/** Project-scoped declarative integration for one real CLI agent. */
+export interface ProjectAgentAdapter {
+  id: string;
+  projectId: string;
+  agentId: string;
+  name: string;
+  description: string | null;
+  formatVersion: number;
+  image: string;
+  command: CliCommandTemplate;
+  connectionCheck: CliCommandTemplate;
+  evidence: CliAdapterEvidenceConfig;
+  parserKind: CliAdapterParserKind | string;
+  parserConfig: Record<string, unknown> | null;
+  providerConfig: Record<string, unknown> | null;
+  sourceRepo: string | null;
+  sourceRef: string | null;
+  containerfile: string | null;
+  buildStatus: string;
+  builtImageId: string | null;
+  builtCommit: string | null;
+  buildLogPath: string | null;
+  lastBuiltAt: string | null;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateProjectAgentAdapterInput {
+  id?: string;
+  agentId: string;
+  name: string;
+  description?: string | null;
+  formatVersion?: number;
+  image: string;
+  command: CliCommandTemplate;
+  connectionCheck: CliCommandTemplate;
+  evidence: CliAdapterEvidenceConfig;
+  parserKind: CliAdapterParserKind | string;
+  parserConfig?: Record<string, unknown> | null;
+  providerConfig?: Record<string, unknown> | null;
+  sourceRepo?: string | null;
+  sourceRef?: string | null;
+  containerfile?: string | null;
+  enabled?: boolean;
+  defaultModel?: string;
+  defaultProvider?: string;
+}
+
+export interface UpdateProjectAgentAdapterInput {
+  name?: string;
+  description?: string | null;
+  formatVersion?: number;
+  image?: string;
+  command?: CliCommandTemplate;
+  connectionCheck?: CliCommandTemplate;
+  evidence?: CliAdapterEvidenceConfig;
+  parserKind?: CliAdapterParserKind | string;
+  parserConfig?: Record<string, unknown> | null;
+  providerConfig?: Record<string, unknown> | null;
+  sourceRepo?: string | null;
+  sourceRef?: string | null;
+  containerfile?: string | null;
+  buildStatus?: string;
+  builtImageId?: string | null;
+  builtCommit?: string | null;
+  buildLogPath?: string | null;
+  lastBuiltAt?: string | null;
+  enabled?: boolean;
+  defaultModel?: string | null;
+  defaultProvider?: string | null;
+}
+
 export interface RunBatch {
   id: string;
   taskId: string;
@@ -236,6 +335,8 @@ export interface RunBatch {
   triggerRef: string | null;
   agentImage: string | null;
   agentCommit: string | null;
+  queueId: string | null;
+  queueRevision: number | null;
   createdAt: string;
 }
 
@@ -251,6 +352,8 @@ export interface CreateBatchInput {
   triggerRef?: string;
   agentImage?: string;
   agentCommit?: string;
+  queueId?: string | null;
+  queueRevision?: number | null;
   id?: string;
 }
 
@@ -279,10 +382,15 @@ export interface Run {
   batchId: string;
   taskId: string;
   projectId: string;
+  queueId: string | null;
+  queueItemId: string | null;
+  queueContainerId: string | null;
   agentId: string;
   model: string;
   provider: string;
   repeatIndex: number;
+  evalVersion: number | null;
+  evalSnapshot: Record<string, unknown> | null;
   status: RunStatus | string;
   workspaceCommit: string | null;
   agentImage: string | null;
@@ -316,10 +424,15 @@ export interface CreateRunInput {
   batchId: string;
   taskId: string;
   projectId: string;
+  queueId?: string | null;
+  queueItemId?: string | null;
+  queueContainerId?: string | null;
   agentId: string;
   model: string;
   provider: string;
   repeatIndex: number;
+  evalVersion?: number | null;
+  evalSnapshot?: Record<string, unknown> | null;
   status?: RunStatus | string;
   workspaceCommit?: string;
   agentImage?: string;
@@ -387,6 +500,7 @@ export interface Judgement {
   id: string;
   runId: string;
   projectId: string;
+  queueAnalysisId: string | null;
   judgeModel: string;
   judgeProvider: string;
   judgePrompt: string | null;
@@ -411,6 +525,7 @@ export interface JudgementWithVerdict extends Judgement {
 export interface CreateJudgementInput {
   runId: string;
   projectId: string;
+  queueAnalysisId?: string | null;
   judgeModel: string;
   judgeProvider: string;
   judgePrompt?: string;
@@ -631,6 +746,232 @@ export interface PromoteQueueEntryResult {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent eval queues + queue containers + archived evidence
+// ---------------------------------------------------------------------------
+
+export type EvalQueueStatus =
+  | "draft"
+  | "starting"
+  | "running"
+  | "paused"
+  | "judging"
+  | "completed"
+  | "tainted"
+  | "stopped"
+  | "failed";
+
+export interface EvalQueue {
+  id: string;
+  projectId: string;
+  name: string;
+  description: string | null;
+  agentId: string;
+  model: string;
+  provider: string;
+  adapterOverrides: Record<string, unknown> | null;
+  sandbox: Record<string, unknown> | null;
+  networkPolicy: string;
+  ports: PortMapping[];
+  judgeModel: string | null;
+  judgeProvider: string | null;
+  autoJudge: boolean;
+  status: EvalQueueStatus | string;
+  activeBatchId: string | null;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateEvalQueueInput {
+  name: string;
+  description?: string | null;
+  agentId: string;
+  model: string;
+  provider: string;
+  adapterOverrides?: Record<string, unknown> | null;
+  sandbox?: Record<string, unknown> | null;
+  networkPolicy?: string;
+  ports?: PortMapping[];
+  judgeModel?: string | null;
+  judgeProvider?: string | null;
+  autoJudge?: boolean;
+  id?: string;
+}
+
+export interface UpdateEvalQueueInput {
+  name?: string;
+  description?: string | null;
+  agentId?: string;
+  model?: string;
+  provider?: string;
+  adapterOverrides?: Record<string, unknown> | null;
+  sandbox?: Record<string, unknown> | null;
+  networkPolicy?: string;
+  ports?: PortMapping[];
+  judgeModel?: string | null;
+  judgeProvider?: string | null;
+  autoJudge?: boolean;
+  status?: EvalQueueStatus | string;
+  activeBatchId?: string | null;
+  incrementRevision?: boolean;
+}
+
+export interface EvalQueueItem {
+  id: string;
+  queueId: string;
+  projectId: string;
+  taskId: string;
+  position: number;
+  repeats: number;
+  enabled: boolean;
+  overrides: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateEvalQueueItemInput {
+  taskId: string;
+  position?: number | { before?: string; after?: string };
+  repeats?: number;
+  enabled?: boolean;
+  overrides?: Record<string, unknown> | null;
+  id?: string;
+}
+
+export interface UpdateEvalQueueItemInput {
+  position?: number;
+  before?: string;
+  after?: string;
+  repeats?: number;
+  enabled?: boolean;
+  overrides?: Record<string, unknown> | null;
+}
+
+export type QueueContainerState =
+  | "starting"
+  | "running"
+  | "idle"
+  | "paused"
+  | "stopping"
+  | "stopped"
+  | "failed";
+
+export interface QueueContainer {
+  id: string;
+  queueId: string;
+  projectId: string;
+  batchId: string;
+  runtimeContainerId: string | null;
+  image: string;
+  state: QueueContainerState | string;
+  ports: ResolvedPort[];
+  workspaceDir: string;
+  startedAt: string | null;
+  stoppedAt: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateQueueContainerInput {
+  id?: string;
+  queueId: string;
+  projectId: string;
+  batchId: string;
+  runtimeContainerId?: string | null;
+  image: string;
+  state: QueueContainerState | string;
+  ports?: ResolvedPort[];
+  workspaceDir: string;
+  startedAt?: string | null;
+  error?: string | null;
+}
+
+export interface UpdateQueueContainerInput {
+  runtimeContainerId?: string | null;
+  state?: QueueContainerState | string;
+  ports?: ResolvedPort[];
+  startedAt?: string | null;
+  stoppedAt?: string | null;
+  error?: string | null;
+}
+
+export type QueueAnalysisStatus = "queued" | "running" | "completed" | "failed";
+
+export interface QueueAnalysis {
+  id: string;
+  queueId: string;
+  projectId: string;
+  batchId: string;
+  selectedRunIds: string[];
+  evidenceHashes: Record<string, string>;
+  judgeModel: string;
+  judgeProvider: string;
+  judgeParams: Record<string, unknown> | null;
+  judgePrompt: string | null;
+  systemPromptVersion: string;
+  parentAnalysisId: string | null;
+  status: QueueAnalysisStatus | string;
+  verdictPath: string | null;
+  reportPath: string | null;
+  eventsPath: string | null;
+  rawResponsePath: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  error: string | null;
+}
+
+export interface CreateQueueAnalysisInput {
+  id?: string;
+  queueId: string;
+  projectId: string;
+  batchId: string;
+  selectedRunIds: string[];
+  evidenceHashes: Record<string, string>;
+  judgeModel: string;
+  judgeProvider: string;
+  judgeParams?: Record<string, unknown> | null;
+  judgePrompt?: string | null;
+  systemPromptVersion: string;
+  parentAnalysisId?: string | null;
+  status?: QueueAnalysisStatus | string;
+}
+
+export interface UpdateQueueAnalysisInput {
+  status?: QueueAnalysisStatus | string;
+  verdictPath?: string | null;
+  reportPath?: string | null;
+  eventsPath?: string | null;
+  rawResponsePath?: string | null;
+  startedAt?: string | null;
+  endedAt?: string | null;
+  error?: string | null;
+}
+
+export interface EvalArchive {
+  runId: string;
+  projectId: string;
+  queueId: string | null;
+  batchId: string;
+  manifestPath: string;
+  manifestSha256: string;
+  sizeBytes: number;
+  sealedAt: string;
+}
+
+export interface StoreEvalArchiveInput {
+  runId: string;
+  projectId: string;
+  queueId?: string | null;
+  batchId: string;
+  manifestPath: string;
+  manifestSha256: string;
+  sizeBytes: number;
+  sealedAt?: string;
+}
+
+// ---------------------------------------------------------------------------
 // API tokens (P8b-auth) — hash only; plaintext returned once at create
 // ---------------------------------------------------------------------------
 
@@ -828,6 +1169,25 @@ export interface QueryStore {
   getAgent(id: string): Agent | null;
   listAgents(): Agent[];
 
+  createProjectAgentAdapter(
+    projectId: string,
+    input: CreateProjectAgentAdapterInput,
+  ): ProjectAgentAdapter;
+  getProjectAgentAdapter(id: string): ProjectAgentAdapter | null;
+  getProjectAgentAdapterByAgentId(
+    projectId: string,
+    agentId: string,
+  ): ProjectAgentAdapter | null;
+  listProjectAgentAdapters(
+    projectId: string,
+    opts?: { includeDisabled?: boolean },
+  ): ProjectAgentAdapter[];
+  updateProjectAgentAdapter(
+    id: string,
+    patch: UpdateProjectAgentAdapterInput,
+  ): ProjectAgentAdapter;
+  deleteProjectAgentAdapter(id: string): void;
+
   createBatch(input: CreateBatchInput): RunBatch;
   createRun(input: CreateRunInput): Run;
   getRun(id: string): Run | null;
@@ -920,6 +1280,34 @@ export interface QueryStore {
   removeQueueEntry(id: string): QueueEntry;
   /** Soft-remove all status=queued entries. Leaves promoted/running untouched. */
   drainQueue(projectId: string): { removed: number };
+
+  // ---- persistent eval queues + containers ----
+  createEvalQueue(projectId: string, input: CreateEvalQueueInput): EvalQueue;
+  getEvalQueue(id: string): EvalQueue | null;
+  listEvalQueues(projectId: string): EvalQueue[];
+  updateEvalQueue(id: string, patch: UpdateEvalQueueInput): EvalQueue;
+  deleteEvalQueue(id: string): void;
+
+  createEvalQueueItem(queueId: string, input: CreateEvalQueueItemInput): EvalQueueItem;
+  getEvalQueueItem(id: string): EvalQueueItem | null;
+  listEvalQueueItems(queueId: string, opts?: { includeDisabled?: boolean }): EvalQueueItem[];
+  updateEvalQueueItem(id: string, patch: UpdateEvalQueueItemInput): EvalQueueItem;
+  deleteEvalQueueItem(id: string): void;
+
+  createQueueContainer(input: CreateQueueContainerInput): QueueContainer;
+  getQueueContainer(id: string): QueueContainer | null;
+  getActiveQueueContainer(queueId: string): QueueContainer | null;
+  listQueueContainers(queueId: string): QueueContainer[];
+  updateQueueContainer(id: string, patch: UpdateQueueContainerInput): QueueContainer;
+
+  createQueueAnalysis(input: CreateQueueAnalysisInput): QueueAnalysis;
+  getQueueAnalysis(id: string): QueueAnalysis | null;
+  listQueueAnalyses(queueId: string, opts?: { batchId?: string }): QueueAnalysis[];
+  updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis;
+
+  storeEvalArchive(input: StoreEvalArchiveInput): EvalArchive;
+  getEvalArchive(runId: string): EvalArchive | null;
+  listEvalArchives(filter: { projectId?: string; queueId?: string; batchId?: string }): EvalArchive[];
 
   // ---- API tokens (P8b-auth) ----
   /**
@@ -1218,6 +1606,7 @@ function mapTask(row: typeof tasks.$inferSelect): Task {
       row.workspaceRef,
     ),
     rubric,
+    version: row.version ?? 1,
     rubricVersion: row.rubricVersion,
     agentCategory: (row.agentCategory ?? "coding") as AgentCategory,
     profile: (row.profile as TaskProfile | null) ?? null,
@@ -1241,6 +1630,37 @@ function mapAgent(row: typeof agents.$inferSelect): Agent {
   };
 }
 
+function mapProjectAgentAdapter(
+  row: typeof projectAgentAdapters.$inferSelect,
+): ProjectAgentAdapter {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    agentId: row.agentId,
+    name: row.name,
+    description: row.description,
+    formatVersion: row.formatVersion,
+    image: row.image,
+    command: parseJson(row.commandJson, { argv: [] }),
+    connectionCheck: parseJson(row.connectionCheckJson, { argv: [] }),
+    evidence: parseJson(row.evidenceJson, { paths: [] }),
+    parserKind: row.parserKind,
+    parserConfig: parseJson(row.parserConfigJson, null),
+    providerConfig: parseJson(row.providerConfigJson, null),
+    sourceRepo: row.sourceRepo,
+    sourceRef: row.sourceRef,
+    containerfile: row.containerfile,
+    buildStatus: row.buildStatus,
+    builtImageId: row.builtImageId,
+    builtCommit: row.builtCommit,
+    buildLogPath: row.buildLogPath,
+    lastBuiltAt: row.lastBuiltAt,
+    enabled: row.enabled === 1,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
 function mapBatch(row: typeof runBatches.$inferSelect): RunBatch {
   return {
     id: row.id,
@@ -1255,6 +1675,8 @@ function mapBatch(row: typeof runBatches.$inferSelect): RunBatch {
     triggerRef: row.triggerRef,
     agentImage: row.agentImage,
     agentCommit: row.agentCommit,
+    queueId: row.queueId ?? null,
+    queueRevision: row.queueRevision ?? null,
     createdAt: row.createdAt,
   };
 }
@@ -1265,10 +1687,15 @@ function mapRun(row: typeof runs.$inferSelect): Run {
     batchId: row.batchId,
     taskId: row.taskId,
     projectId: row.projectId,
+    queueId: row.queueId ?? null,
+    queueItemId: row.queueItemId ?? null,
+    queueContainerId: row.queueContainerId ?? null,
     agentId: row.agentId,
     model: row.model,
     provider: row.provider,
     repeatIndex: row.repeatIndex,
+    evalVersion: row.evalVersion ?? null,
+    evalSnapshot: parseJson(row.evalSnapshotJson, null),
     status: row.status,
     workspaceCommit: row.workspaceCommit,
     agentImage: row.agentImage,
@@ -1302,6 +1729,7 @@ function mapJudgement(row: typeof judgements.$inferSelect): Judgement {
     id: row.id,
     runId: row.runId,
     projectId: row.projectId,
+    queueAnalysisId: row.queueAnalysisId ?? null,
     judgeModel: row.judgeModel,
     judgeProvider: row.judgeProvider,
     judgePrompt: row.judgePrompt,
@@ -1626,6 +2054,112 @@ function mintApiTokenPair(): { token: string; tokenHash: string } {
   return { token, tokenHash };
 }
 
+function mapEvalQueueRow(row: typeof evalQueues.$inferSelect): EvalQueue {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    name: row.name,
+    description: row.description ?? null,
+    agentId: row.agentId,
+    model: row.model,
+    provider: row.provider,
+    adapterOverrides: parseJson(row.adapterOverridesJson, null),
+    sandbox: parseJson(row.sandboxJson, null),
+    networkPolicy: row.networkPolicy ?? "allow",
+    ports: parseJson<PortMapping[]>(row.portsJson, []),
+    judgeModel: row.judgeModel ?? null,
+    judgeProvider: row.judgeProvider ?? null,
+    autoJudge: row.autoJudge === 1,
+    status: row.status,
+    activeBatchId: row.activeBatchId ?? null,
+    revision: row.revision ?? 1,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function mapEvalQueueItemRow(
+  row: typeof evalQueueItems.$inferSelect,
+): EvalQueueItem {
+  return {
+    id: row.id,
+    queueId: row.queueId,
+    projectId: row.projectId,
+    taskId: row.taskId,
+    position: row.position,
+    repeats: row.repeats,
+    enabled: row.enabled === 1,
+    overrides: parseJson(row.overridesJson, null),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function mapQueueContainerRow(
+  row: typeof queueContainers.$inferSelect,
+): QueueContainer {
+  return {
+    id: row.id,
+    queueId: row.queueId,
+    projectId: row.projectId,
+    batchId: row.batchId,
+    runtimeContainerId: row.runtimeContainerId ?? null,
+    image: row.image,
+    state: row.state,
+    ports: parseJson<ResolvedPort[]>(row.portsJson, []),
+    workspaceDir: row.workspaceDir,
+    startedAt: row.startedAt ?? null,
+    stoppedAt: row.stoppedAt ?? null,
+    error: row.error ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function mapQueueAnalysisRow(
+  row: typeof queueAnalyses.$inferSelect,
+): QueueAnalysis {
+  return {
+    id: row.id,
+    queueId: row.queueId,
+    projectId: row.projectId,
+    batchId: row.batchId,
+    selectedRunIds: parseJson<string[]>(row.selectedRunIdsJson, []),
+    evidenceHashes: parseJson<Record<string, string>>(
+      row.evidenceHashesJson,
+      {},
+    ),
+    judgeModel: row.judgeModel,
+    judgeProvider: row.judgeProvider,
+    judgeParams: parseJson(row.judgeParamsJson, null),
+    judgePrompt: row.judgePrompt ?? null,
+    systemPromptVersion: row.systemPromptVersion,
+    parentAnalysisId: row.parentAnalysisId ?? null,
+    status: row.status,
+    verdictPath: row.verdictPath ?? null,
+    reportPath: row.reportPath ?? null,
+    eventsPath: row.eventsPath ?? null,
+    rawResponsePath: row.rawResponsePath ?? null,
+    createdAt: row.createdAt,
+    startedAt: row.startedAt ?? null,
+    endedAt: row.endedAt ?? null,
+    error: row.error ?? null,
+  };
+}
+
+function mapEvalArchiveRow(row: typeof evalArchives.$inferSelect): EvalArchive {
+  return {
+    runId: row.runId,
+    projectId: row.projectId,
+    queueId: row.queueId ?? null,
+    batchId: row.batchId,
+    manifestPath: row.manifestPath,
+    manifestSha256: row.manifestSha256,
+    sizeBytes: row.sizeBytes,
+    sealedAt: row.sealedAt,
+  };
+}
+
 function mapQueueEntryRow(row: typeof queueEntries.$inferSelect): QueueEntry {
   const auto =
     row.autoJudge == null ? null : row.autoJudge === 1 ? true : false;
@@ -1840,6 +2374,7 @@ export class SqliteQueries implements QueryStore {
         workspaceRepo: ws.workspaceRepo,
         workspaceRef: ws.workspaceRef,
         rubricJson: JSON.stringify(spec.rubric),
+        version: 1,
         rubricVersion,
         agentCategory: spec.agentCategory ?? "coding",
         profile: spec.profile ?? spec.rubric.profile ?? null,
@@ -1914,6 +2449,7 @@ export class SqliteQueries implements QueryStore {
         workspaceRepo: ws.workspaceRepo,
         workspaceRef: ws.workspaceRef,
         rubricJson,
+        version: existing.version + 1,
         rubricVersion,
         agentCategory: patch.agentCategory ?? existing.agentCategory,
         profile:
@@ -1961,7 +2497,7 @@ export class SqliteQueries implements QueryStore {
     if (!existing) throw notFound("task", id);
     this.db
       .update(tasks)
-      .set({ archived: 1, updatedAt: nowIso() })
+      .set({ archived: 1, version: existing.version + 1, updatedAt: nowIso() })
       .where(eq(tasks.id, id))
       .run();
     const row = this.getTask(id);
@@ -2010,6 +2546,151 @@ export class SqliteQueries implements QueryStore {
     return this.db.select().from(agents).all().map(mapAgent);
   }
 
+  createProjectAgentAdapter(
+    projectId: string,
+    input: CreateProjectAgentAdapterInput,
+  ): ProjectAgentAdapter {
+    if (!this.getProject(projectId)) throw notFound("project", projectId);
+    this.registerAgent({
+      id: input.agentId,
+      displayName: input.name,
+      ...(input.defaultModel ? { defaultModel: input.defaultModel } : {}),
+      ...(input.defaultProvider ? { defaultProvider: input.defaultProvider } : {}),
+    });
+    if (this.listProjectAgentAdapters(projectId, { includeDisabled: true }).length > 0) {
+      throw new Error(`project ${projectId} already has an agent adapter`);
+    }
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    this.db.insert(projectAgentAdapters).values({
+      id,
+      projectId,
+      agentId: input.agentId,
+      name: input.name,
+      description: input.description ?? null,
+      formatVersion: input.formatVersion ?? 1,
+      image: input.image,
+      commandJson: JSON.stringify(input.command),
+      connectionCheckJson: JSON.stringify(input.connectionCheck),
+      evidenceJson: JSON.stringify(input.evidence),
+      parserKind: input.parserKind,
+      parserConfigJson:
+        input.parserConfig === undefined || input.parserConfig === null
+          ? null
+          : JSON.stringify(input.parserConfig),
+      providerConfigJson:
+        input.providerConfig === undefined || input.providerConfig === null
+          ? null
+          : JSON.stringify(input.providerConfig),
+      sourceRepo: input.sourceRepo ?? null,
+      sourceRef: input.sourceRef ?? null,
+      containerfile: input.containerfile ?? null,
+      buildStatus: "unbuilt",
+      builtImageId: null,
+      builtCommit: null,
+      buildLogPath: null,
+      lastBuiltAt: null,
+      enabled: input.enabled === false ? 0 : 1,
+      createdAt: ts,
+      updatedAt: ts,
+    }).run();
+    return this.getProjectAgentAdapter(id)!;
+  }
+
+  getProjectAgentAdapter(id: string): ProjectAgentAdapter | null {
+    const row = this.db
+      .select()
+      .from(projectAgentAdapters)
+      .where(eq(projectAgentAdapters.id, id))
+      .get();
+    return row ? mapProjectAgentAdapter(row) : null;
+  }
+
+  getProjectAgentAdapterByAgentId(
+    projectId: string,
+    agentId: string,
+  ): ProjectAgentAdapter | null {
+    const row = this.db
+      .select()
+      .from(projectAgentAdapters)
+      .where(
+        and(
+          eq(projectAgentAdapters.projectId, projectId),
+          eq(projectAgentAdapters.agentId, agentId),
+        ),
+      )
+      .get();
+    return row ? mapProjectAgentAdapter(row) : null;
+  }
+
+  listProjectAgentAdapters(
+    projectId: string,
+    opts: { includeDisabled?: boolean } = {},
+  ): ProjectAgentAdapter[] {
+    return this.db
+      .select()
+      .from(projectAgentAdapters)
+      .where(eq(projectAgentAdapters.projectId, projectId))
+      .all()
+      .map(mapProjectAgentAdapter)
+      .filter((adapter) => opts.includeDisabled === true || adapter.enabled)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  updateProjectAgentAdapter(
+    id: string,
+    patch: UpdateProjectAgentAdapterInput,
+  ): ProjectAgentAdapter {
+    const existing = this.getProjectAgentAdapter(id);
+    if (!existing) throw notFound("project agent adapter", id);
+    this.db.update(projectAgentAdapters).set({
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.description !== undefined ? { description: patch.description } : {}),
+      ...(patch.formatVersion !== undefined ? { formatVersion: patch.formatVersion } : {}),
+      ...(patch.image !== undefined ? { image: patch.image } : {}),
+      ...(patch.command !== undefined ? { commandJson: JSON.stringify(patch.command) } : {}),
+      ...(patch.connectionCheck !== undefined
+        ? { connectionCheckJson: JSON.stringify(patch.connectionCheck) }
+        : {}),
+      ...(patch.evidence !== undefined ? { evidenceJson: JSON.stringify(patch.evidence) } : {}),
+      ...(patch.parserKind !== undefined ? { parserKind: patch.parserKind } : {}),
+      ...(patch.parserConfig !== undefined
+        ? { parserConfigJson: patch.parserConfig === null ? null : JSON.stringify(patch.parserConfig) }
+        : {}),
+      ...(patch.providerConfig !== undefined
+        ? { providerConfigJson: patch.providerConfig === null ? null : JSON.stringify(patch.providerConfig) }
+        : {}),
+      ...(patch.sourceRepo !== undefined ? { sourceRepo: patch.sourceRepo } : {}),
+      ...(patch.sourceRef !== undefined ? { sourceRef: patch.sourceRef } : {}),
+      ...(patch.containerfile !== undefined ? { containerfile: patch.containerfile } : {}),
+      ...(patch.buildStatus !== undefined ? { buildStatus: patch.buildStatus } : {}),
+      ...(patch.builtImageId !== undefined ? { builtImageId: patch.builtImageId } : {}),
+      ...(patch.builtCommit !== undefined ? { builtCommit: patch.builtCommit } : {}),
+      ...(patch.buildLogPath !== undefined ? { buildLogPath: patch.buildLogPath } : {}),
+      ...(patch.lastBuiltAt !== undefined ? { lastBuiltAt: patch.lastBuiltAt } : {}),
+      ...(patch.enabled !== undefined ? { enabled: patch.enabled ? 1 : 0 } : {}),
+      updatedAt: nowIso(),
+    }).where(eq(projectAgentAdapters.id, id)).run();
+    if (
+      patch.name !== undefined ||
+      patch.defaultModel !== undefined ||
+      patch.defaultProvider !== undefined
+    ) {
+      this.registerAgent({
+        id: existing.agentId,
+        displayName: patch.name ?? existing.name,
+        ...(patch.defaultModel ? { defaultModel: patch.defaultModel } : {}),
+        ...(patch.defaultProvider ? { defaultProvider: patch.defaultProvider } : {}),
+      });
+    }
+    return this.getProjectAgentAdapter(id)!;
+  }
+
+  deleteProjectAgentAdapter(id: string): void {
+    if (!this.getProjectAgentAdapter(id)) throw notFound("project agent adapter", id);
+    this.db.delete(projectAgentAdapters).where(eq(projectAgentAdapters.id, id)).run();
+  }
+
   // ---- batches + runs ----
 
   createBatch(input: CreateBatchInput): RunBatch {
@@ -2030,6 +2711,8 @@ export class SqliteQueries implements QueryStore {
         triggerRef: input.triggerRef ?? null,
         agentImage: input.agentImage ?? null,
         agentCommit: input.agentCommit ?? null,
+        queueId: input.queueId ?? null,
+        queueRevision: input.queueRevision ?? null,
         createdAt: ts,
       })
       .run();
@@ -2051,10 +2734,15 @@ export class SqliteQueries implements QueryStore {
         batchId: input.batchId,
         taskId: input.taskId,
         projectId: input.projectId,
+        queueId: input.queueId ?? null,
+        queueItemId: input.queueItemId ?? null,
+        queueContainerId: input.queueContainerId ?? null,
         agentId: input.agentId,
         model: input.model,
         provider: input.provider,
         repeatIndex: input.repeatIndex,
+        evalVersion: input.evalVersion ?? null,
+        evalSnapshotJson: stringifyJson(input.evalSnapshot ?? null),
         status: input.status ?? "queued",
         workspaceCommit: input.workspaceCommit ?? null,
         agentImage: input.agentImage ?? null,
@@ -2218,6 +2906,7 @@ export class SqliteQueries implements QueryStore {
         id,
         runId: input.runId,
         projectId: input.projectId,
+        queueAnalysisId: input.queueAnalysisId ?? null,
         judgeModel: input.judgeModel,
         judgeProvider: input.judgeProvider,
         judgePrompt: input.judgePrompt ?? null,
@@ -3150,6 +3839,263 @@ export class SqliteQueries implements QueryStore {
     return { removed: queued.length };
   }
 
+  // ---- persistent eval queues + containers ----
+
+  createEvalQueue(projectId: string, input: CreateEvalQueueInput): EvalQueue {
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    this.db.insert(evalQueues).values({
+      id, projectId, name: input.name, description: input.description ?? null,
+      agentId: input.agentId, model: input.model, provider: input.provider,
+      adapterOverridesJson: stringifyJson(input.adapterOverrides ?? null),
+      sandboxJson: stringifyJson(input.sandbox ?? null),
+      networkPolicy: input.networkPolicy ?? "allow",
+      portsJson: stringifyJson(input.ports ?? []), judgeModel: input.judgeModel ?? null,
+      judgeProvider: input.judgeProvider ?? null,
+      autoJudge: input.autoJudge === false ? 0 : 1, status: "draft",
+      activeBatchId: null, revision: 1, createdAt: ts, updatedAt: ts,
+    }).run();
+    return this.getEvalQueue(id)!;
+  }
+
+  getEvalQueue(id: string): EvalQueue | null {
+    const row = this.db.select().from(evalQueues).where(eq(evalQueues.id, id)).get();
+    return row ? mapEvalQueueRow(row) : null;
+  }
+
+  listEvalQueues(projectId: string): EvalQueue[] {
+    return this.db.select().from(evalQueues).where(eq(evalQueues.projectId, projectId)).all()
+      .map(mapEvalQueueRow).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  updateEvalQueue(id: string, patch: UpdateEvalQueueInput): EvalQueue {
+    const existing = this.getEvalQueue(id);
+    if (!existing) throw notFound("eval queue", id);
+    const values: Partial<typeof evalQueues.$inferInsert> = { updatedAt: nowIso() };
+    if (patch.name !== undefined) values.name = patch.name;
+    if (patch.description !== undefined) values.description = patch.description;
+    if (patch.agentId !== undefined) values.agentId = patch.agentId;
+    if (patch.model !== undefined) values.model = patch.model;
+    if (patch.provider !== undefined) values.provider = patch.provider;
+    if (patch.adapterOverrides !== undefined) values.adapterOverridesJson = stringifyJson(patch.adapterOverrides);
+    if (patch.sandbox !== undefined) values.sandboxJson = stringifyJson(patch.sandbox);
+    if (patch.networkPolicy !== undefined) values.networkPolicy = patch.networkPolicy;
+    if (patch.ports !== undefined) values.portsJson = stringifyJson(patch.ports);
+    if (patch.judgeModel !== undefined) values.judgeModel = patch.judgeModel;
+    if (patch.judgeProvider !== undefined) values.judgeProvider = patch.judgeProvider;
+    if (patch.autoJudge !== undefined) values.autoJudge = patch.autoJudge ? 1 : 0;
+    if (patch.status !== undefined) values.status = patch.status;
+    if (patch.activeBatchId !== undefined) values.activeBatchId = patch.activeBatchId;
+    if (patch.incrementRevision) values.revision = existing.revision + 1;
+    this.db.update(evalQueues).set(values).where(eq(evalQueues.id, id)).run();
+    return this.getEvalQueue(id)!;
+  }
+
+  deleteEvalQueue(id: string): void {
+    if (!this.getEvalQueue(id)) throw notFound("eval queue", id);
+    this.db.delete(evalQueueItems).where(eq(evalQueueItems.queueId, id)).run();
+    this.db.delete(evalQueues).where(eq(evalQueues.id, id)).run();
+  }
+
+  createEvalQueueItem(queueId: string, input: CreateEvalQueueItemInput): EvalQueueItem {
+    const queue = this.getEvalQueue(queueId);
+    if (!queue) throw notFound("eval queue", queueId);
+    const task = this.getTask(input.taskId);
+    if (!task || task.projectId !== queue.projectId) throw notFound("task", input.taskId);
+    const items = this.listEvalQueueItems(queueId, { includeDisabled: true });
+    let position = items.length === 0 ? 1 : items[items.length - 1]!.position + 1;
+    const requestedPosition = input.position;
+    if (typeof requestedPosition === "number") position = requestedPosition;
+    else if (requestedPosition?.before) {
+      const beforeId = requestedPosition.before;
+      const at = items.findIndex((i) => i.id === beforeId);
+      if (at < 0) throw notFound("eval queue item", beforeId);
+      position = ((items[at - 1]?.position ?? items[at]!.position - 1) + items[at]!.position) / 2;
+    } else if (requestedPosition?.after) {
+      const afterId = requestedPosition.after;
+      const at = items.findIndex((i) => i.id === afterId);
+      if (at < 0) throw notFound("eval queue item", afterId);
+      position = (items[at]!.position + (items[at + 1]?.position ?? items[at]!.position + 1)) / 2;
+    }
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    this.db.insert(evalQueueItems).values({
+      id, queueId, projectId: queue.projectId, taskId: input.taskId, position,
+      repeats: Math.max(1, input.repeats ?? 1), enabled: input.enabled === false ? 0 : 1,
+      overridesJson: stringifyJson(input.overrides ?? null), createdAt: ts, updatedAt: ts,
+    }).run();
+    this.updateEvalQueue(queueId, { incrementRevision: true });
+    return this.getEvalQueueItem(id)!;
+  }
+
+  getEvalQueueItem(id: string): EvalQueueItem | null {
+    const row = this.db.select().from(evalQueueItems).where(eq(evalQueueItems.id, id)).get();
+    return row ? mapEvalQueueItemRow(row) : null;
+  }
+
+  listEvalQueueItems(queueId: string, opts: { includeDisabled?: boolean } = {}): EvalQueueItem[] {
+    return this.db.select().from(evalQueueItems).where(eq(evalQueueItems.queueId, queueId)).all()
+      .map(mapEvalQueueItemRow).filter((i) => opts.includeDisabled === true || i.enabled)
+      .sort((a, b) => a.position - b.position || a.createdAt.localeCompare(b.createdAt));
+  }
+
+  updateEvalQueueItem(id: string, patch: UpdateEvalQueueItemInput): EvalQueueItem {
+    const existing = this.getEvalQueueItem(id);
+    if (!existing) throw notFound("eval queue item", id);
+    const items = this.listEvalQueueItems(existing.queueId, { includeDisabled: true });
+    const values: Partial<typeof evalQueueItems.$inferInsert> = { updatedAt: nowIso() };
+    if (patch.position !== undefined) values.position = patch.position;
+    if (patch.before !== undefined) {
+      const at = items.findIndex((i) => i.id === patch.before);
+      if (at < 0) throw notFound("eval queue item", patch.before);
+      values.position = ((items[at - 1]?.position ?? items[at]!.position - 1) + items[at]!.position) / 2;
+    }
+    if (patch.after !== undefined) {
+      const at = items.findIndex((i) => i.id === patch.after);
+      if (at < 0) throw notFound("eval queue item", patch.after);
+      values.position = (items[at]!.position + (items[at + 1]?.position ?? items[at]!.position + 1)) / 2;
+    }
+    if (patch.repeats !== undefined) values.repeats = Math.max(1, patch.repeats);
+    if (patch.enabled !== undefined) values.enabled = patch.enabled ? 1 : 0;
+    if (patch.overrides !== undefined) values.overridesJson = stringifyJson(patch.overrides);
+    this.db.update(evalQueueItems).set(values).where(eq(evalQueueItems.id, id)).run();
+    this.updateEvalQueue(existing.queueId, { incrementRevision: true });
+    return this.getEvalQueueItem(id)!;
+  }
+
+  deleteEvalQueueItem(id: string): void {
+    const existing = this.getEvalQueueItem(id);
+    if (!existing) throw notFound("eval queue item", id);
+    this.db.delete(evalQueueItems).where(eq(evalQueueItems.id, id)).run();
+    this.updateEvalQueue(existing.queueId, { incrementRevision: true });
+  }
+
+  createQueueContainer(input: CreateQueueContainerInput): QueueContainer {
+    const active = this.getActiveQueueContainer(input.queueId);
+    if (active) throw new Error(`eval queue ${input.queueId} already has active container ${active.id}`);
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    this.db.insert(queueContainers).values({
+      id, queueId: input.queueId, projectId: input.projectId, batchId: input.batchId,
+      runtimeContainerId: input.runtimeContainerId ?? null, image: input.image,
+      state: input.state, portsJson: stringifyJson(input.ports ?? []), workspaceDir: input.workspaceDir,
+      startedAt: input.startedAt ?? null, stoppedAt: null, error: input.error ?? null,
+      createdAt: ts, updatedAt: ts,
+    }).run();
+    return this.getQueueContainer(id)!;
+  }
+
+  getQueueContainer(id: string): QueueContainer | null {
+    const row = this.db.select().from(queueContainers).where(eq(queueContainers.id, id)).get();
+    return row ? mapQueueContainerRow(row) : null;
+  }
+
+  getActiveQueueContainer(queueId: string): QueueContainer | null {
+    return this.listQueueContainers(queueId).find(
+      (c) => c.state !== "stopped" && c.runtimeContainerId !== null && c.stoppedAt === null,
+    ) ?? null;
+  }
+
+  listQueueContainers(queueId: string): QueueContainer[] {
+    return this.db.select().from(queueContainers).where(eq(queueContainers.queueId, queueId)).all()
+      .map(mapQueueContainerRow).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  updateQueueContainer(id: string, patch: UpdateQueueContainerInput): QueueContainer {
+    if (!this.getQueueContainer(id)) throw notFound("queue container", id);
+    const values: Partial<typeof queueContainers.$inferInsert> = { updatedAt: nowIso() };
+    if (patch.runtimeContainerId !== undefined) values.runtimeContainerId = patch.runtimeContainerId;
+    if (patch.state !== undefined) values.state = patch.state;
+    if (patch.ports !== undefined) values.portsJson = stringifyJson(patch.ports);
+    if (patch.startedAt !== undefined) values.startedAt = patch.startedAt;
+    if (patch.stoppedAt !== undefined) values.stoppedAt = patch.stoppedAt;
+    if (patch.error !== undefined) values.error = patch.error;
+    this.db.update(queueContainers).set(values).where(eq(queueContainers.id, id)).run();
+    return this.getQueueContainer(id)!;
+  }
+
+  createQueueAnalysis(input: CreateQueueAnalysisInput): QueueAnalysis {
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    this.db.insert(queueAnalyses).values({
+      id,
+      queueId: input.queueId,
+      projectId: input.projectId,
+      batchId: input.batchId,
+      selectedRunIdsJson: JSON.stringify(input.selectedRunIds),
+      evidenceHashesJson: JSON.stringify(input.evidenceHashes),
+      judgeModel: input.judgeModel,
+      judgeProvider: input.judgeProvider,
+      judgeParamsJson: stringifyJson(input.judgeParams ?? null),
+      judgePrompt: input.judgePrompt ?? null,
+      systemPromptVersion: input.systemPromptVersion,
+      parentAnalysisId: input.parentAnalysisId ?? null,
+      status: input.status ?? "queued",
+      verdictPath: null,
+      reportPath: null,
+      eventsPath: null,
+      rawResponsePath: null,
+      createdAt: ts,
+      startedAt: null,
+      endedAt: null,
+      error: null,
+    }).run();
+    return this.getQueueAnalysis(id)!;
+  }
+
+  getQueueAnalysis(id: string): QueueAnalysis | null {
+    const row = this.db.select().from(queueAnalyses).where(eq(queueAnalyses.id, id)).get();
+    return row ? mapQueueAnalysisRow(row) : null;
+  }
+
+  listQueueAnalyses(queueId: string, opts: { batchId?: string } = {}): QueueAnalysis[] {
+    return this.db.select().from(queueAnalyses).where(eq(queueAnalyses.queueId, queueId)).all()
+      .map(mapQueueAnalysisRow).filter((a) => !opts.batchId || a.batchId === opts.batchId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis {
+    if (!this.getQueueAnalysis(id)) throw notFound("queue analysis", id);
+    const values: Partial<typeof queueAnalyses.$inferInsert> = {};
+    if (patch.status !== undefined) values.status = patch.status;
+    if (patch.verdictPath !== undefined) values.verdictPath = patch.verdictPath;
+    if (patch.reportPath !== undefined) values.reportPath = patch.reportPath;
+    if (patch.eventsPath !== undefined) values.eventsPath = patch.eventsPath;
+    if (patch.rawResponsePath !== undefined) values.rawResponsePath = patch.rawResponsePath;
+    if (patch.startedAt !== undefined) values.startedAt = patch.startedAt;
+    if (patch.endedAt !== undefined) values.endedAt = patch.endedAt;
+    if (patch.error !== undefined) values.error = patch.error;
+    this.db.update(queueAnalyses).set(values).where(eq(queueAnalyses.id, id)).run();
+    return this.getQueueAnalysis(id)!;
+  }
+
+  storeEvalArchive(input: StoreEvalArchiveInput): EvalArchive {
+    const sealedAt = input.sealedAt ?? nowIso();
+    this.db.insert(evalArchives).values({
+      runId: input.runId, projectId: input.projectId, queueId: input.queueId ?? null,
+      batchId: input.batchId, manifestPath: input.manifestPath,
+      manifestSha256: input.manifestSha256, sizeBytes: input.sizeBytes, sealedAt,
+    }).onConflictDoUpdate({
+      target: evalArchives.runId,
+      set: { manifestPath: input.manifestPath, manifestSha256: input.manifestSha256,
+        sizeBytes: input.sizeBytes, sealedAt },
+    }).run();
+    return this.getEvalArchive(input.runId)!;
+  }
+
+  getEvalArchive(runId: string): EvalArchive | null {
+    const row = this.db.select().from(evalArchives).where(eq(evalArchives.runId, runId)).get();
+    return row ? mapEvalArchiveRow(row) : null;
+  }
+
+  listEvalArchives(filter: { projectId?: string; queueId?: string; batchId?: string }): EvalArchive[] {
+    return this.db.select().from(evalArchives).all().map(mapEvalArchiveRow)
+      .filter((a) => (!filter.projectId || a.projectId === filter.projectId) &&
+        (!filter.queueId || a.queueId === filter.queueId) &&
+        (!filter.batchId || a.batchId === filter.batchId))
+      .sort((a, b) => b.sealedAt.localeCompare(a.sealedAt));
+  }
+
   // ---- API tokens (P8b-auth) ----
 
   createApiToken(input: CreateApiTokenInput = {}): CreatedApiToken {
@@ -3698,6 +4644,7 @@ export class MemoryQueries implements QueryStore {
   private projects = new Map<string, Project>();
   private tasks = new Map<string, Task>();
   private agents = new Map<string, Agent>();
+  private projectAgentAdapters = new Map<string, ProjectAgentAdapter>();
   private batches = new Map<string, RunBatch>();
   private runs = new Map<string, Run>();
   private judgements = new Map<string, Judgement>();
@@ -3707,6 +4654,11 @@ export class MemoryQueries implements QueryStore {
   private watcherRules = new Map<string, WatcherRule>();
   private watcherEvents = new Map<string, WatcherEvent>();
   private queueEntries = new Map<string, QueueEntry>();
+  private evalQueues = new Map<string, EvalQueue>();
+  private evalQueueItems = new Map<string, EvalQueueItem>();
+  private queueContainers = new Map<string, QueueContainer>();
+  private queueAnalyses = new Map<string, QueueAnalysis>();
+  private evalArchives = new Map<string, EvalArchive>();
   private apiTokens = new Map<string, ApiToken>();
   private outboundSubscriptions = new Map<string, OutboundSubscription>();
   private webhookDeliveries = new Map<string, WebhookDelivery>();
@@ -3835,6 +4787,7 @@ export class MemoryQueries implements QueryStore {
       prompt: spec.prompt,
       workspace: spec.workspace,
       rubric: spec.rubric,
+      version: 1,
       rubricVersion: spec.rubric.version ?? 1,
       agentCategory: spec.agentCategory ?? "coding",
       profile: spec.profile ?? spec.rubric.profile ?? null,
@@ -3895,6 +4848,7 @@ export class MemoryQueries implements QueryStore {
       prompt: patch.prompt ?? existing.prompt,
       workspace: patch.workspace ?? existing.workspace,
       rubric,
+      version: existing.version + 1,
       rubricVersion,
       agentCategory: patch.agentCategory ?? existing.agentCategory,
       profile: patch.profile !== undefined ? patch.profile : existing.profile,
@@ -3926,7 +4880,12 @@ export class MemoryQueries implements QueryStore {
   archiveTask(id: string): Task {
     const existing = this.tasks.get(id);
     if (!existing) throw notFound("task", id);
-    const next = { ...existing, archived: true, updatedAt: nowIso() };
+    const next = {
+      ...existing,
+      archived: true,
+      version: existing.version + 1,
+      updatedAt: nowIso(),
+    };
     this.tasks.set(id, next);
     return { ...next };
   }
@@ -3954,6 +4913,131 @@ export class MemoryQueries implements QueryStore {
     return [...this.agents.values()].map((a) => ({ ...a }));
   }
 
+  createProjectAgentAdapter(
+    projectId: string,
+    input: CreateProjectAgentAdapterInput,
+  ): ProjectAgentAdapter {
+    if (!this.getProject(projectId)) throw notFound("project", projectId);
+    if (this.listProjectAgentAdapters(projectId, { includeDisabled: true }).length > 0) {
+      throw new Error(`project ${projectId} already has an agent adapter`);
+    }
+    this.registerAgent({
+      id: input.agentId,
+      displayName: input.name,
+      ...(input.defaultModel ? { defaultModel: input.defaultModel } : {}),
+      ...(input.defaultProvider ? { defaultProvider: input.defaultProvider } : {}),
+    });
+    const ts = nowIso();
+    const adapter: ProjectAgentAdapter = {
+      id: input.id ?? newId(),
+      projectId,
+      agentId: input.agentId,
+      name: input.name,
+      description: input.description ?? null,
+      formatVersion: input.formatVersion ?? 1,
+      image: input.image,
+      command: structuredClone(input.command),
+      connectionCheck: structuredClone(input.connectionCheck),
+      evidence: structuredClone(input.evidence),
+      parserKind: input.parserKind,
+      parserConfig: input.parserConfig ? structuredClone(input.parserConfig) : null,
+      providerConfig: input.providerConfig ? structuredClone(input.providerConfig) : null,
+      sourceRepo: input.sourceRepo ?? null,
+      sourceRef: input.sourceRef ?? null,
+      containerfile: input.containerfile ?? null,
+      buildStatus: "unbuilt",
+      builtImageId: null,
+      builtCommit: null,
+      buildLogPath: null,
+      lastBuiltAt: null,
+      enabled: input.enabled !== false,
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    this.projectAgentAdapters.set(adapter.id, adapter);
+    return structuredClone(adapter);
+  }
+
+  getProjectAgentAdapter(id: string): ProjectAgentAdapter | null {
+    const adapter = this.projectAgentAdapters.get(id);
+    return adapter ? structuredClone(adapter) : null;
+  }
+
+  getProjectAgentAdapterByAgentId(
+    projectId: string,
+    agentId: string,
+  ): ProjectAgentAdapter | null {
+    const adapter = [...this.projectAgentAdapters.values()].find(
+      (entry) => entry.projectId === projectId && entry.agentId === agentId,
+    );
+    return adapter ? structuredClone(adapter) : null;
+  }
+
+  listProjectAgentAdapters(
+    projectId: string,
+    opts: { includeDisabled?: boolean } = {},
+  ): ProjectAgentAdapter[] {
+    return [...this.projectAgentAdapters.values()]
+      .filter(
+        (adapter) =>
+          adapter.projectId === projectId &&
+          (opts.includeDisabled === true || adapter.enabled),
+      )
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((adapter) => structuredClone(adapter));
+  }
+
+  updateProjectAgentAdapter(
+    id: string,
+    patch: UpdateProjectAgentAdapterInput,
+  ): ProjectAgentAdapter {
+    const existing = this.projectAgentAdapters.get(id);
+    if (!existing) throw notFound("project agent adapter", id);
+    const next: ProjectAgentAdapter = {
+      ...existing,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.description !== undefined ? { description: patch.description } : {}),
+      ...(patch.formatVersion !== undefined ? { formatVersion: patch.formatVersion } : {}),
+      ...(patch.image !== undefined ? { image: patch.image } : {}),
+      ...(patch.command !== undefined ? { command: structuredClone(patch.command) } : {}),
+      ...(patch.connectionCheck !== undefined
+        ? { connectionCheck: structuredClone(patch.connectionCheck) }
+        : {}),
+      ...(patch.evidence !== undefined ? { evidence: structuredClone(patch.evidence) } : {}),
+      ...(patch.parserKind !== undefined ? { parserKind: patch.parserKind } : {}),
+      ...(patch.parserConfig !== undefined
+        ? { parserConfig: patch.parserConfig ? structuredClone(patch.parserConfig) : null }
+        : {}),
+      ...(patch.providerConfig !== undefined
+        ? { providerConfig: patch.providerConfig ? structuredClone(patch.providerConfig) : null }
+        : {}),
+      ...(patch.sourceRepo !== undefined ? { sourceRepo: patch.sourceRepo } : {}),
+      ...(patch.sourceRef !== undefined ? { sourceRef: patch.sourceRef } : {}),
+      ...(patch.containerfile !== undefined ? { containerfile: patch.containerfile } : {}),
+      ...(patch.buildStatus !== undefined ? { buildStatus: patch.buildStatus } : {}),
+      ...(patch.builtImageId !== undefined ? { builtImageId: patch.builtImageId } : {}),
+      ...(patch.builtCommit !== undefined ? { builtCommit: patch.builtCommit } : {}),
+      ...(patch.buildLogPath !== undefined ? { buildLogPath: patch.buildLogPath } : {}),
+      ...(patch.lastBuiltAt !== undefined ? { lastBuiltAt: patch.lastBuiltAt } : {}),
+      ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+      updatedAt: nowIso(),
+    };
+    this.projectAgentAdapters.set(id, next);
+    if (patch.name !== undefined || patch.defaultModel || patch.defaultProvider) {
+      this.registerAgent({
+        id: existing.agentId,
+        displayName: patch.name ?? existing.name,
+        ...(patch.defaultModel ? { defaultModel: patch.defaultModel } : {}),
+        ...(patch.defaultProvider ? { defaultProvider: patch.defaultProvider } : {}),
+      });
+    }
+    return structuredClone(next);
+  }
+
+  deleteProjectAgentAdapter(id: string): void {
+    if (!this.projectAgentAdapters.delete(id)) throw notFound("project agent adapter", id);
+  }
+
   createBatch(input: CreateBatchInput): RunBatch {
     const batch: RunBatch = {
       id: input.id ?? newId(),
@@ -3968,6 +5052,8 @@ export class MemoryQueries implements QueryStore {
       triggerRef: input.triggerRef ?? null,
       agentImage: input.agentImage ?? null,
       agentCommit: input.agentCommit ?? null,
+      queueId: input.queueId ?? null,
+      queueRevision: input.queueRevision ?? null,
       createdAt: nowIso(),
     };
     this.batches.set(batch.id, batch);
@@ -3980,10 +5066,15 @@ export class MemoryQueries implements QueryStore {
       batchId: input.batchId,
       taskId: input.taskId,
       projectId: input.projectId,
+      queueId: input.queueId ?? null,
+      queueItemId: input.queueItemId ?? null,
+      queueContainerId: input.queueContainerId ?? null,
       agentId: input.agentId,
       model: input.model,
       provider: input.provider,
       repeatIndex: input.repeatIndex,
+      evalVersion: input.evalVersion ?? null,
+      evalSnapshot: input.evalSnapshot ?? null,
       status: input.status ?? "queued",
       workspaceCommit: input.workspaceCommit ?? null,
       agentImage: input.agentImage ?? null,
@@ -4113,6 +5204,7 @@ export class MemoryQueries implements QueryStore {
       id,
       runId: input.runId,
       projectId: input.projectId,
+      queueAnalysisId: input.queueAnalysisId ?? null,
       judgeModel: input.judgeModel,
       judgeProvider: input.judgeProvider,
       judgePrompt: input.judgePrompt ?? null,
@@ -4819,6 +5911,261 @@ export class MemoryQueries implements QueryStore {
       });
     }
     return { removed: queued.length };
+  }
+
+  // ---- persistent eval queues + containers ----
+
+  createEvalQueue(projectId: string, input: CreateEvalQueueInput): EvalQueue {
+    if (!this.projects.has(projectId)) throw notFound("project", projectId);
+    const ts = nowIso();
+    const queue: EvalQueue = {
+      id: input.id ?? newId(), projectId, name: input.name,
+      description: input.description ?? null, agentId: input.agentId,
+      model: input.model, provider: input.provider,
+      adapterOverrides: input.adapterOverrides ?? null, sandbox: input.sandbox ?? null,
+      networkPolicy: input.networkPolicy ?? "allow", ports: [...(input.ports ?? [])],
+      judgeModel: input.judgeModel ?? null, judgeProvider: input.judgeProvider ?? null,
+      autoJudge: input.autoJudge !== false, status: "draft", activeBatchId: null,
+      revision: 1, createdAt: ts, updatedAt: ts,
+    };
+    this.evalQueues.set(queue.id, queue);
+    return structuredClone(queue);
+  }
+
+  getEvalQueue(id: string): EvalQueue | null {
+    const row = this.evalQueues.get(id);
+    return row ? structuredClone(row) : null;
+  }
+
+  listEvalQueues(projectId: string): EvalQueue[] {
+    return [...this.evalQueues.values()].filter((q) => q.projectId === projectId)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map((q) => structuredClone(q));
+  }
+
+  updateEvalQueue(id: string, patch: UpdateEvalQueueInput): EvalQueue {
+    const existing = this.evalQueues.get(id);
+    if (!existing) throw notFound("eval queue", id);
+    const next: EvalQueue = {
+      ...existing,
+      name: patch.name ?? existing.name,
+      description: patch.description !== undefined ? patch.description : existing.description,
+      agentId: patch.agentId ?? existing.agentId,
+      model: patch.model ?? existing.model,
+      provider: patch.provider ?? existing.provider,
+      adapterOverrides: patch.adapterOverrides !== undefined ? patch.adapterOverrides : existing.adapterOverrides,
+      sandbox: patch.sandbox !== undefined ? patch.sandbox : existing.sandbox,
+      networkPolicy: patch.networkPolicy ?? existing.networkPolicy,
+      ports: patch.ports !== undefined ? [...patch.ports] : existing.ports,
+      judgeModel: patch.judgeModel !== undefined ? patch.judgeModel : existing.judgeModel,
+      judgeProvider: patch.judgeProvider !== undefined ? patch.judgeProvider : existing.judgeProvider,
+      autoJudge: patch.autoJudge ?? existing.autoJudge,
+      status: patch.status ?? existing.status,
+      activeBatchId: patch.activeBatchId !== undefined ? patch.activeBatchId : existing.activeBatchId,
+      revision: patch.incrementRevision ? existing.revision + 1 : existing.revision,
+      updatedAt: nowIso(),
+    };
+    this.evalQueues.set(id, next);
+    return structuredClone(next);
+  }
+
+  deleteEvalQueue(id: string): void {
+    if (!this.evalQueues.has(id)) throw notFound("eval queue", id);
+    for (const [itemId, item] of this.evalQueueItems) {
+      if (item.queueId === id) this.evalQueueItems.delete(itemId);
+    }
+    this.evalQueues.delete(id);
+  }
+
+  createEvalQueueItem(queueId: string, input: CreateEvalQueueItemInput): EvalQueueItem {
+    const queue = this.evalQueues.get(queueId);
+    if (!queue) throw notFound("eval queue", queueId);
+    const task = this.tasks.get(input.taskId);
+    if (!task || task.projectId !== queue.projectId) throw notFound("task", input.taskId);
+    const items = this.listEvalQueueItems(queueId, { includeDisabled: true });
+    let position = items.length === 0 ? 1 : items[items.length - 1]!.position + 1;
+    const requestedPosition = input.position;
+    if (typeof requestedPosition === "number") position = requestedPosition;
+    else if (requestedPosition?.before) {
+      const beforeId = requestedPosition.before;
+      const at = items.findIndex((i) => i.id === beforeId);
+      if (at < 0) throw notFound("eval queue item", beforeId);
+      position = ((items[at - 1]?.position ?? items[at]!.position - 1) + items[at]!.position) / 2;
+    } else if (requestedPosition?.after) {
+      const afterId = requestedPosition.after;
+      const at = items.findIndex((i) => i.id === afterId);
+      if (at < 0) throw notFound("eval queue item", afterId);
+      position = (items[at]!.position + (items[at + 1]?.position ?? items[at]!.position + 1)) / 2;
+    }
+    const ts = nowIso();
+    const item: EvalQueueItem = {
+      id: input.id ?? newId(), queueId, projectId: queue.projectId, taskId: input.taskId,
+      position, repeats: Math.max(1, input.repeats ?? 1), enabled: input.enabled !== false,
+      overrides: input.overrides ?? null, createdAt: ts, updatedAt: ts,
+    };
+    this.evalQueueItems.set(item.id, item);
+    this.updateEvalQueue(queueId, { incrementRevision: true });
+    return structuredClone(item);
+  }
+
+  getEvalQueueItem(id: string): EvalQueueItem | null {
+    const item = this.evalQueueItems.get(id);
+    return item ? structuredClone(item) : null;
+  }
+
+  listEvalQueueItems(queueId: string, opts: { includeDisabled?: boolean } = {}): EvalQueueItem[] {
+    return [...this.evalQueueItems.values()].filter((i) => i.queueId === queueId &&
+      (opts.includeDisabled === true || i.enabled))
+      .sort((a, b) => a.position - b.position || a.createdAt.localeCompare(b.createdAt))
+      .map((i) => structuredClone(i));
+  }
+
+  updateEvalQueueItem(id: string, patch: UpdateEvalQueueItemInput): EvalQueueItem {
+    const existing = this.evalQueueItems.get(id);
+    if (!existing) throw notFound("eval queue item", id);
+    const items = this.listEvalQueueItems(existing.queueId, { includeDisabled: true });
+    let position = patch.position ?? existing.position;
+    if (patch.before !== undefined) {
+      const at = items.findIndex((i) => i.id === patch.before);
+      if (at < 0) throw notFound("eval queue item", patch.before);
+      position = ((items[at - 1]?.position ?? items[at]!.position - 1) + items[at]!.position) / 2;
+    }
+    if (patch.after !== undefined) {
+      const at = items.findIndex((i) => i.id === patch.after);
+      if (at < 0) throw notFound("eval queue item", patch.after);
+      position = (items[at]!.position + (items[at + 1]?.position ?? items[at]!.position + 1)) / 2;
+    }
+    const next: EvalQueueItem = {
+      ...existing, position, repeats: patch.repeats !== undefined ? Math.max(1, patch.repeats) : existing.repeats,
+      enabled: patch.enabled ?? existing.enabled,
+      overrides: patch.overrides !== undefined ? patch.overrides : existing.overrides,
+      updatedAt: nowIso(),
+    };
+    this.evalQueueItems.set(id, next);
+    this.updateEvalQueue(existing.queueId, { incrementRevision: true });
+    return structuredClone(next);
+  }
+
+  deleteEvalQueueItem(id: string): void {
+    const existing = this.evalQueueItems.get(id);
+    if (!existing) throw notFound("eval queue item", id);
+    this.evalQueueItems.delete(id);
+    this.updateEvalQueue(existing.queueId, { incrementRevision: true });
+  }
+
+  createQueueContainer(input: CreateQueueContainerInput): QueueContainer {
+    const active = this.getActiveQueueContainer(input.queueId);
+    if (active) throw new Error(`eval queue ${input.queueId} already has active container ${active.id}`);
+    const ts = nowIso();
+    const row: QueueContainer = {
+      id: input.id ?? newId(), queueId: input.queueId, projectId: input.projectId,
+      batchId: input.batchId, runtimeContainerId: input.runtimeContainerId ?? null,
+      image: input.image, state: input.state, ports: [...(input.ports ?? [])],
+      workspaceDir: input.workspaceDir, startedAt: input.startedAt ?? null,
+      stoppedAt: null, error: input.error ?? null, createdAt: ts, updatedAt: ts,
+    };
+    this.queueContainers.set(row.id, row);
+    return structuredClone(row);
+  }
+
+  getQueueContainer(id: string): QueueContainer | null {
+    const row = this.queueContainers.get(id);
+    return row ? structuredClone(row) : null;
+  }
+
+  getActiveQueueContainer(queueId: string): QueueContainer | null {
+    return this.listQueueContainers(queueId).find(
+      (c) => c.state !== "stopped" && c.runtimeContainerId !== null && c.stoppedAt === null,
+    ) ?? null;
+  }
+
+  listQueueContainers(queueId: string): QueueContainer[] {
+    return [...this.queueContainers.values()].filter((c) => c.queueId === queueId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((c) => structuredClone(c));
+  }
+
+  updateQueueContainer(id: string, patch: UpdateQueueContainerInput): QueueContainer {
+    const existing = this.queueContainers.get(id);
+    if (!existing) throw notFound("queue container", id);
+    const next: QueueContainer = {
+      ...existing,
+      runtimeContainerId: patch.runtimeContainerId !== undefined ? patch.runtimeContainerId : existing.runtimeContainerId,
+      state: patch.state ?? existing.state,
+      ports: patch.ports !== undefined ? [...patch.ports] : existing.ports,
+      startedAt: patch.startedAt !== undefined ? patch.startedAt : existing.startedAt,
+      stoppedAt: patch.stoppedAt !== undefined ? patch.stoppedAt : existing.stoppedAt,
+      error: patch.error !== undefined ? patch.error : existing.error,
+      updatedAt: nowIso(),
+    };
+    this.queueContainers.set(id, next);
+    return structuredClone(next);
+  }
+
+  createQueueAnalysis(input: CreateQueueAnalysisInput): QueueAnalysis {
+    const row: QueueAnalysis = {
+      id: input.id ?? newId(), queueId: input.queueId, projectId: input.projectId,
+      batchId: input.batchId, selectedRunIds: [...input.selectedRunIds],
+      evidenceHashes: { ...input.evidenceHashes }, judgeModel: input.judgeModel,
+      judgeProvider: input.judgeProvider, judgeParams: input.judgeParams ?? null,
+      judgePrompt: input.judgePrompt ?? null, systemPromptVersion: input.systemPromptVersion,
+      parentAnalysisId: input.parentAnalysisId ?? null, status: input.status ?? "queued",
+      verdictPath: null, reportPath: null, eventsPath: null, rawResponsePath: null,
+      createdAt: nowIso(), startedAt: null, endedAt: null, error: null,
+    };
+    this.queueAnalyses.set(row.id, row);
+    return structuredClone(row);
+  }
+
+  getQueueAnalysis(id: string): QueueAnalysis | null {
+    const row = this.queueAnalyses.get(id);
+    return row ? structuredClone(row) : null;
+  }
+
+  listQueueAnalyses(queueId: string, opts: { batchId?: string } = {}): QueueAnalysis[] {
+    return [...this.queueAnalyses.values()].filter((a) => a.queueId === queueId &&
+      (!opts.batchId || a.batchId === opts.batchId))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((a) => structuredClone(a));
+  }
+
+  updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis {
+    const existing = this.queueAnalyses.get(id);
+    if (!existing) throw notFound("queue analysis", id);
+    const next: QueueAnalysis = {
+      ...existing,
+      status: patch.status ?? existing.status,
+      verdictPath: patch.verdictPath !== undefined ? patch.verdictPath : existing.verdictPath,
+      reportPath: patch.reportPath !== undefined ? patch.reportPath : existing.reportPath,
+      eventsPath: patch.eventsPath !== undefined ? patch.eventsPath : existing.eventsPath,
+      rawResponsePath: patch.rawResponsePath !== undefined ? patch.rawResponsePath : existing.rawResponsePath,
+      startedAt: patch.startedAt !== undefined ? patch.startedAt : existing.startedAt,
+      endedAt: patch.endedAt !== undefined ? patch.endedAt : existing.endedAt,
+      error: patch.error !== undefined ? patch.error : existing.error,
+    };
+    this.queueAnalyses.set(id, next);
+    return structuredClone(next);
+  }
+
+  storeEvalArchive(input: StoreEvalArchiveInput): EvalArchive {
+    const row: EvalArchive = {
+      runId: input.runId, projectId: input.projectId, queueId: input.queueId ?? null,
+      batchId: input.batchId, manifestPath: input.manifestPath,
+      manifestSha256: input.manifestSha256, sizeBytes: input.sizeBytes,
+      sealedAt: input.sealedAt ?? nowIso(),
+    };
+    this.evalArchives.set(row.runId, row);
+    return { ...row };
+  }
+
+  getEvalArchive(runId: string): EvalArchive | null {
+    const row = this.evalArchives.get(runId);
+    return row ? { ...row } : null;
+  }
+
+  listEvalArchives(filter: { projectId?: string; queueId?: string; batchId?: string }): EvalArchive[] {
+    return [...this.evalArchives.values()].filter((a) =>
+      (!filter.projectId || a.projectId === filter.projectId) &&
+      (!filter.queueId || a.queueId === filter.queueId) &&
+      (!filter.batchId || a.batchId === filter.batchId))
+      .sort((a, b) => b.sealedAt.localeCompare(a.sealedAt)).map((a) => ({ ...a }));
   }
 
   // ---- API tokens (P8b-auth) ----

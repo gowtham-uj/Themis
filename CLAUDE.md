@@ -16,8 +16,9 @@ regressions across agent versions. Coding agents are one pre-defined category. S
 
 - Node ≥22, TypeScript, ESM. `tsx` for dev, `vitest` for tests.
 - Persistence: SQLite (`better-sqlite3`/Drizzle) + JSONL/event files on disk, under `data/`.
-- UI (P3+): Next.js App Router + Tailwind, SSE for live streaming.
-- Containers (P2): Docker-per-run — see "Execution environment" below for the environment constraint.
+- Current scope is backend/server/API-only. Frontend work is deferred; do not modify `src/ui/` unless the user explicitly reopens frontend scope.
+- Containers: one real Podman container per active eval queue; evals execute sequentially inside it.
+- Judge: one versatile PI SDK agent using the versioned custom judge system prompt and restricted custom tools; provider/model remain configurable and real.
 
 ## Layout (target; populated across phases)
 
@@ -32,7 +33,7 @@ src/
   api/          # HTTP routes, SSE, webhooks                               (P3+ / P8)
   ui/           # Next.js app                                              (P3+)
 plan/          # the spec (source of truth)
-tests/         # vitest, incl. the Docker test-double
+tests/         # vitest + API-only real-Podman/real-model acceptance coverage
 data/          # gitignored runtime artifacts (projects/<pid>/...)
 ```
 
@@ -48,13 +49,12 @@ This build now has **passwordless `sudo` + podman 4.3.1 / crun**, so real contai
 Podman is the chosen backend over Docker: daemonless (fork/exec per container, nothing to keep
 alive), rootless-capable, same OCI images, and every per-detail knob maps to a flag.
 
-- **`PodmanRuntime`** (`runner/podman-runtime.ts`) is the real backend, selected by
-  `AGENTEVAL_PODMAN=1` (or `AGENTEVAL_RUNTIME=podman`). It needs `AGENTEVAL_PODMAN_SUDO=1` here
-  because uid 65534 `nobody` has no `/etc/subuid` range, so rootless mode cannot map uids.
-- **`FakeContainerRuntime` remains the default** for unit tests: fast, no daemon, and most tests
-  care about runner/redaction/diff/control logic rather than real isolation.
-- **Live container tests** live in `tests/podman-live.test.ts`, guarded by `AGENTEVAL_PODMAN=1`
-  so `npm test` stays green on hosts without podman. Run them with:
+- **`PodmanRuntime`** (`runner/podman-runtime.ts`) is the only supported execution backend and the
+  default. It needs `AGENTEVAL_PODMAN_SUDO=1` here because uid 65534 `nobody` has no `/etc/subuid`
+  range, so rootless mode cannot map uids.
+- There is no fake/local-process runtime, including in tests. Runtime-dependent tests use real Podman
+  and fail explicitly if it is unavailable.
+- Run container tests with:
   `AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=1 npx vitest run tests/podman-live.test.ts`
 - Never inline `podman`/`docker` CLI calls in domain logic — always go through `ContainerRuntime`.
 
@@ -70,13 +70,15 @@ Two environment limits worth knowing before debugging a failure:
 - Captured canonical trace verified faithful against raw agent output (P1 onward).
 - Judge JSON conforms to the versioned Verdict schema; every finding has ≥1 structured `ref` or is
   dropped; diagnostics are `{value, refs, note}`, never bare booleans.
-- No secrets in any emitted artifact (redaction pass on ingest).
+- Redaction is deferred by user direction; traces and artifacts are stored verbatim for now.
+- Runtime, agent, provider/model, and judge acceptance paths use real systems even in tests; unavailable
+  external access is a blocker, never replaced by a fake, mock, canned verdict, or scripted gateway.
 - Public functions have a short doc comment stating what they do, not restating the code.
 
 ## Worker model conventions (for orchestrator-dispatched subagents)
 
-_Build subagents are dispatched via dynamic workflows and use the Grok 4.5 model (`grok-4.5`, verified
-reachable). The orchestrator (the main loop) is a different tier and does verification + QC._ Workers
+_Build subagents use DeepSeek V4 when the active registry exposes it; otherwise the orchestrator
+implements directly rather than substituting another worker model. The orchestrator verifies + QC._ Workers
 return structured output (schema-validated) — the orchestrator adversarially verifies before accepting,
 and re-queues with a specific deficiency note on rejection. See `plan/roadmap.md` sequencing + the
 "design patterns" the orchestrator applies (pipeline-by-default, adversarial verify, multi-modal

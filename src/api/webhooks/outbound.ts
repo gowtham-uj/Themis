@@ -7,8 +7,7 @@
  *
  * Spec: plan/api.md §Streaming "webhooks outbound option".
  *
- * Tests inject a FakeDeliverySink so no real network is used. Production uses
- * RealDeliverySink (global fetch).
+ * Delivery uses the real HTTP sink backed by global fetch.
  */
 
 import { createHmac } from "node:crypto";
@@ -21,7 +20,7 @@ import type {
 // Types
 // ---------------------------------------------------------------------------
 
-/** Injectable HTTP sink so tests capture instead of real fetch. */
+/** HTTP delivery interface for real outbound transports. */
 export interface DeliverySink {
   post(
     url: string,
@@ -44,58 +43,6 @@ export class RealDeliverySink implements DeliverySink {
     });
     const text = await res.text().catch(() => "");
     return { status: res.status, body: text };
-  }
-}
-
-/**
- * Capturing sink for tests. Controllable per-URL / default response, and can
- * throw to simulate network failure.
- */
-export class FakeDeliverySink implements DeliverySink {
-  /** Captured POST attempts in call order. */
-  readonly attempts: Array<{
-    url: string;
-    body: string;
-    headers: Record<string, string>;
-  }> = [];
-
-  /** Default status returned for every post (overridable). */
-  defaultStatus = 200;
-  defaultBody = "ok";
-  /** When true, post() throws (network error). */
-  throwOnPost = false;
-  throwMessage = "network error";
-  /** Per-URL status override. */
-  statusByUrl = new Map<string, number>();
-  /** Call-count-based status sequence (shifts each post). */
-  statusSequence: number[] = [];
-
-  async post(
-    url: string,
-    body: string,
-    headers: Record<string, string>,
-  ): Promise<{ status: number; body: string }> {
-    this.attempts.push({ url, body, headers });
-    if (this.throwOnPost) {
-      throw new Error(this.throwMessage);
-    }
-    let status = this.defaultStatus;
-    if (this.statusSequence.length > 0) {
-      status = this.statusSequence.shift()!;
-    } else if (this.statusByUrl.has(url)) {
-      status = this.statusByUrl.get(url)!;
-    }
-    return { status, body: this.defaultBody };
-  }
-
-  reset(): void {
-    this.attempts.length = 0;
-    this.defaultStatus = 200;
-    this.defaultBody = "ok";
-    this.throwOnPost = false;
-    this.throwMessage = "network error";
-    this.statusByUrl.clear();
-    this.statusSequence = [];
   }
 }
 

@@ -5,15 +5,14 @@
  * plan/api.md (project-scoped). Auth is optional via CreateServerOptions.authEnabled
  * (default false for local-dev + existing tests; see src/api/auth.ts).
  *
- * In this Dockerless env runs execute via FakeContainerRuntime (see
- * run-controller-bridge.ts). Concurrency cap is 1 for P3 (sequential starts).
+ * Runs execute in real Podman containers through run-controller-bridge.ts.
+ * The configurable concurrency cap controls how many run containers are live.
  */
 
 import { createServer as createHttpServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { existsSync, watch as fsWatch } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Adapter } from "../adapters/types.js";
 import { openDb as defaultOpenDb, resolveProjectDir, type OpenDbResult } from "../db/index.js";
 import {
   judgementDir,
@@ -46,13 +45,13 @@ import {
 } from "./errors.js";
 import {
   abortRun,
-  createFixtureAdapter,
   createLiveRunsMap,
   isTerminalStatus,
   pauseRun,
   resolveDiffPath,
   resolveEventsPath,
   resumeRun,
+  runDirPath,
   setNetwork,
   startRun,
   type LiveRunsMap,
@@ -68,6 +67,7 @@ import { registerFindingsRoutes } from "./findings-routes.js";
 import { registerRegressionRoutes } from "./regression-routes.js";
 import { registerWatcherRoutes } from "./watcher-routes.js";
 import { registerQueueRoutes } from "./queue-routes.js";
+import { registerAdapterRoutes } from "./adapter-routes.js";
 import { registerWebhooksRoutes } from "./webhooks-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerRubricRoutes } from "./rubric-routes.js";
@@ -78,9 +78,15 @@ import { registerReleaseRoutes } from "./release-routes.js";
 import { registerCommitEvalRoutes } from "./commit-eval-routes.js";
 import { registerGitHubRoutes } from "./github-routes.js";
 import { registerImprovementRoutes } from "./improvement-routes.js";
+import {
+  createLiveQueueContainersMap,
+  type LiveQueueContainersMap,
+  type StartQueueContainerOptions,
+} from "../runner/queue-worker.js";
 import type { GitHubClient } from "./github.js";
 import { handleRunFinalized, type AutoJudgeDeps } from "./auto-judge.js";
 import { createBatchClaimStore } from "../judge/batch-completion.js";
+import { judgeRun } from "../judge/worker.js";
 import {
   OutboundWebhookDispatcher,
   RealDeliverySink,
@@ -115,8 +121,10 @@ export interface AppCtx {
   queries: DbQueries;
   dataDir: string;
   liveRuns: LiveRunsMap;
-  /** Injected fixture adapter (tests). */
-  adapter?: Adapter;
+  /** Queue-id keyed persistent queue containers. */
+  liveQueueContainers: LiveQueueContainersMap;
+  /** Queue worker options forwarded by the API lifecycle routes. */
+  queueStartOpts?: StartQueueContainerOptions;
   /** Max concurrent live runs (P3 = 1). */
   concurrency: number;
   /**
@@ -134,12 +142,8 @@ export interface AppCtx {
   activeStarts: number;
   /** Extra startRun options forwarded from createServer. */
   startOpts?: Omit<StartRunOptions, "adapter">;
-  /**
-   * Injectable judge runner (P4c). Tests inject a fake that writes judge.jsonl
-   * + storeVerdict; production may wire the P4b worker. When omitted, POST
-   * /judgements only creates the queued row.
-   */
-  judgeRunner?: JudgeRunner;
+  /** Real PI SDK judge runner used by judgement APIs and auto-judge. */
+  judgeRunner: JudgeRunner;
   /** Defaults for create-judgement when the request omits them. */
   defaultSystemPromptVersion?: string;
   defaultJudgeModel?: string;
@@ -186,20 +190,12 @@ export interface CreateServerOptions {
   queries?: DbQueries;
   /** Override openDb (tests / custom backends). */
   openDb?: (dataDir: string) => OpenDbResult;
-  /**
-   * Injected adapter for tests. Documented seam: use createFixtureAdapter()
-   * so tests never hit a real model.
-   */
-  adapter?: Adapter;
   /** Concurrency cap for starting runs (default 1 for P3). */
   concurrency?: number;
   /** Extra startRun options (timeout, skipAgent, …). */
   startOpts?: Omit<StartRunOptions, "adapter">;
-  /**
-   * Injectable judge runner. Prefer a fake in tests so no real LLM is called.
-   * See {@link JudgeRunner} in judgements-routes.ts.
-   */
-  judgeRunner?: JudgeRunner;
+  /** Options for persistent queue-container execution. */
+  queueStartOpts?: StartQueueContainerOptions;
   defaultSystemPromptVersion?: string;
   defaultJudgeModel?: string;
   defaultJudgeProvider?: string;
@@ -240,6 +236,7 @@ export interface ApiServer {
   server: Server;
   queries: DbQueries;
   liveRuns: LiveRunsMap;
+  liveQueueContainers: LiveQueueContainersMap;
   app: AppCtx;
   /** Listen on an ephemeral port (or given port). Resolves with the bound port. */
   listen(port?: number, host?: string): Promise<number>;
@@ -347,6 +344,7 @@ function taskJson(t: Task) {
     prompt: t.prompt,
     workspace: t.workspace,
     rubric: t.rubric,
+    version: t.version,
     rubric_version: t.rubricVersion,
     agent_category: t.agentCategory,
     profile: t.profile,
@@ -439,6 +437,42 @@ function assertNotTerminal(run: Run): void {
 // Sequential start queue (concurrency cap)
 // ---------------------------------------------------------------------------
 
+/** Build the real PI SDK runner used by the single-run judgement API. */
+function createRealJudgeRunner(): JudgeRunner {
+  return async (ctx) => {
+    const run = ctx.queries.getRun(ctx.runId);
+    if (!run) throw new Error(`run not found: ${ctx.runId}`);
+    const task = ctx.queries.getTask(run.taskId);
+    if (!task) throw new Error(`eval not found: ${run.taskId}`);
+    const runDir = runDirPath(ctx.dataDir, ctx.projectId, ctx.runId);
+    const hasSourceArtifacts =
+      existsSync(join(runDir, "diff.patch")) ||
+      existsSync(join(runDir, "outputs-manifest.json"));
+    const result = await judgeRun({
+      runDir,
+      task: {
+        prompt: task.prompt,
+        rubric: ctx.body.rubric ?? task.rubric,
+        agentCategory: task.agentCategory,
+        ...(task.referenceSolution
+          ? { referenceSolution: task.referenceSolution }
+          : {}),
+      },
+      judgeModel: ctx.judgeModel,
+      judgeProvider: ctx.judgeProvider,
+      hasSourceArtifacts,
+      ...(ctx.judgePrompt ? { judgePrompt: ctx.judgePrompt } : {}),
+      judgementId: ctx.judgementId,
+      projectId: ctx.projectId,
+      dataDir: ctx.dataDir,
+    });
+    if (result.status !== "completed" || !result.verdict) {
+      throw new Error(result.error ?? "PI judge did not produce a completed verdict");
+    }
+    ctx.queries.storeVerdict(ctx.judgementId, result.verdict);
+  };
+}
+
 /** Collect the auto-judge coordinator's dependencies from the app context. */
 function autoJudgeDeps(app: AppCtx): AutoJudgeDeps {
   return {
@@ -493,7 +527,6 @@ async function drainStartQueue(app: AppCtx): Promise<void> {
     try {
       const live = await startRun(app.dataDir, app.queries, runId, app.liveRuns, {
         ...(app.startOpts ?? {}),
-        ...(app.adapter ? { adapter: app.adapter } : {}),
         // Thread outbound dispatcher into the runner so run.completed fires
         // exactly once at terminal finalization (not on status polls).
         ...(app.outboundWebhooks
@@ -615,7 +648,7 @@ async function streamEvents(
     return;
   }
 
-  // Live-tail: poll the file for new lines (portable; works with FakeContainerRuntime).
+  // Live-tail: poll the file for new lines (portable across container backends).
   const pollMs = 50;
   const maxWaitMs = 120_000;
   const started = Date.now();
@@ -907,6 +940,15 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
           ? null
           : String(body.reference_solution);
     }
+    if ("checks" in body) {
+      patch.checks = Array.isArray(body.checks) ? body.checks : null;
+    }
+    if ("env" in body) {
+      patch.env =
+        body.env && typeof body.env === "object" && !Array.isArray(body.env)
+          ? (body.env as Record<string, unknown>)
+          : null;
+    }
 
     const updated = app.queries.updateTask(ctx.params.taskId!, patch);
     sendJson(res, 200, taskJson(updated));
@@ -918,6 +960,98 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     requireTask(app.queries, ctx.params.id!, ctx.params.taskId!);
     const archived = app.queries.archiveTask(ctx.params.taskId!);
     sendJson(res, 200, taskJson(archived));
+  });
+
+  // ---- eval definitions (preferred aliases for task CRUD) ----
+
+  router.get("/api/projects/:id/evals", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const includeArchived =
+      ctx.query.include_archived === "1" || ctx.query.include_archived === "true";
+    sendJson(res, 200, {
+      evals: app.queries
+        .listTasks(ctx.params.id!, { includeArchived })
+        .map(taskJson),
+    });
+  });
+
+  router.post("/api/projects/:id/evals", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const project = requireProject(app.queries, ctx.params.id!);
+    const body = await readJsonBody<BuildTaskSpecInput & { source_kind?: string }>(req);
+    let spec: TaskSpec;
+    try {
+      spec = buildTaskSpec(body);
+    } catch (err) {
+      throw badRequest(err instanceof Error ? err.message : String(err));
+    }
+    const sourceKind = body.source_kind ?? "ui-builder";
+    const created = app.queries.createTask(project.id, spec, { sourceKind });
+    sendJson(res, 201, taskJson(created));
+  });
+
+  router.get("/api/projects/:id/evals/:evalId", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    sendJson(
+      res,
+      200,
+      taskJson(requireTask(app.queries, ctx.params.id!, ctx.params.evalId!)),
+    );
+  });
+
+  router.patch("/api/projects/:id/evals/:evalId", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const existing = requireTask(app.queries, ctx.params.id!, ctx.params.evalId!);
+    if (
+      existing.sourceKind &&
+      existing.sourceKind !== "ui-builder" &&
+      existing.sourceKind !== "http-push"
+    ) {
+      throw conflict(
+        `eval ${existing.id} is sourced from ${existing.sourceKind}; edit via the source and re-sync`,
+        "https://agenteval.dev/errors/eval-read-only",
+      );
+    }
+    const body = await readJsonBody<Record<string, unknown>>(req);
+    const patch: UpdateTaskInput = {};
+    if (typeof body.name === "string") patch.name = body.name;
+    if (typeof body.prompt === "string") patch.prompt = body.prompt;
+    if (body.workspace && typeof body.workspace === "object") {
+      patch.workspace = body.workspace as UpdateTaskInput["workspace"];
+    }
+    if (body.rubric && typeof body.rubric === "object") {
+      patch.rubric = body.rubric as UpdateTaskInput["rubric"];
+    }
+    if (typeof body.agent_category === "string") {
+      patch.agentCategory = body.agent_category as UpdateTaskInput["agentCategory"];
+    }
+    if ("profile" in body) {
+      patch.profile = body.profile == null ? null : (body.profile as UpdateTaskInput["profile"]);
+    }
+    if ("tags" in body) patch.tags = Array.isArray(body.tags) ? (body.tags as string[]) : null;
+    if ("reference_solution" in body) {
+      patch.referenceSolution = body.reference_solution == null
+        ? null
+        : String(body.reference_solution);
+    }
+    if ("checks" in body) patch.checks = Array.isArray(body.checks) ? body.checks : null;
+    if ("env" in body) {
+      patch.env =
+        body.env && typeof body.env === "object" && !Array.isArray(body.env)
+          ? (body.env as Record<string, unknown>)
+          : null;
+    }
+    sendJson(res, 200, taskJson(app.queries.updateTask(existing.id, patch)));
+  });
+
+  router.delete("/api/projects/:id/evals/:evalId", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const existing = requireTask(app.queries, ctx.params.id!, ctx.params.evalId!);
+    sendJson(res, 200, taskJson(app.queries.archiveTask(existing.id)));
   });
 
   router.post("/api/projects/:id/tasks/sync", async (_req, res, ctx) => {
@@ -1067,25 +1201,20 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
       throw badRequest("taskId (or taskTags) is required");
     }
 
-    const agentId =
-      body.agent ?? body.agentId ?? body.agent_id ?? project.defaultAgentId ?? "fixture";
-    const model =
-      body.model ?? project.defaultModel ?? "claude-opus-4-6";
-    const provider =
-      body.provider ?? project.defaultProvider ?? "anthropic";
-    const repeats = Math.max(1, Math.min(100, Number(body.repeats ?? 1) || 1));
-
-    // Ensure agent is registered (best-effort).
-    try {
-      app.queries.registerAgent({
-        id: agentId,
-        displayName: agentId,
-        defaultModel: model,
-        defaultProvider: provider,
-      });
-    } catch {
-      // ignore
+    const configuredAdapter = app.queries.listProjectAgentAdapters(project.id, {
+      includeDisabled: true,
+    })[0];
+    const agentId = configuredAdapter?.agentId ?? project.defaultAgentId;
+    const requestedAgent = body.agent ?? body.agentId ?? body.agent_id;
+    if (requestedAgent && requestedAgent !== agentId) {
+      throw badRequest("runs must use the project's configured agent");
     }
+    const model = body.model ?? project.defaultModel;
+    const provider = body.provider ?? project.defaultProvider;
+    if (!agentId || !model || !provider) {
+      throw badRequest("configure the project agent adapter, model, and provider first");
+    }
+    const repeats = Math.max(1, Math.min(100, Number(body.repeats ?? 1) || 1));
 
     // Per-run adapter overrides (image pin, env, tool allowlist). Previously
     // accepted and dropped; the image pin is recorded on the batch so every run
@@ -1508,7 +1637,7 @@ async function waitForLive(
  * Bootstrap the REST API.
  *
  * ```ts
- * const api = createServer({ dataDir, adapter: createFixtureAdapter() });
+ * const api = createServer({ dataDir });
  * const port = await api.listen(0);
  * // ...
  * await api.close();
@@ -1521,6 +1650,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
     : open(opts.dataDir);
 
   const liveRuns = createLiveRunsMap();
+  const liveQueueContainers = createLiveQueueContainersMap();
   const authEnabled = opts.authEnabled === true;
 
   // Outbound webhooks (P8c): default RealDeliverySink dispatcher unless
@@ -1542,7 +1672,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
     queries: opened.queries,
     dataDir: opts.dataDir,
     liveRuns,
-    adapter: opts.adapter,
+    liveQueueContainers,
     concurrency: opts.concurrency ?? 1,
     // LRU + TTL store; still Map-compatible for the inline run/judgement caches.
     idempotency: new IdempotencyStore(),
@@ -1553,13 +1683,14 @@ export function createServer(opts: CreateServerOptions): ApiServer {
     // Bound below after app is constructed so the closure sees the final object.
     enqueueStart: () => undefined,
     batchClaims: createBatchClaimStore(),
+    judgeRunner: createRealJudgeRunner(),
     ...(opts.githubClient ? { githubClient: opts.githubClient } : {}),
   };
   // Wire the real start-pipeline seam (concurrency-limited).
   app.enqueueStart = (runId: string) => enqueueStart(app, runId);
   app.startOpts = opts.startOpts;
+  if (opts.queueStartOpts) app.queueStartOpts = opts.queueStartOpts;
   if (outboundWebhooks) app.outboundWebhooks = outboundWebhooks;
-  if (opts.judgeRunner) app.judgeRunner = opts.judgeRunner;
   if (opts.defaultSystemPromptVersion) {
     app.defaultSystemPromptVersion = opts.defaultSystemPromptVersion;
   }
@@ -1578,7 +1709,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerRegressionRoutes(router);
   // Watcher rules + webhook ingress (P8b) — modular mount.
   registerWatcherRoutes(router);
-  // Eval queue (P8b) — add/peek/reorder/promote/drain.
+  registerAdapterRoutes(router);
   registerQueueRoutes(router);
   // Outbound webhook subscriptions (P8c) — CRUD + deliveries + test fire.
   registerWebhooksRoutes(router);
@@ -1627,6 +1758,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
     server,
     queries: app.queries,
     liveRuns,
+    liveQueueContainers,
     app,
     listen(port = 0, host = "127.0.0.1") {
       return new Promise((resolve, reject) => {
@@ -1655,6 +1787,10 @@ export function createServer(opts: CreateServerOptions): ApiServer {
         }
         liveRuns.delete(id);
       }
+      for (const live of [...liveQueueContainers.values()]) {
+        await live.stop().catch(() => undefined);
+      }
+      liveQueueContainers.clear();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });
@@ -1664,7 +1800,6 @@ export function createServer(opts: CreateServerOptions): ApiServer {
 
 // Re-exports for consumers / tests.
 export {
-  createFixtureAdapter,
   createLiveRunsMap,
   isTerminalStatus,
   startRun,
@@ -1675,9 +1810,17 @@ export {
 };
 export type { LiveRun, LiveRunsMap, StartRunOptions } from "./run-controller-bridge.js";
 export {
+  createLiveQueueContainersMap,
+  startQueueContainer,
+} from "../runner/queue-worker.js";
+export type {
+  LiveQueueContainer,
+  LiveQueueContainersMap,
+  StartQueueContainerOptions,
+} from "../runner/queue-worker.js";
+export {
   OutboundWebhookDispatcher,
   RealDeliverySink,
-  FakeDeliverySink,
   signPayload,
   buildEventPayload,
   dispatch,

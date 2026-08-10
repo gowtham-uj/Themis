@@ -8,6 +8,9 @@
 import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createPiParseState, mapPiEvent } from "../adapters/pi.js";
+import type { RunContext } from "../adapters/types.js";
 import type { AgentCategory, Rubric } from "../domain.js";
 import type { CanonicalEvent } from "../schema/events.js";
 import { SCHEMA_VERSION } from "../schema/events.js";
@@ -18,7 +21,7 @@ import {
   assembleJudgeUserPrompt,
   JUDGE_SYSTEM_PROMPT_VERSION,
 } from "./prompt.js";
-import { extractJsonObject, type JudgeProvider } from "./provider.js";
+import { runPiJudgeAgent } from "./pi-agent.js";
 import {
   validateVerdict,
   VerdictValidationError,
@@ -53,8 +56,6 @@ export interface JudgeRunInput {
   runDir: string;
   task: JudgeTaskInput;
   judgeModel: string;
-  /** Injectable provider (FakeJudgeProvider in tests; Anthropic in prod). */
-  provider: JudgeProvider;
   /** Gates the withSource improvements lens. */
   hasSourceArtifacts: boolean;
   /** Optional operator steer. */
@@ -110,12 +111,9 @@ export interface JudgeRunResult {
   systemPromptVersion: string;
 }
 
-/** sk- shape used as defense-in-depth on the events preview (events are already redacted). */
-const SK_PATTERN = /\bsk-(?:ant-)?[A-Za-z0-9_\-]{8,}\b/g;
-
 /**
- * Grade one run: assemble prompts → call provider → validateVerdict → write
- * verdict.json + judge.jsonl under projects/<pid>/judgements/<jid>/.
+ * Grade one run with the shared PI SDK judge host, validate its terminating
+ * submit_verdict payload, then write verdict.json + canonical judge.jsonl.
  * On validation failure: records an error event in judge.jsonl and does NOT
  * write an invalid verdict.json.
  */
@@ -234,43 +232,89 @@ export async function judgeRun(input: JudgeRunInput): Promise<JudgeRunResult> {
       },
     });
 
-    const { verdictJson, rawEvents } = await input.provider.judge({
-      systemPrompt,
-      userPrompt,
+    const submissionState: { verdict: Verdict | null } = { verdict: null };
+    const submitVerdictTool: ToolDefinition = {
+      name: "submit_verdict",
+      label: "Submit Verdict",
+      description:
+        "Submit the final standard Verdict for this eval. Invalid verdicts are rejected so you can correct and retry.",
+      promptSnippet: "Submit the final validated eval Verdict and terminate the judge session",
+      promptGuidelines: [
+        "Use submit_verdict only after inspecting and reconciling all supplied evidence.",
+        "If submit_verdict rejects the payload, correct every validation error and call it again.",
+      ],
+      parameters: {
+        type: "object",
+        properties: { verdict: { type: "object" } },
+        required: ["verdict"],
+        additionalProperties: false,
+      } as ToolDefinition["parameters"],
+      executionMode: "sequential",
+      async execute(_toolCallId, rawParams) {
+        const params =
+          rawParams && typeof rawParams === "object"
+            ? (rawParams as Record<string, unknown>)
+            : {};
+        const candidate = params.verdict;
+        try {
+          validateVerdict(candidate, {
+            hasSourceArtifacts,
+            ...(allowedCriterionIds !== undefined ? { allowedCriterionIds } : {}),
+          });
+          submissionState.verdict = candidate as Verdict;
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ accepted: true }) }],
+            details: { accepted: true },
+            terminate: true,
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ accepted: false, error: message }),
+              },
+            ],
+            details: { accepted: false, error: message },
+            isError: true,
+          };
+        }
+      },
+    };
+    const piCtx: RunContext = {
+      runId: judgementId,
+      project: { id: projectId },
+      task: { prompt: input.task.prompt, workspace: { source: "empty" } },
       model: input.judgeModel,
       provider: input.judgeProvider ?? "anthropic",
+      params: { systemPromptVersion, hasSourceArtifacts },
+      workspaceDir: judgementDir,
+      apiKeys: {},
+    };
+    const piState = createPiParseState(undefined, { deferRunEnd: true });
+    await runPiJudgeAgent({
+      cwd: judgementDir,
+      agentDir: join(judgementDir, ".pi-agent"),
+      provider: input.judgeProvider ?? "anthropic",
+      model: input.judgeModel,
+      systemPrompt: `${systemPrompt}\n\nPI TOOL MODE OVERRIDE: Do not emit the verdict as plain text. Inspect the supplied evidence, then call submit_verdict with the exact Verdict object. The tool validates the schema and terminates the session only after acceptance.`,
+      userPrompt,
+      tools: [submitVerdictTool],
+      eventsPath: join(judgementDir, "pi-events.jsonl"),
+      transcriptPath: join(judgementDir, "pi-session.json"),
       maxTokens: input.maxTokens,
-      judgementId,
+      onEvent: async (rawEvent) => {
+        for (const event of mapPiEvent(rawEvent, piCtx, piState)) {
+          if (event.type !== "run.start" && event.type !== "run.end") await emit(event);
+        }
+      },
     });
 
-    // Stream the provider's own events into the live judge log.
-    for (const ev of rawEvents) {
-      await emit(ev);
-    }
-
-    let parsedText: string;
-    try {
-      parsedText = extractJsonObject(verdictJson);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await emitError(emit, judgementId, `verdict JSON parse failed: ${message}`);
-      await emitRunEnd(emit, judgementId, "failed");
-      return {
-        judgementId,
-        judgementDir,
-        eventsPath,
-        status: "failed",
-        error: message,
-        systemPromptVersion,
-      };
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(parsedText);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await emitError(emit, judgementId, `verdict JSON.parse failed: ${message}`);
+    const parsed = submissionState.verdict as Verdict | null;
+    if (!parsed) {
+      const message = "PI judge ended without an accepted submit_verdict call";
+      await emitError(emit, judgementId, message);
       await emitRunEnd(emit, judgementId, "failed");
       return {
         judgementId,
@@ -567,10 +611,7 @@ async function readRunJson(runDir: string): Promise<unknown> {
   }
 }
 
-/**
- * Build a bounded events preview: type counts + first/last N seq snippets.
- * Strips sk- patterns as defense-in-depth (events should already be redacted).
- */
+/** Build a bounded events preview with type counts and sequence snippets. */
 export async function buildEventsPreview(
   runDir: string,
   window: number,
@@ -639,7 +680,7 @@ export async function buildEventsPreview(
       ? { actionTimelineTruncated: `only the first ${MAX_TIMELINE_ACTIONS} actions are shown` }
       : {}),
   };
-  return redactPreview(JSON.stringify(body, null, 2));
+  return JSON.stringify(body, null, 2);
 }
 
 /** Cap on timeline entries, so a pathological run cannot flood the prompt. */
@@ -701,11 +742,6 @@ function summarizeEvent(e: Record<string, unknown>): Record<string, unknown> {
         : e.message;
   }
   return out;
-}
-
-/** Strip obvious sk- patterns from preview text (defense in depth). */
-export function redactPreview(text: string): string {
-  return text.replace(SK_PATTERN, "[REDACTED:api_key]");
 }
 
 /**

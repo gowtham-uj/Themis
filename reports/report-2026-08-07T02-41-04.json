@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 2,
+  "evaluationId": "fc30a319-f308-44b9-8e98-bb04b7702c20",
+  "projectId": "bb6c195d-a9ef-4c2f-864f-419afd599b47",
+  "agentId": "reapercode",
+  "model": "claude-opus-4-6",
+  "provider": "anthropic",
+  "commit": "2d6aa072084476746bcf287c8c0004e94799248e",
+  "generatedAt": "2026-08-07T02:41:04.791Z",
+  "summary": {
+    "score": 0,
+    "evalsTotal": 2,
+    "evalsPassed": 0,
+    "evalsFailed": 0,
+    "evalsUnjudged": 2,
+    "text": "0/0 tasks passed; mean score 0.00; 2 run(s) produced no verdict"
+  },
+  "themes": [],
+  "strengths": [],
+  "reliability": [],
+  "regressions": [],
+  "evals": [
+    {
+      "name": "Add a guard for reversed ranges",
+      "taskId": "877b4b39-cb65-4618-ac3c-aeb2bf0b10eb",
+      "runId": "2872c931-986d-4f49-8771-b879e8b13382",
+      "status": "failed",
+      "score": null,
+      "verdict": null,
+      "headline": "Run ended as failed.",
+      "themeIds": [],
+      "environmentError": null,
+      "evidence": {
+        "traceUrl": null,
+        "diffUrl": null,
+        "reportUrl": null,
+        "artifactCount": 0,
+        "traceEventCount": 0
+      }
+    },
+    {
+      "name": "Fix the inclusive-range off-by-one",
+      "taskId": "c50974d1-d103-48f0-9d26-84db83718933",
+      "runId": "df00726c-877f-4d53-a9d5-e33ae238f031",
+      "status": "failed",
+      "score": null,
+      "verdict": null,
+      "headline": "Run ended as failed.",
+      "themeIds": [],
+      "environmentError": null,
+      "evidence": {
+        "traceUrl": null,
+        "diffUrl": null,
+        "reportUrl": null,
+        "artifactCount": 0,
+        "traceEventCount": 0
+      }
+    }
+  ],
+  "nextEvaluation": {
+    "description": "No themes to address. Re-evaluate a new commit when there is one.",
+    "request": {
+      "method": "POST",
+      "path": "/api/projects/bb6c195d-a9ef-4c2f-864f-419afd599b47/evaluate",
+      "body": {
+        "commit": "<the commit containing your fixes>",
+        "agentId": "reapercode",
+        "label": "verify fixes from evaluation fc30a319"
+      }
+    }
+  }
+}

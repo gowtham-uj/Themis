@@ -670,8 +670,7 @@ export async function* parseReaperStream(
 /** Build the headless ReaperCode launch command (post-change flags). */
 export function buildReaperCommand(ctx: RunContext): AdapterCommand {
   const argv = [
-    "node",
-    "bin/reaper",
+    "reaper",
     "exec",
     "run",
     "--prompt",
@@ -699,7 +698,7 @@ export function buildReaperCommand(ctx: RunContext): AdapterCommand {
     // Env-form of the stream flag, accepted per plan/reapercode-changes.md.
     REAPER_STREAM_EVENTS: "1",
   };
-  // Inject API keys without logging them (runner redacts separately).
+  // Inject API keys into the agent process environment.
   for (const [k, v] of Object.entries(ctx.apiKeys)) {
     env[k] = v;
   }
@@ -725,7 +724,27 @@ export function reaperImage(ctx: RunContext): string {
 export const reaperCodeAdapter: Adapter = {
   id: "reapercode",
   image: reaperImage,
+  connectionCheck(ctx) {
+    const checkCtx: RunContext = {
+      ...ctx,
+      task: {
+        prompt: "Reply with exactly AGENTEVAL_CONNECTION_OK. Do not use tools.",
+        workspace: { source: "empty" },
+      },
+    };
+    return {
+      command: buildReaperCommand(checkCtx),
+      cwd: "/workspace",
+      timeoutMs: 60_000,
+    };
+  },
   command: buildReaperCommand,
+  evidence() {
+    return {
+      paths: [".reaper"],
+      requiredPaths: [".reaper/runs"],
+    };
+  },
   parse(streams, ctx) {
     return parseReaperStream(streams, ctx);
   },

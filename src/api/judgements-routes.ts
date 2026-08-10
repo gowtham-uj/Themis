@@ -35,7 +35,7 @@ import {
 } from "../runner/artifact-retention.js";
 
 // ---------------------------------------------------------------------------
-// Injectable judge runner (tests inject a fake; production may use worker)
+// Real judge runner contract
 // ---------------------------------------------------------------------------
 
 /**
@@ -84,11 +84,8 @@ export interface JudgementAppCtx {
     string,
     { status: number; body: unknown; headers?: Record<string, string> }
   >;
-  /**
-   * Optional injectable judge runner. When omitted, routes mark the judgement
-   * queued and leave execution to a later phase / external kick.
-   */
-  judgeRunner?: JudgeRunner;
+  /** Real PI SDK judge runner. */
+  judgeRunner: JudgeRunner;
   /**
    * Default system prompt version when the request does not specify one.
    * P4b owns the real version string; P4c uses a stable placeholder.
@@ -234,8 +231,8 @@ function requireJudgement(
 }
 
 const DEFAULT_SYSTEM_PROMPT_VERSION = "v2";
-const DEFAULT_JUDGE_MODEL = "claude-opus-4-6";
-const DEFAULT_JUDGE_PROVIDER = "anthropic";
+const DEFAULT_JUDGE_MODEL = "deepseek-v4-flash";
+const DEFAULT_JUDGE_PROVIDER = "nuralwatt";
 
 // ---------------------------------------------------------------------------
 // HTML file serving (report.html)
@@ -506,74 +503,72 @@ export function registerJudgementRoutes(router: Router): void {
 
     sendJson(res, 202, bodyOut, headers);
 
-    // Kick off the judge asynchronously (do not await — 202 already sent).
-    if (app.judgeRunner) {
-      const runnerCtx: JudgeRunContext = {
-        judgementId: judgement.id,
-        runId: run.id,
-        projectId: run.projectId,
-        judgeModel,
-        judgeProvider,
-        judgePrompt,
-        systemPromptVersion,
-        dataDir: app.dataDir,
-        queries: app.queries,
-        eventsPath,
-        body,
-      };
-      void Promise.resolve()
-        .then(async () => {
+    // Kick off the real PI judge asynchronously (do not await — 202 already sent).
+    const runnerCtx: JudgeRunContext = {
+      judgementId: judgement.id,
+      runId: run.id,
+      projectId: run.projectId,
+      judgeModel,
+      judgeProvider,
+      judgePrompt,
+      systemPromptVersion,
+      dataDir: app.dataDir,
+      queries: app.queries,
+      eventsPath,
+      body,
+    };
+    void Promise.resolve()
+      .then(async () => {
+        try {
+          app.queries.setJudgementStatus(judgement.id, "running");
+        } catch {
+          // best-effort
+        }
+        await app.judgeRunner(runnerCtx);
+
+        // Artifact retention: the verdict is written, so the run's outputs
+        // can go. Default policy `keep` changes nothing; `referenced` keeps
+        // only what the verdict's artifact refs cite, so located evidence
+        // stays clickable. Never fails the judgement.
+        await purgeJudgedRunArtifacts(app, run.id, run.projectId);
+
+        // P8c: emit verdict.completed once if the runner completed the judgement.
+        // No-ops when outbound webhooks are off or the judgement is not completed.
+        if (app.outboundWebhooks) {
           try {
-            app.queries.setJudgementStatus(judgement.id, "running");
-          } catch {
-            // best-effort
-          }
-          await app.judgeRunner!(runnerCtx);
-
-          // Artifact retention: the verdict is written, so the run's outputs
-          // can go. Default policy `keep` changes nothing; `referenced` keeps
-          // only what the verdict's artifact refs cite, so located evidence
-          // stays clickable. Never fails the judgement.
-          await purgeJudgedRunArtifacts(app, run.id, run.projectId);
-
-          // P8c: emit verdict.completed once if the runner completed the judgement.
-          // No-ops when outbound webhooks are off or the judgement is not completed.
-          if (app.outboundWebhooks) {
-            try {
-              const done = app.queries.getJudgement(judgement.id);
-              if (done && done.status === "completed") {
-                void app.outboundWebhooks.dispatchEvent({
-                  type: "verdict.completed",
-                  projectId: run.projectId,
-                  resourceId: judgement.id,
-                  data: {
-                    runId: run.id,
-                    overallScore: done.overallScore ?? null,
-                    verdictVersion: done.systemPromptVersion,
-                  },
-                  timestamp: done.endedAt ?? new Date().toISOString(),
-                });
-              }
-            } catch {
-              // never break the judge path for webhook delivery
+            const done = app.queries.getJudgement(judgement.id);
+            if (done && done.status === "completed") {
+              void app.outboundWebhooks.dispatchEvent({
+                type: "verdict.completed",
+                projectId: run.projectId,
+                resourceId: judgement.id,
+                data: {
+                  runId: run.id,
+                  overallScore: done.overallScore ?? null,
+                  verdictVersion: done.systemPromptVersion,
+                },
+                timestamp: done.endedAt ?? new Date().toISOString(),
+              });
             }
-          }
-        })
-        .catch((err) => {
-          try {
-            app.queries.setJudgementStatus(
-              judgement.id,
-              "failed",
-              new Date().toISOString(),
-            );
           } catch {
-            // best-effort
+            // never break the judge path for webhook delivery
           }
-          if (process.env.AGENTEVAL_JUDGE_DEBUG) {
-            console.error("[judgeRunner] failed:", err);
-          }
-        });
-    }
+        }
+      })
+      .catch((err) => {
+        try {
+          app.queries.setJudgementStatus(
+            judgement.id,
+            "failed",
+            new Date().toISOString(),
+          );
+        } catch {
+          // best-effort
+        }
+        if (process.env.AGENTEVAL_JUDGE_DEBUG) {
+          console.error("[judgeRunner] failed:", err);
+        }
+      });
   });
 
   // GET /api/judgements — list

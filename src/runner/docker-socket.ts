@@ -3,13 +3,15 @@
  *
  * In a Docker + root deployment this class would drive the daemon over the socket
  * (or DOCKER_HOST) to honour mounts, limits, network policy, and cgroup pause.
- * This build environment is Dockerless, so `run()` throws {@link NotImplementedError}
- * with a clear message. Tests always use {@link FakeContainerRuntime}.
+ * This backend is not implemented; PodmanRuntime is the supported real backend.
+ * Selecting Docker fails clearly rather than falling back to host execution.
  *
  * Do NOT call the docker CLI from domain code — go through ContainerRuntime.
  */
 
 import type {
+  BuildImageResult,
+  BuildImageSpec,
   ContainerHandle,
   ContainerRuntime,
   RunContainerSpec,
@@ -29,9 +31,15 @@ export class NotImplementedError extends Error {
  * socket / AGENTEVAL_DOCKER is present, and callers get a clear failure at run().
  */
 export class DockerSocketRuntime implements ContainerRuntime {
+  async buildImage(_spec: BuildImageSpec): Promise<BuildImageResult> {
+    throw new NotImplementedError(
+      "Docker socket backend is not implemented; configure AGENTEVAL_RUNTIME=podman",
+    );
+  }
+
   async run(_spec: RunContainerSpec): Promise<ContainerHandle> {
     throw new NotImplementedError(
-      "real Docker socket backend — enable in a Docker+root environment; tests use FakeContainerRuntime",
+      "Docker socket backend is not implemented; configure AGENTEVAL_RUNTIME=podman",
     );
   }
 }

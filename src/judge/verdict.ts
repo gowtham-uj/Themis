@@ -255,7 +255,7 @@ export interface CheckResult {
   /** Check kind (test_suite, build, typecheck, lint, repro, secret_scan, …). */
   kind: string;
   status: CheckStatus;
-  /** Human-readable detail; secrets MUST already be redacted. */
+  /** Human-readable detail captured from the check. */
   detail?: string;
   durationMs?: number;
   exitCode?: number;

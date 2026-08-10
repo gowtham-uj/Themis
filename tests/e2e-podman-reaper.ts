@@ -10,8 +10,8 @@
  *    over HTTP (tests/fixtures/mock-model-gateway.ts), scripted to produce a
  *    run with a genuine defect;
  *  - the judge's model: a scripted verdict grounded in the real captured trace.
- * Everything between them is production code: podman, event capture, redaction,
- * diff capture, checks, verdict validation, findings ingest, report render.
+ * Everything between them is production code: podman, event capture, diff
+ * capture, checks, verdict validation, findings ingest, and report rendering.
  *
  * Run (not part of `npm test` — needs podman + a built pod image):
  *   AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=1 npx tsx tests/e2e-podman-reaper.ts

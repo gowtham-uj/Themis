@@ -38,7 +38,7 @@ project through its pluggable **task source**, not through the adapter.
 
 The **runner** (shared, not per-agent) does: workspace prep → `docker run` with
 `image()`/`command()` → feed streams to `parse()` → append each event to `events.jsonl` + push to SSE
-→ on exit, `git diff` → `run.end`. Timeouts, resource limits, redaction, and retries live here too.
+→ on exit, `git diff` → `run.end`. Timeouts, resource limits, and retries live here too. Event payloads are persisted verbatim; redaction is deferred.
 
 ## Workspace prep (shared)
 
@@ -110,6 +110,6 @@ overrides for a project come from its settings, not from the task source.
 - **Correlate** tool calls/results by id; synthesize an id if the agent doesn't provide one
   (`name#turn#n`).
 - **Truncate** giant tool outputs in the event (keep full blob on disk, mark `truncated`).
-- **Redact** secrets (API keys, tokens) from all event text before persisting.
+- Persist event text verbatim. Redaction is intentionally deferred.
 - **Never trust** clean exit alone: derive `run.end.status` from exit code **and** presence of a
   terminal event; a crash mid-stream → `status:"failed"` with the last error.

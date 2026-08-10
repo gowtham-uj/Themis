@@ -94,8 +94,8 @@ export async function judgeRunNow(
   const judgeModel =
     project?.defaultJudgeModel ??
     deps.defaultJudgeModel ??
-    "claude-opus-4-6";
-  const judgeProvider = deps.defaultJudgeProvider ?? "anthropic";
+    "deepseek-v4-flash";
+  const judgeProvider = deps.defaultJudgeProvider ?? "nuralwatt";
   const systemPromptVersion = deps.defaultSystemPromptVersion ?? "v2";
 
   const judgement = deps.queries.createJudgement({

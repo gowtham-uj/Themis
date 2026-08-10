@@ -1,18 +1,14 @@
 /**
  * Report HTTP routes (P5b-api).
  *
- * Boots the real ApiServer on a temp dataDir. Seeds a completed run + judgement
- * and writes report.html into the judgement dir. OFFLINE — no real LLM.
+ * Boots the real API server, seeds completed persisted rows, and verifies the
+ * report HTTP surface. No agent or judge execution is involved.
  */
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  createFixtureAdapter,
-  createServer,
-  type ApiServer,
-} from "../src/api/server.ts";
+import { createServer, type ApiServer } from "../src/api/server.ts";
 import { judgementDir } from "../src/db/queries.ts";
 import {
   VERDICT_SCHEMA_VERSION,
@@ -143,79 +139,52 @@ async function http(
   return { status: res.status, headers: res.headers, text, json };
 }
 
-async function waitFor(
-  pred: () => boolean | Promise<boolean>,
-  opts: { timeoutMs?: number; intervalMs?: number } = {},
-): Promise<void> {
-  const timeoutMs = opts.timeoutMs ?? 15_000;
-  const intervalMs = opts.intervalMs ?? 25;
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (await pred()) return;
-    await new Promise((r) => setTimeout(r, intervalMs));
-  }
-  throw new Error("waitFor timed out");
-}
-
 async function boot(): Promise<{ api: ApiServer; base: string }> {
   const dataDir = await tempDataDir();
-  const adapter = createFixtureAdapter({
-    holdMs: 40,
-    messages: ["fixture-hello"],
-  });
-  const api = createServer({
-    dataDir,
-    adapter,
-    concurrency: 1,
-    startOpts: { timeoutMs: 15_000 },
-  });
+  const api = createServer({ dataDir });
   servers.push(api);
   const port = await api.listen(0);
   return { api, base: `http://127.0.0.1:${port}` };
 }
 
 async function seedCompletedRun(
-  base: string,
   api: ApiServer,
 ): Promise<{ projectId: string; taskId: string; runId: string }> {
-  const proj = await http(base, "POST", "/api/projects", {
-    body: { name: "ReportProj", slug: `report-${Date.now()}` },
+  const project = api.queries.createProject({
+    name: "ReportProj",
+    slug: `report-${Date.now()}`,
   });
-  expect(proj.status).toBe(201);
-  const projectId = (proj.json as { id: string }).id;
-
-  const taskRes = await http(base, "POST", `/api/projects/${projectId}/tasks`, {
-    body: {
-      name: "Report task",
-      prompt: "Do the thing",
-      workspace: { source: "empty" },
-      rubric: sampleRubric(),
-      profile: "bugfix",
-    },
+  const agent = api.queries.registerAgent({
+    id: `report-agent-${Date.now()}`,
+    displayName: "Report Agent",
   });
-  expect(taskRes.status).toBe(201);
-  const taskId = (taskRes.json as { id: string }).id;
-
-  const start = await http(base, "POST", `/api/projects/${projectId}/runs`, {
-    body: {
-      taskId,
-      agent: "fixture",
-      model: "fixture-model",
-      provider: "fixture",
-      repeats: 1,
-    },
+  const task = api.queries.createTask(project.id, {
+    name: "Report task",
+    prompt: "Do the thing",
+    workspace: { source: "empty" },
+    rubric: sampleRubric(),
+    profile: "bugfix",
   });
-  expect(start.status).toBe(202);
-  const runId = (start.json as { run_ids: string[] }).run_ids[0]!;
-
-  await waitFor(() => {
-    const r = api.queries.getRun(runId);
-    return r != null && (r.status === "completed" || r.status === "failed");
+  const batch = api.queries.createBatch({
+    taskId: task.id,
+    projectId: project.id,
+    agentId: agent.id,
+    model: "stored-model",
+    provider: "stored-provider",
+    repeats: 1,
   });
-
-  const run = api.queries.getRun(runId);
-  expect(run?.status).toBe("completed");
-  return { projectId, taskId, runId };
+  const run = api.queries.createRun({
+    id: `report-run-${Date.now()}`,
+    batchId: batch.id,
+    taskId: task.id,
+    projectId: project.id,
+    agentId: agent.id,
+    model: "stored-model",
+    provider: "stored-provider",
+    repeatIndex: 0,
+    status: "completed",
+  });
+  return { projectId: project.id, taskId: task.id, runId: run.id };
 }
 
 /**
@@ -246,7 +215,7 @@ async function seedCompletedJudgementWithReport(
 describe("Report routes (P5b-api)", () => {
   it("GET /api/runs/:id/report → 200 text/html with nosniff when report exists", async () => {
     const { api, base } = await boot();
-    const { projectId, runId } = await seedCompletedRun(base, api);
+    const { projectId, runId } = await seedCompletedRun(api);
     await seedCompletedJudgementWithReport(api, { runId, projectId });
 
     const res = await http(base, "GET", `/api/runs/${runId}/report`, {
@@ -264,7 +233,7 @@ describe("Report routes (P5b-api)", () => {
 
   it("GET /api/runs/:id/report?download=1 → Content-Disposition attachment", async () => {
     const { api, base } = await boot();
-    const { projectId, runId } = await seedCompletedRun(base, api);
+    const { projectId, runId } = await seedCompletedRun(api);
     await seedCompletedJudgementWithReport(api, { runId, projectId });
 
     const res = await http(
@@ -281,7 +250,7 @@ describe("Report routes (P5b-api)", () => {
 
   it("GET /api/runs/:id/report → 404 when run has no judgement", async () => {
     const { api, base } = await boot();
-    const { runId } = await seedCompletedRun(base, api);
+    const { runId } = await seedCompletedRun(api);
 
     const res = await http(base, "GET", `/api/runs/${runId}/report`, {
       raw: true,
@@ -291,7 +260,7 @@ describe("Report routes (P5b-api)", () => {
 
   it("GET /api/judgements/:id/report → 200 text/html; 404 if missing", async () => {
     const { api, base } = await boot();
-    const { projectId, runId } = await seedCompletedRun(base, api);
+    const { projectId, runId } = await seedCompletedRun(api);
     const { judgementId } = await seedCompletedJudgementWithReport(api, {
       runId,
       projectId,
@@ -338,7 +307,7 @@ describe("Report routes (P5b-api)", () => {
 
   it("GET /api/judgements/:id/report?download=1 sets judgement filename", async () => {
     const { api, base } = await boot();
-    const { projectId, runId } = await seedCompletedRun(base, api);
+    const { projectId, runId } = await seedCompletedRun(api);
     const { judgementId } = await seedCompletedJudgementWithReport(api, {
       runId,
       projectId,

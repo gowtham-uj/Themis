@@ -28,7 +28,11 @@
  *    agent. `npm install` creating 12,000 files must not read as agent work.
  */
 
-import type { ContainerRuntime, RunContainerSpec } from "./runtime.js";
+import type {
+  ContainerHandle,
+  ContainerRuntime,
+  RunContainerSpec,
+} from "./runtime.js";
 
 /** Whether the eval starts from scratch or from an existing codebase. */
 export type EnvKind = "greenfield" | "brownfield";
@@ -66,6 +70,10 @@ export interface EvalEnvSpec {
   cleanupScript?: string;
   /** Seconds the cleanup script may run before it is killed. */
   cleanupTimeoutSec?: number;
+  /** Post-cleanup assertion; non-zero marks the queue container tainted. */
+  cleanupVerifyScript?: string;
+  /** Seconds the cleanup verification may run. */
+  cleanupVerifyTimeoutSec?: number;
 }
 
 /** Result of provisioning, recorded as run provenance. */
@@ -142,6 +150,21 @@ export function parseEvalEnvSpec(v: unknown): EvalEnvSpec | undefined {
   const ct =
     typeof cleanupTimeout === "number" ? cleanupTimeout : Number(cleanupTimeout);
   if (Number.isFinite(ct) && ct > 0) out.cleanupTimeoutSec = Math.floor(ct);
+
+  const cleanupVerify =
+    o.cleanupVerifyScript ?? o.cleanup_verify_script ?? o.cleanupVerify;
+  if (typeof cleanupVerify === "string" && cleanupVerify.trim()) {
+    out.cleanupVerifyScript = cleanupVerify;
+  }
+  const cleanupVerifyTimeout =
+    o.cleanupVerifyTimeoutSec ?? o.cleanup_verify_timeout_sec;
+  const cvt =
+    typeof cleanupVerifyTimeout === "number"
+      ? cleanupVerifyTimeout
+      : Number(cleanupVerifyTimeout);
+  if (Number.isFinite(cvt) && cvt > 0) {
+    out.cleanupVerifyTimeoutSec = Math.floor(cvt);
+  }
 
   return out;
 }
@@ -325,6 +348,65 @@ export async function provisionEnv(
   return result;
 }
 
+/** Run eval setup through exec in an already-live queue container. */
+export async function provisionEnvInContainer(
+  handle: ContainerHandle,
+  spec: EvalEnvSpec,
+  workspaceDir: string,
+): Promise<ProvisionResult> {
+  const started = Date.now();
+  const commitBaseline = spec.commitBaseline !== false;
+  if (!spec.setupScript && !commitBaseline) {
+    return {
+      kind: spec.kind,
+      ran: false,
+      exitCode: null,
+      log: "",
+      durationMs: 0,
+      baselineCommit: null,
+      error: null,
+    };
+  }
+  const timeoutMs = (spec.setupTimeoutSec ?? DEFAULT_SETUP_TIMEOUT_SEC) * 1000;
+  const exec = await handle.exec({
+    argv: buildSetupCommand(spec, { commitBaseline }),
+    cwd: WORKSPACE,
+    env: { ...(spec.setupEnv ?? {}) },
+    timeoutMs,
+    maxOutputBytes: MAX_LOG_BYTES,
+  });
+  const log = `${exec.stdout}${exec.stderr}`;
+  const lines = log.trimEnd().split("\n");
+  const lastLine = lines[lines.length - 1]?.trim() ?? "";
+  let baselineCommit =
+    commitBaseline && /^[0-9a-f]{40}$/.test(lastLine) ? lastLine : null;
+  const result: ProvisionResult = {
+    kind: spec.kind,
+    ran: true,
+    exitCode: exec.exitCode,
+    log: truncateLog(log),
+    durationMs: exec.durationMs || Date.now() - started,
+    baselineCommit,
+    error: null,
+  };
+  if (exec.timedOut) {
+    result.error = `setup script timed out after ${timeoutMs}ms`;
+    throw new ProvisionError(result.error, result);
+  }
+  if (exec.exitCode !== 0) {
+    result.error = `setup script failed with exit code ${exec.exitCode}`;
+    throw new ProvisionError(result.error, result);
+  }
+  if (commitBaseline && lastLine === NO_GIT_MARKER) {
+    baselineCommit = await takeBaselineOnHost(workspaceDir);
+    result.baselineCommit = baselineCommit;
+    result.log = truncateLog(
+      log.split("\n").filter((line) => line.trim() !== NO_GIT_MARKER).join("\n"),
+    );
+  }
+  return result;
+}
+
 /**
  * Commit the provisioned tree as the baseline, on the host.
  *
@@ -455,4 +537,80 @@ export async function cleanupEnv(
       error: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+/** Run cleanup in the queue's existing container. */
+export async function cleanupEnvInContainer(
+  handle: ContainerHandle,
+  spec: EvalEnvSpec,
+): Promise<CleanupResult> {
+  if (!spec.cleanupScript) {
+    return { ran: false, exitCode: null, log: "", durationMs: 0, error: null };
+  }
+  const timeoutMs =
+    (spec.cleanupTimeoutSec ?? DEFAULT_CLEANUP_TIMEOUT_SEC) * 1000;
+  const started = Date.now();
+  try {
+    const result = await handle.exec({
+      argv: ["sh", "-c", `cd ${WORKSPACE}\n${spec.cleanupScript}`],
+      cwd: WORKSPACE,
+      timeoutMs,
+      maxOutputBytes: MAX_LOG_BYTES,
+    });
+    return {
+      ran: true,
+      exitCode: result.exitCode,
+      log: truncateLog(`${result.stdout}${result.stderr}`),
+      durationMs: result.durationMs || Date.now() - started,
+      error: result.timedOut
+        ? `cleanup script timed out after ${timeoutMs}ms`
+        : result.exitCode !== 0
+          ? `cleanup script exited ${result.exitCode}`
+          : null,
+    };
+  } catch (err) {
+    return {
+      ran: true,
+      exitCode: null,
+      log: "",
+      durationMs: Date.now() - started,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export interface CleanupVerificationResult {
+  ran: boolean;
+  exitCode: number | null;
+  log: string;
+  durationMs: number;
+  error: string | null;
+}
+
+/** Verify cleanup before a persistent queue container advances to the next eval. */
+export async function verifyCleanupInContainer(
+  handle: ContainerHandle,
+  spec: EvalEnvSpec,
+): Promise<CleanupVerificationResult> {
+  if (!spec.cleanupVerifyScript) {
+    return { ran: false, exitCode: null, log: "", durationMs: 0, error: null };
+  }
+  const timeoutMs = (spec.cleanupVerifyTimeoutSec ?? 60) * 1000;
+  const result = await handle.exec({
+    argv: ["sh", "-c", `cd ${WORKSPACE}\n${spec.cleanupVerifyScript}`],
+    cwd: WORKSPACE,
+    timeoutMs,
+    maxOutputBytes: MAX_LOG_BYTES,
+  });
+  return {
+    ran: true,
+    exitCode: result.exitCode,
+    log: truncateLog(`${result.stdout}${result.stderr}`),
+    durationMs: result.durationMs,
+    error: result.timedOut
+      ? `cleanup verification timed out after ${timeoutMs}ms`
+      : result.exitCode !== 0
+        ? `cleanup verification exited ${result.exitCode}`
+        : null,
+  };
 }

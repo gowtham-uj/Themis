@@ -1,10 +1,10 @@
 # LLM Judge Subsystem
 
-The judge is a **decoupled, repeatable** grading step. It is itself an **agent** — the **opencode**
-coding agent, run with its **system prompt replaced** by our judge prompt and equipped with a set of
-**custom judge tools** — with swappable provider/model. It ingests a completed run's immutable logs +
-the task rubric, grades the run, streams its own reasoning to a **live judge log** in the UI, and
-emits a polished **HTML report**.
+The judge is a **decoupled, repeatable** grading step. It is itself a **PI agent**, embedded through
+PI's SDK with its **system prompt replaced** by our versioned judge prompt and equipped only with our
+**custom judge tools**. Provider/model selection is swappable. It ingests immutable eval archives and
+the task rubric, grades one run or an entire queue in one agent session, persists its own full PI event
+trace, and emits validated verdict data from which the platform renders a polished **HTML report**.
 
 ## What the judge produces (three layers of feedback)
 
@@ -28,21 +28,21 @@ log; scores and diagnostics are the trend signal. Verdict shape and the judge's 
 [rubric.md §6–7](rubric.md). This three-layer design is what stops the platform from being "just a
 numbering machine": the queryable data is defects-with-locations, not scores-with-boolean-flags.
 
-## Why an agent (opencode) as the judge, not a one-shot LLM call
+## Why a PI agent as the judge, not a one-shot LLM call
 
 - **Judging a trajectory needs tools, not one prompt.** A coding run can touch dozens of files and a
-  long trace that won't fit in one context. An agentic judge *inspects* — it reads the diff, greps the
-  workspace snapshot, opens specific log slices, and runs sanctioned checks — exactly the
-  "Agent-as-a-Judge" pattern that outperforms outcome-only judging (see [rubric.md](rubric.md)).
-- **opencode as the engine**: a mature coding agent with a **custom-agent** mechanism (own system
-  prompt, own model, own restricted toolset), first-class **custom tools / MCP**, a **headless run**
-  mode plus a **server + SDK** event stream, and **swappable providers/models** — everything the judge
-  needs. Concrete integration surface (system-prompt replacement, custom-tool registration, event
-  capture, model swap) is specified in **[judge-engine.md](judge-engine.md)**.
-- **Its own trace is captured** in the same canonical schema as agent runs, so the judge log renders
-  in the same UI and is itself auditable.
-- Different engine from the agents-under-eval (ReaperCode, pi) → the measurer and the measured don't
-  share a codebase.
+  long trace that won't fit in one context. An agentic judge *inspects* — it lists immutable archive
+  files, reads exact byte ranges, reconstructs the trajectory, and submits only after required
+  evidence coverage is complete.
+- **PI SDK as the engine**: the server replaces PI's system prompt with the versioned custom judge
+  prompt, disables built-in tools/extensions/skills/context discovery, registers only the platform's
+  evidence and terminating submission tools, chooses a real configured provider/model, and captures
+  every PI session event plus the final transcript.
+- **One versatile host** supports single-eval and queue-wide judging by supplying different custom tool
+  sets and user payloads. The queue form uses one PI session for every selected immutable archive and
+  emits exactly one Verdict per eval plus cross-eval analysis.
+- The judge is auditable and decoupled: re-judging creates a new revision over byte-identical archives
+  without rerunning the agent under evaluation.
 
 ## Inputs to a judgement
 

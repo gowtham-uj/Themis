@@ -2,11 +2,7 @@
  * Bridge DB runs → P2 RunController + NetworkCutoff (in-process worker).
  *
  * P3 keeps live runs in memory; P8 replaces this with a real worker/queue.
- * In this Dockerless env every run executes via {@link FakeContainerRuntime}.
- *
- * Test seam: pass `{ adapter }` (or set via {@link setDefaultAdapter}) so tests
- * can inject a fixture adapter that yields a couple of events then exits
- * promptly — never hit a real model.
+ * Every run executes through a real OCI container backend; Podman is default.
  *
  * Spec: plan/api.md (run control), plan/execution.md (run lifecycle).
  */
@@ -15,15 +11,20 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Adapter, RunContext } from "../adapters/types.js";
 import { getAdapter } from "../adapters/index.js";
+import { createDeclarativeAdapter } from "../adapters/declarative.js";
 import type { DbQueries, Run } from "../db/queries.js";
 import type { CanonicalEvent, RunStatus as EventRunStatus } from "../schema/events.js";
 import { appendEvent } from "../schema/append.js";
 import { RunController, type ControlState } from "../runner/control.js";
-import { FakeContainerRuntime } from "../runner/fake-runtime.js";
 import { NetworkCutoff } from "../runner/network-control.js";
-import { redactEvent } from "../runner/redact.js";
 import { prepareWorkspace, ensureGitRepo } from "../runner/workspace.js";
-import type { ContainerHandle, ContainerRuntime } from "../runner/runtime.js";
+import {
+  resolveRuntime,
+  type ContainerExecResult,
+  type ContainerExecSpec,
+  type ContainerHandle,
+  type ContainerRuntime,
+} from "../runner/runtime.js";
 import { runChecks } from "../runner/check-runner.js";
 import { captureDiff } from "../runner/diff.js";
 import {
@@ -117,6 +118,10 @@ export interface LiveRun {
   controller: RunController;
   network: NetworkCutoff;
   handle: ContainerHandle;
+  /** Execute inside this exact live container and append an operator exec event. */
+  exec(spec: ContainerExecSpec): Promise<ContainerExecResult>;
+  /** False once agent execution has ended and final diff capture has begun. */
+  acceptingExec: boolean;
   /** Promise that resolves when the run finishes (success or abort). */
   done: Promise<void>;
   /** True once finalize has written terminal status to the DB. */
@@ -139,11 +144,6 @@ export interface OutboundWebhookEmitter {
 
 /** Options for {@link startRun}. */
 export interface StartRunOptions {
-  /**
-   * Inject a fixture adapter for tests. Prefer this over real pi/reaper so
-   * tests stay fast + deterministic (no model calls).
-   */
-  adapter?: Adapter;
   /**
    * Container backend for this run. Any {@link ContainerRuntime} — the fake
    * (tests), or a real one such as PodmanRuntime. Defaults to the fake.
@@ -182,21 +182,6 @@ export function createLiveRunsMap(): LiveRunsMap {
   return new Map();
 }
 
-/** Process-wide default adapter override (tests). Cleared with undefined. */
-let defaultAdapter: Adapter | undefined;
-
-/**
- * Set a process-default adapter used when startRun is not given one.
- * Tests should call `setDefaultAdapter(fixture)` in beforeAll and clear after.
- */
-export function setDefaultAdapter(adapter: Adapter | undefined): void {
-  defaultAdapter = adapter;
-}
-
-export function getDefaultAdapter(): Adapter | undefined {
-  return defaultAdapter;
-}
-
 /** On-disk dir for a run: `<dataDir>/projects/<pid>/runs/<rid>`. */
 export function runDirPath(dataDir: string, projectId: string, runId: string): string {
   return join(dataDir, "projects", projectId, "runs", runId);
@@ -213,6 +198,9 @@ function collectApiKeys(): Record<string, string> {
     "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY",
     "MINIMAX_API_KEY",
+    "NEURALWATT_API_KEY",
+    "NURALWATT_API_KEY",
+    "NURALWATT_BASE_URL",
     "ANTHROPIC_BASE_URL",
   ]) {
     const v = process.env[name];
@@ -225,12 +213,9 @@ function collectApiKeys(): Record<string, string> {
 }
 
 /**
- * Start a previously-created DB run: prepare workspace, launch via
- * FakeContainerRuntime, stream redacted events to events.jsonl, and register
- * the RunController in `liveRuns`.
- *
- * Marks the run as executing via FakeContainerRuntime in this Dockerless env.
- * Returns the live entry (also stored in the map).
+ * Start a previously-created DB run: prepare workspace, launch through the
+ * configured real container runtime, stream events to events.jsonl,
+ * and register the RunController in `liveRuns`.
  */
 export async function startRun(
   dataDir: string,
@@ -259,9 +244,21 @@ export async function startRun(
   await mkdir(runDir, { recursive: true });
   await mkdir(workspaceDir, { recursive: true });
 
-  // Resolve adapter: explicit opt > process default > registry by agentId.
-  const adapter: Adapter =
-    opts.adapter ?? defaultAdapter ?? getAdapter(run.agentId);
+  // Resolve the project's one real CLI agent adapter, falling back to a
+  // built-in adapter only when the project has not created a declarative one.
+  const projectAdapter = queries.getProjectAgentAdapterByAgentId(
+    run.projectId,
+    run.agentId,
+  );
+  const configuredAdapters = queries.listProjectAgentAdapters(run.projectId, {
+    includeDisabled: true,
+  });
+  if (configuredAdapters.length > 0 && (!projectAdapter || !projectAdapter.enabled)) {
+    throw new Error(`run ${run.id} does not use the project's enabled agent adapter`);
+  }
+  const adapter: Adapter = projectAdapter
+    ? createDeclarativeAdapter(projectAdapter)
+    : getAdapter(run.agentId);
 
   // Prepare the workspace.
   //
@@ -297,7 +294,7 @@ export async function startRun(
     await ensureGitRepo(workspaceDir);
   }
 
-  const runtime = opts.runtime ?? new FakeContainerRuntime();
+  const runtime = opts.runtime ?? resolveRuntime();
 
   // ---- eval environment ----
   // The eval declares what it needs (greenfield scaffold or brownfield repo
@@ -392,7 +389,7 @@ export async function startRun(
         agent: adapter.id,
         model: run.model,
         provider: run.provider,
-        runtime: "FakeContainerRuntime",
+        runtime: runtime.constructor.name,
         workspace: {
           dir: workspaceDir,
           source: task.workspace.source,
@@ -421,14 +418,19 @@ export async function startRun(
 
   let handle: ContainerHandle;
   let nextSeq = 0;
+  let recordTail: Promise<void> = Promise.resolve();
 
-  const record = async (event: CanonicalEvent): Promise<void> => {
-    let e = event;
-    if (e.seq <= nextSeq - 1 && nextSeq > 0) {
-      e = { ...e, seq: nextSeq };
-    }
-    nextSeq = e.seq + 1;
-    await appendEvent(eventsPath, redactEvent(e));
+  // Adapter output and operator introspection can arrive concurrently. Serialize
+  // assignment + append so events.jsonl remains monotonic and append-only.
+  const record = (event: CanonicalEvent): Promise<void> => {
+    const write = recordTail.then(async () => {
+      let e = event;
+      if (e.seq < nextSeq) e = { ...e, seq: nextSeq };
+      nextSeq = e.seq + 1;
+      await appendEvent(eventsPath, e);
+    });
+    recordTail = write.catch(() => undefined);
+    return write;
   };
 
   // Emit harness-owned run.start.
@@ -510,6 +512,7 @@ export async function startRun(
     nextSeq,
   });
 
+  const activeExecs = new Set<Promise<ContainerExecResult>>();
   const live: LiveRun = {
     runId,
     projectId,
@@ -520,6 +523,37 @@ export async function startRun(
     controller,
     network,
     handle,
+    acceptingExec: true,
+    exec(spec) {
+      if (!live.acceptingExec || live.finished) {
+        throw Object.assign(
+          new Error(`run ${runId} is no longer accepting container exec`),
+          { code: "NOT_LIVE" },
+        );
+      }
+      const startedAt = Date.now();
+      const execution = (async () => {
+        const result = await handle.exec(spec);
+        await record({
+          v: 1,
+          runId,
+          seq: -1,
+          ts: new Date().toISOString(),
+          type: "exec",
+          actor: "operator",
+          source: "introspection",
+          argv: [...spec.argv],
+          cwd: spec.cwd ?? "/workspace",
+          user: "container-default",
+          exitCode: result.timedOut ? null : result.exitCode,
+          durationMs: result.durationMs || Date.now() - startedAt,
+        });
+        return result;
+      })();
+      activeExecs.add(execution);
+      void execution.finally(() => activeExecs.delete(execution)).catch(() => undefined);
+      return execution;
+    },
     finished: false,
     done: Promise.resolve(),
   };
@@ -546,6 +580,12 @@ export async function startRun(
           // Keep controller's nextSeq roughly in sync for abort error events.
         }
       }
+
+      // Close the bridge before final capture, then wait for every command that
+      // was accepted while the agent was live. This prevents a command racing
+      // diff capture or continuing after container teardown.
+      live.acceptingExec = false;
+      await Promise.allSettled([...activeExecs]);
 
       // Capture diff best-effort.
       let diffPath: string | undefined;
@@ -645,6 +685,8 @@ export async function startRun(
         await notifyRunFinalized(opts, queries, runId, projectId, status);
       }
     } catch (err) {
+      live.acceptingExec = false;
+      await Promise.allSettled([...activeExecs]);
       const message = err instanceof Error ? err.message : String(err);
       try {
         await record({
@@ -685,6 +727,7 @@ export async function startRun(
       emitRunCompletedHook(opts.outboundWebhooks, queries, runId, projectId, "failed");
       await notifyRunFinalized(opts, queries, runId, projectId, "failed");
     } finally {
+      live.acceptingExec = false;
       try {
         await handle.remove();
       } catch {
@@ -773,6 +816,7 @@ export async function abortRun(
   const projectId = run.projectId;
   const live = liveRuns.get(runId);
   if (live) {
+    live.acceptingExec = false;
     // Mark aborting in DB first so concurrent readers see it.
     queries.updateRunControlState(runId, {
       controlState: "aborting",
@@ -866,82 +910,3 @@ export function resolveDiffPath(
   return join(runDirPath(dataDir, projectId, runId), "diff.patch");
 }
 
-/**
- * Build a minimal fixture adapter for tests.
- * Yields a `log` event (and optional extras) then exits via a short node -e.
- *
- * Documented test seam: pass the result to createServer({ adapter }) or
- * startRun(..., { adapter }).
- */
-export function createFixtureAdapter(
-  opts: {
-    id?: string;
-    /** Extra stdout lines the fake process prints (parsed as log messages). */
-    messages?: string[];
-    /** Exit code of the child process. */
-    exitCode?: number;
-    /** Hold the process open for N ms (for pause/abort tests). */
-    holdMs?: number;
-  } = {},
-): Adapter {
-  const id = opts.id ?? "fixture";
-  const messages = opts.messages ?? ["fixture-hello"];
-  const exitCode = opts.exitCode ?? 0;
-  const holdMs = opts.holdMs ?? 50;
-
-  // Encode messages as JSON lines on stdout so parse() can pick them up.
-  const stdoutScript = [
-    ...messages.map(
-      (m) => `process.stdout.write(${JSON.stringify(m + "\\n")});`,
-    ),
-    holdMs > 0
-      ? `await new Promise(r => setTimeout(r, ${holdMs}));`
-      : "",
-    `process.exit(${exitCode});`,
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  return {
-    id,
-    image: () => "agenteval/fixture:test",
-    command: () => ({
-      argv: ["node", "--input-type=module", "-e", stdoutScript],
-      env: {},
-    }),
-    async *parse(streams, ctx) {
-      // Drain stdout into log events; ignore stderr.
-      let seq = 1;
-      let buf = "";
-      for await (const chunk of streams.stdout) {
-        buf += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-        let idx: number;
-        while ((idx = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, idx);
-          buf = buf.slice(idx + 1);
-          if (!line) continue;
-          yield {
-            v: 1 as const,
-            runId: ctx.runId,
-            seq: seq++,
-            ts: new Date().toISOString(),
-            type: "log" as const,
-            level: "info" as const,
-            message: line,
-          };
-        }
-      }
-      if (buf.trim()) {
-        yield {
-          v: 1 as const,
-          runId: ctx.runId,
-          seq: seq++,
-          ts: new Date().toISOString(),
-          type: "log" as const,
-          level: "info" as const,
-          message: buf.trim(),
-        };
-      }
-    },
-  };
-}

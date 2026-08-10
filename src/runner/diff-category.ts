@@ -26,7 +26,6 @@ import {
   type CaptureDiffOptions,
   type CaptureDiffResult,
 } from "./diff.js";
-import { redactString } from "./redact.js";
 
 /** What "the diff" means for a category. */
 export type DiffKind = "git" | "outputs" | "none";
@@ -51,7 +50,7 @@ export const AGENT_CATEGORIES: readonly AgentCategory[] = [
 
 /** One entry in an outputs-kind manifest. */
 export interface OutputManifestEntry {
-  /** Path relative to the outputs directory (redacted if secret-looking). */
+  /** Path relative to the outputs directory. */
   path: string;
   /** Lowercase hex sha256 of file contents. */
   sha256: string;
@@ -195,11 +194,7 @@ export async function captureDiffByCategory(
   return captureOutputsManifest(workspaceDir, opts);
 }
 
-/**
- * Walk `outputsDir`, sha256 every regular file, write `outputs-manifest.json`.
- * Paths containing secret-looking segments (token/secret/key/cred) are
- * redacted via {@link redactString} before being recorded.
- */
+/** Walk `outputsDir`, hash every regular file, and write the exact manifest. */
 export async function captureOutputsManifest(
   workspaceDir: string,
   opts: CaptureDiffByCategoryOptions = {},
@@ -217,7 +212,7 @@ export async function captureOutputsManifest(
       if (!st.isFile()) continue;
       const sha256 = await sha256File(abs);
       entries.push({
-        path: redactManifestPath(rel),
+        path: rel,
         sha256,
         sizeBytes: st.size,
       });
@@ -266,31 +261,6 @@ function resolveManifestPath(
     return resolve(opts.outPath);
   }
   return join(workspaceDir, "outputs-manifest.json");
-}
-
-/**
- * Redact a manifest path when it looks secret-bearing.
- * Segments containing token / secret / key / cred are run through
- * {@link redactString}; the path structure is otherwise preserved.
- *
- * Documented minor policy (plan P2c): keep simple — only path *names* that
- * smell like secrets are scrubbed, not every path.
- */
-export function redactManifestPath(path: string): string {
-  // Split on / and scrub any segment that looks secret-ish.
-  return path
-    .split("/")
-    .map((seg) => {
-      if (/token|secret|key|cred/i.test(seg)) {
-        // Prefer a clear placeholder over pattern-matching the whole filename
-        // (which may not look like a secret *value*).
-        const scrubbed = redactString(seg);
-        if (scrubbed !== seg) return scrubbed;
-        return "[REDACTED:secret]";
-      }
-      return seg;
-    })
-    .join("/");
 }
 
 async function listFilesRecursive(dir: string): Promise<string[]> {

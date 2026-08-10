@@ -58,6 +58,23 @@ export interface AdapterCommand {
   env: Record<string, string>;
 }
 
+/** Real provider/model connectivity probe executed through the supported agent. */
+export interface AdapterConnectionCheck {
+  command: AdapterCommand;
+  /** Working directory inside the queue container. Default `/workspace`. */
+  cwd?: string;
+  /** Probe timeout in milliseconds. Default 60 seconds. */
+  timeoutMs?: number;
+}
+
+/** Native agent evidence locations copied after each eval. */
+export interface AdapterEvidenceSpec {
+  /** Paths relative to `/workspace`; files or directories are accepted. */
+  paths: string[];
+  /** Paths that must exist for evidence extraction to be considered complete. */
+  requiredPaths?: string[];
+}
+
 /**
  * Turns a task + run config into a stream of canonical events.
  * Everything downstream is agent-agnostic.
@@ -66,8 +83,16 @@ export interface Adapter {
   id: "reapercode" | "pi" | string;
   /** Docker image this adapter runs the agent in. */
   image(ctx: RunContext): string;
-  /** argv + env to launch the agent headlessly. */
+  /**
+   * Configure and invoke a real connectivity probe through this agent using the
+   * selected provider/model. A successful process must also yield a real model
+   * message when parsed; the queue worker enforces both conditions.
+   */
+  connectionCheck(ctx: RunContext): AdapterConnectionCheck;
+  /** argv + env to launch the agent headlessly for the eval prompt. */
   command(ctx: RunContext): AdapterCommand;
+  /** Declare where this agent stores native trajectories/logs in the workspace. */
+  evidence(ctx: RunContext): AdapterEvidenceSpec;
   /**
    * Consume the agent's stdout/stderr (and/or a mounted trajectory file) and
    * yield canonical events. The runner handles persistence, SSE, and diff.

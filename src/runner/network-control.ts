@@ -8,16 +8,15 @@
  * restart the container: flipping the flag refuses new outbound connections at
  * the edge and models killing in-flight ones.
  *
- * Integration contract for FakeContainerRuntime (P2a) and any real runtime:
+ * Integration contract for live container runtimes:
  * before allowing a network attempt, the runtime calls
  * {@link NetworkCutoffController.isBlocked} (or consults
  * {@link NetworkCutoffController.policyFor} with the static policy). When
  * blocked, the attempt must not leave the container and should be reported to
  * the exec/net recorder as `net{blocked:true, blockedReason:"live-cutoff"}`.
  *
- * The interface is exported from this module so consumers (e.g. the fake
- * runtime) can depend on the contract without a circular import on the
- * concrete class.
+ * The interface is exported so runtime and API layers can share the contract
+ * without a circular import on the concrete class.
  */
 
 /** Static per-task network policy (distinct from live cutoff). */
@@ -25,8 +24,7 @@ export type StaticNetworkPolicy = "allow" | "allowlist" | "offline";
 
 /**
  * Seam the container runtime checks before allowing egress.
- * Implemented by {@link NetworkCutoff}; held by FakeContainerRuntime without
- * importing the concrete class if needed.
+ * Implemented by {@link NetworkCutoff} without coupling callers to its class.
  */
 export interface NetworkCutoffController {
   /** True when live cutoff is active (egress disabled). */

@@ -2,29 +2,29 @@
  * Global adapter registry. Projects refine adapters via overrides (plan/projects.md).
  */
 
-import { browserStubAdapter } from "./browser-stub.js";
 import { piAdapter } from "./pi.js";
 import { reaperCodeAdapter } from "./reapercode.js";
 import type { Adapter } from "./types.js";
 
-export type { Adapter, AdapterCommand, AdapterOverrides, AgentStreams, ProjectRef, RunContext, WorkspaceSpec } from "./types.js";
+export type {
+  Adapter,
+  AdapterCommand,
+  AdapterConnectionCheck,
+  AdapterEvidenceSpec,
+  AdapterOverrides,
+  AgentStreams,
+  ProjectRef,
+  RunContext,
+  WorkspaceSpec,
+} from "./types.js";
 export { piAdapter } from "./pi.js";
 export { reaperCodeAdapter, ADAPTER_STATUS as REAPER_ADAPTER_STATUS } from "./reapercode.js";
-export {
-  browserStubAdapter,
-  collectBrowserStubEvents,
-  defaultBrowserScript,
-  scriptedBrowserEvents,
-} from "./browser-stub.js";
-export type { BrowserStubAction } from "./browser-stub.js";
-
 const REGISTRY: Map<string, Adapter> = new Map();
 
 function registerDefaults(): void {
   if (REGISTRY.size > 0) return;
   REGISTRY.set(piAdapter.id, piAdapter);
   REGISTRY.set(reaperCodeAdapter.id, reaperCodeAdapter);
-  REGISTRY.set(browserStubAdapter.id, browserStubAdapter);
 }
 
 /** Look up a registered adapter by id. Throws if unknown. */

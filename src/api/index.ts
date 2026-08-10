@@ -4,7 +4,6 @@
 
 export {
   createServer,
-  createFixtureAdapter,
   createLiveRunsMap,
   isTerminalStatus,
   startRun,

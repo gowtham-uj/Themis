@@ -92,6 +92,8 @@ model-pricing table.
 ### exec  (a command the sandbox executed — instrumented, not model-authored)
 ```ts
 { type: "exec", turn?: number,
+  actor?: "agent"|"operator"|"harness", // initiator; absent on legacy events
+  source?: "instrumentation"|"introspection", // capture channel
   argv: string[],                       // the exact argv as exec'd in the sandbox
   cwd: string,                         // working dir inside the container
   user: string,                        // uid/name it ran as (sanity: must be the non-root sandbox user)
@@ -101,9 +103,10 @@ model-pricing table.
   blockedReason?: string }             // why, if blocked
 ```
 Captured by the sandbox's **exec instrumentation** (see [execution.md](execution.md)), not by the agent.
-This is the ground truth of *what the agent actually ran* — distinct from `tool.call` (what the agent
-*asked* a tool to do). It is indexed and addressable as `refs{kind:"trace",...}` so a finding can point
-at the exact command (e.g. a `rm -rf` an agent slipped in).
+Operator commands sent through the live bash bridge use `actor:"operator",source:"introspection"` so the
+judge can distinguish an intervention from agent behavior. This is the ground truth of *what actually
+ran* — distinct from `tool.call` (what the agent *asked* a tool to do). It is indexed and addressable as
+`refs{kind:"trace",...}` so a finding can point at the exact command.
 
 ### net  (an outbound network call the sandbox made — instrumented)
 ```ts

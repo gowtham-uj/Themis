@@ -1,34 +1,34 @@
 # Execution & Sandbox
 
-Every agent run and every judge run executes inside a **Docker container**. Rationale: agents run
-arbitrary shell/code, and reproducibility requires a pinned environment.
+Every evaluated agent executes as a real CLI inside a queue-owned persistent **Podman container**.
+Rationale: agents run arbitrary shell/code, and reproducibility requires a pinned source commit, image,
+provider/model, and adapter contract.
 
-## Why Docker-per-run (recap)
+## Queue-owned container model
 
-- **Safety**: arbitrary code shouldn't touch the host on a shared, few-users box.
-- **Reproducibility**: pinned base image + pinned repo commit + recorded model/params → comparable
-  runs, which is what makes "regressed vs progressed" meaningful.
-- **Parallelism & cleanup**: isolated containers run concurrently and tear down cleanly.
-
-## Container model
-
-- **One container per run.** Start simple (cold start per run); optimize later with a warm pool or
-  prebuilt images if startup latency matters.
-- **Images**:
-  - `agenteval/reapercode:<ver>` — Node 22 + ReaperCode built in.
-  - `agenteval/pi:<ver>` — Node + `@earendil-works/pi-coding-agent`.
-  - `agenteval/judge:<ver>` — pi + the report-generation skill mounted (see [judge.md](judge.md)).
-  - Base tooling image with git, common language runtimes for workspaces (extend per task later).
-- **Mounts**:
-  - Run: the run's **workspace dir** → `/workspace` (read-write).
-  - Judge: the run's log dir → `/logs` (**read-only**) + the report skill (read-only).
-- **Hardening**: non-root user, `--cpus`, `--memory`, `--pids-limit`, `--read-only` root fs where
-  feasible with a writable `/workspace` + `/tmp`, drop capabilities, no host mounts beyond the above.
-- **Network**: default allow (agents install deps). Optional per-task allowlist / offline mode
-  (`PI_OFFLINE`, npm cache) for stricter, more reproducible runs.
-- **Secrets**: API keys injected as env at `docker run` (never baked into images, never written to
-  `events.jsonl` — redaction pass on ingest).
-- **Timeouts**: hard wall-clock per run; on expiry → SIGTERM then SIGKILL, `run.end.status:"timeout"`.
+- A project is bound to one CLI agent adapter and may define many queues.
+- **One persistent container per active queue.** That container runs the queue's ordered evals one at a
+  time. Different queues provide parallelism. No eval spins up its own container.
+- The adapter's git source + Containerfile are built through the API with real Podman; build provenance
+  records source commit and image id.
+- `/workspace` is one host bind mount reused by that queue. It is reset between evals only after all
+  evidence has been copied and the eval archive is sealed.
+- The queue first runs the adapter's real provider/model connection check. A non-zero exit, timeout,
+  fatal event, or absence of a model message stops the queue before setup.
+- Each eval executes: workspace prep → setup + baseline → real CLI agent → live raw/canonical capture →
+  native evidence extraction + checks → cleanup → cleanup verification → residual-process kill → root
+  workspace reset → immutable content-hash archive.
+- Cleanup, required-evidence, reset, or archive failure marks the queue tainted and preserves the live
+  container for operator inspection; the next eval never starts in a contaminated workspace.
+- Completed queue containers remain alive and count against the live-container cap until explicitly
+  stopped. Introspection never implicitly spawns or restarts them.
+- Queue launch applies pinned image, cpu/pid limits, network policy, ports, mounts, capabilities,
+  devices, tmpfs, and other project sandbox controls through `ContainerRuntime`.
+- API keys are injected only into the real agent command environment and are not baked into images.
+  Redaction is intentionally deferred; traces and artifacts are currently stored verbatim.
+- Agent exec sessions have hard timeouts and can be stopped without stopping the queue container.
+- The privileged introspection endpoint executes `/bin/bash -lc` as root and streams exact stdout/stderr
+  bytes in a channel-framed HTTP response.
 
 ## Workspace sourcing + diff capture (category-aware)
 
@@ -95,6 +95,12 @@ Exposed as run-control actions (same surface as pause/resume/abort, [api.md](api
   partial logs. A runaway loop consuming all memory is observable (the `exec`/`usage` telemetry) and
   stoppable before it OOMs the host.
 - **Pause/resume** (already specced) and **abort** — as in the run-control section below.
+- **Live bash introspection** — execute a bounded command through `ContainerHandle.exec` in the exact
+  already-running eval container. There is one agent container per run/attempt, so parallel project
+  evals expose multiple independently-addressed containers by `run_id`. The API never creates a
+  replacement when no container is alive: absent/queued/terminal runs return 409, and a project with
+  multiple live containers requires an explicit run id. Commands accepted before agent exit finish
+  before diff capture; no new command is accepted once finalization starts.
 - **eBPF-backed** where available (cgroup + `tc`/`nftables` for net, `cgroup freezer` for pause), so
   control is enforced by the kernel, not cooperatively by the agent.
 

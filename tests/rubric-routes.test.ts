@@ -6,17 +6,13 @@
  * with the same version-bump-on-semantic-edit rule as task rubrics
  * (plan/rubric.md).
  *
- * Boots the real ApiServer. OFFLINE.
+ * Boots the real API server; no agent or judge execution is involved.
  */
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  createFixtureAdapter,
-  createServer,
-  type ApiServer,
-} from "../src/api/server.ts";
+import { createServer, type ApiServer } from "../src/api/server.ts";
 import type { Rubric } from "../src/domain.ts";
 
 const tempDirs: string[] = [];
@@ -63,7 +59,7 @@ async function boot(): Promise<{
 }> {
   const dataDir = await mkdtemp(join(tmpdir(), "agenteval-rubric-routes-"));
   tempDirs.push(dataDir);
-  const api = createServer({ dataDir, adapter: createFixtureAdapter() });
+  const api = createServer({ dataDir });
   servers.push(api);
   const port = await api.listen(0);
   const project = api.queries.createProject({

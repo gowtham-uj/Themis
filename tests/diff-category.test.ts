@@ -8,7 +8,6 @@ import { describe, expect, it } from "vitest";
 import {
   captureDiffByCategory,
   categoryToDiffKind,
-  redactManifestPath,
   type OutputManifestEntry,
 } from "../src/runner/diff-category.ts";
 import type { HunkIndexEntry } from "../src/runner/diff.ts";
@@ -173,15 +172,5 @@ describe("captureDiffByCategory", () => {
       expect(dirty.empty).toBe(false);
       expect(dirty.hunks.length).toBeGreaterThanOrEqual(1);
     }
-  });
-});
-
-describe("redactManifestPath", () => {
-  it("redacts path segments that look like secrets", () => {
-    expect(redactManifestPath("ok/file.csv")).toBe("ok/file.csv");
-    expect(redactManifestPath("secrets/out.bin")).toContain("REDACTED");
-    expect(redactManifestPath("dir/api_key.txt")).toContain("REDACTED");
-    expect(redactManifestPath("dir/my_token.pem")).toContain("REDACTED");
-    expect(redactManifestPath("dir/cred-store.json")).toContain("REDACTED");
   });
 });

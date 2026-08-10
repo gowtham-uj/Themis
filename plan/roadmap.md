@@ -42,7 +42,7 @@ Move runs into isolation and make them controllable; establish that partial resu
 - **Workspace sourcing** (git clone@commit / empty `git init`); **category-aware diff capture**
   ([categories.md](categories.md)) — git diff with **stable hunk numbers** for `coding`/`git`-`data`;
   `outputs` capture for data pipelines; **no diff** for `none` categories.
-- **Redaction** pass on ingested events; crash reaping of stale `running` runs.
+- Event payloads are persisted verbatim while redaction is deferred; crash reaping handles stale `running` runs.
 - **Run control**: `pause` (soft = stop dequeuing / hard = cgroup `freezer`/`docker pause`),
   `resume`, `abort` (graceful, **keeps partial logs**). Append-only `events.jsonl` means **partial
   results are always inspectable** in any state. New `control_state`/`paused_at`/`pause_count` columns.
