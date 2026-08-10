@@ -1,20 +1,16 @@
 /**
  * Watcher HTTP routes (P8b-routes).
  *
- * Boots the real ApiServer on a temp dataDir with a FAKE refResolver +
- * createFixtureAdapter. OFFLINE — no real git, no real LLM.
- * HMAC tests use node crypto to sign payloads with the once-surfaced secret.
+ * Boots the real API server on a temp dataDir with an offline ref resolver
+ * (no network git). HMAC tests sign payloads with the once-surfaced secret.
+ * No agent or judge execution is involved: routes enqueue, they do not run.
  */
 import { createHmac } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  createFixtureAdapter,
-  createServer,
-  type ApiServer,
-} from "../src/api/server.ts";
+import { createServer, type ApiServer } from "../src/api/server.ts";
 import type { Rubric, TaskSpec } from "../src/domain.ts";
 import type { RefResolver } from "../src/watcher/engine.ts";
 import type { WatcherRule } from "../src/db/queries.ts";
@@ -80,7 +76,8 @@ function sampleTask(overrides: Partial<TaskSpec> = {}): TaskSpec {
   };
 }
 
-class FakeRefResolver implements RefResolver {
+/** Offline ref resolver — deterministic, no network git (a seam, not a model double). */
+class OfflineRefResolver implements RefResolver {
   constructor(
     private readonly map: Record<string, { sha: string; imageTag?: string }> = {},
   ) {}
@@ -190,14 +187,10 @@ interface Seeded {
 }
 
 async function seedWorld(
-  resolver: RefResolver = new FakeRefResolver(),
+  resolver: RefResolver = new OfflineRefResolver(),
 ): Promise<Seeded> {
   const dataDir = await tempDataDir();
-  const api = createServer({
-    dataDir,
-    adapter: createFixtureAdapter(),
-    refResolver: resolver,
-  });
+  const api = createServer({ dataDir, refResolver: resolver });
   servers.push(api);
   const port = await api.listen(0);
   const base = `http://127.0.0.1:${port}`;
@@ -319,7 +312,7 @@ describe("watcher routes — CRUD", () => {
 
 describe("watcher routes — manual fire", () => {
   it("POST .../run → 202 + batchIds when tasks exist", async () => {
-    const resolver = new FakeRefResolver({
+    const resolver = new OfflineRefResolver({
       "v1.0.0": { sha: "abc123", imageTag: "v1.0.0" },
     });
     const { base, projectId } = await seedWorld(resolver);
@@ -366,7 +359,7 @@ describe("watcher routes — manual fire", () => {
 
 describe("watcher routes — webhook ingress HMAC", () => {
   it("valid signature → 202 matched; last-byte-tampered → 401; no secret → 401", async () => {
-    const resolver = new FakeRefResolver({
+    const resolver = new OfflineRefResolver({
       "v2.3.0": { sha: "deadbeef", imageTag: "v2.3.0" },
     });
     const { api, base, projectId } = await seedWorld(resolver);

@@ -12,3 +12,6 @@ coverage/
 src/ui/.next/
 # local eval data — never commit runs/findings/reports
 data/
+.env.test
+.env
+.env.local
