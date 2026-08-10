@@ -154,6 +154,13 @@ export interface StartRunOptions {
   /** When true, skip spawning the agent process (events-only dry run). */
   skipAgent?: boolean;
   /**
+   * Optional injected adapter. When omitted, startRun resolves the project's
+   * configured CLI adapter (declarative project adapter, else a built-in).
+   * Tests that exercise container-config plumbing with a real Podman container
+   * (no model: a `sh -c exit 0` adapter) may pass one explicitly.
+   */
+  adapter?: Adapter;
+  /**
    * Optional outbound webhook dispatcher (P8c). When present, emits
    * run.completed exactly once after terminal finalize. No-ops when omitted
    * so runner stays unchanged for callers that do not enable outbound webhooks.
@@ -246,19 +253,27 @@ export async function startRun(
 
   // Resolve the project's one real CLI agent adapter, falling back to a
   // built-in adapter only when the project has not created a declarative one.
-  const projectAdapter = queries.getProjectAgentAdapterByAgentId(
-    run.projectId,
-    run.agentId,
-  );
-  const configuredAdapters = queries.listProjectAgentAdapters(run.projectId, {
-    includeDisabled: true,
-  });
-  if (configuredAdapters.length > 0 && (!projectAdapter || !projectAdapter.enabled)) {
-    throw new Error(`run ${run.id} does not use the project's enabled agent adapter`);
+  // An explicitly injected adapter (real-container config tests) short-circuits
+  // this so they do not depend on a project adapter row.
+  const projectAdapter = opts.adapter
+    ? undefined
+    : queries.getProjectAgentAdapterByAgentId(run.projectId, run.agentId);
+  if (!opts.adapter) {
+    const configuredAdapters = queries.listProjectAgentAdapters(run.projectId, {
+      includeDisabled: true,
+    });
+    if (
+      configuredAdapters.length > 0 &&
+      (!projectAdapter || !projectAdapter.enabled)
+    ) {
+      throw new Error(
+        `run ${run.id} does not use the project's enabled agent adapter`,
+      );
+    }
   }
-  const adapter: Adapter = projectAdapter
-    ? createDeclarativeAdapter(projectAdapter)
-    : getAdapter(run.agentId);
+  const adapter: Adapter =
+    opts.adapter ??
+    (projectAdapter ? createDeclarativeAdapter(projectAdapter) : getAdapter(run.agentId));
 
   // Prepare the workspace.
   //

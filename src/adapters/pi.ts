@@ -877,16 +877,23 @@ export function buildPiCommand(
   ctx: RunContext,
   options: { agentDir?: string; noSession?: boolean; piBin?: string } = {},
 ): AdapterCommand {
-  // Queue adapters execute inside the agent image, where `pi` is the stable CLI
-  // entrypoint. An explicit override remains available for custom real images.
+  // Precedence: explicit option > project override (AGENTEVAL_PI_BIN, for
+  // containerized images that ship pi elsewhere) > host resolution.
+  // Container images set AGENTEVAL_PI_BIN=pi (or a node+cli.js path) via the
+  // declarative adapter's command template, so the resolved argv is correct
+  // both on the host (runPi / tests resolve the package cli.js) and in the
+  // queue container (the image's `pi` entrypoint).
   const overridePiBin = ctx.overrides?.env?.AGENTEVAL_PI_BIN;
   const piBin =
     options.piBin ??
     (typeof overridePiBin === "string" && overridePiBin.trim()
       ? overridePiBin.trim()
-      : "pi");
+      : resolvePiBin());
   const useNode = piBin.endsWith(".js") || piBin.includes(`${join("dist", "cli")}`);
-  const argv: string[] = useNode ? ["node", piBin] : [piBin];
+  // Launch node-launched pi via the current process's node binary so the child
+  // resolves regardless of PATH (host runPi + local tests). Container images
+  // that ship a shebanged `pi` set AGENTEVAL_PI_BIN=pi and skip this branch.
+  const argv: string[] = useNode ? [process.execPath, piBin] : [piBin];
 
   argv.push(
     "--mode",
