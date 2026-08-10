@@ -438,7 +438,42 @@ async function executeTool(
         log: { accepted: false, missingCount: missing.length },
       };
     }
-    const submission = parseSubmission(args);
+    let submission: QueueSubmission;
+    try {
+      submission = parseSubmission(args);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        response: { accepted: false, error: `submission shape invalid: ${message}` },
+        log: { accepted: false, error: message },
+      };
+    }
+    // Validate each per-eval verdict so the judge can correct and retry rather
+    // than the whole analysis failing after submission.
+    const validationErrors: string[] = [];
+    for (const entry of submission.perEval) {
+      const ctx = archives.get(entry.runId);
+      try {
+        validateVerdict(entry.verdict, {
+          hasSourceArtifacts: ctx ? hasSourceArtifacts(ctx.manifest) : true,
+        });
+      } catch (err) {
+        validationErrors.push(
+          `${entry.runId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    if (validationErrors.length > 0) {
+      return {
+        response: {
+          accepted: false,
+          error:
+            "one or more verdicts failed schema validation — correct every error and call submit_queue_analysis again",
+          validationErrors,
+        },
+        log: { accepted: false, validationErrors: validationErrors.length },
+      };
+    }
     return {
       response: { accepted: true },
       log: { accepted: true, perEval: submission.perEval.length },
