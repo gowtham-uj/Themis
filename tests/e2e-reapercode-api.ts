@@ -51,7 +51,9 @@ try {
   });
   const projectId = string(project.id, "project.id");
 
-  const image = `localhost/agenteval-reapercode-e2e:${Date.now().toString(36)}`;
+  // Stable image tag so podman reuses the build cache across runs (the
+  // Containerfile + source ref are identical), making iteration fast.
+  const image = "localhost/agenteval-reapercode-e2e:latest";
   const adapterCreated = await json("POST", `/api/projects/${projectId}/adapters`, {
     agent_id: "reapercode",
     name: "ReaperCode CLI",
