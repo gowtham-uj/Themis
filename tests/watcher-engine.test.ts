@@ -1,6 +1,6 @@
 /**
  * Pure watcher engine tests (P8a).
- * Offline: FakeRefResolver + MemoryQueries — no real git network.
+ * Offline: OfflineRefResolver + MemoryQueries — no real git network.
  */
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -89,7 +89,7 @@ function rule(partial: Partial<WatcherRule> & Pick<WatcherRule, "id">): WatcherR
   };
 }
 
-class FakeRefResolver implements RefResolver {
+class OfflineRefResolver implements RefResolver {
   constructor(
     private readonly map: Record<string, { sha: string; imageTag?: string }> = {},
     private readonly throwOn?: string,
@@ -272,7 +272,7 @@ describe("handleWatcherEvent", () => {
     });
     expect(created.webhookSecret).toBeTruthy();
 
-    const resolver = new FakeRefResolver({
+    const resolver = new OfflineRefResolver({
       "v2.3.0": { sha: "deadbeef", imageTag: "v2.3.0" },
     });
 
@@ -319,7 +319,7 @@ describe("handleWatcherEvent", () => {
       trigger: "tag",
       action: { enqueue: "all" },
     });
-    const out = await handleWatcherEvent(q, new FakeRefResolver(), {
+    const out = await handleWatcherEvent(q, new OfflineRefResolver(), {
       projectId: project.id,
       trigger: "tag",
       ref: "v1.0.0",
@@ -338,7 +338,7 @@ describe("handleWatcherEvent", () => {
       semverFilter: ">=3.0.0",
       action: { enqueue: "all" },
     });
-    const out = await handleWatcherEvent(q, new FakeRefResolver(), {
+    const out = await handleWatcherEvent(q, new OfflineRefResolver(), {
       projectId: project.id,
       trigger: "tag",
       ref: "v2.0.0",

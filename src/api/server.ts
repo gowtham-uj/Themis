@@ -213,9 +213,9 @@ export interface CreateServerOptions {
   refResolver?: RefResolver;
   /**
    * Optional outbound webhook dispatcher (P8c). When omitted, createServer
-   * builds a default RealDeliverySink-backed dispatcher. Tests inject a
-   * dispatcher pre-bound to a FakeDeliverySink (backoffMs: [0,0,0]).
-   * Pass `null` to disable outbound webhooks entirely (hooks no-op).
+   * builds a default RealDeliverySink-backed dispatcher. Tests pass a
+   * dispatcher pointed at a real local HTTP server. Pass `null` to disable
+   * outbound webhooks entirely (hooks no-op).
    */
   outboundDispatcher?: OutboundWebhookDispatcher | null;
   /**
