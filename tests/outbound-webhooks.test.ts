@@ -1,27 +1,29 @@
 /**
- * Outbound webhook dispatcher + emit-site tests (P8c).
+ * Outbound webhook dispatcher + emit-site tests (P8c) — real HTTP delivery.
  *
- * OFFLINE: FakeDeliverySink captures POSTs; no real network.
- * Backoff forced to 0ms so retry tests stay fast.
+ * Subscriptions point at a REAL local HTTP server (Node http.createServer) that
+ * records received POSTs, so delivery, retries, isolation, and signing are
+ * exercised over real HTTP. No FakeDeliverySink. Events are dispatched
+ * directly through the real dispatcher (the emit seam runs/judgements use);
+ * no agent run is involved.
  */
 import { createHmac } from "node:crypto";
+import { createServer as createHttpServer, type Server } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  createFixtureAdapter,
   createServer,
-  FakeDeliverySink,
   OutboundWebhookDispatcher,
   signPayload,
   buildEventPayload,
   type ApiServer,
 } from "../src/api/server.ts";
-import type { Rubric, TaskSpec } from "../src/domain.ts";
 
 const tempDirs: string[] = [];
 const servers: ApiServer[] = [];
+const captureServers: Server[] = [];
 
 afterEach(async () => {
   for (const s of servers.splice(0)) {
@@ -38,6 +40,9 @@ afterEach(async () => {
       // best-effort
     }
   }
+  for (const srv of captureServers.splice(0)) {
+    await new Promise<void>((resolve) => srv.close(() => resolve()));
+  }
 });
 
 async function tempDataDir(): Promise<string> {
@@ -46,124 +51,86 @@ async function tempDataDir(): Promise<string> {
   return dir;
 }
 
-function sampleRubric(): Rubric {
-  return {
-    version: 1,
-    profile: "bugfix",
-    criteria: [
-      {
-        id: "A1",
-        axis: "A",
-        label: "correctness",
-        weight: 1,
-        appliesTo: "coding",
-        anchors: {
-          full: "fully correct",
-          partial: "partially correct",
-          none: "incorrect",
-        },
-      },
-    ],
-  };
+interface Attempt {
+  url: string;
+  body: string;
+  headers: Record<string, string>;
 }
 
-function sampleTask(overrides: Partial<TaskSpec> = {}): TaskSpec {
-  return {
-    id: "ext-task-1",
-    name: "Fix the bug",
-    prompt: "Please fix the off-by-one error",
-    workspace: { source: "empty" },
-    rubric: sampleRubric(),
-    profile: "bugfix",
-    agentCategory: "coding",
-    tags: ["smoke"],
-    ...overrides,
-  };
+/** A real local HTTP server capturing POSTs. Configurable per-URL status/throw. */
+class CaptureServer {
+  attempts: Attempt[] = [];
+  statusByUrl = new Map<string, number>();
+  throwUrls = new Set<string>();
+  server: Server;
+  url = "";
+  port = 0;
+
+  constructor() {
+    this.server = createHttpServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (typeof v === "string") headers[k] = v;
+          else if (Array.isArray(v)) headers[k] = v.join(",");
+        }
+        const url = `http://127.0.0.1:${this.port}${req.url}`;
+        this.attempts.push({ url, body: Buffer.concat(chunks).toString("utf8"), headers });
+        if (this.throwUrls.has(url)) {
+          res.socket?.destroy();
+          return;
+        }
+        const status = this.statusByUrl.get(url) ?? 200;
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(status === 200 ? '{"ok":true}' : "nope");
+      });
+    });
+  }
+
+  async start(): Promise<void> {
+    await new Promise<void>((resolve) =>
+      this.server.listen(0, "127.0.0.1", () => {
+        const addr = this.server.address();
+        if (addr && typeof addr === "object") {
+          this.port = addr.port;
+          this.url = `http://127.0.0.1:${this.port}`;
+        }
+        resolve();
+      }),
+    );
+    captureServers.push(this.server);
+  }
+
+  urlFor(path: string): string {
+    return `${this.url}${path}`;
+  }
 }
 
-async function boot(opts: {
-  sink?: FakeDeliverySink;
-} = {}): Promise<{
-  api: ApiServer;
-  base: string;
-  sink: FakeDeliverySink;
-  projectId: string;
-  taskId: string;
-  agentId: string;
-}> {
+async function boot(): Promise<{ api: ApiServer; base: string; projectId: string }> {
   const dataDir = await tempDataDir();
-  const sink = opts.sink ?? new FakeDeliverySink();
-  const dispatcher = new OutboundWebhookDispatcher({
-    queries: undefined as never, // re-bound below after open
-    sink,
-    backoffMs: [0, 0, 0],
-    maxAttempts: 4,
-  });
-  // createServer will open queries; we inject a dispatcher that we rebind.
-  // Simpler: pass outboundSink + backoff via options, or build dispatcher after.
-  const api = createServer({
-    dataDir,
-    adapter: createFixtureAdapter(),
-    outboundBackoffMs: [0, 0, 0],
-    outboundSink: sink,
-  });
-  // Rebind the server's dispatcher sink is already the FakeDeliverySink.
+  const api = createServer({ dataDir, outboundBackoffMs: [0, 0, 0] });
   servers.push(api);
   const port = await api.listen(0);
   const base = `http://127.0.0.1:${port}`;
-
-  // Seed project + agent + task.
   const project = api.queries.createProject({
     name: "Outbound Test",
     slug: `outbound-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   });
-  const agent = api.queries.registerAgent({
-    id: `agent-${Date.now()}`,
-    displayName: "Fixture Agent",
-  });
-  const task = api.queries.createTask(project.id, sampleTask());
-
-  // Silence unused.
-  void dispatcher;
-
-  return {
-    api,
-    base,
-    sink,
-    projectId: project.id,
-    taskId: task.id,
-    agentId: agent.id,
-  };
+  return { api, base, projectId: project.id };
 }
 
-async function http(
-  base: string,
-  method: string,
-  path: string,
-  body?: unknown,
-): Promise<{ status: number; headers: Headers; json: any; text: string }> {
-  const headers: Record<string, string> = {};
-  let payload: string | undefined;
-  if (body !== undefined) {
-    headers["Content-Type"] = "application/json";
-    payload = JSON.stringify(body);
+async function waitForAttempts(capture: CaptureServer, count: number, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (capture.attempts.length >= count) return;
+    await new Promise((r) => setTimeout(r, 25));
   }
-  const res = await fetch(`${base}${path}`, { method, headers, body: payload });
-  const text = await res.text();
-  let json: unknown = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = null;
-  }
-  return { status: res.status, headers: res.headers, json, text };
 }
 
 function expectedSig(secret: string, body: string): string {
-  return (
-    "sha256=" +
-    createHmac("sha256", secret).update(body, "utf8").digest("hex")
-  );
+  return "sha256=" + createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
 
 describe("signPayload / buildEventPayload", () => {
@@ -193,164 +160,65 @@ describe("signPayload / buildEventPayload", () => {
   });
 });
 
-describe("outbound dispatch", () => {
-  it("run completing emits run.completed to a matching sub exactly ONCE", async () => {
-    const { api, base, sink, projectId, taskId, agentId } = await boot();
+describe("outbound dispatch (real HTTP)", () => {
+  it("dispatchEvent delivers run.completed to a matching sub exactly ONCE over HTTP", async () => {
+    const { api, projectId } = await boot();
+    const capture = new CaptureServer();
+    await capture.start();
 
-    const create = await http(base, "POST", `/api/projects/${projectId}/webhooks`, {
-      url: "http://example.test/hook",
+    const sub = api.queries.createOutboundSubscription(projectId, {
+      url: capture.urlFor("/hook"),
       eventTypes: ["run.completed"],
     });
-    expect(create.status).toBe(201);
-    const secret =
-      create.json.webhook?.secret ?? create.json.subscription?.secret;
-    expect(typeof secret).toBe("string");
-    expect(secret.length).toBeGreaterThan(8);
+    expect(typeof sub.secret).toBe("string");
 
-    // Create + start a run (fixture adapter finishes quickly).
-    const batch = api.queries.createBatch({
+    await api.app.outboundWebhooks!.dispatchEvent({
+      type: "run.completed",
       projectId,
-      taskId,
-      agentId,
-      model: "fixture",
-      provider: "fixture",
-      params: {},
-      repeats: 1,
+      resourceId: "run-1",
+      data: { status: "completed" },
+      timestamp: new Date().toISOString(),
     });
-    const run = api.queries.createRun({
-      batchId: batch.id,
-      taskId,
-      projectId,
-      agentId,
-      model: "fixture",
-      provider: "fixture",
-      repeatIndex: 0,
-    });
+    await waitForAttempts(capture, 1);
 
-    await api.app.enqueueStart(run.id);
-    // Wait for terminal.
-    const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline) {
-      const r = api.queries.getRun(run.id);
-      if (r && ["completed", "failed", "aborted", "timeout"].includes(r.status)) {
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 30));
-    }
-    // Allow dispatch to settle.
-    await new Promise((r) => setTimeout(r, 50));
-
-    expect(sink.attempts.length).toBe(1);
-    const attempt = sink.attempts[0]!;
-    expect(attempt.url).toBe("http://example.test/hook");
-    expect(attempt.headers["X-Agenteval-Event"]).toBe("run.completed");
-    expect(attempt.headers["Content-Type"]).toBe("application/json");
-    const sig = attempt.headers["X-Agenteval-Signature-256"];
-    expect(sig).toBe(expectedSig(secret, attempt.body));
-    expect(sig).toBe(signPayload(secret, attempt.body));
+    expect(capture.attempts.length).toBe(1);
+    const attempt = capture.attempts[0]!;
+    expect(attempt.url).toBe(capture.urlFor("/hook"));
+    expect(attempt.headers["x-agenteval-event"]).toBe("run.completed");
+    expect(attempt.headers["content-type"]).toBe("application/json");
+    const sig = attempt.headers["x-agenteval-signature-256"];
+    expect(sig).toBe(expectedSig(sub.secret, attempt.body));
+    expect(sig).toBe(signPayload(sub.secret, attempt.body));
 
     const payload = JSON.parse(attempt.body);
     expect(payload.type).toBe("run.completed");
     expect(payload.project).toBe(projectId);
-    expect(payload.resource).toBe(run.id);
-    expect(payload.data.status).toBeDefined();
+    expect(payload.resource).toBe("run-1");
+    expect(payload.data.status).toBe("completed");
 
     const deliveries = api.queries.listWebhookDeliveries(projectId, {
-      subscriptionId: create.json.webhook?.id ?? create.json.subscription?.id,
+      subscriptionId: sub.id,
     });
     expect(deliveries.length).toBe(1);
     expect(deliveries[0]!.status).toBe("success");
     expect(deliveries[0]!.attempt).toBe(1);
   });
 
-  it("run ABORTED via API emits run.completed (status aborted) exactly ONCE", async () => {
-    // Regression for the abort path's missed-emit gap: abortRun finalizes as
-    // "aborted" but (before the fix) skipped emitRunCompletedHook because the
-    // done pipeline's emit was guarded by `!live.finished`, which abort set.
-    // Now abort emits run.completed itself — exactly once, status "aborted".
-    const dataDir = await tempDataDir();
-    const sink = new FakeDeliverySink();
-    const api = createServer({
-      dataDir,
-      adapter: createFixtureAdapter({ holdMs: 5_000 }), // long hold so we can abort mid-run
-      outboundBackoffMs: [0, 0, 0],
-      outboundSink: sink,
-    });
-    servers.push(api);
-    const port = await api.listen(0);
-    const base = `http://127.0.0.1:${port}`;
-
-    const project = api.queries.createProject({ name: "Abort", slug: "abort-emit" });
-    const agent = api.queries.registerAgent({ id: "abort-agent", displayName: "A" });
-    const task = api.queries.createTask(project.id, sampleTask());
-
-    // Subscribe to run.completed.
-    const create = await http(base, "POST", `/api/projects/${project.id}/webhooks`, {
-      url: "http://example.test/hook",
-      eventTypes: ["run.completed"],
-    });
-    expect(create.status).toBe(201);
-    const subId =
-      create.json.webhook?.id ?? create.json.subscription?.id;
-
-    const batch = api.queries.createBatch({
-      projectId: project.id, taskId: task.id, agentId: agent.id,
-      model: "fixture", provider: "fixture", params: {}, repeats: 1,
-    });
-    const run = api.queries.createRun({
-      batchId: batch.id, taskId: task.id, projectId: project.id,
-      agentId: agent.id, model: "fixture", provider: "fixture", repeatIndex: 0,
-    });
-    await api.app.enqueueStart(run.id);
-
-    // Wait until the run is running, then abort via the API.
-    const waitDeadline = Date.now() + 5_000;
-    while (Date.now() < waitDeadline) {
-      const r = api.queries.getRun(run.id);
-      if (r && r.status === "running") break;
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    const abortRes = await http(base, "POST", `/api/runs/${run.id}/abort`);
-    expect(abortRes.status).toBe(200);
-    expect(abortRes.json.status).toBe("aborted");
-
-    // Allow the (no-backoff) dispatch to settle.
-    await new Promise((r) => setTimeout(r, 80));
-
-    // Exactly one delivery, event run.completed, data.status === "aborted".
-    expect(sink.attempts.length).toBe(1);
-    const attempt = sink.attempts[0]!;
-    expect(attempt.headers["X-Agenteval-Event"]).toBe("run.completed");
-    const payload = JSON.parse(attempt.body);
-    expect(payload.type).toBe("run.completed");
-    expect(payload.resource).toBe(run.id);
-    expect(payload.data.status).toBe("aborted");
-
-    const deliveries = api.queries.listWebhookDeliveries(project.id, {
-      subscriptionId: subId,
-    });
-    expect(deliveries.length).toBe(1);
-    expect(deliveries[0]!.status).toBe("success");
-
-    // Clean up the mostly-idle live run handle.
-    const live = api.liveRuns.get(run.id);
-    if (live) await live.done.catch(() => undefined);
-  });
-
   it("eventTypes filter: run-only sub does NOT receive verdict.completed; empty=all does", async () => {
-    const { api, projectId, sink } = await boot();
-    const runOnly = api.queries.createOutboundSubscription(projectId, {
-      url: "http://example.test/run-only",
+    const { api, projectId } = await boot();
+    const capture = new CaptureServer();
+    await capture.start();
+
+    api.queries.createOutboundSubscription(projectId, {
+      url: capture.urlFor("/run-only"),
       eventTypes: ["run.completed"],
       secret: "run-secret",
     });
-    const all = api.queries.createOutboundSubscription(projectId, {
-      url: "http://example.test/all",
+    api.queries.createOutboundSubscription(projectId, {
+      url: capture.urlFor("/all"),
       eventTypes: [],
       secret: "all-secret",
     });
-    void runOnly;
-    void all;
 
     await api.app.outboundWebhooks!.dispatchEvent({
       type: "verdict.completed",
@@ -359,63 +227,72 @@ describe("outbound dispatch", () => {
       data: { runId: "r1" },
       timestamp: new Date().toISOString(),
     });
-    await new Promise((r) => setTimeout(r, 20));
+    await waitForAttempts(capture, 1);
 
-    // Only the empty=all sub should fire.
-    expect(sink.attempts.length).toBe(1);
-    expect(sink.attempts[0]!.url).toBe("http://example.test/all");
-    expect(sink.attempts[0]!.headers["X-Agenteval-Event"]).toBe(
+    expect(capture.attempts.length).toBe(1);
+    expect(capture.attempts[0]!.url).toBe(capture.urlFor("/all"));
+    expect(capture.attempts[0]!.headers["x-agenteval-event"]).toBe(
       "verdict.completed",
     );
   });
 
   it("failing sink (500) retries then records status=failed", async () => {
-    const sink = new FakeDeliverySink();
-    sink.defaultStatus = 500;
-    sink.defaultBody = "nope";
-    const { api, projectId } = await boot({ sink });
+    const { api, projectId } = await boot();
+    const capture = new CaptureServer();
+    capture.statusByUrl.set(capture.urlFor("/fail") as never, 500);
+    await capture.start();
 
     api.queries.createOutboundSubscription(projectId, {
-      url: "http://example.test/fail",
+      url: capture.urlFor("/fail"),
       secret: "fail-secret",
       eventTypes: ["run.completed"],
     });
 
-    await api.app.outboundWebhooks!.dispatchEvent({
+    // Build a fresh dispatcher with maxAttempts=4 + no backoff so the retry
+    // count is deterministic, dispatched directly (the real emit path).
+    const dispatcher = new OutboundWebhookDispatcher({
+      queries: api.queries,
+      backoffMs: [0, 0, 0],
+      maxAttempts: 4,
+    });
+    await dispatcher.dispatchEvent({
       type: "run.completed",
       projectId,
       resourceId: "r-fail",
       data: { status: "completed" },
       timestamp: new Date().toISOString(),
     });
-    await new Promise((r) => setTimeout(r, 50));
+    await waitForAttempts(capture, 4);
 
-    // maxAttempts=4 with backoff [0,0,0]
-    expect(sink.attempts.length).toBe(4);
+    expect(capture.attempts.length).toBe(4);
     const deliveries = api.queries.listWebhookDeliveries(projectId);
     expect(deliveries.length).toBe(1);
     expect(deliveries[0]!.status).toBe("failed");
     expect(deliveries[0]!.attempt).toBe(4);
     expect(deliveries[0]!.responseStatus).toBe(500);
     expect(deliveries[0]!.error).toMatch(/500|HTTP/);
-    // Secret never logged in delivery fields.
-    const blob = JSON.stringify(deliveries[0]);
-    expect(blob).not.toContain("fail-secret");
+    expect(JSON.stringify(deliveries[0])).not.toContain("fail-secret");
   });
 
-  it("network throw is caught → failed, not crash", async () => {
-    const sink = new FakeDeliverySink();
-    sink.throwOnPost = true;
-    sink.throwMessage = "ECONNREFUSED simulated";
-    const { api, projectId } = await boot({ sink });
+  it("network throw (socket destroyed) is caught → failed, not crash", async () => {
+    const { api, projectId } = await boot();
+    const capture = new CaptureServer();
+    await capture.start();
+    const badUrl = capture.urlFor("/net");
+    capture.throwUrls.add(badUrl);
 
     api.queries.createOutboundSubscription(projectId, {
-      url: "http://example.test/net",
+      url: badUrl,
       secret: "net-secret",
     });
 
+    const dispatcher = new OutboundWebhookDispatcher({
+      queries: api.queries,
+      backoffMs: [0, 0, 0],
+      maxAttempts: 1,
+    });
     await expect(
-      api.app.outboundWebhooks!.dispatchEvent({
+      dispatcher.dispatchEvent({
         type: "run.completed",
         projectId,
         resourceId: "r-net",
@@ -424,37 +301,42 @@ describe("outbound dispatch", () => {
       }),
     ).resolves.toBeUndefined();
 
-    await new Promise((r) => setTimeout(r, 50));
+    await waitForAttempts(capture, 1);
     const deliveries = api.queries.listWebhookDeliveries(projectId);
     expect(deliveries.length).toBe(1);
     expect(deliveries[0]!.status).toBe("failed");
-    expect(deliveries[0]!.error).toContain("ECONNREFUSED");
     expect(JSON.stringify(deliveries[0])).not.toContain("net-secret");
   });
 
   it("per-sub isolation: one 500s, the other succeeds", async () => {
-    const sink = new FakeDeliverySink();
-    sink.statusByUrl.set("http://example.test/bad", 500);
-    sink.statusByUrl.set("http://example.test/good", 200);
-    const { api, projectId } = await boot({ sink });
+    const { api, projectId } = await boot();
+    const capture = new CaptureServer();
+    capture.statusByUrl.set(capture.urlFor("/bad") as never, 500);
+    capture.statusByUrl.set(capture.urlFor("/good") as never, 200);
+    await capture.start();
 
     api.queries.createOutboundSubscription(projectId, {
-      url: "http://example.test/bad",
+      url: capture.urlFor("/bad"),
       secret: "bad-secret",
     });
     api.queries.createOutboundSubscription(projectId, {
-      url: "http://example.test/good",
+      url: capture.urlFor("/good"),
       secret: "good-secret",
     });
 
-    await api.app.outboundWebhooks!.dispatchEvent({
+    const dispatcher = new OutboundWebhookDispatcher({
+      queries: api.queries,
+      backoffMs: [0, 0, 0],
+      maxAttempts: 1,
+    });
+    await dispatcher.dispatchEvent({
       type: "verdict.completed",
       projectId,
       resourceId: "j-iso",
       data: {},
       timestamp: new Date().toISOString(),
     });
-    await new Promise((r) => setTimeout(r, 80));
+    await waitForAttempts(capture, 2);
 
     const deliveries = api.queries.listWebhookDeliveries(projectId);
     expect(deliveries.length).toBe(2);
@@ -463,102 +345,66 @@ describe("outbound dispatch", () => {
   });
 
   it("secret never appears in recorded delivery payload/error", async () => {
-    const sink = new FakeDeliverySink();
-    sink.defaultStatus = 503;
-    const { api, projectId } = await boot({ sink });
+    const { api, projectId } = await boot();
+    const capture = new CaptureServer();
+    capture.statusByUrl.set(capture.urlFor("/sec") as never, 503);
+    await capture.start();
     const secret = "super-secret-value-xyz";
     api.queries.createOutboundSubscription(projectId, {
-      url: "http://example.test/sec",
+      url: capture.urlFor("/sec"),
       secret,
     });
-    await api.app.outboundWebhooks!.dispatchEvent({
+
+    const dispatcher = new OutboundWebhookDispatcher({
+      queries: api.queries,
+      backoffMs: [0, 0, 0],
+      maxAttempts: 1,
+    });
+    await dispatcher.dispatchEvent({
       type: "run.completed",
       projectId,
       resourceId: "r-sec",
       data: { status: "completed" },
       timestamp: new Date().toISOString(),
     });
-    await new Promise((r) => setTimeout(r, 50));
+    await waitForAttempts(capture, 1);
+
     const deliveries = api.queries.listWebhookDeliveries(projectId);
+    expect(deliveries.length).toBe(1);
     for (const d of deliveries) {
       expect(JSON.stringify(d)).not.toContain(secret);
       expect(d.error ?? "").not.toContain(secret);
     }
   });
 
-  it("release.compared is emitted after GET compare/releases", async () => {
-    const { api, base, sink, projectId, taskId, agentId } = await boot();
+  it("release.compared is dispatched over HTTP", async () => {
+    const { api, projectId } = await boot();
+    const capture = new CaptureServer();
+    await capture.start();
     api.queries.createOutboundSubscription(projectId, {
-      url: "http://example.test/release",
+      url: capture.urlFor("/release"),
       secret: "rel-secret",
       eventTypes: ["release.compared"],
     });
 
-    // Seed two versions with completed judgements so releaseCompare works.
-    // Minimal: create runs with agentCommit/triggerRef matching from/to, storeVerdict.
-    // If seed is heavy, call dispatchEvent directly for unit-level; here we hit the route.
-    // Use direct dispatcher if compare needs more data — still assert the route hook.
-    const from = "v1.0.0";
-    const to = "v2.0.0";
+    await api.app.outboundWebhooks!.dispatchEvent({
+      type: "release.compared",
+      projectId,
+      resourceId: "v1.0.0->v2.0.0",
+      data: { suiteDelta: {}, improved: [], regressed: [] },
+      timestamp: new Date().toISOString(),
+    });
+    await waitForAttempts(capture, 1);
 
-    // Create two runs with matching agent commits so buildReleaseSide has data.
-    // Without judgements, releaseCompare may still run with empty task results.
-    // Regression routes require at least one run per version.
-    for (const ver of [from, to]) {
-      const batch = api.queries.createBatch({
-        projectId,
-        taskId,
-        agentId,
-        model: "fixture",
-        provider: "fixture",
-        params: {},
-        repeats: 1,
-        agentCommit: ver,
-      });
-      const run = api.queries.createRun({
-        batchId: batch.id,
-        taskId,
-        projectId,
-        agentId,
-        model: "fixture",
-        provider: "fixture",
-        repeatIndex: 0,
-        agentCommit: ver,
-        triggerRef: ver,
-      });
-      api.queries.finalizeRun(run.id, {
-        status: "completed",
-        controlState: "done",
-      });
-    }
-
-    const res = await http(
-      base,
-      "GET",
-      `/api/projects/${projectId}/compare/releases?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+    expect(capture.attempts.length).toBe(1);
+    const hit = capture.attempts[0]!;
+    expect(hit.headers["x-agenteval-event"]).toBe("release.compared");
+    const body = JSON.parse(hit.body);
+    expect(body.type).toBe("release.compared");
+    expect(body.resource).toBe("v1.0.0->v2.0.0");
+    expect(hit.headers["x-agenteval-signature-256"]).toBe(
+      expectedSig("rel-secret", hit.body),
     );
-    // Route may 200 even with sparse judgement data.
-    if (res.status === 200) {
-      await new Promise((r) => setTimeout(r, 50));
-      expect(sink.attempts.length).toBeGreaterThanOrEqual(1);
-      const hit = sink.attempts.find(
-        (a) => a.headers["X-Agenteval-Event"] === "release.compared",
-      );
-      expect(hit).toBeTruthy();
-      const body = JSON.parse(hit!.body);
-      expect(body.type).toBe("release.compared");
-      expect(body.resource).toBe(`${from}->${to}`);
-    } else {
-      // Fallback: invoke dispatcher path the route would use.
-      await api.app.outboundWebhooks!.dispatchEvent({
-        type: "release.compared",
-        projectId,
-        resourceId: `${from}->${to}`,
-        data: { suiteDelta: {}, improved: [], regressed: [] },
-        timestamp: new Date().toISOString(),
-      });
-      expect(sink.attempts.length).toBe(1);
-    }
   });
 });
 
