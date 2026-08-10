@@ -269,6 +269,9 @@ export interface ProjectAgentAdapter {
   sourceRef: string | null;
   containerfile: string | null;
   generatorScript: string | null;
+  installType: string;
+  configure: CliCommandTemplate | null;
+  shared: boolean;
   buildStatus: string;
   builtImageId: string | null;
   builtCommit: string | null;
@@ -297,6 +300,9 @@ export interface CreateProjectAgentAdapterInput {
   sourceRef?: string | null;
   containerfile?: string | null;
   generatorScript?: string | null;
+  installType?: string;
+  configure?: CliCommandTemplate | null;
+  shared?: boolean;
   enabled?: boolean;
   defaultModel?: string;
   defaultProvider?: string;
@@ -318,6 +324,9 @@ export interface UpdateProjectAgentAdapterInput {
   sourceRef?: string | null;
   containerfile?: string | null;
   generatorScript?: string | null;
+  installType?: string;
+  configure?: CliCommandTemplate | null;
+  shared?: boolean;
   buildStatus?: string;
   builtImageId?: string | null;
   builtCommit?: string | null;
@@ -783,6 +792,7 @@ export interface EvalQueue {
   autoJudge: boolean;
   status: EvalQueueStatus | string;
   activeBatchId: string | null;
+  sharedAdapterId: string | null;
   revision: number;
   createdAt: string;
   updatedAt: string;
@@ -801,6 +811,7 @@ export interface CreateEvalQueueInput {
   judgeModel?: string | null;
   judgeProvider?: string | null;
   autoJudge?: boolean;
+  sharedAdapterId?: string | null;
   id?: string;
 }
 
@@ -1184,6 +1195,10 @@ export interface QueryStore {
     projectId: string,
     agentId: string,
   ): ProjectAgentAdapter | null;
+  /** Find a shared adapter by agent_id from any project (cross-project fallback). */
+  getSharedAdapterByAgentId(agentId: string): ProjectAgentAdapter | null;
+  /** List all shared adapters across all projects. */
+  listSharedAdapters(): ProjectAgentAdapter[];
   listProjectAgentAdapters(
     projectId: string,
     opts?: { includeDisabled?: boolean },
@@ -1658,6 +1673,9 @@ function mapProjectAgentAdapter(
     sourceRef: row.sourceRef,
     containerfile: row.containerfile,
     generatorScript: row.generatorScript,
+    installType: row.installType,
+    configure: parseJson(row.configureJson, null),
+    shared: row.shared === 1,
     buildStatus: row.buildStatus,
     builtImageId: row.builtImageId,
     builtCommit: row.builtCommit,
@@ -2080,6 +2098,7 @@ function mapEvalQueueRow(row: typeof evalQueues.$inferSelect): EvalQueue {
     autoJudge: row.autoJudge === 1,
     status: row.status,
     activeBatchId: row.activeBatchId ?? null,
+    sharedAdapterId: row.sharedAdapterId ?? null,
     revision: row.revision ?? 1,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -2595,6 +2614,12 @@ export class SqliteQueries implements QueryStore {
       sourceRef: input.sourceRef ?? null,
       containerfile: input.containerfile ?? null,
       generatorScript: input.generatorScript ?? null,
+      installType: input.installType ?? "source-build",
+      configureJson:
+        input.configure === undefined || input.configure === null
+          ? null
+          : JSON.stringify(input.configure),
+      shared: input.shared === true ? 1 : 0,
       buildStatus: "unbuilt",
       builtImageId: null,
       builtCommit: null,
@@ -2631,6 +2656,37 @@ export class SqliteQueries implements QueryStore {
       )
       .get();
     return row ? mapProjectAgentAdapter(row) : null;
+  }
+
+  getSharedAdapterByAgentId(agentId: string): ProjectAgentAdapter | null {
+    const row = this.db
+      .select()
+      .from(projectAgentAdapters)
+      .where(
+        and(
+          eq(projectAgentAdapters.agentId, agentId),
+          eq(projectAgentAdapters.shared, 1),
+          eq(projectAgentAdapters.enabled, 1),
+        ),
+      )
+      .all()
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+    return row ? mapProjectAgentAdapter(row) : null;
+  }
+
+  listSharedAdapters(): ProjectAgentAdapter[] {
+    return this.db
+      .select()
+      .from(projectAgentAdapters)
+      .where(
+        and(
+          eq(projectAgentAdapters.shared, 1),
+          eq(projectAgentAdapters.enabled, 1),
+        ),
+      )
+      .all()
+      .map(mapProjectAgentAdapter)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   listProjectAgentAdapters(
@@ -2677,6 +2733,11 @@ export class SqliteQueries implements QueryStore {
       ...(patch.sourceRef !== undefined ? { sourceRef: patch.sourceRef } : {}),
       ...(patch.containerfile !== undefined ? { containerfile: patch.containerfile } : {}),
       ...(patch.generatorScript !== undefined ? { generatorScript: patch.generatorScript } : {}),
+      ...(patch.installType !== undefined ? { installType: patch.installType } : {}),
+      ...(patch.configure !== undefined
+        ? { configureJson: patch.configure === null ? null : JSON.stringify(patch.configure) }
+        : {}),
+      ...(patch.shared !== undefined ? { shared: patch.shared ? 1 : 0 } : {}),
       ...(patch.buildStatus !== undefined ? { buildStatus: patch.buildStatus } : {}),
       ...(patch.builtImageId !== undefined ? { builtImageId: patch.builtImageId } : {}),
       ...(patch.builtCommit !== undefined ? { builtCommit: patch.builtCommit } : {}),
@@ -3867,7 +3928,8 @@ export class SqliteQueries implements QueryStore {
       portsJson: stringifyJson(input.ports ?? []), judgeModel: input.judgeModel ?? null,
       judgeProvider: input.judgeProvider ?? null,
       autoJudge: input.autoJudge === false ? 0 : 1, status: "draft",
-      activeBatchId: null, revision: 1, createdAt: ts, updatedAt: ts,
+      activeBatchId: null, sharedAdapterId: input.sharedAdapterId ?? null,
+      revision: 1, createdAt: ts, updatedAt: ts,
     }).run();
     return this.getEvalQueue(id)!;
   }
@@ -4961,6 +5023,9 @@ export class MemoryQueries implements QueryStore {
       sourceRef: input.sourceRef ?? null,
       containerfile: input.containerfile ?? null,
       generatorScript: input.generatorScript ?? null,
+      installType: input.installType ?? "source-build",
+      configure: input.configure ? structuredClone(input.configure) : null,
+      shared: input.shared === true,
       buildStatus: "unbuilt",
       builtImageId: null,
       builtCommit: null,
@@ -4987,6 +5052,20 @@ export class MemoryQueries implements QueryStore {
       (entry) => entry.projectId === projectId && entry.agentId === agentId,
     );
     return adapter ? structuredClone(adapter) : null;
+  }
+
+  getSharedAdapterByAgentId(agentId: string): ProjectAgentAdapter | null {
+    const shared = [...this.projectAgentAdapters.values()]
+      .filter((a) => a.agentId === agentId && a.shared && a.enabled)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return shared[0] ? structuredClone(shared[0]) : null;
+  }
+
+  listSharedAdapters(): ProjectAgentAdapter[] {
+    return [...this.projectAgentAdapters.values()]
+      .filter((a) => a.shared && a.enabled)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((a) => structuredClone(a));
   }
 
   listProjectAgentAdapters(
@@ -5034,6 +5113,11 @@ export class MemoryQueries implements QueryStore {
       ...(patch.sourceRef !== undefined ? { sourceRef: patch.sourceRef } : {}),
       ...(patch.containerfile !== undefined ? { containerfile: patch.containerfile } : {}),
       ...(patch.generatorScript !== undefined ? { generatorScript: patch.generatorScript } : {}),
+      ...(patch.installType !== undefined ? { installType: patch.installType } : {}),
+      ...(patch.configure !== undefined
+        ? { configure: patch.configure ? structuredClone(patch.configure) : null }
+        : {}),
+      ...(patch.shared !== undefined ? { shared: patch.shared } : {}),
       ...(patch.buildStatus !== undefined ? { buildStatus: patch.buildStatus } : {}),
       ...(patch.builtImageId !== undefined ? { builtImageId: patch.builtImageId } : {}),
       ...(patch.builtCommit !== undefined ? { builtCommit: patch.builtCommit } : {}),
@@ -5946,6 +6030,7 @@ export class MemoryQueries implements QueryStore {
       networkPolicy: input.networkPolicy ?? "allow", ports: [...(input.ports ?? [])],
       judgeModel: input.judgeModel ?? null, judgeProvider: input.judgeProvider ?? null,
       autoJudge: input.autoJudge !== false, status: "draft", activeBatchId: null,
+      sharedAdapterId: input.sharedAdapterId ?? null,
       revision: 1, createdAt: ts, updatedAt: ts,
     };
     this.evalQueues.set(queue.id, queue);

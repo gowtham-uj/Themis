@@ -64,6 +64,9 @@ const DDL: string[] = [
     source_ref TEXT,
     containerfile TEXT,
     generator_script TEXT,
+    install_type TEXT NOT NULL DEFAULT 'source-build',
+    configure_json TEXT,
+    shared INTEGER NOT NULL DEFAULT 0,
     build_status TEXT NOT NULL DEFAULT 'unbuilt',
     built_image_id TEXT,
     built_commit TEXT,
@@ -93,6 +96,7 @@ const DDL: string[] = [
     auto_judge INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'draft',
     active_batch_id TEXT,
+    shared_adapter_id TEXT,
     revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -507,6 +511,10 @@ function ensureColumns(db: Database.Database): void {
     // Adapter generator + connection-check derivation.
     "ALTER TABLE project_agent_adapters ADD COLUMN connection_check_derived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE project_agent_adapters ADD COLUMN generator_script TEXT",
+    "ALTER TABLE project_agent_adapters ADD COLUMN install_type TEXT NOT NULL DEFAULT 'source-build'",
+    "ALTER TABLE project_agent_adapters ADD COLUMN configure_json TEXT",
+    "ALTER TABLE project_agent_adapters ADD COLUMN shared INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE eval_queues ADD COLUMN shared_adapter_id TEXT",
   ];
   for (const sql of alters) {
     try {

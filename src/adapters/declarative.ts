@@ -58,6 +58,18 @@ export function createDeclarativeAdapter(definition: ProjectAgentAdapter): Adapt
     command(ctx) {
       return renderCommand(definition.command, ctx, definition.providerConfig);
     },
+    configure(ctx) {
+      if (!definition.configure) return null;
+      return {
+        command: renderCommand(definition.configure, ctx, definition.providerConfig),
+        ...(definition.configure.cwd
+          ? { cwd: renderTemplate(definition.configure.cwd, ctx) }
+          : {}),
+        ...(definition.configure.timeoutMs
+          ? { timeoutMs: definition.configure.timeoutMs }
+          : {}),
+      };
+    },
     evidence() {
       return {
         paths: [...definition.evidence.paths],

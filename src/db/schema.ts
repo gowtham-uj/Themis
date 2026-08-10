@@ -92,6 +92,9 @@ export const projectAgentAdapters = sqliteTable(
     sourceRef: text("source_ref"),
     containerfile: text("containerfile"),
     generatorScript: text("generator_script"),
+    installType: text("install_type").notNull().default("source-build"),
+    configureJson: text("configure_json"),
+    shared: integer("shared").notNull().default(0),
     buildStatus: text("build_status").notNull().default("unbuilt"),
     builtImageId: text("built_image_id"),
     builtCommit: text("built_commit"),
@@ -134,6 +137,7 @@ export const evalQueues = sqliteTable(
     autoJudge: integer("auto_judge").notNull().default(1),
     status: text("status").notNull().default("draft"),
     activeBatchId: text("active_batch_id"),
+    sharedAdapterId: text("shared_adapter_id"),
     revision: integer("revision").notNull().default(1),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
@@ -766,4 +770,4 @@ export const schema = {
 export type Schema = typeof schema;
 
 /** Migration version stamped into pragma user_version / migrations table. */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;

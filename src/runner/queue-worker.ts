@@ -126,13 +126,23 @@ export async function startQueueContainer(
     queue.projectId,
     queue.agentId,
   );
+  // Shared adapter: if the project doesn't own one, check if it explicitly
+  // references a shared adapter from the adapter store (by shared_adapter_id).
+  const sharedAdapterId = (queue as { sharedAdapterId?: string | null }).sharedAdapterId;
+  const sharedAdapter = !projectAdapter && sharedAdapterId
+    ? queries.getProjectAgentAdapter(sharedAdapterId)
+    : null;
+  const adapterDef = projectAdapter ?? sharedAdapter;
   if (projectAdapter && !projectAdapter.enabled) {
     throw new Error(`project agent adapter ${projectAdapter.id} is disabled`);
   }
-  if (projectAdapter?.sourceRepo && projectAdapter.buildStatus !== "ready") {
+  if (adapterDef?.sourceRepo && adapterDef.buildStatus !== "ready") {
     throw new Error(
-      `project agent adapter ${projectAdapter.id} image is not ready; build it through the adapter API first`,
+      `agent adapter ${adapterDef.id} image is not ready; build it through the adapter API first`,
     );
+  }
+  if (sharedAdapter && (!sharedAdapter.shared || !sharedAdapter.enabled)) {
+    throw new Error(`referenced shared adapter ${sharedAdapter.id} is not shared or disabled`);
   }
   const configuredAdapters = queries.listProjectAgentAdapters(queue.projectId, {
     includeDisabled: true,
@@ -142,8 +152,8 @@ export async function startQueueContainer(
       `queue ${queue.id} does not use project ${queue.projectId}'s configured agent`,
     );
   }
-  const adapter = projectAdapter
-    ? createDeclarativeAdapter(projectAdapter)
+  const queueAdapter = adapterDef
+    ? createDeclarativeAdapter(adapterDef)
     : getAdapter(queue.agentId);
   const runtime = opts.runtime ?? resolveRuntime();
   const tasks = new Map<string, Task>();
@@ -176,14 +186,14 @@ export async function startQueueContainer(
     workspaceDir,
     resolveAdapterOverrides(project, firstOverrides),
   );
-  const image = adapter.image(firstCtx);
+  const image = queueAdapter.image(firstCtx);
 
   // A persistent queue cannot change images between evals. Reject such a queue
   // before creating any durable execution rows.
   for (const item of items) {
     const task = tasks.get(item.taskId)!;
     const raw = mergeOverrides(queue.adapterOverrides, item.overrides);
-    const itemImage = adapter.image(
+    const itemImage = queueAdapter.image(
       makeRunContext(
         `queue-image-${queue.id}-${item.id}`,
         queue,
@@ -417,7 +427,7 @@ export async function startQueueContainer(
         dataDir,
         queue,
         batchId: batch.id,
-        adapter,
+        adapter: queueAdapter,
         handle,
         workspaceDir,
         task: firstTask,
@@ -445,8 +455,52 @@ export async function startQueueContainer(
         return;
       }
 
-      for (const entry of expanded) {
-        if (live.stopRequested || tainted) break;
+      // Run the adapter's optional configure step (provider connection + model
+      // selection) once before any eval. A non-zero exit taints the queue.
+      if (queueAdapter.configure) {
+        const configureCtx: RunContext = {
+          runId: "configure",
+          project: { id: queue.projectId },
+          task: { prompt: "", workspace: { source: "empty" } },
+          model: queue.model,
+          provider: queue.provider,
+          params: {},
+          workspaceDir,
+          apiKeys: collectApiKeys(),
+          overrides: resolveAdapterOverrides(project, firstOverrides),
+        };
+        const configureProbe = queueAdapter.configure(configureCtx);
+        if (configureProbe) {
+          const configureResult = await handle.exec({
+            argv: configureProbe.command.argv,
+            env: configureProbe.command.env,
+            cwd: configureProbe.cwd ?? "/workspace",
+            user: "root",
+            timeoutMs: configureProbe.timeoutMs ?? 120_000,
+            maxOutputBytes: 1024 * 1024,
+          });
+          const configureDir = join(dataDir, "projects", queue.projectId, "adapters", adapterDef?.id ?? queue.agentId);
+          await mkdir(configureDir, { recursive: true }).catch(() => undefined);
+          await writeJson(join(configureDir, "configure.json"), {
+            exitCode: configureResult.exitCode,
+            stdout: configureResult.stdout,
+            stderr: configureResult.stderr,
+            timedOut: configureResult.timedOut,
+            durationMs: configureResult.durationMs,
+          }).catch(() => undefined);
+          if (configureResult.exitCode !== 0) {
+            const message = `agent configure step failed (exit ${configureResult.exitCode}): ${configureResult.stderr.slice(0, 500)}`;
+            queries.updateQueueContainer(containerRow.id, { state: "running", error: message });
+            queries.updateEvalQueue(queue.id, { status: "failed" });
+            for (const entry of expanded) {
+              queries.finalizeRun(entry.run.id, { status: "failed", error: message, controlState: "done" });
+            }
+            return;
+          }
+        }
+      }
+
+      for (const entry of expanded) {        if (live.stopRequested || tainted) break;
         live.currentRunId = entry.run.id;
         live.currentQueueItemId = entry.item.id;
         queries.updateQueueContainer(containerRow.id, { state: "running" });
@@ -457,7 +511,7 @@ export async function startQueueContainer(
           queue,
           containerRow,
           handle,
-          adapter,
+          adapter: queueAdapter,
           entry,
           workspaceDir,
           timeoutMs: opts.timeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
@@ -643,7 +697,7 @@ async function executeEval(input: {
       seq: 0,
       ts: new Date().toISOString(),
       type: "run.start",
-      agent: adapter.id === "reapercode" ? "reapercode" : "pi",
+      agent: input.adapter.id === "reapercode" ? "reapercode" : "pi",
       model: queue.model,
       provider: queue.provider,
       workspace: {
@@ -655,8 +709,8 @@ async function executeEval(input: {
     });
     nextSeq = 1;
 
-    const command = adapter.command(ctx);
-    if (command.argv.length === 0) throw new Error(`adapter ${adapter.id} returned empty argv`);
+    const command = input.adapter.command(ctx);
+    if (command.argv.length === 0) throw new Error(`adapter ${input.adapter.id} returned empty argv`);
     const session = await handle.startExec({
       argv: command.argv,
       cwd: "/workspace",
@@ -673,7 +727,7 @@ async function executeEval(input: {
     const waitPromise = session.wait();
 
     try {
-      for await (const event of adapter.parse(
+      for await (const event of input.adapter.parse(
         {
           stdout: stdoutChannel,
           stderr: stderrChannel,
@@ -757,7 +811,7 @@ async function executeEval(input: {
   const evidence = await copyRetainedEvidence(
     workspaceDir,
     runDir,
-    adapter.evidence(ctx),
+    input.adapter.evidence(ctx),
   );
   await writeJson(join(runDir, "evidence-extraction.json"), evidence);
   await record.append({

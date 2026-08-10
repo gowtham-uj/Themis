@@ -91,6 +91,12 @@ export interface Adapter {
   connectionCheck(ctx: RunContext): AdapterConnectionCheck;
   /** argv + env to launch the agent headlessly for the eval prompt. */
   command(ctx: RunContext): AdapterCommand;
+  /**
+   * Optional: run once after the container starts + connection check passes,
+   * before any eval. Lets the agent write its own provider/model/API-key config
+   * that it reads at run time. Returns null when env injection alone suffices.
+   */
+  configure?(ctx: RunContext): AdapterConnectionCheck | null;
   /** Declare where this agent stores native trajectories/logs in the workspace. */
   evidence(ctx: RunContext): AdapterEvidenceSpec;
   /**

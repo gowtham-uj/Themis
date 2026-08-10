@@ -141,8 +141,14 @@ async function buildAdapter(
   projectId: string,
   adapter: ProjectAgentAdapter,
 ): Promise<{ adapter: ProjectAgentAdapter; build: Record<string, unknown> }> {
-  if (!adapter.sourceRepo || !adapter.containerfile) {
-    throw badRequest("adapter source_repo and containerfile are required before build");
+  if (!adapter.containerfile) {
+    throw badRequest("adapter containerfile is required before build");
+  }
+  // npm install type: no source repo needed — the Containerfile pulls the
+  // package from the npm registry during build. source-build: clone git repo.
+  const isNpm = adapter.installType === "npm";
+  if (!isNpm && !adapter.sourceRepo) {
+    throw badRequest("adapter source_repo is required before build (or set install_type to 'npm')");
   }
   const sourceDir = join(
     app.dataDir,
@@ -161,14 +167,21 @@ async function buildAdapter(
     buildLogPath: logPath,
   });
   try {
-    const prepared = await prepareWorkspace(
-      {
-        source: "git",
-        repo: adapter.sourceRepo,
-        ...(adapter.sourceRef ? { ref: adapter.sourceRef } : {}),
-      },
-      { targetDir: sourceDir },
-    );
+    let commit: string | null = null;
+    if (!isNpm && adapter.sourceRepo) {
+      const prepared = await prepareWorkspace(
+        {
+          source: "git",
+          repo: adapter.sourceRepo,
+          ...(adapter.sourceRef ? { ref: adapter.sourceRef } : {}),
+        },
+        { targetDir: sourceDir },
+      );
+      commit = prepared.commit ?? null;
+    } else {
+      // npm install: create a minimal context dir with just the Containerfile.
+      await mkdir(sourceDir, { recursive: true });
+    }
     const containerfilePath = join(sourceDir, ".agenteval.Containerfile");
     await writeFile(containerfilePath, adapter.containerfile, "utf8");
     const result = await resolveRuntime().buildImage({
@@ -185,7 +198,7 @@ async function buildAdapter(
     const updated = app.queries.updateProjectAgentAdapter(adapter.id, {
       buildStatus: "ready",
       builtImageId: result.imageId,
-      builtCommit: prepared.commit ?? null,
+      builtCommit: commit,
       buildLogPath: logPath,
       lastBuiltAt: new Date().toISOString(),
     });
@@ -194,7 +207,7 @@ async function buildAdapter(
       build: {
         image: result.image,
         image_id: result.imageId,
-        commit: prepared.commit ?? null,
+        commit,
         duration_ms: result.durationMs,
         log_path: logPath,
       },
@@ -312,8 +325,14 @@ export function registerAdapterRoutes(router: Router): void {
       input.containerfile = body.containerfile as string | null;
     }
     if (typeof body.enabled === "boolean") input.enabled = body.enabled;
-    const defaultModel = body.default_model ?? body.defaultModel;
-    if (typeof defaultModel === "string") input.defaultModel = defaultModel;
+    if (typeof body.shared === "boolean") input.shared = body.shared;
+    if (typeof body.install_type === "string") input.installType = body.install_type;
+    else if (typeof body.installType === "string") input.installType = body.installType;
+    const configureVal = body.configure;
+    if (configureVal === null || (configureVal && typeof configureVal === "object")) {
+      input.configure = configureVal === null ? null : commandTemplate(configureVal, "configure");
+    }
+    const defaultModel = body.default_model ?? body.defaultModel;    if (typeof defaultModel === "string") input.defaultModel = defaultModel;
     const defaultProvider = body.default_provider ?? body.defaultProvider;
     if (typeof defaultProvider === "string") input.defaultProvider = defaultProvider;
 
@@ -539,6 +558,14 @@ export function registerAdapterRoutes(router: Router): void {
       else if (sourceRef) input.sourceRef = sourceRef;
       if (typeof emitted.containerfile === "string") input.containerfile = emitted.containerfile;
       if (typeof emitted.enabled === "boolean") input.enabled = emitted.enabled;
+      if (typeof emitted.shared === "boolean") input.shared = emitted.shared;
+      if (typeof (emitted.install_type ?? emitted.installType) === "string") {
+        input.installType = (emitted.install_type ?? emitted.installType) as string;
+      }
+      const emittedConfigure = emitted.configure;
+      if (emittedConfigure === null || (emittedConfigure && typeof emittedConfigure === "object")) {
+        input.configure = emittedConfigure === null ? null : commandTemplate(emittedConfigure, "configure");
+      }
       if (typeof (emitted.default_model ?? emitted.defaultModel) === "string") {
         input.defaultModel = (emitted.default_model ?? emitted.defaultModel) as string;
       } else if (model) input.defaultModel = model;
@@ -566,6 +593,12 @@ export function registerAdapterRoutes(router: Router): void {
 
   router.get("/api/adapters/generator-contract", (_req, res, _ctx) => {
     sendJson(res, 200, GENERATOR_CONTRACT);
+  });
+
+  // --- Shared adapters: cross-project discovery ---
+
+  router.get("/api/adapters/store", (_req, res, ctx) => {    const app = appOf(ctx);
+    sendJson(res, 200, { adapters: app.queries.listSharedAdapters() });
   });
 
   // --- Validate / dry-run: render command + connection_check, no execution ---

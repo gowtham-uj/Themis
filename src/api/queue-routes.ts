@@ -261,8 +261,9 @@ export function registerQueueRoutes(router: Router): void {
       judgeProvider?: string | null;
       auto_judge?: boolean;
       autoJudge?: boolean;
-    }>(req);
-    if (typeof body.name !== "string" || !body.name.trim()) {
+      shared_adapter_id?: string | null;
+      sharedAdapterId?: string | null;
+    }>(req);    if (typeof body.name !== "string" || !body.name.trim()) {
       throw badRequest("name is required");
     }
     const configuredAdapter = app.queries.listProjectAgentAdapters(projectId, {
@@ -299,8 +300,9 @@ export function registerQueueRoutes(router: Router): void {
     if (judgeProvider !== undefined) input.judgeProvider = judgeProvider;
     const autoJudge = body.auto_judge ?? body.autoJudge;
     if (autoJudge !== undefined) input.autoJudge = autoJudge;
-    const queue = app.queries.createEvalQueue(projectId, input);
-    sendJson(res, 201, queueView(app, queue));
+    const sharedAdapterId = body.shared_adapter_id ?? body.sharedAdapterId;
+    if (sharedAdapterId !== undefined) input.sharedAdapterId = sharedAdapterId ?? null;
+    const queue = app.queries.createEvalQueue(projectId, input);    sendJson(res, 201, queueView(app, queue));
   });
 
   router.get("/api/projects/:id/queues", (_req, res, ctx) => {
