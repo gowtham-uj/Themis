@@ -281,8 +281,11 @@ async function execBridge(projectId: string, queueId: string, command: string) {
       body: JSON.stringify({ command, timeout_ms: 30_000 }),
     },
   );
-  assert(response.status === 200, `bridge HTTP ${response.status}: ${await response.text()}`);
   const bytes = Buffer.from(await response.arrayBuffer());
+  assert(
+    response.status === 200,
+    `bridge HTTP ${response.status}: ${bytes.toString("utf8").slice(0, 500)}`,
+  );
   let offset = 0;
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
