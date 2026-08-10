@@ -166,6 +166,9 @@ async function createJudgeModelRuntime(
           id: model,
           name: model,
           reasoning: true,
+          // NeuralWatt (vLLM) rejects the `developer` role and only accepts
+          // `system`. Disable it so the openai-completions path uses `system`.
+          compat: { supportsDeveloperRole: false },
           input: ["text"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: 128_000,
