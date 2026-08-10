@@ -29,9 +29,61 @@ For each queue container, agenteval performs this order:
 The adapter owns agent-specific knowledge. Queue orchestration must not contain CLI flags, provider
 configuration conventions, trajectory paths, or parser rules for a particular agent.
 
-## Adapter JSON format (version 1)
+## Creating an adapter — two paths
+
+### Path 1 (recommended): Generator script
+
+Write a bash or JS script that inspects your agent (the platform clones its repo to
+`$AGENTEVAL_WORKSPACE_DIR`) and **emits the adapter JSON contract on stdout**. The platform
+runs your script, validates the output, stores the adapter, and builds the real OCI image.
+
+```
+POST /api/projects/:projectId/adapters/from-generator
+```
+
+```json
+{
+  "agent_id": "my-agent",
+  "name": "My Agent",
+  "generator": "#!/bin/bash\nset -euo pipefail\nENTRY=$(jq -r '.bin' $AGENTEVAL_WORKSPACE_DIR/package.json)\ncat <<JSON\n{\"agent_id\":\"$AGENTEVAL_AGENT_ID\",\"command\":{\"argv\":[\"$ENTRY\",\"--prompt\",\"{{prompt}}\",...]},...}\nJSON",
+  "source_repo": "https://github.com/example/my-agent.git",
+  "source_ref": "main",
+  "default_provider": "nuralwatt",
+  "default_model": "deepseek-v4-flash"
+}
+```
+
+**Input environment** (provided to your script):
+
+| Variable | Value |
+|---|---|
+| `AGENTEVAL_PROJECT_ID` | The project id |
+| `AGENTEVAL_AGENT_ID` | The agent_id you chose |
+| `AGENTEVAL_SOURCE_REPO` | The git repo URL or local path |
+| `AGENTEVAL_SOURCE_REF` | The pinned ref (or empty) |
+| `AGENTEVAL_PROVIDER` | Selected provider (e.g. `nuralwatt`) |
+| `AGENTEVAL_MODEL` | Selected model (e.g. `deepseek-v4-flash`) |
+| `AGENTEVAL_CREDENTIALS_DIR` | Dir with one file per named credential (secrets — never print to stdout) |
+| `AGENTEVAL_WORKSPACE_DIR` | A clone of your agent source at `source_ref` — inspect this to detect entrypoint, build system, evidence paths |
+
+**Output**: one JSON object on stdout matching the adapter contract (Path 2 below).
+The platform validates it with the same field validators. On success it stores the adapter
+(+ persists your generator script for reproducibility) and optionally builds the image.
+
+Discovery: `GET /api/adapters/generator-contract` returns the input env names, the output
+JSON schema, and a complete bash example.
+
+Dry-run: `POST /api/projects/:projectId/adapters/:adapterId/validate` renders the command
+template with a sample context (placeholders substituted) without running anything — useful
+for debugging template errors.
+
+See `examples/adapter-generators/generic-node-cli.sh` and `examples/adapter-generators/reapercode.sh`
+for complete working reference generators.
+
+### Path 2 (advanced): Raw JSON POST
 
 Create with `POST /api/projects/:projectId/adapters`. A project may have exactly one adapter.
+Use this when you want full control over every field and don't want a generator script.
 
 ```json
 {
@@ -106,7 +158,9 @@ Create with `POST /api/projects/:projectId/adapters`. A project may have exactly
   is called. Build commit, image id, log path, status, and timestamp are persisted.
 - `command.argv`: exact CLI argv template for an eval. No shell interpolation is performed.
 - `connection_check.argv`: a cheap real CLI/model probe. It must emit a model message in the same
-  stream protocol used for evals.
+  stream protocol used for evals. **Optional**: set `derive_connection_check: true` (or omit
+  `connection_check` entirely) and the platform auto-derives the probe from `command` with a
+  standard `"Reply with exactly AGENTEVAL_CONNECTION_OK. Do not use tools."` prompt.
 - `parser_kind`: one of:
   - `canonical-jsonl` — recommended for new agents; stdout is one canonical event JSON object per line.
   - `pi-jsonl` — consume pi's native `--mode json` protocol.
