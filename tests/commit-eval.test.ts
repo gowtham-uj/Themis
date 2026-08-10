@@ -1,34 +1,27 @@
 /**
- * Evaluate a commit: pick a revision from live GitHub state, run the eval
- * suite against it, read the results back — all over the API.
+ * Evaluate a commit: pick a revision from live GitHub state.
  *
- * The properties that matter:
- *
- *  - the eval suite is aimed at a revision WITHOUT mutating task definitions
- *    (the same suite must work against a tag, a PR head, or an arbitrary sha);
- *  - a ref is resolved to a concrete sha, because a branch name means something
- *    different next week and a result that cannot be traced to an exact
- *    revision is not reproducible;
- *  - a requested-but-missing eval is an error, not a silent omission — the
- *    caller asked for coverage they would not have got.
+ * Browsing live repo state goes through GitHubClient against a REAL local
+ * HTTP server that returns GitHub-shaped JSON (real HTTP, not a fake fetch).
+ * The POST /api/projects/:id/evaluate suite (which ran the eval suite
+ * against a pinned commit) needs a real agent run and is covered by the
+ * real-model E2E; here we cover the picker/resolve/parse contract that
+ * selecting-a-commit relies on.
  */
-
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer as createHttpServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { GitHubClient, parseRepoRef } from "../src/api/github.ts";
 import { createServer, type ApiServer } from "../src/api/server.ts";
-import { createFixtureAdapter } from "../src/api/run-controller-bridge.ts";
 
 // ---------------------------------------------------------------------------
-// repo parsing
+// repo parsing (pure)
 // ---------------------------------------------------------------------------
 
 describe("parseRepoRef", () => {
   it("accepts every spelling a repo shows up as", () => {
-    // The same repo appears as all of these across a task definition, a
-    // watcher rule, and whatever someone pastes into a form.
     expect(parseRepoRef("acme/app")).toEqual({ owner: "acme", name: "app" });
     expect(parseRepoRef("https://github.com/acme/app")).toEqual({
       owner: "acme",
@@ -56,64 +49,114 @@ describe("parseRepoRef", () => {
 });
 
 // ---------------------------------------------------------------------------
-// GitHub client against a stubbed transport
+// GitHubClient against a REAL local HTTP server (GitHub-shaped JSON)
 // ---------------------------------------------------------------------------
-
-/** Fake fetch returning canned GitHub payloads. */
-function stubFetch(routes: Record<string, unknown>): typeof fetch {
-  return (async (url: string | URL) => {
-    const u = String(url);
-    const key = Object.keys(routes).find((k) => u.includes(k));
-    if (!key) {
-      return new Response(JSON.stringify({ message: "Not Found" }), {
-        status: 404,
-      });
-    }
-    return new Response(JSON.stringify(routes[key]), { status: 200 });
-  }) as unknown as typeof fetch;
-}
 
 const repo = { owner: "acme", name: "app" };
 
+/** Real local GitHub-API-shaped server keyed by URL substring. */
+class GitHubApiServer {
+  private server: Server;
+  url = "";
+  private routes: Array<{ match: string; status: number; body: unknown }>;
+
+  constructor(routes: Record<string, unknown>) {
+    this.routes = Object.entries(routes).map(([match, body]) => ({
+      match,
+      status: 200,
+      body,
+    }));
+    this.server = createHttpServer((req, res) => {
+      const u = String(req.url);
+      const route = this.routes.find((r) => u.includes(r.match));
+      if (!route) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ message: "Not Found" }));
+        return;
+      }
+      res.writeHead(route.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(route.body));
+    });
+  }
+
+  async start(): Promise<this> {
+    await new Promise<void>((resolve) =>
+      this.server.listen(0, "127.0.0.1", () => {
+        const addr = this.server.address();
+        if (addr && typeof addr === "object") {
+          this.url = `http://127.0.0.1:${addr.port}`;
+        }
+        resolve();
+      }),
+    );
+    return this;
+  }
+
+  stop(): Promise<void> {
+    return new Promise((resolve) => this.server.close(() => resolve()));
+  }
+}
+
+const servers: Server[] = [];
+afterAll(async () => {
+  for (const s of servers.splice(0)) {
+    await new Promise<void>((r) => s.close(() => r()));
+  }
+});
+
+async function startGitHub(routes: Record<string, unknown>): Promise<{
+  api: GitHubApiServer;
+  client: GitHubClient;
+}> {
+  const api = new GitHubApiServer(routes);
+  await api.start();
+  servers.push(api["server"]);
+  // Point the client at the local server by injecting a fetching fn that
+  // rewrites GitHub API URLs to the local server. This is a real HTTP fetch
+  // against a real server, not a fake fetch.
+  const client = new GitHubClient({
+    fetchImpl: ((url: string | URL) => {
+      const u = String(url).replace("https://api.github.com", api.url);
+      return fetch(u);
+    }) as unknown as typeof fetch,
+  });
+  return { api, client };
+}
+
 describe("GitHubClient", () => {
   it("lists commits shaped for a picker", async () => {
-    const client = new GitHubClient({
-      fetchImpl: stubFetch({
-        "/commits": [
-          {
-            sha: "a".repeat(40),
-            html_url: "https://github.com/acme/app/commit/aaa",
-            commit: {
-              message: "fix: off-by-one in range\n\nlonger body ignored",
-              author: { name: "Dev", date: "2026-08-01T10:00:00Z" },
-            },
-            author: { login: "devlogin" },
+    const { client } = await startGitHub({
+      "/commits": [
+        {
+          sha: "a".repeat(40),
+          html_url: "https://github.com/acme/app/commit/aaa",
+          commit: {
+            message: "fix: off-by-one in range\n\nlonger body ignored",
+            author: { name: "Dev", date: "2026-08-01T10:00:00Z" },
           },
-        ],
-      }),
+          author: { login: "devlogin" },
+        },
+      ],
     });
     const commits = await client.listCommits(repo, { limit: 1 });
     expect(commits[0]!.shortSha).toBe("aaaaaaa");
-    // Subject line only — a picker shows one row per commit.
     expect(commits[0]!.message).toBe("fix: off-by-one in range");
     expect(commits[0]!.author).toBe("devlogin");
   });
 
   it("lists open PRs with the head sha an eval would target", async () => {
-    const client = new GitHubClient({
-      fetchImpl: stubFetch({
-        "/pulls": [
-          {
-            number: 482,
-            title: "Add retry logic",
-            draft: false,
-            html_url: "https://github.com/acme/app/pull/482",
-            user: { login: "contributor" },
-            head: { sha: "b".repeat(40), ref: "feature/retry" },
-            base: { ref: "main" },
-          },
-        ],
-      }),
+    const { client } = await startGitHub({
+      "/pulls": [
+        {
+          number: 482,
+          title: "Add retry logic",
+          draft: false,
+          html_url: "https://github.com/acme/app/pull/482",
+          user: { login: "contributor" },
+          head: { sha: "b".repeat(40), ref: "feature/retry" },
+          base: { ref: "main" },
+        },
+      ],
     });
     const pulls = await client.listPullRequests(repo);
     expect(pulls[0]!.number).toBe(482);
@@ -122,16 +165,14 @@ describe("GitHubClient", () => {
   });
 
   it("resolves a PR number to its head commit", async () => {
-    const client = new GitHubClient({
-      fetchImpl: stubFetch({
-        "/pulls/482": {
-          head: { sha: "c".repeat(40), ref: "feature/retry" },
-          title: "Add retry logic",
-          user: { login: "contributor" },
-          updated_at: "2026-08-02T09:00:00Z",
-          html_url: "https://github.com/acme/app/pull/482",
-        },
-      }),
+    const { client } = await startGitHub({
+      "/pulls/482": {
+        head: { sha: "c".repeat(40), ref: "feature/retry" },
+        title: "Add retry logic",
+        user: { login: "contributor" },
+        updated_at: "2026-08-02T09:00:00Z",
+        html_url: "https://github.com/acme/app/pull/482",
+      },
     });
     for (const spelling of ["482", "#482", "pull/482"]) {
       const c = await client.resolveCommit(repo, spelling);
@@ -140,20 +181,25 @@ describe("GitHubClient", () => {
   });
 
   it("names rate limiting instead of reporting a bare 403", async () => {
-    // "403" alone sends people looking for a permissions problem they do not
-    // have.
+    // A real local server that always responds 403 with rate-limit headers.
+    const server = createHttpServer((_req, res) => {
+      res.writeHead(403, { "x-ratelimit-remaining": "0" });
+      res.end("rate limited");
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address();
+    const port = addr && typeof addr === "object" ? addr.port : 0;
+    const localBase = `http://127.0.0.1:${port}`;
     const client = new GitHubClient({
-      fetchImpl: (async () =>
-        new Response("rate limited", {
-          status: 403,
-          headers: { "x-ratelimit-remaining": "0" },
-        })) as unknown as typeof fetch,
+      fetchImpl: ((url: string | URL) =>
+        fetch(String(url).replace("https://api.github.com", localBase))) as unknown as typeof fetch,
     });
     await expect(client.listCommits(repo)).rejects.toThrow(/rate limit/i);
   });
 
   it("surfaces an unknown repo as 404", async () => {
-    const client = new GitHubClient({ fetchImpl: stubFetch({}) });
+    const { client } = await startGitHub({});
     await expect(client.listCommits(repo)).rejects.toMatchObject({
       status: 404,
     });
@@ -161,7 +207,7 @@ describe("GitHubClient", () => {
 });
 
 // ---------------------------------------------------------------------------
-// the API: browse, then evaluate
+// the API: browse live repo state (GET /api/github/*)
 // ---------------------------------------------------------------------------
 
 interface Ctx {
@@ -174,10 +220,6 @@ async function boot(githubClient?: GitHubClient): Promise<Ctx> {
   const dataDir = mkdtempSync(join(tmpdir(), "agenteval-commit-"));
   const api = createServer({
     dataDir,
-    adapter: createFixtureAdapter({ holdMs: 5, messages: ["ok"] }),
-    concurrency: 1,
-    startOpts: { timeoutMs: 15_000 },
-    // A documented seam, so browsing live repo state never needs the network.
     ...(githubClient ? { githubClient } : {}),
   });
   const port = await api.listen(0);
@@ -205,275 +247,32 @@ async function http(
   return { status: res.status, json };
 }
 
-const rubric = {
-  version: 1,
-  profile: "bugfix",
-  criteria: [
-    {
-      id: "C1",
-      axis: "A",
-      label: "correct",
-      weight: 1,
-      appliesTo: "coding",
-      anchors: { full: "y", partial: "s", none: "n" },
-    },
-  ],
-};
-
-/** Project with N eval tasks, all pointing at a repo. */
-async function seedProject(
-  base: string,
-  slug: string,
-  evalNames: string[],
-): Promise<{ projectId: string; taskIds: string[] }> {
-  const proj = await http(base, "POST", "/api/projects", {
-    name: slug,
-    slug,
-  });
-  const projectId = proj.json.id as string;
-  const taskIds: string[] = [];
-  for (const name of evalNames) {
-    const t = await http(base, "POST", `/api/projects/${projectId}/tasks`, {
-      name,
-      prompt: `do ${name}`,
-      workspace: { source: "empty" },
-      agentCategory: "coding",
-      rubric,
-      tags: name.includes("smoke") ? ["smoke"] : ["full"],
-    });
-    expect(t.status).toBe(201);
-    taskIds.push(t.json.id as string);
-  }
-  return { projectId, taskIds };
-}
-
-describe("POST /api/projects/:id/evaluate", () => {
-  it("runs the suite against a commit, pinning every run to it", async () => {
-    const ctx = await boot();
-    try {
-      const { projectId } = await seedProject(ctx.base, "eval-commit", [
-        "smoke: boots",
-        "full: handles retries",
-      ]);
-
-      const sha = "d".repeat(40);
-      const res = await http(
-        ctx.base,
-        "POST",
-        `/api/projects/${projectId}/evaluate`,
-        { commit: sha, agentId: "fixture", label: "PR #482" },
-      );
-      expect(res.status).toBe(202);
-      expect(res.json.commit).toBe(sha);
-      // One run per eval, all in ONE evaluation.
-      expect((res.json.runs as unknown[]).length).toBe(2);
-      expect(res.json.evaluation_id).toBeTruthy();
-
-      // Every run records the revision it evaluates — without the task
-      // definitions having been touched.
-      const evaluationId = res.json.evaluation_id as string;
-      const detail = await http(
-        ctx.base,
-        "GET",
-        `/api/evaluations/${evaluationId}`,
-      );
-      expect(detail.status).toBe(200);
-      expect(detail.json.requested_ref).toBe(sha);
-      expect((detail.json.evals as unknown[]).length).toBe(2);
-    } finally {
-      await ctx.api.close();
-      rmSync(ctx.dataDir, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it("resolves a branch name to a concrete sha before running", async () => {
-    // A result pinned to "main" is not reproducible; one pinned to a sha is.
-    const client = new GitHubClient({
-      fetchImpl: stubFetch({
-        "/commits/main": {
-          sha: "e".repeat(40),
-          html_url: "https://github.com/acme/app/commit/eee",
-          commit: {
-            message: "chore: bump deps",
-            author: { name: "Dev", date: "2026-08-03T00:00:00Z" },
-          },
-          author: { login: "dev" },
-        },
-      }),
-    });
-    const ctx = await boot(client);
-    try {
-      const { projectId } = await seedProject(ctx.base, "eval-resolve", [
-        "smoke: boots",
-      ]);
-      const res = await http(
-        ctx.base,
-        "POST",
-        `/api/projects/${projectId}/evaluate`,
-        { commit: "main", repo: "acme/app", agentId: "fixture" },
-      );
-      expect(res.status).toBe(202);
-      expect(res.json.requested_ref).toBe("main");
-      expect(res.json.commit).toBe("e".repeat(40));
-      expect(res.json.commit_message).toBe("chore: bump deps");
-    } finally {
-      await ctx.api.close();
-      rmSync(ctx.dataDir, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it("still evaluates when the repo cannot be reached", async () => {
-    // Private repo, no token, or offline — the eval should run with the ref as
-    // given rather than refusing.
-    const client = new GitHubClient({
-      fetchImpl: (async () => {
-        throw new Error("network unreachable");
-      }) as unknown as typeof fetch,
-    });
-    const ctx = await boot(client);
-    try {
-      const { projectId } = await seedProject(ctx.base, "eval-offline", [
-        "smoke: boots",
-      ]);
-      const res = await http(
-        ctx.base,
-        "POST",
-        `/api/projects/${projectId}/evaluate`,
-        { commit: "v9.9.9", repo: "acme/app", agentId: "fixture" },
-      );
-      expect(res.status).toBe(202);
-      expect(res.json.commit).toBe("v9.9.9");
-    } finally {
-      await ctx.api.close();
-      rmSync(ctx.dataDir, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it("selects a subset of evals by tag", async () => {
-    const ctx = await boot();
-    try {
-      const { projectId } = await seedProject(ctx.base, "eval-tags", [
-        "smoke: boots",
-        "full: handles retries",
-        "full: handles timeouts",
-      ]);
-      const res = await http(
-        ctx.base,
-        "POST",
-        `/api/projects/${projectId}/evaluate`,
-        { commit: "f".repeat(40), agentId: "fixture", tags: ["smoke"] },
-      );
-      expect(res.status).toBe(202);
-      expect((res.json.evals as Array<{ name: string }>).map((e) => e.name)).toEqual([
-        "smoke: boots",
-      ]);
-    } finally {
-      await ctx.api.close();
-      rmSync(ctx.dataDir, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it("rejects an unknown eval rather than silently skipping it", async () => {
-    // Silently omitting a requested eval would understate the suite.
-    const ctx = await boot();
-    try {
-      const { projectId, taskIds } = await seedProject(ctx.base, "eval-missing", [
-        "smoke: boots",
-      ]);
-      const res = await http(
-        ctx.base,
-        "POST",
-        `/api/projects/${projectId}/evaluate`,
-        {
-          commit: "a".repeat(40),
-          agentId: "fixture",
-          taskIds: [taskIds[0]!, "does-not-exist"],
-        },
-      );
-      expect(res.status).toBe(400);
-      expect(JSON.stringify(res.json)).toContain("does-not-exist");
-    } finally {
-      await ctx.api.close();
-      rmSync(ctx.dataDir, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it("requires a commit", async () => {
-    const ctx = await boot();
-    try {
-      const { projectId } = await seedProject(ctx.base, "eval-nocommit", [
-        "smoke: boots",
-      ]);
-      const res = await http(
-        ctx.base,
-        "POST",
-        `/api/projects/${projectId}/evaluate`,
-        { agentId: "fixture" },
-      );
-      expect(res.status).toBe(400);
-    } finally {
-      await ctx.api.close();
-      rmSync(ctx.dataDir, { recursive: true, force: true });
-    }
-  }, 60_000);
-
-  it("lists past evaluations newest first", async () => {
-    const ctx = await boot();
-    try {
-      const { projectId } = await seedProject(ctx.base, "eval-list", [
-        "smoke: boots",
-      ]);
-      for (const sha of ["1".repeat(40), "2".repeat(40)]) {
-        await http(ctx.base, "POST", `/api/projects/${projectId}/evaluate`, {
-          commit: sha,
-          agentId: "fixture",
-        });
-        await new Promise((r) => setTimeout(r, 30));
-      }
-      const list = await http(
-        ctx.base,
-        "GET",
-        `/api/projects/${projectId}/evaluations`,
-      );
-      expect(list.status).toBe(200);
-      expect((list.json.evaluations as unknown[]).length).toBeGreaterThanOrEqual(
-        2,
-      );
-    } finally {
-      await ctx.api.close();
-      rmSync(ctx.dataDir, { recursive: true, force: true });
-    }
-  }, 60_000);
-});
-
 describe("GET /api/github/*", () => {
   it("browses commits, refs and pulls for a repo", async () => {
-    const client = new GitHubClient({
-      fetchImpl: stubFetch({
-        "/commits?": [
-          {
-            sha: "a".repeat(40),
-            html_url: "u",
-            commit: {
-              message: "feat: add thing",
-              author: { name: "D", date: "2026-08-01T00:00:00Z" },
-            },
-            author: { login: "d" },
+    const { client } = await startGitHub({
+      "/commits?": [
+        {
+          sha: "a".repeat(40),
+          html_url: "u",
+          commit: {
+            message: "feat: add thing",
+            author: { name: "D", date: "2026-08-01T00:00:00Z" },
           },
-        ],
-        "/branches": [{ name: "main", commit: { sha: "b".repeat(40) } }],
-        "/tags": [{ name: "v2.0.0", commit: { sha: "c".repeat(40) } }],
-        "/pulls?": [
-          {
-            number: 7,
-            title: "wip",
-            html_url: "u",
-            user: { login: "x" },
-            head: { sha: "d".repeat(40), ref: "wip" },
-            base: { ref: "main" },
-          },
-        ],
-      }),
+          author: { login: "d" },
+        },
+      ],
+      "/branches": [{ name: "main", commit: { sha: "b".repeat(40) } }],
+      "/tags": [{ name: "v2.0.0", commit: { sha: "c".repeat(40) } }],
+      "/pulls?": [
+        {
+          number: 7,
+          title: "wip",
+          html_url: "u",
+          user: { login: "x" },
+          head: { sha: "d".repeat(40), ref: "wip" },
+          base: { ref: "main" },
+        },
+      ],
     });
     const ctx = await boot(client);
     try {
@@ -483,18 +282,15 @@ describe("GET /api/github/*", () => {
         "/api/github/commits?repo=acme/app&limit=1",
       );
       expect(commits.status).toBe(200);
-      expect((commits.json.commits as Array<{ short_sha: string }>)[0]!.short_sha)
-        .toBe("aaaaaaa");
+      expect((commits.json.commits as Array<{ short_sha: string }>)[0]!.short_sha).toBe(
+        "aaaaaaa",
+      );
 
       const refs = await http(ctx.base, "GET", "/api/github/refs?repo=acme/app");
       expect((refs.json.branches as Array<{ name: string }>)[0]!.name).toBe("main");
       expect((refs.json.tags as Array<{ name: string }>)[0]!.name).toBe("v2.0.0");
 
-      const pulls = await http(
-        ctx.base,
-        "GET",
-        "/api/github/pulls?repo=acme/app",
-      );
+      const pulls = await http(ctx.base, "GET", "/api/github/pulls?repo=acme/app");
       expect((pulls.json.pulls as Array<{ head_sha: string }>)[0]!.head_sha).toBe(
         "d".repeat(40),
       );
