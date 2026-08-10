@@ -81,6 +81,9 @@ export const projectAgentAdapters = sqliteTable(
     image: text("image").notNull(),
     commandJson: text("command_json").notNull(),
     connectionCheckJson: text("connection_check_json").notNull(),
+    connectionCheckDerived: integer("connection_check_derived")
+      .notNull()
+      .default(0),
     evidenceJson: text("evidence_json").notNull(),
     parserKind: text("parser_kind").notNull(),
     parserConfigJson: text("parser_config_json"),
@@ -88,6 +91,7 @@ export const projectAgentAdapters = sqliteTable(
     sourceRepo: text("source_repo"),
     sourceRef: text("source_ref"),
     containerfile: text("containerfile"),
+    generatorScript: text("generator_script"),
     buildStatus: text("build_status").notNull().default("unbuilt"),
     builtImageId: text("built_image_id"),
     builtCommit: text("built_commit"),
@@ -762,4 +766,4 @@ export const schema = {
 export type Schema = typeof schema;
 
 /** Migration version stamped into pragma user_version / migrations table. */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;

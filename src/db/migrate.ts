@@ -55,6 +55,7 @@ const DDL: string[] = [
     image TEXT NOT NULL,
     command_json TEXT NOT NULL,
     connection_check_json TEXT NOT NULL,
+    connection_check_derived INTEGER NOT NULL DEFAULT 0,
     evidence_json TEXT NOT NULL,
     parser_kind TEXT NOT NULL,
     parser_config_json TEXT,
@@ -62,6 +63,7 @@ const DDL: string[] = [
     source_repo TEXT,
     source_ref TEXT,
     containerfile TEXT,
+    generator_script TEXT,
     build_status TEXT NOT NULL DEFAULT 'unbuilt',
     built_image_id TEXT,
     built_commit TEXT,
@@ -502,6 +504,9 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE runs ADD COLUMN eval_version INTEGER",
     "ALTER TABLE runs ADD COLUMN eval_snapshot_json TEXT",
     "ALTER TABLE judgements ADD COLUMN queue_analysis_id TEXT REFERENCES queue_analyses(id)",
+    // Adapter generator + connection-check derivation.
+    "ALTER TABLE project_agent_adapters ADD COLUMN connection_check_derived INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE project_agent_adapters ADD COLUMN generator_script TEXT",
   ];
   for (const sql of alters) {
     try {

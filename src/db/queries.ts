@@ -260,6 +260,7 @@ export interface ProjectAgentAdapter {
   image: string;
   command: CliCommandTemplate;
   connectionCheck: CliCommandTemplate;
+  connectionCheckDerived: boolean;
   evidence: CliAdapterEvidenceConfig;
   parserKind: CliAdapterParserKind | string;
   parserConfig: Record<string, unknown> | null;
@@ -267,6 +268,7 @@ export interface ProjectAgentAdapter {
   sourceRepo: string | null;
   sourceRef: string | null;
   containerfile: string | null;
+  generatorScript: string | null;
   buildStatus: string;
   builtImageId: string | null;
   builtCommit: string | null;
@@ -286,6 +288,7 @@ export interface CreateProjectAgentAdapterInput {
   image: string;
   command: CliCommandTemplate;
   connectionCheck: CliCommandTemplate;
+  connectionCheckDerived?: boolean;
   evidence: CliAdapterEvidenceConfig;
   parserKind: CliAdapterParserKind | string;
   parserConfig?: Record<string, unknown> | null;
@@ -293,6 +296,7 @@ export interface CreateProjectAgentAdapterInput {
   sourceRepo?: string | null;
   sourceRef?: string | null;
   containerfile?: string | null;
+  generatorScript?: string | null;
   enabled?: boolean;
   defaultModel?: string;
   defaultProvider?: string;
@@ -305,6 +309,7 @@ export interface UpdateProjectAgentAdapterInput {
   image?: string;
   command?: CliCommandTemplate;
   connectionCheck?: CliCommandTemplate;
+  connectionCheckDerived?: boolean;
   evidence?: CliAdapterEvidenceConfig;
   parserKind?: CliAdapterParserKind | string;
   parserConfig?: Record<string, unknown> | null;
@@ -312,6 +317,7 @@ export interface UpdateProjectAgentAdapterInput {
   sourceRepo?: string | null;
   sourceRef?: string | null;
   containerfile?: string | null;
+  generatorScript?: string | null;
   buildStatus?: string;
   builtImageId?: string | null;
   builtCommit?: string | null;
@@ -1643,6 +1649,7 @@ function mapProjectAgentAdapter(
     image: row.image,
     command: parseJson(row.commandJson, { argv: [] }),
     connectionCheck: parseJson(row.connectionCheckJson, { argv: [] }),
+    connectionCheckDerived: row.connectionCheckDerived === 1,
     evidence: parseJson(row.evidenceJson, { paths: [] }),
     parserKind: row.parserKind,
     parserConfig: parseJson(row.parserConfigJson, null),
@@ -1650,6 +1657,7 @@ function mapProjectAgentAdapter(
     sourceRepo: row.sourceRepo,
     sourceRef: row.sourceRef,
     containerfile: row.containerfile,
+    generatorScript: row.generatorScript,
     buildStatus: row.buildStatus,
     builtImageId: row.builtImageId,
     builtCommit: row.builtCommit,
@@ -2572,6 +2580,7 @@ export class SqliteQueries implements QueryStore {
       image: input.image,
       commandJson: JSON.stringify(input.command),
       connectionCheckJson: JSON.stringify(input.connectionCheck),
+      connectionCheckDerived: input.connectionCheckDerived === true ? 1 : 0,
       evidenceJson: JSON.stringify(input.evidence),
       parserKind: input.parserKind,
       parserConfigJson:
@@ -2585,6 +2594,7 @@ export class SqliteQueries implements QueryStore {
       sourceRepo: input.sourceRepo ?? null,
       sourceRef: input.sourceRef ?? null,
       containerfile: input.containerfile ?? null,
+      generatorScript: input.generatorScript ?? null,
       buildStatus: "unbuilt",
       builtImageId: null,
       builtCommit: null,
@@ -2652,6 +2662,9 @@ export class SqliteQueries implements QueryStore {
       ...(patch.connectionCheck !== undefined
         ? { connectionCheckJson: JSON.stringify(patch.connectionCheck) }
         : {}),
+      ...(patch.connectionCheckDerived !== undefined
+        ? { connectionCheckDerived: patch.connectionCheckDerived ? 1 : 0 }
+        : {}),
       ...(patch.evidence !== undefined ? { evidenceJson: JSON.stringify(patch.evidence) } : {}),
       ...(patch.parserKind !== undefined ? { parserKind: patch.parserKind } : {}),
       ...(patch.parserConfig !== undefined
@@ -2663,6 +2676,7 @@ export class SqliteQueries implements QueryStore {
       ...(patch.sourceRepo !== undefined ? { sourceRepo: patch.sourceRepo } : {}),
       ...(patch.sourceRef !== undefined ? { sourceRef: patch.sourceRef } : {}),
       ...(patch.containerfile !== undefined ? { containerfile: patch.containerfile } : {}),
+      ...(patch.generatorScript !== undefined ? { generatorScript: patch.generatorScript } : {}),
       ...(patch.buildStatus !== undefined ? { buildStatus: patch.buildStatus } : {}),
       ...(patch.builtImageId !== undefined ? { builtImageId: patch.builtImageId } : {}),
       ...(patch.builtCommit !== undefined ? { builtCommit: patch.builtCommit } : {}),
@@ -4938,6 +4952,7 @@ export class MemoryQueries implements QueryStore {
       image: input.image,
       command: structuredClone(input.command),
       connectionCheck: structuredClone(input.connectionCheck),
+      connectionCheckDerived: input.connectionCheckDerived === true,
       evidence: structuredClone(input.evidence),
       parserKind: input.parserKind,
       parserConfig: input.parserConfig ? structuredClone(input.parserConfig) : null,
@@ -4945,6 +4960,7 @@ export class MemoryQueries implements QueryStore {
       sourceRepo: input.sourceRepo ?? null,
       sourceRef: input.sourceRef ?? null,
       containerfile: input.containerfile ?? null,
+      generatorScript: input.generatorScript ?? null,
       buildStatus: "unbuilt",
       builtImageId: null,
       builtCommit: null,
@@ -5003,6 +5019,9 @@ export class MemoryQueries implements QueryStore {
       ...(patch.connectionCheck !== undefined
         ? { connectionCheck: structuredClone(patch.connectionCheck) }
         : {}),
+      ...(patch.connectionCheckDerived !== undefined
+        ? { connectionCheckDerived: patch.connectionCheckDerived }
+        : {}),
       ...(patch.evidence !== undefined ? { evidence: structuredClone(patch.evidence) } : {}),
       ...(patch.parserKind !== undefined ? { parserKind: patch.parserKind } : {}),
       ...(patch.parserConfig !== undefined
@@ -5014,6 +5033,7 @@ export class MemoryQueries implements QueryStore {
       ...(patch.sourceRepo !== undefined ? { sourceRepo: patch.sourceRepo } : {}),
       ...(patch.sourceRef !== undefined ? { sourceRef: patch.sourceRef } : {}),
       ...(patch.containerfile !== undefined ? { containerfile: patch.containerfile } : {}),
+      ...(patch.generatorScript !== undefined ? { generatorScript: patch.generatorScript } : {}),
       ...(patch.buildStatus !== undefined ? { buildStatus: patch.buildStatus } : {}),
       ...(patch.builtImageId !== undefined ? { builtImageId: patch.builtImageId } : {}),
       ...(patch.builtCommit !== undefined ? { builtCommit: patch.builtCommit } : {}),

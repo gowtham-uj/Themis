@@ -14,6 +14,10 @@ import type {
 
 const TEMPLATE = /\{\{([^{}]+)\}\}/g;
 
+/** Probe prompt used when an adapter derives its connection check from `command`. */
+export const PROBE_PROMPT =
+  "Reply with exactly AGENTEVAL_CONNECTION_OK. Do not use tools.";
+
 /** Build the common Adapter interface from a persisted CLI adapter definition. */
 export function createDeclarativeAdapter(definition: ProjectAgentAdapter): Adapter {
   return {
@@ -22,6 +26,25 @@ export function createDeclarativeAdapter(definition: ProjectAgentAdapter): Adapt
       return renderTemplate(definition.image, ctx);
     },
     connectionCheck(ctx) {
+      // When the adapter derives its connection check from `command`, render the
+      // command template against a probe context (prompt overridden) instead of
+      // a hand-written probe block.
+      if (definition.connectionCheckDerived) {
+        const probeCtx: RunContext = {
+          ...ctx,
+          task: { ...ctx.task, prompt: PROBE_PROMPT },
+        };
+        const probeCommand = renderCommand(
+          definition.command,
+          probeCtx,
+          definition.providerConfig,
+        );
+        return {
+          command: probeCommand,
+          cwd: definition.command.cwd ?? "/workspace",
+          timeoutMs: definition.command.timeoutMs ?? 60_000,
+        };
+      }
       return {
         command: renderCommand(definition.connectionCheck, ctx, definition.providerConfig),
         ...(definition.connectionCheck.cwd
