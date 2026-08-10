@@ -239,8 +239,8 @@ describe("outbound dispatch (real HTTP)", () => {
   it("failing sink (500) retries then records status=failed", async () => {
     const { api, projectId } = await boot();
     const capture = new CaptureServer();
-    capture.statusByUrl.set(capture.urlFor("/fail") as never, 500);
     await capture.start();
+    capture.statusByUrl.set(capture.urlFor("/fail"), 500);
 
     api.queries.createOutboundSubscription(projectId, {
       url: capture.urlFor("/fail"),
@@ -311,9 +311,9 @@ describe("outbound dispatch (real HTTP)", () => {
   it("per-sub isolation: one 500s, the other succeeds", async () => {
     const { api, projectId } = await boot();
     const capture = new CaptureServer();
-    capture.statusByUrl.set(capture.urlFor("/bad") as never, 500);
-    capture.statusByUrl.set(capture.urlFor("/good") as never, 200);
     await capture.start();
+    capture.statusByUrl.set(capture.urlFor("/bad"), 500);
+    capture.statusByUrl.set(capture.urlFor("/good"), 200);
 
     api.queries.createOutboundSubscription(projectId, {
       url: capture.urlFor("/bad"),
@@ -347,8 +347,8 @@ describe("outbound dispatch (real HTTP)", () => {
   it("secret never appears in recorded delivery payload/error", async () => {
     const { api, projectId } = await boot();
     const capture = new CaptureServer();
-    capture.statusByUrl.set(capture.urlFor("/sec") as never, 503);
     await capture.start();
+    capture.statusByUrl.set(capture.urlFor("/sec"), 503);
     const secret = "super-secret-value-xyz";
     api.queries.createOutboundSubscription(projectId, {
       url: capture.urlFor("/sec"),
