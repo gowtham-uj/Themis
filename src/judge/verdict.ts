@@ -426,6 +426,11 @@ function assertRef(v: unknown, ctx: string): asserts v is Ref {
   throw new VerdictValidationError(`${ctx}: unknown ref kind ${String(kind)}`);
 }
 
+/** Validate one structured evidence reference using the Verdict contract. */
+export function validateRef(value: unknown, context = "ref"): asserts value is Ref {
+  assertRef(value, context);
+}
+
 function validateFindingIdsUnique(findings: Finding[], label: string): void {
   const seen = new Set<string>();
   for (const f of findings) {

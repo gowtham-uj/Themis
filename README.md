@@ -18,6 +18,9 @@ versioned custom prompt and restricted archive tools. Frontend work is deferred.
 
 See:
 
+- [`docs/README.md`](./docs/README.md) — complete user/operator documentation.
+- [`docs/eval-authoring.md`](./docs/eval-authoring.md) — canonical eval package authoring and strict creation.
+- [`docs/platform-api-guide.md`](./docs/platform-api-guide.md) — end-to-end API operations.
 - [`plan/adapter-generation-guide.md`](./plan/adapter-generation-guide.md) — integrate a real CLI agent.
 - [`plan/execution.md`](./plan/execution.md) — queue container and evidence lifecycle.
 - [`plan/judge.md`](./plan/judge.md) — PI judge, verdict, and report lifecycle.

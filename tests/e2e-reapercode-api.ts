@@ -12,6 +12,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, setGlobalDispatcher } from "undici";
 import { createServer } from "../src/api/server.js";
+import type { EvalPackageUpload } from "../src/evals/package.js";
+import {
+  evalOnePackage,
+  evalTwoPackage,
+} from "./helpers/reapercode-e2e-packages.js";
 
 // The queue-container spawn endpoint blocks while it starts the persistent
 // Podman container and runs the real adapter connection check (real reaper +
@@ -109,14 +114,20 @@ try {
   });
   const queue = object(queueView.queue, "queue");
   const queueId = string(queue.id, "queue.id");
-  await json("POST", `/api/projects/${projectId}/queues/${queueId}/items`, {
-    eval_id: evalOneId,
-    repeats: 1,
-  });
-  await json("POST", `/api/projects/${projectId}/queues/${queueId}/items`, {
-    eval_id: evalTwoId,
-    repeats: 1,
-  });
+  const loaded = await json(
+    "POST",
+    `/api/projects/${projectId}/queues/${queueId}/items:load-category`,
+    { category_name: "reapercode-acceptance", repeats: 1, enabled: true },
+  );
+  assert(array(loaded.added, "category load added").length === 2, "category loading must add both evals");
+  assert(
+    array(loaded.added, "category load added").map((entry) => string(object(entry, "queue item").taskId, "queue item.taskId")).includes(evalOneId),
+    "category loading must include eval one",
+  );
+  assert(
+    array(loaded.added, "category load added").map((entry) => string(object(entry, "queue item").taskId, "queue item.taskId")).includes(evalTwoId),
+    "category loading must include eval two",
+  );
 
   const spawned = await json(
     "PUT",
@@ -145,9 +156,27 @@ try {
       run.queueContainerId === spawned.queue_container_id,
       "every run must point to the same queue container row",
     );
-    const archive = await json("GET", `/api/evals/${string(run.id, "run.id")}/archive`);
+    const runId = string(run.id, "run.id");
+    const archive = await json("GET", `/api/evals/${runId}/archive`);
     const verification = object(archive.verification, "archive.verification");
-    assert(verification.ok === true, `archive verification failed for ${String(run.id)}`);
+    assert(verification.ok === true, `archive verification failed for ${runId}`);
+    const manifest = object(verification.manifest, "archive.verification.manifest");
+    const files = array(manifest.files, "archive.verification.manifest.files")
+      .map((entry) => string(object(entry, "archive file").path, "archive file.path"));
+    for (const required of [
+      "run.json",
+      "run-metrics.json",
+      "evidence-integrity.json",
+      "verifier.json",
+      "diff.patch",
+      "events.jsonl",
+    ]) {
+      assert(files.includes(required), `archive ${runId} missing ${required}`);
+    }
+    assert(
+      !files.some((path) => path.startsWith("solution/") || path.startsWith("tests/") || path.startsWith("validation/")),
+      `archive ${runId} leaked protected eval package content`,
+    );
   }
 
   // Privileged bridge remains live after drain. Decode exact framed stdout/stderr.
@@ -159,33 +188,52 @@ try {
     `introspection command must exit 0: ${JSON.stringify(bridge.control)}`,
   );
 
-  const analysisResult = await json(
-    "POST",
-    `/api/projects/${projectId}/queues/${queueId}/analyses`,
+  const analysisCreate = await fetch(
+    `${base}/api/projects/${projectId}/queues/${queueId}/analyses`,
     {
-      batch_id: batchId,
-      all: true,
-      judge_model: MODEL,
-      judge_provider: "neuralwatt",
-      judge_prompt:
-        "Be exacting. Evaluate whether ReaperCode solved and verified each task, identify cross-eval reliability defects, and propose concrete agent-level fixes with verification sets.",
-      judge_params: { maxTokens: 16384 },
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        batch_id: batchId,
+        all: true,
+        judge_model: MODEL,
+        judge_provider: "neuralwatt",
+        judge_prompt:
+          "Be exacting. Evaluate whether ReaperCode solved and verified each task, identify cross-eval reliability defects, and propose concrete agent-level fixes with verification sets.",
+        judge_params: { maxTokens: 16384 },
+      }),
     },
   );
-  assert(analysisResult.status === "completed", `analysis failed: ${String(analysisResult.error)}`);
-  const analysis = object(analysisResult.analysis, "analysis");
-  const analysisId = string(analysis.id, "analysis.id");
+  const analysisCreateText = await analysisCreate.text();
+  assert(
+    analysisCreate.status === 202,
+    `analysis create must be async 202 (got ${analysisCreate.status}): ${analysisCreateText}`,
+  );
+  const analysisCreateBody = JSON.parse(analysisCreateText) as { analysis: { id: string } };
+  const analysisId = string(analysisCreateBody.analysis.id, "analysis.id");
+
+  // Poll the analysis detail endpoint until it reaches terminal state; the 202
+  // must have returned immediately (judge runs detached in the background).
+  const analysis = await waitForAnalysis(projectId, queueId, analysisId, 10 * 60 * 1000);
+  assert(analysis.status === "completed", `queue judge did not complete: ${String(analysis.status)} ${String(analysis.error ?? "")}`);
+  const analysesBase = `/api/projects/${projectId}/queues/${queueId}/analyses`;
+  const analysisRoot = `${analysesBase}/${analysisId}`;
 
   assert(
     string(analysis.systemPromptVersion, "analysis.systemPromptVersion").startsWith("2-queue-pi-"),
     "queue analysis must use the versioned custom judge prompt through PI",
   );
-  const analysisRoot = `/api/projects/${projectId}/queues/${queueId}/analyses/${analysisId}`;
   const judgeEventsResponse = await fetch(`${base}${analysisRoot}/events`);
   assert(judgeEventsResponse.status === 200, `judge events HTTP ${judgeEventsResponse.status}`);
   const judgeEvents = await judgeEventsResponse.text();
   assert(judgeEvents.includes('"type":"agent_start"'), "PI judge trace must contain agent_start");
   assert(judgeEvents.includes('"type":"tool_execution_start"'), "PI judge must use custom tools");
+  assert(judgeEvents.includes("preflight_queue_analysis"), "PI judge must preflight the complete v2 payload");
+  assert(judgeEvents.includes("submit_queue_analysis"), "PI judge must submit the preflight token");
+  assert(
+    judgeEvents.split("submit_queue_analysis").length - 1 >= 1,
+    "PI judge must perform token-based final submission",
+  );
 
   const transcriptResponse = await fetch(`${base}${analysisRoot}/transcript`);
   assert(transcriptResponse.status === 200, `PI transcript HTTP ${transcriptResponse.status}`);
@@ -197,6 +245,26 @@ try {
   assert(verdictResponse.status === 200, `verdict HTTP ${verdictResponse.status}`);
   const verdict = object(await verdictResponse.json(), "queue verdict");
   assert(Array.isArray(verdict.perEval) && verdict.perEval.length === 2, "judge must emit both eval verdicts");
+  for (const rawEntry of verdict.perEval) {
+    const entry = object(rawEntry, "per-eval verdict");
+    const narrative = object(entry.narrative, "per-eval narrative");
+    assert(narrative.schemaVersion === 1, "every eval narrative must use schema v1");
+    assert(array(narrative.executionAnalysis, "narrative.executionAnalysis").length > 0, "narrative must explain execution");
+  }
+  const queueAnalysis = object(verdict.queueAnalysis, "queueAnalysis");
+  assert(queueAnalysis.schemaVersion === 2, "queue analysis must use schema v2");
+  assert(Array.isArray(queueAnalysis.improvementPlan), "queue analysis must contain the improvement plan");
+
+  for (const rawRun of runs) {
+    const runId = string(object(rawRun, "run").id, "run.id");
+    const metrics = await json("GET", `/api/evals/${runId}/metrics`);
+    assert(metrics.schema_version === 1, `metrics ${runId} must use schema v1`);
+    const execution = object(metrics.execution, "metrics.execution");
+    assert(object(execution.measurements, "metrics.execution.measurements").tool_calls !== undefined, "execution metrics must include tool_calls");
+    const outcome = object(metrics.outcome, "metrics.outcome");
+    const reward = outcome.officialReward as number;
+    assert(reward === 0 || reward === 1, `run ${runId} officialReward must be binary (got ${String(reward)})`);
+  }
 
   const reportResponse = await fetch(`${base}${analysisRoot}/report`);
   assert(reportResponse.status === 200, `report HTTP ${reportResponse.status}`);
@@ -205,13 +273,46 @@ try {
   for (const required of [
     "Cross-eval themes",
     "Reliability",
-    "Ranked defects",
-    "Per-eval verdicts",
-    "Improvement plan",
-    "ReaperCode",
+    "Ranked observed defects",
+    "Subsystem attribution",
+    "Per-eval verdicts and narratives",
+    "Execution timeline",
+    "Evidence boundaries",
+    "Owner backlogs",
+    "agent backlog",
+    "platform backlog",
+    "judge backlog",
+    "eval backlog",
   ]) {
     assert(report.includes(required), `report missing quality section: ${required}`);
   }
+
+  // Standalone invocation: analyze a single eval by explicit run_ids (judge can
+  // be driven directly from a chosen archive set, independent of the queue link).
+  const twoRunIds = array(completed.runs, "completed.runs").map((rawRun) => string(object(rawRun, "run").id, "run.id"));
+  const standaloneCreate = await fetch(`${base}${analysesBase}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      batch_id: batchId,
+      run_ids: [twoRunIds[0]!],
+      judge_model: MODEL,
+      judge_provider: "neuralwatt",
+      judge_prompt: "Exact single-eval judge. Did ReaperCode repair and verify the arithmetic task?",
+      judge_params: { maxTokens: 12288, timeoutMs: 5 * 60 * 1000 },
+    }),
+  });
+  assert(standaloneCreate.status === 202, `standalone analysis create must be 202`);
+  const standaloneId = string(((await standaloneCreate.json()) as { analysis: { id: string } }).analysis.id, "standalone analysis.id");
+  const standaloneView = await waitForAnalysis(projectId, queueId, standaloneId, 10 * 60 * 1000);
+  assert(
+    standaloneView.status === "completed",
+    `standalone judge did not complete: ${String(standaloneView.status)} ${String(standaloneView.error ?? "")}`,
+  );
+  const standaloneResponse = await fetch(`${base}${analysesBase}/${standaloneId}/verdict`);
+  assert(standaloneResponse.status === 200, `standalone verdict HTTP ${standaloneResponse.status}`);
+  const standaloneVerdict = object(await standaloneResponse.json(), "standalone verdict");
+  assert(Array.isArray(standaloneVerdict.perEval) && standaloneVerdict.perEval.length === 1, "standalone judge must emit exactly one verdict");
 
   console.log(
     JSON.stringify(
@@ -256,6 +357,27 @@ async function json(method: string, path: string, body?: unknown): Promise<Recor
     throw new Error(`${method} ${path} failed ${response.status}: ${text.slice(0, 2000)}`);
   }
   return parsed;
+}
+
+async function waitForAnalysis(
+  projectId: string,
+  queueId: string,
+  analysisId: string,
+  timeoutMs: number,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch(
+      `${base}/api/projects/${projectId}/queues/${queueId}/analyses/${analysisId}`,
+    );
+    assert(response.status === 200, `analysis detail HTTP ${response.status}`);
+    const view = object((await response.json()).analysis, "analysis");
+    if (["completed", "failed"].includes(String(view.status))) {
+      return view;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  throw new Error(`analysis ${analysisId} did not become terminal within ${timeoutMs}ms`);
 }
 
 async function waitForQueue(
@@ -388,129 +510,12 @@ CMD ["reaper", "--help"]
 `;
 }
 
-function evalOneSpec() {
-  return {
-    id: "repair-addition",
-    name: "Repair addition and verify edge cases",
-    prompt:
-      "Fix the add function so all tests pass. Inspect the existing code, make the smallest correct change, run the complete test suite after the final edit, and leave the workspace in a verified state.",
-    agentCategory: "coding",
-    workspace: { source: "empty" },
-    tags: ["coding", "javascript", "verification"],
-    env: {
-      kind: "greenfield",
-      setupScript: `mkdir -p src test
-cat > package.json <<'JSON'
-{"name":"eval-add","type":"module","scripts":{"test":"node --test"}}
-JSON
-cat > src/math.js <<'JS'
-export function add(a, b) { return a - b; }
-JS
-cat > test/math.test.js <<'JS'
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import { add } from '../src/math.js';
-test('positive', () => assert.equal(add(2, 3), 5));
-test('negative', () => assert.equal(add(-2, -3), -5));
-test('zero', () => assert.equal(add(0, 7), 7));
-JS
-touch /tmp/agenteval-eval-one`,
-      setupTimeoutSec: 120,
-      commitBaseline: true,
-      cleanupScript: "rm -f /tmp/agenteval-eval-one",
-      cleanupTimeoutSec: 60,
-      cleanupVerifyScript: "test ! -e /tmp/agenteval-eval-one",
-      cleanupVerifyTimeoutSec: 30,
-    },
-    checks: [
-      { id: "tests", kind: "test_suite", command: "npm test" },
-      { id: "status", kind: "command", command: "git status --short" },
-    ],
-    rubric: codingRubric("addition"),
-  };
+function evalOneSpec(): EvalPackageUpload {
+  return evalOnePackage();
 }
 
-function evalTwoSpec() {
-  return {
-    id: "repair-slugify",
-    name: "Repair slugify without breaking punctuation behavior",
-    prompt:
-      "Repair slugify to satisfy every test. Preserve the intended behavior, avoid hard-coding examples, run all tests after the final change, and explain success only after verification.",
-    agentCategory: "coding",
-    workspace: { source: "empty" },
-    tags: ["coding", "javascript", "robustness"],
-    env: {
-      kind: "greenfield",
-      setupScript: `mkdir -p src test
-cat > package.json <<'JSON'
-{"name":"eval-slug","type":"module","scripts":{"test":"node --test"}}
-JSON
-cat > src/slug.js <<'JS'
-export function slugify(value) { return value.trim().replace(/\\s+/g, '_'); }
-JS
-cat > test/slug.test.js <<'JS'
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import { slugify } from '../src/slug.js';
-test('spaces', () => assert.equal(slugify('Hello World'), 'hello-world'));
-test('punctuation', () => assert.equal(slugify(' API, Design! '), 'api-design'));
-test('repeated separators', () => assert.equal(slugify('a---b   c'), 'a-b-c'));
-JS
-touch /tmp/agenteval-eval-two`,
-      setupTimeoutSec: 120,
-      commitBaseline: true,
-      cleanupScript: "rm -f /tmp/agenteval-eval-two",
-      cleanupTimeoutSec: 60,
-      cleanupVerifyScript: "test ! -e /tmp/agenteval-eval-two",
-      cleanupVerifyTimeoutSec: 30,
-    },
-    checks: [
-      { id: "tests", kind: "test_suite", command: "npm test" },
-      { id: "diff", kind: "command", command: "git diff --check" },
-    ],
-    rubric: codingRubric("slugification"),
-  };
-}
-
-function codingRubric(label: string) {
-  return {
-    version: 1,
-    profile: "bugfix",
-    criteria: [
-      {
-        id: "correctness",
-        axis: "A",
-        label: `${label} correctness`,
-        weight: 0.55,
-        appliesTo: "coding",
-        anchors: { full: "all tests pass", partial: "some cases pass", none: "tests fail" },
-      },
-      {
-        id: "verification",
-        axis: "B",
-        label: "verification discipline",
-        weight: 0.3,
-        appliesTo: "coding",
-        anchors: {
-          full: "complete tests run after final edit",
-          partial: "incomplete or stale verification",
-          none: "no verification",
-        },
-      },
-      {
-        id: "quality",
-        axis: "C",
-        label: "change quality",
-        weight: 0.15,
-        appliesTo: "coding",
-        anchors: {
-          full: "minimal general solution",
-          partial: "works with avoidable issues",
-          none: "hard-coded or damaging change",
-        },
-      },
-    ],
-  };
+function evalTwoSpec(): EvalPackageUpload {
+  return evalTwoPackage();
 }
 
 function object(value: unknown, name: string): Record<string, unknown> {

@@ -79,6 +79,7 @@ export const DEFAULT_DIFF_EXCLUDES: readonly string[] = [
   ".reaper/",
   ".pi/",
   ".agent/",
+  ".agenteval/",
 ];
 
 /**

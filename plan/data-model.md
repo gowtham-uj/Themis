@@ -18,7 +18,9 @@ keeps the DB small and fast, makes runs immutable, and lets the UI replay logs d
         <runId>/
           run.json                  # snapshot (agent, model, params, resolved commit)
           events.jsonl              # canonical event stream (immutable, append-only)
-          diff.patch                # git diff produced after the run (hunk-numbered for refs)
+          diff.patch                # scored task diff; harness-owned .agenteval/** excluded
+          run-metrics.json          # platform facts derived from canonical events
+          evidence-integrity.json   # raw-evidence validity/contradiction boundaries
           raw/                      # optional: raw agent stdout/stderr, native trajectory
       judgements/
         <judgementId>/
@@ -294,7 +296,38 @@ CREATE TABLE judgements (
   overall_score REAL,              -- normalized 0..100 (or 0..1)
   verdict TEXT,                     -- pass|fail|partial (derived)
   report_path TEXT, events_path TEXT, verdict_path TEXT,
+  narrative_json TEXT,              -- queue v2 EvalJudgementNarrative; null for historical v1 rows
+  narrative_schema_version INTEGER,
   created_at TEXT, ended_at TEXT
+);
+
+-- Queryable lifecycle projection of the immutable queue-wide improvement plan.
+CREATE TABLE improvement_steps (
+  id TEXT PRIMARY KEY,
+  queue_analysis_id TEXT NOT NULL REFERENCES queue_analyses(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  queue_id TEXT NOT NULL REFERENCES eval_queues(id),
+  rank INTEGER NOT NULL,
+  class TEXT NOT NULL,               -- agent|platform|judge|eval
+  priority INTEGER NOT NULL,         -- 0 highest
+  confidence REAL NOT NULL,
+  defect_ids_json TEXT NOT NULL,
+  subsystem TEXT NOT NULL,
+  problem TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  target_json TEXT NOT NULL,         -- resolved target or explicit external blocker
+  change TEXT NOT NULL,
+  acceptance_criteria_json TEXT NOT NULL,
+  tests_json TEXT NOT NULL,
+  verify_task_ids_json TEXT NOT NULL,
+  regression_task_ids_json TEXT NOT NULL,
+  dependencies_json TEXT NOT NULL,
+  non_goals_json TEXT NOT NULL,
+  status TEXT NOT NULL,              -- proposed|ready|blocked|in_progress|verified|rejected
+  blocking_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(queue_analysis_id, rank)
 );
 
 -- Per-criterion scores (for trend charts + drill-down)

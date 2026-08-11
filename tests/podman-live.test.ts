@@ -11,6 +11,7 @@
  * reachable from the host, and that pause really freezes the process.
  */
 
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -141,6 +142,32 @@ d("PodmanRuntime (live containers)", () => {
       await handle.wait();
       expect(out).toContain("v=hunter2");
     } finally {
+      await handle.remove();
+      rmSync(s.workspaceDir, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it("injects exec env vars without embedding values in podman argv", async () => {
+    const s = spec({ argv: ["sh", "-c", "sleep 300"], timeoutMs: 0 });
+    const handle = await runtime().run(s);
+    try {
+      const value = `exec-secret-value-${Date.now()}`;
+      const session = await handle.startExec({
+        argv: ["sh", "-c", "sleep 2; printf '%s' \"$AGENTEVAL_EXEC_VAR\""],
+        env: { AGENTEVAL_EXEC_VAR: value },
+        timeoutMs: 30_000,
+      });
+      const stdout = drain(session.stdout());
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const hostProcesses = execFileSync("ps", ["-eo", "args"], {
+        encoding: "utf8",
+      });
+      expect(hostProcesses).not.toContain(value);
+      const result = await session.wait();
+      expect(result.exitCode).toBe(0);
+      expect(await stdout).toBe(value);
+    } finally {
+      await handle.stop(2_000);
       await handle.remove();
       rmSync(s.workspaceDir, { recursive: true, force: true });
     }

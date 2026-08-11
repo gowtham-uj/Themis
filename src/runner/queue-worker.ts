@@ -1,6 +1,6 @@
 /** Sequential eval execution inside one persistent queue-owned container. */
 
-import { cp, mkdir, open, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Adapter, RunContext } from "../adapters/types.js";
 import { getAdapter } from "../adapters/index.js";
@@ -13,9 +13,15 @@ import type {
   Run,
   Task,
 } from "../db/queries.js";
+import {
+  evalEnvironmentDigest,
+  loadEvalPackageRuntimeConfig,
+  prepareEvalPackageWorkspace,
+  restoreEvalLifecycleScript,
+  type EvalPackageRuntimeConfig,
+} from "../evals/package.js";
 import type { CanonicalEvent, RunStatus as EventRunStatus } from "../schema/events.js";
 import { appendEvent } from "../schema/append.js";
-import { runChecks } from "./check-runner.js";
 import { captureDiffByCategory } from "./diff-category.js";
 import {
   cleanupEnvInContainer,
@@ -25,6 +31,10 @@ import {
   verifyCleanupInContainer,
 } from "./env-provision.js";
 import { sealEvalArchive } from "./eval-archive.js";
+import { analyzeEvidenceIntegrity } from "./evidence-integrity.js";
+import { deriveRunMetrics } from "./metrics.js";
+import { buildEvalAgentImage } from "./package-image.js";
+import { runCanonicalPackageVerifier } from "./package-verifier.js";
 import { resolveAdapterOverrides, resolveNetworkMode } from "./project-config.js";
 import { resolveRuntime } from "./runtime.js";
 import type {
@@ -35,7 +45,7 @@ import type {
   ContainerRuntime,
 } from "./runtime.js";
 import { deriveRunStatus } from "./run.js";
-import { ensureGitRepo, prepareWorkspace } from "./workspace.js";
+import { commitWorkspaceBaseline } from "./workspace.js";
 
 const DEFAULT_AGENT_TIMEOUT_MS = 120_000;
 const RAW_STDOUT = "raw-stdout.log";
@@ -87,6 +97,7 @@ interface ExpandedRun {
   run: Run;
   item: EvalQueueItem;
   task: Task;
+  packageRuntime: EvalPackageRuntimeConfig;
   overrides: Record<string, unknown> | null;
 }
 
@@ -156,12 +167,23 @@ export async function startQueueContainer(
     : getAdapter(queue.agentId);
   const runtime = opts.runtime ?? resolveRuntime();
   const tasks = new Map<string, Task>();
+  const packageRuntimes = new Map<string, EvalPackageRuntimeConfig>();
   for (const item of items) {
     const task = queries.getTask(item.taskId);
     if (!task || task.projectId !== queue.projectId || task.archived) {
       throw new Error(`queue item ${item.id} references unavailable eval ${item.taskId}`);
     }
+    if (!task.packagePath || !task.packageDigest || !task.packageManifest) {
+      throw new Error(`queue item ${item.id} references a non-canonical eval package`);
+    }
     tasks.set(task.id, task);
+    if (!packageRuntimes.has(task.id)) {
+      packageRuntimes.set(task.id, await loadEvalPackageRuntimeConfig({
+        packagePath: task.packagePath,
+        packageDigest: task.packageDigest,
+        manifest: task.packageManifest,
+      }));
+    }
   }
 
   const workspaceDir = join(
@@ -185,9 +207,32 @@ export async function startQueueContainer(
     workspaceDir,
     resolveAdapterOverrides(project, firstOverrides),
   );
-  const image = queueAdapter.image(firstCtx);
+  const adapterImage = queueAdapter.image(firstCtx);
+  const firstEnvironmentDigest = evalEnvironmentDigest(firstTask.packageManifest!);
+  const builtEvalImage = await buildEvalAgentImage({
+    runtime,
+    task: firstTask,
+    adapterImage,
+    buildRoot: join(
+      dataDir,
+      "projects",
+      queue.projectId,
+      "queues",
+      queue.id,
+      "environment-builds",
+    ),
+  });
+  const image = builtEvalImage.image;
   const firstResolved = resolveAdapterOverrides(project, firstOverrides);
-  const containerNetwork = resolveNetworkMode(firstResolved?.network ?? queue.networkPolicy);
+  const firstPackageRuntime = packageRuntimes.get(firstTask.id)!;
+  const configuredNetwork = resolveNetworkMode(firstResolved?.network ?? queue.networkPolicy);
+  if (configuredNetwork !== firstPackageRuntime.network) {
+    throw new Error(
+      `queue ${queue.id} network policy ${configuredNetwork} does not match eval package policy ${firstPackageRuntime.network}`,
+    );
+  }
+  const containerNetwork = firstPackageRuntime.network;
+  const containerNetworkAllowlist = firstPackageRuntime.networkAllowlist;
   const containerPorts = queue.ports.length > 0 ? queue.ports : (firstResolved?.ports ?? []);
 
   // Container-level settings are immutable for the lifetime of a persistent
@@ -196,7 +241,7 @@ export async function startQueueContainer(
     const task = tasks.get(item.taskId)!;
     const raw = mergeOverrides(queue.adapterOverrides, item.overrides);
     const resolved = resolveAdapterOverrides(project, raw);
-    const itemImage = queueAdapter.image(
+    const itemAdapterImage = queueAdapter.image(
       makeRunContext(
         `queue-image-${queue.id}-${item.id}`,
         queue,
@@ -205,15 +250,35 @@ export async function startQueueContainer(
         resolved,
       ),
     );
-    if (itemImage !== image) {
+    if (itemAdapterImage !== adapterImage) {
       throw new Error(
-        `queue ${queue.id} resolves multiple images (${image}, ${itemImage}); one persistent queue requires one image`,
+        `queue ${queue.id} resolves multiple adapter images (${adapterImage}, ${itemAdapterImage}); one persistent queue requires one image`,
+      );
+    }
+    const itemEnvironmentDigest = evalEnvironmentDigest(task.packageManifest!);
+    if (itemEnvironmentDigest !== firstEnvironmentDigest) {
+      throw new Error(
+        `queue ${queue.id} contains multiple agent environment digests; split them into separate queues`,
       );
     }
     const itemNetwork = resolveNetworkMode(resolved?.network ?? queue.networkPolicy);
-    if (itemNetwork !== containerNetwork) {
+    const itemPackageRuntime = packageRuntimes.get(task.id)!;
+    if (itemNetwork !== containerNetwork || itemPackageRuntime.network !== containerNetwork) {
       throw new Error(
-        `queue ${queue.id} resolves multiple network policies (${containerNetwork}, ${itemNetwork}); one persistent queue requires one network policy`,
+        `queue ${queue.id} resolves incompatible queue/package network policies; one persistent queue requires one policy`,
+      );
+    }
+    if (JSON.stringify(itemPackageRuntime.networkAllowlist) !== JSON.stringify(containerNetworkAllowlist)) {
+      throw new Error(
+        `queue ${queue.id} contains multiple package network allowlists; split them into separate queues`,
+      );
+    }
+    if (
+      itemPackageRuntime.cpus !== firstPackageRuntime.cpus ||
+      itemPackageRuntime.memoryMiB !== firstPackageRuntime.memoryMiB
+    ) {
+      throw new Error(
+        `queue ${queue.id} contains multiple package CPU/RAM limits; split them into separate queues`,
       );
     }
     const itemPorts = queue.ports.length > 0 ? queue.ports : (resolved?.ports ?? []);
@@ -273,7 +338,13 @@ export async function startQueueContainer(
         triggerRef: queue.id,
         controlState: "running",
       });
-      expanded.push({ run, item, task, overrides: rawOverrides });
+      expanded.push({
+        run,
+        item,
+        task,
+        packageRuntime: packageRuntimes.get(task.id)!,
+        overrides: rawOverrides,
+      });
     }
   }
 
@@ -297,9 +368,12 @@ export async function startQueueContainer(
         "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
       ],
       env: {},
-      limits: { cpus: 2, pids: 512 },
+      limits: { cpus: firstPackageRuntime.cpus, pids: 512 },
       timeoutMs: 0,
       network: containerNetwork,
+      ...(containerNetwork === "allowlist"
+        ? { networkAllowlist: containerNetworkAllowlist }
+        : {}),
       ports: containerPorts,
       nonRoot: false,
       ...(Object.keys(sandbox).length > 0 ? { sandbox } : {}),
@@ -535,7 +609,7 @@ export async function startQueueContainer(
           adapter: queueAdapter,
           entry,
           workspaceDir,
-          timeoutMs: opts.timeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
+          timeoutMs: opts.timeoutMs ?? entry.packageRuntime.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
           isStopRequested: () => live.stopRequested,
           setExec: (session) => {
             currentExec = session;
@@ -614,13 +688,17 @@ async function executeEval(input: {
   await mkdir(runDir, { recursive: true });
   await clearDirectory(workspaceDir);
 
-  let workspaceCommit: string | undefined;
-  if (task.workspace.source === "git") {
-    const prepared = await prepareWorkspace(task.workspace, { targetDir: workspaceDir });
-    workspaceCommit = prepared.commit;
-  } else {
-    await ensureGitRepo(workspaceDir);
+  if (!task.packagePath || !task.packageDigest || !task.packageManifest) {
+    throw new Error(`eval ${task.id} is not a validated canonical eval package`);
   }
+  await prepareEvalPackageWorkspace({
+    packagePath: task.packagePath,
+    packageDigest: task.packageDigest,
+    manifest: task.packageManifest,
+    workspaceDir,
+  });
+  let workspaceCommit: string | undefined = await commitWorkspaceBaseline(workspaceDir);
+  const packageRuntime = entry.packageRuntime;
 
   const project = queries.getProject(queue.projectId);
   if (!project) throw new Error(`project not found: ${queue.projectId}`);
@@ -630,6 +708,7 @@ async function executeEval(input: {
   const startedAt = Date.now();
   let nextSeq = 0;
   let recordTail: Promise<void> = Promise.resolve();
+  const recordedEvents: CanonicalEvent[] = [];
 
   const record: EventRecorder = {
     append(event) {
@@ -637,6 +716,7 @@ async function executeEval(input: {
         const normalized = event.seq < nextSeq ? { ...event, seq: nextSeq } : event;
         nextSeq = normalized.seq + 1;
         await appendEvent(eventsPath, normalized);
+        recordedEvents.push(normalized);
       });
       recordTail = pending.catch(() => undefined);
       return pending;
@@ -700,6 +780,34 @@ async function executeEval(input: {
   let agentStarted = false;
 
   try {
+    if (packageRuntime.setupPath) {
+      const setup = await handle.exec({
+        argv: ["/bin/bash", packageRuntime.setupPath],
+        cwd: "/workspace",
+        env: {
+          ...packageRuntime.agentEnv,
+          AGENTEVAL_TRIAL_ID: run.id,
+        },
+        user: "root",
+        timeoutMs: packageRuntime.setupTimeoutMs,
+      });
+      await writeJson(join(runDir, "setup-manifest.json"), {
+        setup_status: setup.exitCode === 0 && !setup.timedOut ? "success" : "failed",
+        duration_ms: setup.durationMs,
+        exit_code: setup.exitCode,
+        timed_out: setup.timedOut,
+        stdout: setup.stdout,
+        stderr: setup.stderr,
+        package_digest: task.packageDigest,
+      });
+      if (setup.exitCode !== 0 || setup.timedOut) {
+        throw new Error(
+          setup.timedOut
+            ? "canonical eval setup timed out"
+            : `canonical eval setup exited ${setup.exitCode}`,
+        );
+      }
+    }
     if (envSpec && (envSpec.setupScript || envSpec.commitBaseline !== false)) {
       try {
         const provision = await provisionEnvInContainer(handle, envSpec, workspaceDir);
@@ -738,7 +846,7 @@ async function executeEval(input: {
     const session = await handle.startExec({
       argv: command.argv,
       cwd: command.cwd ?? "/workspace",
-      env: command.env,
+      env: { ...packageRuntime.agentEnv, ...command.env },
       timeoutMs: command.timeoutMs ?? input.timeoutMs,
     });
     input.setExec(session);
@@ -817,21 +925,8 @@ async function executeEval(input: {
     });
   }
 
-  try {
-    await runChecks(queries, input.runtime, project, task, runDir, {
-      workspaceDir,
-      runId: run.id,
-      timeoutMs: input.timeoutMs,
-      image: handle.image,
-      container: handle,
-      containerCwd: "/workspace",
-    });
-  } catch (err) {
-    await writeJson(join(runDir, "checks-error.json"), {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
+  // Capture agent-authored evidence before the hidden verifier can touch the
+  // workspace. The agent process is already stopped at this point.
   const evidence = await copyRetainedEvidence(
     workspaceDir,
     runDir,
@@ -849,6 +944,80 @@ async function executeEval(input: {
     ...(diffPath ? { diffPath } : {}),
   }).catch(() => undefined);
   await recordTail;
+
+  let verifierError: string | null = null;
+  try {
+    const verifier = await runCanonicalPackageVerifier({
+      runtime: input.runtime,
+      task,
+      runId: run.id,
+      workspaceDir,
+      runDir,
+    });
+    queries.storeCheckResults(run.id, verifier.checks);
+    await writeJson(join(runDir, "verifier.json"), verifier);
+  } catch (err) {
+    verifierError = err instanceof Error ? err.message : String(err);
+    queries.storeCheckResults(run.id, [{
+      checkId: "package-verifier",
+      kind: "test_suite",
+      status: "error",
+      detail: verifierError,
+    }]);
+    await writeJson(join(runDir, "verifier-error.json"), {
+      error: verifierError,
+    });
+  }
+
+  let packageCleanup = {
+    ran: false,
+    exitCode: null as number | null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    durationMs: 0,
+    error: null as string | null,
+  };
+  if (packageRuntime.cleanupPath) {
+    try {
+      await restoreEvalLifecycleScript({
+        packagePath: task.packagePath,
+        workspaceDir,
+        containerPath: packageRuntime.cleanupPath,
+      });
+      const result = await handle.exec({
+        argv: ["/bin/bash", packageRuntime.cleanupPath],
+        cwd: "/workspace",
+        env: {
+          ...packageRuntime.agentEnv,
+          AGENTEVAL_TRIAL_ID: run.id,
+        },
+        user: "root",
+        timeoutMs: packageRuntime.cleanupTimeoutMs,
+      });
+      packageCleanup = {
+        ran: true,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        durationMs: result.durationMs,
+        error:
+          result.exitCode === 0 && !result.timedOut
+            ? null
+            : result.timedOut
+              ? "canonical eval cleanup timed out"
+              : `canonical eval cleanup exited ${result.exitCode}`,
+      };
+    } catch (err) {
+      packageCleanup = {
+        ...packageCleanup,
+        ran: true,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+  await writeJson(join(runDir, "package-cleanup.json"), packageCleanup);
 
   const cleanup = envSpec
     ? await cleanupEnvInContainer(handle, envSpec)
@@ -878,7 +1047,7 @@ async function executeEval(input: {
   const reset = await resetContainerWorkspace(handle);
   await writeJson(join(runDir, "workspace-reset.json"), reset);
 
-  queries.finalizeRun(run.id, {
+  const finalizedRun = queries.finalizeRun(run.id, {
     status,
     durationMs: Date.now() - startedAt,
     eventsPath,
@@ -886,6 +1055,40 @@ async function executeEval(input: {
     error: runError,
     controlState: status === "aborted" ? "aborted" : "done",
   });
+
+  const finalizationErrors: string[] = [];
+  try {
+    await writeJson(join(runDir, "run.json"), {
+      ...finalizedRun,
+      evalVersion: task.version,
+      workspaceCommit: workspaceCommit ?? finalizedRun.workspaceCommit,
+    });
+    const diffText = diffPath
+      ? await readFile(diffPath, "utf8").catch(() => undefined)
+      : undefined;
+    const metrics = deriveRunMetrics(recordedEvents, {
+      ...(diffText !== undefined ? { diffText } : {}),
+      totalCost: finalizedRun.totalCost,
+    });
+    await writeJson(join(runDir, "run-metrics.json"), metrics);
+    queries.upsertEvalMetrics({
+      runId: run.id,
+      projectId: queue.projectId,
+      schemaVersion: metrics.schemaVersion,
+      execution: metrics as unknown as Record<string, unknown>,
+    });
+    const integrity = await analyzeEvidenceIntegrity({
+      runId: run.id,
+      retainedDir: join(runDir, "retained"),
+      metrics,
+    });
+    await writeJson(join(runDir, "evidence-integrity.json"), integrity);
+  } catch (err) {
+    finalizationErrors.push(err instanceof Error ? err.message : String(err));
+    await writeJson(join(runDir, "finalization-error.json"), {
+      errors: finalizationErrors,
+    }).catch(() => undefined);
+  }
 
   let archiveError: string | null = null;
   try {
@@ -902,11 +1105,14 @@ async function executeEval(input: {
   input.setRecorder(null);
   return {
     tainted:
+      packageCleanup.error !== null ||
       cleanup.error !== null ||
       verification.error !== null ||
+      verifierError !== null ||
       evidence.missingRequired.length > 0 ||
       evidence.errors.length > 0 ||
       !reset.ok ||
+      finalizationErrors.length > 0 ||
       archiveError !== null,
   };
 }
@@ -1067,7 +1273,9 @@ function taskSnapshot(task: Task): Record<string, unknown> {
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const tmp = `${path}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(tmp, path);
 }
 
 async function clearDirectory(dir: string): Promise<void> {

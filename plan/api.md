@@ -53,18 +53,11 @@ POST   /api/projects/:id/watchers/:ruleId/run     manual "fire now" (resolve ref
 POST   /api/projects/:id/watcher/hooks/:ruleId    git-host webhook ingress (HMAC-verified)
 ```
 
-### Tasks (CRUD — per project)
-```
-POST   /api/projects/:id/tasks                    create task (ui-builder) — body: TaskSpec
-GET    /api/projects/:id/tasks                    list (filter by tag/profile)
-GET    /api/projects/:id/tasks/:taskId            detail (prompt, rubric, checks)
-PATCH  /api/projects/:id/tasks/:taskId            update → bumps rubric_version (new baseline)
-DELETE /api/projects/:id/tasks/:taskId            archive
-POST   /api/projects/:id/tasks/sync               pull the project's task source (repo-md/manifest/...)
-```
-> Tasks that originate from `repo-md`/`manifest-yaml`/`ci-artifact` are **read-only via the API** in
-> the sense that their source of truth is the repo; edits round-trip through the source (PATCH returns
-> 409 with a pointer). `ui-builder` and `http-push` tasks are fullymutable through the API.
+### Internal task projection (read/archive only)
+
+Canonical eval packages are projected into the `tasks` table for queue/run compatibility. Flat task
+creation, patching, source sync and HTTP-push are rejected; the immutable package is the only source of
+truth. `GET /tasks` remains a read alias and `DELETE` archives the projected eval.
 
 ### Project agent adapter — owned or explicitly shared
 
@@ -91,21 +84,23 @@ Execution edits/rebuild/deletion are rejected while an owning-project queue cont
 consumer queue references the shared adapter. Tests and production use the same real CLI/provider path;
 missing model access is a blocker, never a reason to substitute a fake.
 
-### Eval store
+### Canonical eval package store
 
-`tasks` remains the storage table; `/evals` is the preferred product API and `/tasks` is compatibility.
-Every edit bumps the eval version. Queue execution snapshots the exact version and definition.
+Only the immutable directory package in [eval-package.md](eval-package.md) is accepted. Both creation
+transports enter the same strict validator and atomically create no row on failure.
 
 ```
-POST   /api/projects/:id/evals
-GET    /api/projects/:id/evals
+POST   /api/projects/:id/evals                         JSON {files:{path:content|{encoding,content}}}
+POST   /api/projects/:id/evals:import-archive?format=zip|tar|tar.gz   raw archive bytes
+GET    /api/projects/:id/evals?category_name=...
 GET    /api/projects/:id/evals/:evalId
-PATCH  /api/projects/:id/evals/:evalId
-DELETE /api/projects/:id/evals/:evalId
+DELETE /api/projects/:id/evals/:evalId                 archive
+GET    /api/projects/:id/eval-categories
 ```
 
-Eval definitions include prompt, workspace, category, rubric, deterministic checks, setup script,
-cleanup script, cleanup verification, timeouts, reference solution, and tags.
+Packages are not patchable. A semantic edit is a complete new package version with a new immutable
+digest. Responses expose package digest/manifest/validation plus arbitrary grouping `category_name` and
+functional `agent_category`.
 
 ### Persistent eval queues and queue-owned containers
 
@@ -122,6 +117,7 @@ PATCH  /api/projects/:id/queues/:queueId
 DELETE /api/projects/:id/queues/:queueId
 
 POST   /api/projects/:id/queues/:queueId/items
+POST   /api/projects/:id/queues/:queueId/items:load-category  {category_name,repeats?,enabled?}
 GET    /api/projects/:id/queues/:queueId/items
 PATCH  /api/projects/:id/queues/:queueId/items/:itemId
 DELETE /api/projects/:id/queues/:queueId/items/:itemId
@@ -133,10 +129,13 @@ DELETE /api/projects/:id/queues/:queueId/container   stop and remove
 GET    /api/projects/:id/containers                  list live queue containers
 ```
 
-Spawn runs a real adapter/provider/model connection check before any eval setup. Each eval then follows
-setup → real CLI agent → raw/canonical/native evidence extraction → checks → cleanup → cleanup verify →
-process kill/reset → immutable archive. A cleanup/evidence/archive failure taints the queue and stops it
-before the next eval.
+Spawn builds one isolated canonical `environment/` on top of the real adapter image, then runs the real
+adapter/provider/model connection check. Each eval follows trusted setup → real CLI agent → stop agent →
+diff/native evidence capture → separate offline hidden verifier (`tests/` context only) → binary reward +
+diagnostics → trusted cleanup → workspace reset → finalized metadata/integrity/metrics → immutable archive.
+`solution/`, hidden tests/oracles and validation data never enter the agent image/container/workspace.
+Setup/verifier/cleanup/evidence/archive failure is explicit; cleanup/evidence/archive failures taint the
+queue before the next eval.
 
 ### Privileged streaming introspection bridge
 
@@ -158,19 +157,39 @@ When auth is disabled the bridge is loopback-only; read-only tokens cannot invok
 GET  /api/evals/:runId/archive
 POST /api/projects/:id/queues/:queueId/analyses
      {batch_id,all:true|run_ids[],judge_model,judge_provider,judge_prompt?,judge_params?}
+     → 202 Accepted {analysis:{...}} + Location; judge runs detached, poll GET :analysisId
 GET  /api/projects/:id/queues/:queueId/analyses
 GET  /api/projects/:id/queues/:queueId/analyses/:analysisId
 GET  /api/projects/:id/queues/:queueId/analyses/:analysisId/events
 GET  /api/projects/:id/queues/:queueId/analyses/:analysisId/transcript
 GET  /api/projects/:id/queues/:queueId/analyses/:analysisId/verdict
 GET  /api/projects/:id/queues/:queueId/analyses/:analysisId/report
+GET  /api/projects/:id/queues/:queueId/analyses/:analysisId/improvement-steps
+     ?class=agent|platform|judge|eval&priority=0..3&status=proposed|ready|blocked|in_progress|verified|rejected&defect_id=...
+PATCH /api/projects/:id/queues/:queueId/analyses/:analysisId/improvement-steps/:stepId
+      {status,blocking_reason?}
 ```
 
 One real PI SDK judge-agent session uses the versioned custom judge system prompt and restricted
 archive/submission tools. It must list and completely read every file in every selected immutable
-archive before its terminating submit tool is accepted. It emits one standard Verdict per eval plus cross-eval
-themes, reliability, ranked defects, subsystem attribution, regressions, and a verification-oriented
-improvement plan. Rejudging creates an append-only revision and never reruns the evaluated agent.
+archive, then pass the complete v2 payload through `preflight_queue_analysis`; the token-based final
+submit persists those exact validated bytes. Invocation is async: `POST .../analyses` validates the
+request, verifies every immutable archive, and creates the running analysis row, returning `202` with a
+`Location` immediately; a detached background executor runs the judge against that row so a caller whose
+HTTP client times out cannot kill an in-flight judge. Callers poll `GET .../analyses/:analysisId` until
+`status` is `completed`/`failed`. The judge is queue-linked when `all:true`, or standalone when explicit
+`run_ids[]` select a specific archive set.
+
+When a queue configured with `auto_judge` runs its evals, the pipeline automatically judges its own
+immutable archives when it drains cleanly: `PUT .../queue/:queueId/container` supplies an `onQueueDrained`
+handler that preflights and starts a detached judge producing the HTML report. A tainted drain (cleanup,
+evidence, archive, or setup failure) does not auto-judge; the judge must then be invoked explicitly.
+ It emits one standard Verdict plus an evidence-linked
+narrative per eval, cross-eval themes/reliability/ranked defects/subsystem attribution/regressions, and
+four queryable improvement backlogs (`agent|platform|judge|eval`). Every step is linked to evidence and
+contains acceptance criteria, tests, and target+regression task sets. `PATCH` changes lifecycle fields
+only; immutable evidence/problem/change content remains part of the append-only analysis revision.
+Rejudging creates a new revision and never reruns the evaluated agent.
 
 ### Legacy runs + batches — compatibility/control
 

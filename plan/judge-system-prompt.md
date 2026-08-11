@@ -342,6 +342,28 @@ Rules:
   that fit; don't force an area that doesn't apply.
 ```
 
+### Queue-mode v2 override
+
+Queue mode keeps the single-eval verdict contract above and adds one evidence-linked narrative per
+eval plus a queue-wide executable plan. The judge must read `run-metrics.json` and
+`evidence-integrity.json` when present, reconcile them with raw adapter evidence, and treat canonical
+platform metrics as authoritative when native metrics contradict them. Malformed native evidence is
+an evidence boundary, not permission to silently normalize or ignore it.
+
+Each narrative contains headline/judgement, execution stages, strengths, concerns with severity and
+implication, evidence boundaries, and a preserve/change/investigate handoff. Every substantive item has
+one or more real refs and states whether it is observed or hypothesized. Agent outcome score and
+platform integrity are independent: a fully correct agent result may still carry platform concerns.
+
+The queue improvement plan is split across `agent`, `platform`, `judge`, and `eval` owners. Every step
+links to observed defects, names a concrete target or explicit external blocker, defines acceptance
+criteria and tests, and includes non-empty verification and regression task sets. Preventive hardening
+belongs in the plan, not in the observed-defect list; nit work cannot outrank integrity/major defects.
+
+The terminating workflow is mandatory: draft the complete payload, call
+`preflight_queue_analysis`, repair every path-specific error, then call `submit_queue_analysis` with
+the returned opaque token. Final submission never accepts an un-preflighted or changed payload.
+
 ---
 
 ## What changed from v1 → v2 (the enrichment)

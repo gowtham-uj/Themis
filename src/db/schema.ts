@@ -254,8 +254,10 @@ export const tasks = sqliteTable(
     version: integer("version").notNull().default(1),
     /** Bumps on rubric edit → new comparison baseline. */
     rubricVersion: integer("rubric_version").notNull().default(1),
-    /** coding|research|general|browser|data|conversational */
+    /** coding|research|general|browser|data|conversational execution semantics. */
     agentCategory: text("agent_category").notNull().default("coding"),
+    /** Arbitrary project-scoped grouping label; does not change execution semantics. */
+    categoryName: text("category_name"),
     /** bugfix|feature|refactor|research|general|browser|etl|conversational */
     profile: text("profile"),
     referenceSolution: text("reference_solution"),
@@ -267,6 +269,10 @@ export const tasks = sqliteTable(
     tags: text("tags"),
     /** Which task source created this. */
     sourceKind: text("source_kind"),
+    packagePath: text("package_path"),
+    packageDigest: text("package_digest"),
+    packageManifestJson: text("package_manifest_json"),
+    packageValidationJson: text("package_validation_json"),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
     archived: integer("archived").notNull().default(0),
@@ -499,6 +505,8 @@ export const judgements = sqliteTable("judgements", {
   reportPath: text("report_path"),
   eventsPath: text("events_path"),
   verdictPath: text("verdict_path"),
+  narrativeJson: text("narrative_json"),
+  narrativeSchemaVersion: integer("narrative_schema_version"),
   createdAt: text("created_at"),
   endedAt: text("ended_at"),
 });
@@ -512,6 +520,64 @@ export const scores = sqliteTable("scores", {
   weight: real("weight").notNull(),
   score: real("score").notNull(),
   rationale: text("rationale"),
+});
+
+export const improvementSteps = sqliteTable(
+  "improvement_steps",
+  {
+    id: text("id").primaryKey(),
+    stepKey: text("step_key").notNull(),
+    queueAnalysisId: text("queue_analysis_id")
+      .notNull()
+      .references(() => queueAnalyses.id),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    queueId: text("queue_id")
+      .notNull()
+      .references(() => evalQueues.id),
+    rank: integer("rank").notNull(),
+    ownerClass: text("class").notNull(),
+    priority: integer("priority").notNull(),
+    confidence: real("confidence").notNull(),
+    defectIdsJson: text("defect_ids_json").notNull(),
+    subsystem: text("subsystem").notNull(),
+    problem: text("problem").notNull(),
+    evidenceJson: text("evidence_json").notNull(),
+    targetJson: text("target_json").notNull(),
+    change: text("change").notNull(),
+    acceptanceCriteriaJson: text("acceptance_criteria_json").notNull(),
+    testsJson: text("tests_json").notNull(),
+    verifyTaskIdsJson: text("verify_task_ids_json").notNull(),
+    regressionTaskIdsJson: text("regression_task_ids_json").notNull(),
+    dependenciesJson: text("dependencies_json").notNull(),
+    nonGoalsJson: text("non_goals_json").notNull(),
+    preventive: integer("preventive").notNull().default(0),
+    status: text("status").notNull(),
+    blockingReason: text("blocking_reason"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (t) => [
+    unique("improvement_steps_analysis_rank").on(t.queueAnalysisId, t.rank),
+    unique("improvement_steps_analysis_key").on(t.queueAnalysisId, t.stepKey),
+    index("idx_improvement_steps_analysis_status").on(t.queueAnalysisId, t.status),
+  ],
+);
+
+/** Versioned exact/derived/judge-derived per-eval metrics projection. */
+export const evalMetrics = sqliteTable("eval_metrics", {
+  runId: text("run_id")
+    .primaryKey()
+    .references(() => runs.id),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id),
+  schemaVersion: integer("schema_version").notNull(),
+  executionJson: text("execution_json").notNull(),
+  outcomeJson: text("outcome_json"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
 });
 
 // ---------------------------------------------------------------------------
@@ -755,6 +821,8 @@ export const schema = {
   queueAnalyses,
   judgements,
   scores,
+  improvementSteps,
+  evalMetrics,
   findings,
   findingOccurrences,
   checks,
@@ -770,4 +838,4 @@ export const schema = {
 export type Schema = typeof schema;
 
 /** Migration version stamped into pragma user_version / migrations table. */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;

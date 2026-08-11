@@ -27,7 +27,10 @@ import {
   portFlag,
   WORKSPACE_MOUNT,
 } from "../src/runner/podman-argv.ts";
-import { parsePortOutput } from "../src/runner/podman-runtime.ts";
+import {
+  parsePortOutput,
+  podmanCommandWithEnv,
+} from "../src/runner/podman-runtime.ts";
 import type { RunContainerSpec } from "../src/runner/runtime.ts";
 import { createServer, type ApiServer } from "../src/api/server.ts";
 
@@ -334,14 +337,22 @@ describe("buildPodmanRunArgs", () => {
     expect(args.slice(-4)).toEqual(["alpine:3.19", "node", "agent.js", "--flag"]);
   });
 
-  it("passes env as separate argv entries (no shell quoting concerns)", () => {
+  it("passes only env names in argv so values stay out of process listings", () => {
     const args = buildPodmanRunArgs(
       spec({ env: { TOKEN: "a b'c\"d", EMPTY: "" } }),
       defaultSandboxPolicy(),
       { name: "c" },
     );
-    expect(allValuesAfter(args, "-e")).toContain(`TOKEN=a b'c"d`);
-    expect(allValuesAfter(args, "-e")).toContain("EMPTY=");
+    expect(allValuesAfter(args, "-e")).toContain("TOKEN");
+    expect(allValuesAfter(args, "-e")).toContain("EMPTY");
+    expect(args.join(" ")).not.toContain(`a b'c"d`);
+  });
+
+  it("preserves only env names across a sudo prefix", () => {
+    expect(
+      podmanCommandWithEnv(["sudo", "-n", "podman"], ["TOKEN", "EMPTY", "TOKEN"]),
+    ).toEqual(["sudo", "--preserve-env=EMPTY,TOKEN", "-n", "podman"]);
+    expect(podmanCommandWithEnv(["podman"], ["TOKEN"])).toEqual(["podman"]);
   });
 });
 

@@ -141,6 +141,8 @@ export interface TaskSpec {
   checks?: Check[];
   /** Category the task targets (defaults from project). */
   agentCategory?: AgentCategory;
+  /** Arbitrary project-scoped grouping label used for queue bulk loading. */
+  categoryName?: string;
   /**
    * Environment this eval needs: greenfield vs brownfield, image, and a setup
    * script run in the pod before the agent starts. See runner/env-provision.ts.

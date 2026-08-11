@@ -123,6 +123,26 @@ interface MetaFinding {
 }
 ```
 
+### Queue analysis v2: narrative + executable improvement plan
+
+A queue judge emits one standard `Verdict` per selected eval **plus** an `EvalJudgementNarrative`.
+The narrative is evidence-linked prose for humans: headline/judgement, execution stages, strengths,
+concerns with implications, evidence boundaries, and a handoff split into preserve/change/investigate.
+Every substantive item has at least one structured `Ref`; observed facts and hypotheses are distinct.
+A score of `1.0` does not suppress independently observed platform/evidence-integrity concerns.
+
+The queue-wide `improvementPlan` is a machine-actionable `QueueImprovementStep[]`, not loose advice.
+Each step has a stable id/rank, owner class (`agent|platform|judge|eval`), priority/confidence, linked
+defect ids, subsystem, problem/evidence/change, resolved target or explicit upstream blocker,
+acceptance criteria, tests, target+regression task ids, dependencies, non-goals, and lifecycle status.
+The platform rejects unlinked or unverifiable steps and prevents cosmetic/nit work from outranking an
+unresolved evidence-integrity or major defect.
+
+Queue submission is two-stage. `preflight_queue_analysis` receives the complete v2 payload, verifies
+full archive coverage, deep schema/ref/cross-link invariants, and stores the validated payload under an
+opaque token. `submit_queue_analysis` accepts only that token, so the first final submission persists
+exactly the payload that passed preflight.
+
 ## Report-generation skill (great UI/UX)
 
 The judge produces the HTML via a **pi skill** we author and mount — this is where "get a famous

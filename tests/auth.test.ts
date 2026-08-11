@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer, type ApiServer } from "../src/api/server.ts";
 import { hashToken } from "../src/api/auth.ts";
-import type { Rubric } from "../src/domain.ts";
+import { validEvalPackageUpload } from "./helpers/eval-package.ts";
 
 const tempDirs: string[] = [];
 const servers: ApiServer[] = [];
@@ -36,27 +36,6 @@ async function tempDataDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "agenteval-auth-"));
   tempDirs.push(dir);
   return dir;
-}
-
-function sampleRubric(): Rubric {
-  return {
-    version: 1,
-    profile: "bugfix",
-    criteria: [
-      {
-        id: "A1",
-        axis: "A",
-        label: "correctness",
-        weight: 1,
-        appliesTo: "coding",
-        anchors: {
-          full: "fully correct",
-          partial: "partially correct",
-          none: "incorrect",
-        },
-      },
-    ],
-  };
 }
 
 interface HttpResult {
@@ -162,13 +141,8 @@ describe("API auth (P8b)", () => {
     expect(proj.status).toBe(201);
     const projectId = (proj.json as { id: string }).id;
 
-    const task = await http(base, "POST", `/api/projects/${projectId}/tasks`, {
-      body: {
-        name: "T",
-        prompt: "do it",
-        workspace: { source: "empty" },
-        rubric: sampleRubric(),
-      },
+    const task = await http(base, "POST", `/api/projects/${projectId}/evals`, {
+      body: validEvalPackageUpload(),
       headers: { Authorization: `Bearer ${admin.token}` },
     });
     expect(task.status).toBe(201);

@@ -52,7 +52,23 @@ After the agent finishes, diff capture depends on the task's **agent category**
   deterministic checks. (For `git` sources we diff against the checked-out commit; for `empty`, against
   the empty init.)
 
-```
+Harness-owned `.agenteval/**` files are excluded from the scored source diff. They may still be retained
+as diagnostic artifacts, but must never make an agent appear to have changed task source.
+
+### Finalized metadata and evidence integrity
+
+A run archive is sealed only after terminal DB finalization. Immediately before sealing, the worker
+rewrites `run.json` from the finalized row and writes two platform-owned, versioned artifacts:
+
+- `run-metrics.json`: facts derived from canonical events (mutation/verification activity, terminal
+  status, duplicate messages, verification after the final mutation). These are authoritative over
+  contradictory adapter-native trajectory metrics.
+- `evidence-integrity.json`: validity/contradiction/unknown checks over retained raw evidence, with exact
+  artifact/trace refs, observed-vs-hypothesis boundaries, owner class, and scoring-safety status.
+
+Raw adapter evidence is preserved verbatim. Malformed JSON or contradictory native metrics are never
+silently repaired; the integrity report tells the judge what is and is not safe to use. Failure to
+finalize metadata or integrity artifacts taints the queue item, and sealing remains the last write.
 
 ## N repeats (variance)
 

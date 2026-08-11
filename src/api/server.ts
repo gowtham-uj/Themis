@@ -9,9 +9,10 @@
  * The configurable concurrency cap controls how many run containers are live.
  */
 
+import { randomUUID } from "node:crypto";
 import { createServer as createHttpServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { existsSync, watch as fsWatch } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { openDb as defaultOpenDb, resolveProjectDir, type OpenDbResult } from "../db/index.js";
 import {
@@ -21,19 +22,15 @@ import {
   type Run,
   type Task,
   type UpdateProjectInput,
-  type UpdateTaskInput,
 } from "../db/queries.js";
-import type { ProjectCtx, TaskSpec } from "../domain.js";
 import {
-  buildTaskSpec,
-  createTaskSource,
-  pushHttpTask,
-  rubricsEqual,
-  syncTasks,
-  type BuildTaskSpecInput,
-  type CreateTaskSourceOptions,
-  type TaskStore,
-} from "../tasks/index.js";
+  decodeEvalArchiveFile,
+  type EvalArchiveFormat,
+} from "../evals/archive.js";
+import {
+  materializeEvalPackage,
+  type EvalPackageUpload,
+} from "../evals/package.js";
 import { readFromSeq } from "../schema/jsonl.js";
 import { Router, readJsonBody, sendJson, type RequestContext } from "./router.js";
 import {
@@ -73,7 +70,6 @@ import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerRubricRoutes } from "./rubric-routes.js";
 import { registerArtifactRoutes } from "./artifact-routes.js";
 import { registerSandboxRoutes } from "./sandbox-routes.js";
-import { parseEvalEnvSpec } from "../runner/env-provision.js";
 import { registerReleaseRoutes } from "./release-routes.js";
 import { registerCommitEvalRoutes } from "./commit-eval-routes.js";
 import { registerGitHubRoutes } from "./github-routes.js";
@@ -245,69 +241,6 @@ export interface ApiServer {
 }
 
 // ---------------------------------------------------------------------------
-// TaskStore over DbQueries (for POST .../tasks/sync)
-// ---------------------------------------------------------------------------
-
-function createDbTaskStore(queries: DbQueries): TaskStore {
-  return {
-    get(projectId, externalId) {
-      const tasks = queries.listTasks(projectId, { includeArchived: true });
-      const hit = tasks.find((t) => t.externalId === externalId);
-      if (!hit) return null;
-      return taskToSpec(hit);
-    },
-    upsert(ctx, spec) {
-      const externalId = spec.id ?? spec.name;
-      const existing = queries
-        .listTasks(ctx.projectId, { includeArchived: true })
-        .find((t) => t.externalId === externalId);
-
-      if (!existing) {
-        const created = queries.createTask(ctx.projectId, spec, {
-          sourceKind: "repo-md",
-        });
-        return { taskId: created.id, rubricVersionBumped: false };
-      }
-
-      const bumped = !rubricsEqual(existing.rubric, spec.rubric);
-      const updated = queries.updateTask(existing.id, {
-        name: spec.name,
-        prompt: spec.prompt,
-        workspace: spec.workspace,
-        rubric: spec.rubric,
-        agentCategory: spec.agentCategory,
-        profile: spec.profile ?? null,
-        referenceSolution: spec.referenceSolution ?? null,
-        checks: (spec.checks ?? null) as unknown[] | null,
-        tags: spec.tags ?? null,
-        externalId,
-        sourceKind: "repo-md",
-      });
-      return {
-        taskId: updated.id,
-        rubricVersionBumped: bumped || updated.rubricVersion > existing.rubricVersion,
-      };
-    },
-  };
-}
-
-function taskToSpec(t: Task): TaskSpec {
-  return {
-    id: t.externalId ?? t.id,
-    name: t.name,
-    prompt: t.prompt,
-    workspace: t.workspace,
-    rubric: t.rubric,
-    ...(t.profile ? { profile: t.profile } : {}),
-    ...(t.tags ? { tags: t.tags } : {}),
-    agentCategory: t.agentCategory,
-    ...(t.referenceSolution ? { referenceSolution: t.referenceSolution } : {}),
-    ...(t.checks ? { checks: t.checks as TaskSpec["checks"] } : {}),
-    ...(t.env ? { env: parseEvalEnvSpec(t.env) } : {}),
-  };
-}
-
-// ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
 
@@ -347,16 +280,66 @@ function taskJson(t: Task) {
     version: t.version,
     rubric_version: t.rubricVersion,
     agent_category: t.agentCategory,
+    category_name: t.categoryName,
     profile: t.profile,
     reference_solution: t.referenceSolution,
     checks: t.checks,
     env: t.env,
     tags: t.tags,
     source_kind: t.sourceKind,
+    package_digest: t.packageDigest,
+    package_manifest: t.packageManifest,
+    package_validation: t.packageValidation,
     archived: t.archived,
     created_at: t.createdAt,
     updated_at: t.updatedAt,
   };
+}
+
+async function createCanonicalEval(
+  app: AppCtx,
+  project: Project,
+  upload: EvalPackageUpload,
+): Promise<Task> {
+  const id = randomUUID();
+  const packagePath = join(
+    app.dataDir,
+    "projects",
+    project.id,
+    "evals",
+    id,
+    "package",
+  );
+  const materialized = await materializeEvalPackage({ upload, destination: packagePath });
+  try {
+    return app.queries.createTask(project.id, materialized.taskSpec, {
+      id,
+      sourceKind: "eval-package",
+      packagePath: materialized.packagePath,
+      packageDigest: materialized.packageDigest,
+      packageManifest: materialized.manifest as unknown as Record<string, unknown>,
+      packageValidation: materialized.validation as unknown as Record<string, unknown>,
+    });
+  } catch (err) {
+    await rm(join(packagePath, ".."), { recursive: true, force: true });
+    throw err;
+  }
+}
+
+async function readBinaryBody(
+  req: IncomingMessage,
+  limitBytes: number,
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += bytes.length;
+    if (total > limitBytes) throw badRequest(`request body exceeds ${limitBytes} bytes`);
+    chunks.push(bytes);
+  }
+  if (total === 0) throw badRequest("archive request body is empty");
+  return Buffer.concat(chunks);
 }
 
 function runJson(r: Run) {
@@ -858,31 +841,18 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     requireProject(app.queries, ctx.params.id!);
     const includeArchived =
       ctx.query.include_archived === "1" || ctx.query.include_archived === "true";
+    const categoryName = ctx.query.category_name;
     const list = app.queries
       .listTasks(ctx.params.id!, { includeArchived })
+      .filter((task) => !categoryName || task.categoryName === categoryName)
       .map(taskJson);
     sendJson(res, 200, { tasks: list });
   });
 
-  router.post("/api/projects/:id/tasks", async (req, res, ctx) => {
-    const app = appOf(ctx);
-    const project = requireProject(app.queries, ctx.params.id!);
-    const body = await readJsonBody<BuildTaskSpecInput & { source_kind?: string }>(req);
-    let spec: TaskSpec;
-    try {
-      spec = buildTaskSpec(body);
-    } catch (err) {
-      throw badRequest(err instanceof Error ? err.message : String(err));
-    }
-    const sourceKind = body.source_kind ?? "ui-builder";
-    // http-push creates are also mirrored into the push catalog so sync re-yields them.
-    if (sourceKind === "http-push") {
-      pushHttpTask(project.id, spec);
-    }
-    const task = app.queries.createTask(project.id, spec, {
-      sourceKind,
-    });
-    sendJson(res, 201, taskJson(task));
+  router.post("/api/projects/:id/tasks", (_req, _res, _ctx) => {
+    throw badRequest(
+      "flat task creation is not supported; create a canonical eval package through POST /api/projects/:id/evals",
+    );
   });
 
   router.get("/api/projects/:id/tasks/:taskId", (_req, res, ctx) => {
@@ -892,66 +862,13 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     sendJson(res, 200, taskJson(task));
   });
 
-  router.patch("/api/projects/:id/tasks/:taskId", async (req, res, ctx) => {
+  router.patch("/api/projects/:id/tasks/:taskId", (_req, _res, ctx) => {
     const app = appOf(ctx);
     requireProject(app.queries, ctx.params.id!);
     requireTask(app.queries, ctx.params.id!, ctx.params.taskId!);
-    const body = await readJsonBody<Record<string, unknown>>(req);
-
-    // repo-md / manifest tasks are read-only via API (source of truth is the repo).
-    const existing = app.queries.getTask(ctx.params.taskId!)!;
-    if (
-      existing.sourceKind &&
-      existing.sourceKind !== "ui-builder" &&
-      existing.sourceKind !== "http-push"
-    ) {
-      throw conflict(
-        `task ${existing.id} is sourced from ${existing.sourceKind}; edit via the source and re-sync`,
-        "https://agenteval.dev/errors/task-read-only",
-      );
-    }
-
-    const patch: UpdateTaskInput = {};
-    if (typeof body.name === "string") patch.name = body.name;
-    if (typeof body.prompt === "string") patch.prompt = body.prompt;
-    if (body.workspace && typeof body.workspace === "object") {
-      patch.workspace = body.workspace as UpdateTaskInput["workspace"];
-    }
-    if (body.rubric && typeof body.rubric === "object") {
-      patch.rubric = body.rubric as UpdateTaskInput["rubric"];
-    }
-    if (typeof body.agent_category === "string") {
-      patch.agentCategory = body.agent_category as UpdateTaskInput["agentCategory"];
-    }
-    if ("profile" in body) {
-      patch.profile =
-        body.profile === null || body.profile === undefined
-          ? null
-          : (body.profile as UpdateTaskInput["profile"]);
-    }
-    if ("tags" in body) {
-      patch.tags = Array.isArray(body.tags)
-        ? (body.tags as string[])
-        : null;
-    }
-    if ("reference_solution" in body) {
-      patch.referenceSolution =
-        body.reference_solution === null || body.reference_solution === undefined
-          ? null
-          : String(body.reference_solution);
-    }
-    if ("checks" in body) {
-      patch.checks = Array.isArray(body.checks) ? body.checks : null;
-    }
-    if ("env" in body) {
-      patch.env =
-        body.env && typeof body.env === "object" && !Array.isArray(body.env)
-          ? (body.env as Record<string, unknown>)
-          : null;
-    }
-
-    const updated = app.queries.updateTask(ctx.params.taskId!, patch);
-    sendJson(res, 200, taskJson(updated));
+    throw conflict(
+      "canonical eval packages are immutable; upload a complete new package version instead of patching fields",
+    );
   });
 
   router.delete("/api/projects/:id/tasks/:taskId", (_req, res, ctx) => {
@@ -972,23 +889,62 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     sendJson(res, 200, {
       evals: app.queries
         .listTasks(ctx.params.id!, { includeArchived })
+        .filter((task) => !ctx.query.category_name || task.categoryName === ctx.query.category_name)
         .map(taskJson),
+    });
+  });
+
+  router.get("/api/projects/:id/eval-categories", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const counts = new Map<string, number>();
+    for (const task of app.queries.listTasks(ctx.params.id!)) {
+      if (!task.categoryName) continue;
+      counts.set(task.categoryName, (counts.get(task.categoryName) ?? 0) + 1);
+    }
+    sendJson(res, 200, {
+      categories: [...counts.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, evalCount]) => ({ name, eval_count: evalCount })),
     });
   });
 
   router.post("/api/projects/:id/evals", async (req, res, ctx) => {
     const app = appOf(ctx);
     const project = requireProject(app.queries, ctx.params.id!);
-    const body = await readJsonBody<BuildTaskSpecInput & { source_kind?: string }>(req);
-    let spec: TaskSpec;
+    const upload = await readJsonBody<EvalPackageUpload>(req, {
+      limitBytes: 70 * 1024 * 1024,
+    });
     try {
-      spec = buildTaskSpec(body);
+      const created = await createCanonicalEval(app, project, upload);
+      sendJson(res, 201, taskJson(created));
     } catch (err) {
       throw badRequest(err instanceof Error ? err.message : String(err));
     }
-    const sourceKind = body.source_kind ?? "ui-builder";
-    const created = app.queries.createTask(project.id, spec, { sourceKind });
-    sendJson(res, 201, taskJson(created));
+  });
+
+  router.post("/api/projects/:id/evals:import-archive", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const project = requireProject(app.queries, ctx.params.id!);
+    const format = ctx.query.format as EvalArchiveFormat | undefined;
+    if (!format || !["zip", "tar", "tar.gz"].includes(format)) {
+      throw badRequest("format query parameter must be zip|tar|tar.gz");
+    }
+    const archive = await readBinaryBody(req, 64 * 1024 * 1024);
+    const importId = randomUUID();
+    const quarantineDir = join(app.dataDir, "projects", project.id, "eval-imports");
+    const archivePath = join(quarantineDir, `${importId}.${format.replace(".", "-")}`);
+    await mkdir(quarantineDir, { recursive: true });
+    await writeFile(archivePath, archive);
+    try {
+      const upload = await decodeEvalArchiveFile(archivePath, format);
+      const created = await createCanonicalEval(app, project, upload);
+      sendJson(res, 201, taskJson(created));
+    } catch (err) {
+      throw badRequest(err instanceof Error ? err.message : String(err));
+    } finally {
+      await rm(archivePath, { force: true });
+    }
   });
 
   router.get("/api/projects/:id/evals/:evalId", (_req, res, ctx) => {
@@ -1001,50 +957,13 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     );
   });
 
-  router.patch("/api/projects/:id/evals/:evalId", async (req, res, ctx) => {
+  router.patch("/api/projects/:id/evals/:evalId", (_req, _res, ctx) => {
     const app = appOf(ctx);
     requireProject(app.queries, ctx.params.id!);
-    const existing = requireTask(app.queries, ctx.params.id!, ctx.params.evalId!);
-    if (
-      existing.sourceKind &&
-      existing.sourceKind !== "ui-builder" &&
-      existing.sourceKind !== "http-push"
-    ) {
-      throw conflict(
-        `eval ${existing.id} is sourced from ${existing.sourceKind}; edit via the source and re-sync`,
-        "https://agenteval.dev/errors/eval-read-only",
-      );
-    }
-    const body = await readJsonBody<Record<string, unknown>>(req);
-    const patch: UpdateTaskInput = {};
-    if (typeof body.name === "string") patch.name = body.name;
-    if (typeof body.prompt === "string") patch.prompt = body.prompt;
-    if (body.workspace && typeof body.workspace === "object") {
-      patch.workspace = body.workspace as UpdateTaskInput["workspace"];
-    }
-    if (body.rubric && typeof body.rubric === "object") {
-      patch.rubric = body.rubric as UpdateTaskInput["rubric"];
-    }
-    if (typeof body.agent_category === "string") {
-      patch.agentCategory = body.agent_category as UpdateTaskInput["agentCategory"];
-    }
-    if ("profile" in body) {
-      patch.profile = body.profile == null ? null : (body.profile as UpdateTaskInput["profile"]);
-    }
-    if ("tags" in body) patch.tags = Array.isArray(body.tags) ? (body.tags as string[]) : null;
-    if ("reference_solution" in body) {
-      patch.referenceSolution = body.reference_solution == null
-        ? null
-        : String(body.reference_solution);
-    }
-    if ("checks" in body) patch.checks = Array.isArray(body.checks) ? body.checks : null;
-    if ("env" in body) {
-      patch.env =
-        body.env && typeof body.env === "object" && !Array.isArray(body.env)
-          ? (body.env as Record<string, unknown>)
-          : null;
-    }
-    sendJson(res, 200, taskJson(app.queries.updateTask(existing.id, patch)));
+    requireTask(app.queries, ctx.params.id!, ctx.params.evalId!);
+    throw conflict(
+      "canonical eval packages are immutable; upload a complete new package version",
+    );
   });
 
   router.delete("/api/projects/:id/evals/:evalId", (_req, res, ctx) => {
@@ -1054,107 +973,12 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     sendJson(res, 200, taskJson(app.queries.archiveTask(existing.id)));
   });
 
-  router.post("/api/projects/:id/tasks/sync", async (_req, res, ctx) => {
-    const app = appOf(ctx);
-    const project = requireProject(app.queries, ctx.params.id!);
-    const projectDir = resolveProjectDir(app.dataDir, project.id);
-    const kind = (project.taskSource?.kind as
-      | "ui-builder"
-      | "repo-md"
-      | "manifest-yaml"
-      | "ci-artifact"
-      | "http-push") ?? "ui-builder";
-    const params = project.taskSource?.params ?? {};
-    const sourceOpts: CreateTaskSourceOptions = {};
-    if (kind === "repo-md" && typeof params.glob === "string") {
-      (sourceOpts as { glob?: string }).glob = params.glob;
-    }
-    if (kind === "manifest-yaml" && typeof params.path === "string") {
-      (sourceOpts as { path?: string }).path = params.path;
-    }
-    if (kind === "ci-artifact") {
-      if (typeof params.artifactDir === "string") {
-        (sourceOpts as { artifactDir?: string }).artifactDir = params.artifactDir;
-      }
-      if (typeof params.manifestFile === "string") {
-        (sourceOpts as { manifestFile?: string }).manifestFile = params.manifestFile;
-      }
-    }
-    const source = createTaskSource(kind, sourceOpts);
-    const store = createDbTaskStore(app.queries);
-    const pctx: ProjectCtx = {
-      projectId: project.id,
-      projectDir,
-      defaultAgentCategory: "coding",
-    };
-    // Pull sources may need workspaceDir / artifactDir from params.
-    if (
-      (kind === "repo-md" ||
-        kind === "manifest-yaml" ||
-        kind === "ci-artifact") &&
-      params.workspaceDir
-    ) {
-      pctx.workspaceDir = String(params.workspaceDir);
-    }
-    const result = await syncTasks(pctx, source, store);
-    sendJson(res, 200, result);
+  router.post("/api/projects/:id/tasks/sync", (_req, _res, _ctx) => {
+    throw badRequest("legacy task-source sync is disabled; import canonical eval packages instead");
   });
 
-  /**
-   * HTTP-push ingest: POST a TaskSpec into the project's http-push catalog.
-   * Fully mutable afterwards via PATCH (plan/api.md §Tasks).
-   */
-  router.post("/api/projects/:id/tasks:push", async (req, res, ctx) => {
-    const app = appOf(ctx);
-    const project = requireProject(app.queries, ctx.params.id!);
-    const body = await readJsonBody<BuildTaskSpecInput & Record<string, unknown>>(req);
-
-    let spec: TaskSpec;
-    try {
-      // Prefer buildTaskSpec when the body has the form shape; else accept loose.
-      if (
-        typeof body.name === "string" &&
-        typeof body.prompt === "string" &&
-        body.rubric &&
-        typeof body.rubric === "object"
-      ) {
-        spec = buildTaskSpec(body);
-      } else {
-        throw new Error("name, prompt, and rubric are required");
-      }
-    } catch (err) {
-      throw badRequest(err instanceof Error ? err.message : String(err));
-    }
-
-    // Mirror into the in-memory http-push catalog so sync list() can re-yield.
-    pushHttpTask(project.id, spec);
-
-    // Upsert by external id when one already exists for this project.
-    const externalId = spec.id ?? spec.name;
-    const existing = app.queries
-      .listTasks(project.id, { includeArchived: false })
-      .find((t) => t.externalId === externalId || t.name === externalId);
-
-    if (existing) {
-      const updated = app.queries.updateTask(existing.id, {
-        name: spec.name,
-        prompt: spec.prompt,
-        workspace: spec.workspace,
-        rubric: spec.rubric,
-        profile: spec.profile ?? null,
-        tags: spec.tags ?? null,
-        agentCategory: spec.agentCategory,
-        referenceSolution: spec.referenceSolution ?? null,
-        sourceKind: "http-push",
-      });
-      sendJson(res, 200, taskJson(updated));
-      return;
-    }
-
-    const task = app.queries.createTask(project.id, spec, {
-      sourceKind: "http-push",
-    });
-    sendJson(res, 201, taskJson(task));
+  router.post("/api/projects/:id/tasks:push", (_req, _res, _ctx) => {
+    throw badRequest("flat HTTP-push tasks are disabled; import a canonical eval package instead");
   });
 
   // ---- runs (create under project) ----

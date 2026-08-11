@@ -9,12 +9,20 @@ import type {
   DbQueries,
   EvalQueue,
   EvalQueueItem,
+  ImprovementStepRecord,
   Project,
   QueueAnalysis,
   UpdateEvalQueueInput,
   UpdateEvalQueueItemInput,
 } from "../db/queries.js";
-import { runQueueAnalysis } from "../judge/queue-worker.js";
+import {
+  executeQueueAnalysis,
+  prepareQueueAnalysis,
+} from "../judge/queue-worker.js";
+import type {
+  ImprovementOwnerClass,
+  ImprovementStepStatus,
+} from "../judge/queue-schema.js";
 import { verifyEvalArchive } from "../runner/eval-archive.js";
 import { parsePorts } from "../runner/project-config.js";
 import {
@@ -108,6 +116,36 @@ function requireItem(
     throw notFound(`queue item not found: ${itemId}`);
   }
   return item;
+}
+
+function improvementStepView(step: ImprovementStepRecord) {
+  return {
+    id: step.id,
+    queue_analysis_id: step.queueAnalysisId,
+    project_id: step.projectId,
+    queue_id: step.queueId,
+    rank: step.rank,
+    class: step.class,
+    priority: step.priority,
+    confidence: step.confidence,
+    defect_ids: step.defectIds,
+    subsystem: step.subsystem,
+    problem: step.problem,
+    evidence: step.evidence,
+    target: step.target,
+    change: step.change,
+    acceptance_criteria: step.acceptanceCriteria,
+    tests: step.tests,
+    verify_task_ids: step.verifyTaskIds,
+    regression_task_ids: step.regressionTaskIds,
+    dependencies: step.dependencies,
+    non_goals: step.nonGoals,
+    preventive: step.preventive,
+    status: step.status,
+    blocking_reason: step.blockingReason ?? null,
+    created_at: step.createdAt,
+    updated_at: step.updatedAt,
+  };
 }
 
 function requireLiveQueue(
@@ -446,6 +484,53 @@ export function registerQueueRoutes(router: Router): void {
     sendJson(res, 201, { item });
   });
 
+  router.post(
+    "/api/projects/:id/queues/:queueId/items:load-category",
+    async (req, res, ctx) => {
+      const app = appOf(ctx);
+      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
+      if (app.queries.getActiveQueueContainer(queue.id)) {
+        throw conflict("stop the queue container before changing queue items");
+      }
+      const body = await readJsonBody<{
+        category_name?: string;
+        categoryName?: string;
+        repeats?: number;
+        enabled?: boolean;
+      }>(req);
+      const categoryName = body.category_name ?? body.categoryName;
+      if (!categoryName?.trim()) throw badRequest("category_name is required");
+      const repeats = body.repeats === undefined ? 1 : positiveInt(body.repeats, "repeats");
+      const existingTaskIds = new Set(
+        app.queries.listEvalQueueItems(queue.id, { includeDisabled: true }).map((item) => item.taskId),
+      );
+      const matches = app.queries.listTasks(queue.projectId)
+        .filter((task) => task.categoryName === categoryName.trim());
+      if (matches.length === 0) {
+        throw badRequest(`no enabled evals found in category: ${categoryName.trim()}`);
+      }
+      const added = [];
+      const skipped: string[] = [];
+      for (const task of matches) {
+        if (existingTaskIds.has(task.id)) {
+          skipped.push(task.id);
+          continue;
+        }
+        added.push(app.queries.createEvalQueueItem(queue.id, {
+          taskId: task.id,
+          repeats,
+          enabled: body.enabled ?? true,
+        }));
+      }
+      sendJson(res, added.length > 0 ? 201 : 200, {
+        category_name: categoryName.trim(),
+        matched_eval_count: matches.length,
+        added,
+        skipped_eval_ids: skipped,
+      });
+    },
+  );
+
   router.get("/api/projects/:id/queues/:queueId/items", (_req, res, ctx) => {
     const app = appOf(ctx);
     const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
@@ -495,13 +580,65 @@ export function registerQueueRoutes(router: Router): void {
   router.put("/api/projects/:id/queues/:queueId/container", async (_req, res, ctx) => {
     const app = appOf(ctx);
     const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
+    const startOpts = {
+      ...app.queueStartOpts,
+      onQueueDrained: async (info: {
+        queueId: string;
+        projectId: string;
+        batchId: string;
+        runIds: string[];
+        tainted: boolean;
+      }) => {
+        // The eval pipeline ends by judging its own queue archives when the
+        // queue is configured with auto_judge and drained cleanly. The judge
+        // runs detached (202-style) so the drain callback returns promptly and
+        // the report is produced in the background once the judge finishes.
+        const current = app.queries.getEvalQueue(queue.id);
+        const autoJudge = current?.autoJudge ?? queue.autoJudge;
+        if (!autoJudge || info.tainted || info.runIds.length === 0) {
+          if (app.queueStartOpts?.onQueueDrained) {
+            await app.queueStartOpts.onQueueDrained(info);
+          }
+          return;
+        }
+        const input = {
+          queueId: queue.id,
+          batchId: info.batchId,
+          judgeModel: current?.judgeModel ?? "deepseek-v4-flash",
+          judgeProvider: current?.judgeProvider ?? current?.provider ?? "neuralwatt",
+          judgePrompt: null,
+          judgeParams: null,
+          parentAnalysisId: null,
+        };
+        try {
+          const { analysis } = await prepareQueueAnalysis(app.dataDir, app.queries, input);
+          void executeQueueAnalysis(app.dataDir, app.queries, input, analysis)
+            .catch((err) => {
+              const message = err instanceof Error ? err.message : String(err);
+              app.queries.updateQueueAnalysis(analysis.id, {
+                status: "failed",
+                error: message,
+                endedAt: new Date().toISOString(),
+              });
+            });
+        } catch (err) {
+          app.queries.updateEvalQueue(queue.id, {
+            status: "failed",
+            activeBatchId: null,
+          });
+        }
+        if (app.queueStartOpts?.onQueueDrained) {
+          await app.queueStartOpts.onQueueDrained(info);
+        }
+      },
+    };
     try {
       const live = await startQueueContainer(
         app.dataDir,
         app.queries,
         queue.id,
         app.liveQueueContainers,
-        app.queueStartOpts,
+        startOpts,
       );
       sendJson(res, 202, {
         queue_id: queue.id,
@@ -706,7 +843,7 @@ export function registerQueueRoutes(router: Router): void {
       if (!judgeModel || !judgeProvider) {
         throw badRequest("judge_model and judge_provider are required");
       }
-      const result = await runQueueAnalysis(app.dataDir, app.queries, {
+      const input = {
         queueId: queue.id,
         batchId,
         ...(body.all ? {} : { runIds }),
@@ -716,8 +853,16 @@ export function registerQueueRoutes(router: Router): void {
         judgeParams: body.judge_params ?? body.judgeParams ?? null,
         parentAnalysisId:
           body.parent_analysis_id ?? body.parentAnalysisId ?? null,
-      });
-      sendJson(res, result.status === "completed" ? 201 : 502, result);
+      };
+      const { analysis } = await prepareQueueAnalysis(app.dataDir, app.queries, input);
+      // Run the judge detached so the 202 returns and the request never blocks
+      // for the full judge session. A caller whose client times out therefore
+      // cannot kill the in-flight judge; they poll the analysis detail endpoint.
+      void executeQueueAnalysis(app.dataDir, app.queries, input, analysis)
+        .catch(() => undefined);
+      const location = `/api/projects/${queue.projectId}/queues/${queue.id}/analyses/${analysis.id}`;
+      res.writeHead(202, { "content-type": "application/json", Location: location });
+      res.end(JSON.stringify({ analysis }));
     },
   );
 
@@ -804,6 +949,68 @@ export function registerQueueRoutes(router: Router): void {
   );
 
   router.get(
+    "/api/projects/:id/queues/:queueId/analyses/:analysisId/improvement-steps",
+    (_req, res, ctx) => {
+      const app = appOf(ctx);
+      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
+      const analysis = requireQueueAnalysis(app.queries, queue, ctx.params.analysisId!);
+      const owner = ctx.query.class;
+      const status = ctx.query.status;
+      if (owner && !["agent", "platform", "judge", "eval"].includes(owner)) {
+        throw badRequest("class must be agent|platform|judge|eval");
+      }
+      if (status && !["proposed", "ready", "blocked", "in_progress", "verified", "rejected"].includes(status)) {
+        throw badRequest("invalid improvement step status");
+      }
+      const priority = ctx.query.priority === undefined ? undefined : Number(ctx.query.priority);
+      if (priority !== undefined && (!Number.isInteger(priority) || priority < 0 || priority > 3)) {
+        throw badRequest("priority must be an integer 0..3");
+      }
+      const steps = app.queries.listImprovementSteps({
+        queueAnalysisId: analysis.id,
+        ...(owner ? { class: owner as ImprovementOwnerClass } : {}),
+        ...(status ? { status: status as ImprovementStepStatus } : {}),
+        ...(priority !== undefined ? { priority } : {}),
+        ...(ctx.query.defect_id ? { defectId: ctx.query.defect_id } : {}),
+      });
+      sendJson(res, 200, { improvement_steps: steps.map(improvementStepView) });
+    },
+  );
+
+  router.patch(
+    "/api/projects/:id/queues/:queueId/analyses/:analysisId/improvement-steps/:stepId",
+    async (req, res, ctx) => {
+      const app = appOf(ctx);
+      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
+      const analysis = requireQueueAnalysis(app.queries, queue, ctx.params.analysisId!);
+      const body = await readJsonBody<{
+        status?: ImprovementStepStatus;
+        blocking_reason?: string | null;
+        blockingReason?: string | null;
+      }>(req);
+      if (!body.status || !["proposed", "ready", "blocked", "in_progress", "verified", "rejected"].includes(body.status)) {
+        throw badRequest("status is required and must be a valid lifecycle status");
+      }
+      let updated;
+      try {
+        updated = app.queries.updateImprovementStepLifecycle(
+          analysis.id,
+          ctx.params.stepId!,
+          {
+            status: body.status,
+            blockingReason: body.blocking_reason ?? body.blockingReason ?? null,
+          },
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/not found/i.test(message)) throw notFound(message);
+        throw badRequest(message);
+      }
+      sendJson(res, 200, { improvement_step: improvementStepView(updated) });
+    },
+  );
+
+  router.get(
     "/api/projects/:id/queues/:queueId/analyses/:analysisId/report",
     async (_req, res, ctx) => {
       const app = appOf(ctx);
@@ -822,6 +1029,31 @@ export function registerQueueRoutes(router: Router): void {
       res.end(html);
     },
   );
+
+  router.get("/api/evals/:runId/metrics", (req, res, ctx) => {
+    const app = appOf(ctx);
+    const run = app.queries.getRun(ctx.params.runId!);
+    if (!run) throw notFound(`run not found: ${ctx.params.runId}`);
+    if (app.authEnabled) {
+      const auth = getRequestAuth(req);
+      if (auth?.projectId != null && auth.projectId !== run.projectId) {
+        throw new HttpError(401, "Unauthorized", "token is not scoped to this project", {
+          type: "https://agenteval.dev/errors/unauthorized",
+        });
+      }
+    }
+    const metrics = app.queries.getEvalMetrics(run.id);
+    if (!metrics) throw notFound(`eval metrics not found: ${run.id}`);
+    sendJson(res, 200, {
+      run_id: metrics.runId,
+      project_id: metrics.projectId,
+      schema_version: metrics.schemaVersion,
+      execution: metrics.execution,
+      outcome: metrics.outcome,
+      created_at: metrics.createdAt,
+      updated_at: metrics.updatedAt,
+    });
+  });
 
   router.get("/api/evals/:runId/archive", async (req, res, ctx) => {
     const app = appOf(ctx);

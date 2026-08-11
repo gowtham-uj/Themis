@@ -23,6 +23,12 @@ import type {
 import type { WorkspaceSpec } from "../adapters/types.js";
 import type { PortMapping, ResolvedPort } from "../runner/runtime.js";
 import type { CheckResult, Verdict } from "../judge/verdict.js";
+import type {
+  EvalJudgementNarrative,
+  ImprovementOwnerClass,
+  ImprovementStepStatus,
+  QueueImprovementStep,
+} from "../judge/queue-schema.js";
 import {
   applyRecurrenceToVerdict,
   ingestFindings as runIngestFindings,
@@ -39,10 +45,12 @@ import {
   apiTokens,
   checkResults,
   evalArchives,
+  evalMetrics,
   evalQueueItems,
   evalQueues,
   findingOccurrences,
   findings,
+  improvementSteps,
   judgements,
   outboundSubscriptions,
   projectAgentAdapters,
@@ -154,6 +162,8 @@ export interface Task {
   version: number;
   rubricVersion: number;
   agentCategory: AgentCategory;
+  /** Arbitrary grouping label; does not alter execution semantics. */
+  categoryName: string | null;
   profile: TaskProfile | null;
   referenceSolution: string | null;
   checks: unknown[] | null;
@@ -161,6 +171,10 @@ export interface Task {
   env: Record<string, unknown> | null;
   tags: string[] | null;
   sourceKind: string | null;
+  packagePath: string | null;
+  packageDigest: string | null;
+  packageManifest: Record<string, unknown> | null;
+  packageValidation: Record<string, unknown> | null;
   archived: boolean;
   createdAt: string;
   updatedAt: string;
@@ -172,6 +186,7 @@ export interface UpdateTaskInput {
   workspace?: WorkspaceSpec;
   rubric?: Rubric;
   agentCategory?: AgentCategory;
+  categoryName?: string | null;
   profile?: TaskProfile | null;
   referenceSolution?: string | null;
   checks?: unknown[] | null;
@@ -500,6 +515,10 @@ export interface ListRunsFilter {
 export interface CreateTaskOptions {
   sourceKind?: string;
   id?: string;
+  packagePath?: string;
+  packageDigest?: string;
+  packageManifest?: Record<string, unknown>;
+  packageValidation?: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +546,8 @@ export interface Judgement {
   reportPath: string | null;
   eventsPath: string | null;
   verdictPath: string | null;
+  narrative: EvalJudgementNarrative | null;
+  narrativeSchemaVersion: number | null;
   createdAt: string | null;
   endedAt: string | null;
 }
@@ -967,6 +988,37 @@ export interface UpdateQueueAnalysisInput {
   error?: string | null;
 }
 
+export interface ImprovementStepRecord extends QueueImprovementStep {
+  queueAnalysisId: string;
+  projectId: string;
+  queueId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ListImprovementStepsFilter {
+  queueAnalysisId: string;
+  class?: ImprovementOwnerClass;
+  priority?: number;
+  status?: ImprovementStepStatus;
+  defectId?: string;
+}
+
+export interface UpdateImprovementStepLifecycleInput {
+  status: ImprovementStepStatus;
+  blockingReason?: string | null;
+}
+
+export interface EvalMetricsRecord {
+  runId: string;
+  projectId: string;
+  schemaVersion: number;
+  execution: Record<string, unknown>;
+  outcome: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface EvalArchive {
   runId: string;
   projectId: string;
@@ -1164,6 +1216,9 @@ export interface ListWebhookDeliveriesOpts {
  * Shared query surface. Both SqliteQueries and MemoryQueries implement this.
  */
 export interface QueryStore {
+  /** Run synchronous persistence as one atomic unit. */
+  transaction<T>(operation: () => T): T;
+
   createProject(input: CreateProjectInput): Project;
   getProject(id: string): Project | null;
   listProjects(opts?: { includeArchived?: boolean }): Project[];
@@ -1226,7 +1281,11 @@ export interface QueryStore {
    * Findings-ingest errors are caught + console.warn'd — they must not break
    * verdict persistence (verdict.json remains the source of truth).
    */
-  storeVerdict(judgementId: string, verdict: Verdict): JudgementWithVerdict;
+  storeVerdict(
+    judgementId: string,
+    verdict: Verdict,
+    narrative?: EvalJudgementNarrative | null,
+  ): JudgementWithVerdict;
   /** Load judgement row + verdict.json body (if present). */
   getJudgement(id: string): JudgementWithVerdict | null;
   /** List judgements with optional filters + cursor pagination. */
@@ -1324,6 +1383,27 @@ export interface QueryStore {
   getQueueAnalysis(id: string): QueueAnalysis | null;
   listQueueAnalyses(queueId: string, opts?: { batchId?: string }): QueueAnalysis[];
   updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis;
+  storeImprovementSteps(
+    queueAnalysisId: string,
+    projectId: string,
+    queueId: string,
+    steps: QueueImprovementStep[],
+  ): ImprovementStepRecord[];
+  listImprovementSteps(filter: ListImprovementStepsFilter): ImprovementStepRecord[];
+  updateImprovementStepLifecycle(
+    queueAnalysisId: string,
+    id: string,
+    patch: UpdateImprovementStepLifecycleInput,
+  ): ImprovementStepRecord;
+
+  upsertEvalMetrics(input: {
+    runId: string;
+    projectId: string;
+    schemaVersion: number;
+    execution: Record<string, unknown>;
+    outcome?: Record<string, unknown> | null;
+  }): EvalMetricsRecord;
+  getEvalMetrics(runId: string): EvalMetricsRecord | null;
 
   storeEvalArchive(input: StoreEvalArchiveInput): EvalArchive;
   getEvalArchive(runId: string): EvalArchive | null;
@@ -1441,6 +1521,22 @@ function nowIso(): string {
 
 function newId(): string {
   return randomUUID();
+}
+
+function canTransitionImprovementStatus(
+  from: ImprovementStepStatus,
+  to: ImprovementStepStatus,
+): boolean {
+  if (from === to) return true;
+  const allowed: Record<ImprovementStepStatus, ImprovementStepStatus[]> = {
+    proposed: ["ready", "blocked", "rejected"],
+    ready: ["in_progress", "blocked", "rejected"],
+    blocked: ["ready", "rejected"],
+    in_progress: ["verified", "blocked", "rejected"],
+    verified: ["in_progress"],
+    rejected: [],
+  };
+  return allowed[from].includes(to);
 }
 
 function parseJson<T>(raw: string | null | undefined, fallback: T): T {
@@ -1629,12 +1725,17 @@ function mapTask(row: typeof tasks.$inferSelect): Task {
     version: row.version ?? 1,
     rubricVersion: row.rubricVersion,
     agentCategory: (row.agentCategory ?? "coding") as AgentCategory,
+    categoryName: row.categoryName ?? null,
     profile: (row.profile as TaskProfile | null) ?? null,
     referenceSolution: row.referenceSolution,
     checks: parseJson(row.checksJson, null),
     env: parseJson(row.envJson, null),
     tags: parseJson(row.tags, null),
     sourceKind: row.sourceKind,
+    packagePath: row.packagePath ?? null,
+    packageDigest: row.packageDigest ?? null,
+    packageManifest: parseJson(row.packageManifestJson, null),
+    packageValidation: parseJson(row.packageValidationJson, null),
     archived: row.archived === 1,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -1765,6 +1866,8 @@ function mapJudgement(row: typeof judgements.$inferSelect): Judgement {
     reportPath: row.reportPath,
     eventsPath: row.eventsPath,
     verdictPath: row.verdictPath,
+    narrative: parseJson<EvalJudgementNarrative | null>(row.narrativeJson, null),
+    narrativeSchemaVersion: row.narrativeSchemaVersion ?? null,
     createdAt: row.createdAt,
     endedAt: row.endedAt,
   };
@@ -2173,6 +2276,50 @@ function mapQueueAnalysisRow(
   };
 }
 
+function mapImprovementStepRow(
+  row: typeof improvementSteps.$inferSelect,
+): ImprovementStepRecord {
+  return {
+    id: row.stepKey,
+    queueAnalysisId: row.queueAnalysisId,
+    projectId: row.projectId,
+    queueId: row.queueId,
+    rank: row.rank,
+    class: row.ownerClass as ImprovementOwnerClass,
+    priority: row.priority as QueueImprovementStep["priority"],
+    confidence: row.confidence,
+    defectIds: parseJson<string[]>(row.defectIdsJson, []),
+    subsystem: row.subsystem,
+    problem: row.problem,
+    evidence: parseJson(row.evidenceJson, []),
+    target: parseJson(row.targetJson, { kind: "external", system: "unknown", blocker: "missing target" }),
+    change: row.change,
+    acceptanceCriteria: parseJson<string[]>(row.acceptanceCriteriaJson, []),
+    tests: parseJson(row.testsJson, []),
+    verifyTaskIds: parseJson<string[]>(row.verifyTaskIdsJson, []),
+    regressionTaskIds: parseJson<string[]>(row.regressionTaskIdsJson, []),
+    dependencies: parseJson<string[]>(row.dependenciesJson, []),
+    nonGoals: parseJson<string[]>(row.nonGoalsJson, []),
+    preventive: row.preventive === 1,
+    status: row.status as ImprovementStepStatus,
+    ...(row.blockingReason ? { blockingReason: row.blockingReason } : {}),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function mapEvalMetricsRow(row: typeof evalMetrics.$inferSelect): EvalMetricsRecord {
+  return {
+    runId: row.runId,
+    projectId: row.projectId,
+    schemaVersion: row.schemaVersion,
+    execution: parseJson(row.executionJson, {}),
+    outcome: parseJson(row.outcomeJson, null),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
 function mapEvalArchiveRow(row: typeof evalArchives.$inferSelect): EvalArchive {
   return {
     runId: row.runId,
@@ -2245,6 +2392,10 @@ export class SqliteQueries implements QueryStore {
     private readonly db: DrizzleDb,
     private readonly dataDir: string,
   ) {}
+
+  transaction<T>(operation: () => T): T {
+    return this.db.transaction(() => operation());
+  }
 
   // ---- projects ----
 
@@ -2403,12 +2554,17 @@ export class SqliteQueries implements QueryStore {
         version: 1,
         rubricVersion,
         agentCategory: spec.agentCategory ?? "coding",
+        categoryName: spec.categoryName?.trim() || null,
         profile: spec.profile ?? spec.rubric.profile ?? null,
         referenceSolution: spec.referenceSolution ?? null,
         checksJson: stringifyJson(checks),
         envJson: stringifyJson(spec.env ?? null),
         tags: stringifyJson(spec.tags ?? null),
         sourceKind: opts.sourceKind ?? null,
+        packagePath: opts.packagePath ?? null,
+        packageDigest: opts.packageDigest ?? null,
+        packageManifestJson: stringifyJson(opts.packageManifest ?? null),
+        packageValidationJson: stringifyJson(opts.packageValidation ?? null),
         createdAt: ts,
         updatedAt: ts,
         archived: 0,
@@ -2478,6 +2634,10 @@ export class SqliteQueries implements QueryStore {
         version: existing.version + 1,
         rubricVersion,
         agentCategory: patch.agentCategory ?? existing.agentCategory,
+        categoryName:
+          patch.categoryName !== undefined
+            ? patch.categoryName?.trim() || null
+            : existing.categoryName,
         profile:
           patch.profile !== undefined ? patch.profile : existing.profile,
         referenceSolution:
@@ -3035,7 +3195,11 @@ export class SqliteQueries implements QueryStore {
     return out;
   }
 
-  storeVerdict(judgementId: string, verdict: Verdict): JudgementWithVerdict {
+  storeVerdict(
+    judgementId: string,
+    verdict: Verdict,
+    narrative: EvalJudgementNarrative | null = null,
+  ): JudgementWithVerdict {
     const existing = this.db
       .select()
       .from(judgements)
@@ -3074,6 +3238,8 @@ export class SqliteQueries implements QueryStore {
         verdict: verdict.overall?.verdict ?? null,
         verdictPath: jVerdictPath,
         eventsPath,
+        narrativeJson: narrative ? JSON.stringify(narrative) : null,
+        narrativeSchemaVersion: narrative?.schemaVersion ?? null,
         endedAt,
       })
       .where(eq(judgements.id, judgementId))
@@ -4129,6 +4295,122 @@ export class SqliteQueries implements QueryStore {
     return this.getQueueAnalysis(id)!;
   }
 
+  storeImprovementSteps(
+    queueAnalysisId: string,
+    projectId: string,
+    queueId: string,
+    steps: QueueImprovementStep[],
+  ): ImprovementStepRecord[] {
+    const ts = nowIso();
+    this.db.transaction((tx) => {
+      tx.delete(improvementSteps)
+        .where(eq(improvementSteps.queueAnalysisId, queueAnalysisId))
+        .run();
+      for (const step of steps) {
+        tx.insert(improvementSteps).values({
+          id: `${queueAnalysisId}:${step.id}`,
+          stepKey: step.id,
+          queueAnalysisId,
+          projectId,
+          queueId,
+          rank: step.rank,
+          ownerClass: step.class,
+          priority: step.priority,
+          confidence: step.confidence,
+          defectIdsJson: JSON.stringify(step.defectIds),
+          subsystem: step.subsystem,
+          problem: step.problem,
+          evidenceJson: JSON.stringify(step.evidence),
+          targetJson: JSON.stringify(step.target),
+          change: step.change,
+          acceptanceCriteriaJson: JSON.stringify(step.acceptanceCriteria),
+          testsJson: JSON.stringify(step.tests),
+          verifyTaskIdsJson: JSON.stringify(step.verifyTaskIds),
+          regressionTaskIdsJson: JSON.stringify(step.regressionTaskIds),
+          dependenciesJson: JSON.stringify(step.dependencies),
+          nonGoalsJson: JSON.stringify(step.nonGoals),
+          preventive: step.preventive ? 1 : 0,
+          status: step.status,
+          blockingReason: step.blockingReason ?? null,
+          createdAt: ts,
+          updatedAt: ts,
+        }).run();
+      }
+    });
+    return this.listImprovementSteps({ queueAnalysisId });
+  }
+
+  listImprovementSteps(filter: ListImprovementStepsFilter): ImprovementStepRecord[] {
+    return this.db.select().from(improvementSteps)
+      .where(eq(improvementSteps.queueAnalysisId, filter.queueAnalysisId)).all()
+      .map(mapImprovementStepRow)
+      .filter((step) =>
+        (!filter.class || step.class === filter.class) &&
+        (filter.priority === undefined || step.priority === filter.priority) &&
+        (!filter.status || step.status === filter.status) &&
+        (!filter.defectId || step.defectIds.includes(filter.defectId)))
+      .sort((a, b) => a.rank - b.rank);
+  }
+
+  updateImprovementStepLifecycle(
+    queueAnalysisId: string,
+    id: string,
+    patch: UpdateImprovementStepLifecycleInput,
+  ): ImprovementStepRecord {
+    const storageId = `${queueAnalysisId}:${id}`;
+    const row = this.db.select().from(improvementSteps)
+      .where(eq(improvementSteps.id, storageId)).get();
+    if (!row) throw notFound("improvement step", id);
+    if (!canTransitionImprovementStatus(row.status as ImprovementStepStatus, patch.status)) {
+      throw new Error(`invalid improvement step transition ${row.status} -> ${patch.status}`);
+    }
+    if (patch.status === "blocked" && !patch.blockingReason?.trim()) {
+      throw new Error("blockingReason is required when status=blocked");
+    }
+    this.db.update(improvementSteps).set({
+      status: patch.status,
+      blockingReason: patch.status === "blocked" ? patch.blockingReason!.trim() : null,
+      updatedAt: nowIso(),
+    }).where(eq(improvementSteps.id, storageId)).run();
+    return mapImprovementStepRow(
+      this.db.select().from(improvementSteps).where(eq(improvementSteps.id, storageId)).get()!,
+    );
+  }
+
+  upsertEvalMetrics(input: {
+    runId: string;
+    projectId: string;
+    schemaVersion: number;
+    execution: Record<string, unknown>;
+    outcome?: Record<string, unknown> | null;
+  }): EvalMetricsRecord {
+    const existing = this.getEvalMetrics(input.runId);
+    const ts = nowIso();
+    this.db.insert(evalMetrics).values({
+      runId: input.runId,
+      projectId: input.projectId,
+      schemaVersion: input.schemaVersion,
+      executionJson: JSON.stringify(input.execution),
+      outcomeJson: stringifyJson(input.outcome ?? existing?.outcome ?? null),
+      createdAt: existing?.createdAt ?? ts,
+      updatedAt: ts,
+    }).onConflictDoUpdate({
+      target: evalMetrics.runId,
+      set: {
+        schemaVersion: input.schemaVersion,
+        executionJson: JSON.stringify(input.execution),
+        outcomeJson: stringifyJson(input.outcome ?? existing?.outcome ?? null),
+        updatedAt: ts,
+      },
+    }).run();
+    return this.getEvalMetrics(input.runId)!;
+  }
+
+  getEvalMetrics(runId: string): EvalMetricsRecord | null {
+    const row = this.db.select().from(evalMetrics).where(eq(evalMetrics.runId, runId)).get();
+    return row ? mapEvalMetricsRow(row) : null;
+  }
+
   storeEvalArchive(input: StoreEvalArchiveInput): EvalArchive {
     const sealedAt = input.sealedAt ?? nowIso();
     this.db.insert(evalArchives).values({
@@ -4718,6 +5000,8 @@ export class MemoryQueries implements QueryStore {
   private evalQueueItems = new Map<string, EvalQueueItem>();
   private queueContainers = new Map<string, QueueContainer>();
   private queueAnalyses = new Map<string, QueueAnalysis>();
+  private improvementSteps = new Map<string, ImprovementStepRecord>();
+  private evalMetrics = new Map<string, EvalMetricsRecord>();
   private evalArchives = new Map<string, EvalArchive>();
   private apiTokens = new Map<string, ApiToken>();
   private outboundSubscriptions = new Map<string, OutboundSubscription>();
@@ -4728,6 +5012,28 @@ export class MemoryQueries implements QueryStore {
   private projectRubrics = new Map<string, ProjectRubric>();
 
   constructor(private readonly dataDir: string) {}
+
+  transaction<T>(operation: () => T): T {
+    const snapshot = {
+      judgements: structuredClone(this.judgements),
+      scores: structuredClone(this.scores),
+      findings: structuredClone(this.findings),
+      occurrences: structuredClone(this.occurrences),
+      improvementSteps: structuredClone(this.improvementSteps),
+      evalMetrics: structuredClone(this.evalMetrics),
+    };
+    try {
+      return operation();
+    } catch (error) {
+      this.judgements = snapshot.judgements;
+      this.scores = snapshot.scores;
+      this.findings = snapshot.findings;
+      this.occurrences = snapshot.occurrences;
+      this.improvementSteps = snapshot.improvementSteps;
+      this.evalMetrics = snapshot.evalMetrics;
+      throw error;
+    }
+  }
 
   createProject(input: CreateProjectInput): Project {
     const ts = nowIso();
@@ -4850,12 +5156,17 @@ export class MemoryQueries implements QueryStore {
       version: 1,
       rubricVersion: spec.rubric.version ?? 1,
       agentCategory: spec.agentCategory ?? "coding",
+      categoryName: spec.categoryName?.trim() || null,
       profile: spec.profile ?? spec.rubric.profile ?? null,
       referenceSolution: spec.referenceSolution ?? null,
       checks: (spec.checks ?? spec.rubric.checks ?? null) as unknown[] | null,
       env: (spec.env ?? null) as Record<string, unknown> | null,
       tags: spec.tags ?? null,
       sourceKind: opts.sourceKind ?? null,
+      packagePath: opts.packagePath ?? null,
+      packageDigest: opts.packageDigest ?? null,
+      packageManifest: opts.packageManifest ? structuredClone(opts.packageManifest) : null,
+      packageValidation: opts.packageValidation ? structuredClone(opts.packageValidation) : null,
       archived: false,
       createdAt: ts,
       updatedAt: ts,
@@ -4911,6 +5222,10 @@ export class MemoryQueries implements QueryStore {
       version: existing.version + 1,
       rubricVersion,
       agentCategory: patch.agentCategory ?? existing.agentCategory,
+      categoryName:
+        patch.categoryName !== undefined
+          ? patch.categoryName?.trim() || null
+          : existing.categoryName,
       profile: patch.profile !== undefined ? patch.profile : existing.profile,
       referenceSolution:
         patch.referenceSolution !== undefined
@@ -5296,6 +5611,8 @@ export class MemoryQueries implements QueryStore {
       reportPath: null,
       eventsPath,
       verdictPath: jVerdictPath,
+      narrative: null,
+      narrativeSchemaVersion: null,
       createdAt: ts,
       endedAt: null,
     };
@@ -5337,7 +5654,11 @@ export class MemoryQueries implements QueryStore {
     return out;
   }
 
-  storeVerdict(judgementId: string, verdict: Verdict): JudgementWithVerdict {
+  storeVerdict(
+    judgementId: string,
+    verdict: Verdict,
+    narrative: EvalJudgementNarrative | null = null,
+  ): JudgementWithVerdict {
     const existing = this.judgements.get(judgementId);
     if (!existing) throw notFound("judgement", judgementId);
     const jVerdictPath =
@@ -5370,6 +5691,8 @@ export class MemoryQueries implements QueryStore {
       verdict: verdict.overall?.verdict ?? null,
       verdictPath: jVerdictPath,
       eventsPath,
+      narrative,
+      narrativeSchemaVersion: narrative?.schemaVersion ?? null,
       endedAt: nowIso(),
     };
     this.judgements.set(judgementId, next);
@@ -6225,6 +6548,94 @@ export class MemoryQueries implements QueryStore {
     };
     this.queueAnalyses.set(id, next);
     return structuredClone(next);
+  }
+
+  storeImprovementSteps(
+    queueAnalysisId: string,
+    projectId: string,
+    queueId: string,
+    steps: QueueImprovementStep[],
+  ): ImprovementStepRecord[] {
+    for (const [id, step] of this.improvementSteps) {
+      if (step.queueAnalysisId === queueAnalysisId) this.improvementSteps.delete(id);
+    }
+    const ts = nowIso();
+    for (const step of steps) {
+      this.improvementSteps.set(`${queueAnalysisId}:${step.id}`, {
+        ...structuredClone(step),
+        queueAnalysisId,
+        projectId,
+        queueId,
+        createdAt: ts,
+        updatedAt: ts,
+      });
+    }
+    return this.listImprovementSteps({ queueAnalysisId });
+  }
+
+  listImprovementSteps(filter: ListImprovementStepsFilter): ImprovementStepRecord[] {
+    return [...this.improvementSteps.values()]
+      .filter((step) =>
+        step.queueAnalysisId === filter.queueAnalysisId &&
+        (!filter.class || step.class === filter.class) &&
+        (filter.priority === undefined || step.priority === filter.priority) &&
+        (!filter.status || step.status === filter.status) &&
+        (!filter.defectId || step.defectIds.includes(filter.defectId)))
+      .sort((a, b) => a.rank - b.rank)
+      .map((step) => structuredClone(step));
+  }
+
+  updateImprovementStepLifecycle(
+    queueAnalysisId: string,
+    id: string,
+    patch: UpdateImprovementStepLifecycleInput,
+  ): ImprovementStepRecord {
+    const storageId = `${queueAnalysisId}:${id}`;
+    const existing = this.improvementSteps.get(storageId);
+    if (!existing) throw notFound("improvement step", id);
+    if (!canTransitionImprovementStatus(existing.status, patch.status)) {
+      throw new Error(`invalid improvement step transition ${existing.status} -> ${patch.status}`);
+    }
+    if (patch.status === "blocked" && !patch.blockingReason?.trim()) {
+      throw new Error("blockingReason is required when status=blocked");
+    }
+    const next: ImprovementStepRecord = {
+      ...existing,
+      status: patch.status,
+      ...(patch.status === "blocked"
+        ? { blockingReason: patch.blockingReason!.trim() }
+        : { blockingReason: undefined }),
+      updatedAt: nowIso(),
+    };
+    this.improvementSteps.set(storageId, next);
+    return structuredClone(next);
+  }
+
+  upsertEvalMetrics(input: {
+    runId: string;
+    projectId: string;
+    schemaVersion: number;
+    execution: Record<string, unknown>;
+    outcome?: Record<string, unknown> | null;
+  }): EvalMetricsRecord {
+    const existing = this.evalMetrics.get(input.runId);
+    const ts = nowIso();
+    const row: EvalMetricsRecord = {
+      runId: input.runId,
+      projectId: input.projectId,
+      schemaVersion: input.schemaVersion,
+      execution: structuredClone(input.execution),
+      outcome: structuredClone(input.outcome ?? existing?.outcome ?? null),
+      createdAt: existing?.createdAt ?? ts,
+      updatedAt: ts,
+    };
+    this.evalMetrics.set(row.runId, row);
+    return structuredClone(row);
+  }
+
+  getEvalMetrics(runId: string): EvalMetricsRecord | null {
+    const row = this.evalMetrics.get(runId);
+    return row ? structuredClone(row) : null;
   }
 
   storeEvalArchive(input: StoreEvalArchiveInput): EvalArchive {

@@ -18,6 +18,7 @@ import {
 import { createServer, type ApiServer } from "../src/api/server.ts";
 import { runDirPath } from "../src/api/run-controller-bridge.ts";
 import type { Rubric } from "../src/domain.ts";
+import { validEvalPackageUpload } from "./helpers/eval-package.ts";
 
 const tempDirs: string[] = [];
 const servers: ApiServer[] = [];
@@ -228,7 +229,7 @@ async function seedCompletedRun(
 }
 
 describe("REST API (P3c)", () => {
-  it("project + task CRUD, rubric_version bump rules, 404 problem shape", async () => {
+  it("project + canonical eval package creation, immutability, and 404 problem shape", async () => {
     const { base } = await boot();
 
     const created = await http(base, "POST", "/api/projects", {
@@ -244,43 +245,34 @@ describe("REST API (P3c)", () => {
     expect(list.status).toBe(200);
     expect((list.json as { projects: unknown[] }).projects.length).toBeGreaterThanOrEqual(1);
 
-    const taskRes = await http(base, "POST", `/api/projects/${project.id}/tasks`, {
-      body: {
-        name: "Fix off-by-one",
-        prompt: "Fix the bug in main.ts",
-        workspace: { source: "empty" },
-        rubric: sampleRubric(1),
-        profile: "bugfix",
-        agentCategory: "coding",
-        tags: ["smoke"],
-      },
+    const flatTask = await http(base, "POST", `/api/projects/${project.id}/tasks`, {
+      body: { name: "legacy", prompt: "legacy", rubric: sampleRubric(1) },
+    });
+    expect(flatTask.status).toBe(400);
+
+    const taskRes = await http(base, "POST", `/api/projects/${project.id}/evals`, {
+      body: validEvalPackageUpload(),
     });
     expect(taskRes.status).toBe(201);
-    const task = taskRes.json as { id: string; name: string; rubric_version: number };
-    expect(task.name).toBe("Fix off-by-one");
+    const task = taskRes.json as {
+      id: string;
+      name: string;
+      rubric_version: number;
+      category_name: string;
+      package_digest: string;
+    };
+    expect(task.name).toBe("Return 42");
     expect(task.rubric_version).toBe(1);
+    expect(task.category_name).toBe("javascript-bugfix");
+    expect(task.package_digest).toMatch(/^[a-f0-9]{64}$/);
 
-    const namePatch = await http(
+    const immutablePatch = await http(
       base,
       "PATCH",
-      `/api/projects/${project.id}/tasks/${task.id}`,
-      { body: { name: "Fix off-by-one (renamed)" } },
+      `/api/projects/${project.id}/evals/${task.id}`,
+      { body: { name: "mutated" } },
     );
-    expect(namePatch.status).toBe(200);
-    const renamed = namePatch.json as { name: string; rubric_version: number };
-    expect(renamed.name).toBe("Fix off-by-one (renamed)");
-    expect(renamed.rubric_version).toBe(1);
-
-    const rubricPatch = await http(
-      base,
-      "PATCH",
-      `/api/projects/${project.id}/tasks/${task.id}`,
-      { body: { rubric: sampleRubric(1, "correctness-v2") } },
-    );
-    expect(rubricPatch.status).toBe(200);
-    const bumped = rubricPatch.json as { rubric_version: number; rubric: Rubric };
-    expect(bumped.rubric_version).toBe(2);
-    expect(bumped.rubric.criteria[0]!.label).toBe("correctness-v2");
+    expect(immutablePatch.status).toBe(409);
 
     const missing = await http(base, "GET", "/api/runs/does-not-exist");
     expect(missing.status).toBe(404);

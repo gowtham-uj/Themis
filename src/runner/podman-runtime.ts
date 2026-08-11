@@ -63,7 +63,7 @@ interface CliResult {
 /** Spawn a podman subcommand and collect its output. */
 function runCli(
   argv: string[],
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<CliResult> {
   return new Promise((resolve) => {
     const [file, ...args] = argv;
@@ -71,7 +71,10 @@ function runCli(
       resolve({ code: 1, stdout: "", stderr: "empty argv" });
       return;
     }
-    const child = spawn(file, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(file, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      ...(opts.env ? { env: opts.env } : {}),
+    });
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -103,6 +106,19 @@ function runCli(
     });
     child.on("close", (code) => finish(code ?? 0));
   });
+}
+
+/** Preserve named child env vars across a sudo prefix without putting values in argv. */
+export function podmanCommandWithEnv(
+  command: string[],
+  names: string[],
+): string[] {
+  if (names.length === 0) return [...command];
+  const first = command[0] ?? "";
+  const isSudo = first === "sudo" || first.endsWith("/sudo");
+  if (!isSudo) return [...command];
+  const unique = [...new Set(names)].sort();
+  return [first, `--preserve-env=${unique.join(",")}`, ...command.slice(1)];
 }
 
 /** Turn a `podman logs -f` child process into an async byte stream. */
@@ -356,18 +372,19 @@ class PodmanContainerHandle implements ContainerHandle {
     const args = ["exec"];
     if (spec.cwd) args.push("--workdir", spec.cwd);
     if (spec.user) args.push("--user", spec.user);
-    for (const [name, value] of Object.entries(spec.env ?? {})) {
-      args.push("--env", `${name}=${value}`);
-    }
+    const commandEnv = spec.env ?? {};
+    const envNames = Object.keys(commandEnv);
+    for (const name of envNames) args.push("--env", name);
     args.push(this.id, ...spec.argv);
     const [file, ...spawnArgs] = [
-      ...this.podman,
+      ...podmanCommandWithEnv(this.podman, envNames),
       "--log-level=error",
       ...args,
     ];
     const child = spawn(file!, spawnArgs, {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
+      env: { ...process.env, ...commandEnv },
     });
     return new PodmanExecHandle(child, spec.timeoutMs ?? 30_000);
   }
@@ -566,9 +583,14 @@ export class PodmanRuntime implements ContainerRuntime {
     }
 
     const args = buildPodmanRunArgs(effectiveSpec, policy, { name });
-    const created = await runCli([...this.cmd(), ...args], {
-      timeoutMs: this.startTimeoutMs,
-    });
+    const envNames = Object.keys(effectiveSpec.env);
+    const created = await runCli(
+      [...podmanCommandWithEnv(this.cmd(), envNames), ...args],
+      {
+        timeoutMs: this.startTimeoutMs,
+        env: { ...process.env, ...effectiveSpec.env },
+      },
+    );
     if (created.code !== 0) {
       throw new Error(
         `podman run failed (exit ${created.code}): ${created.stderr.trim() || created.stdout.trim()}`,

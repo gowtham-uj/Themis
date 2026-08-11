@@ -117,8 +117,9 @@ export function buildPodmanRunArgs(
   args.push("-w", spec.workdir ?? policy.workdir ?? WORKSPACE_MOUNT);
 
   // ---- env ----
-  // Values go through argv, not a shell, so no quoting concerns.
-  for (const [k, v] of Object.entries(spec.env)) args.push("-e", `${k}=${v}`);
+  // Values travel in the podman child environment, never process argv. A
+  // name-only flag asks podman to copy that variable into the container.
+  for (const k of Object.keys(spec.env)) args.push("-e", k);
 
   args.push(spec.image, ...spec.argv);
   return args;

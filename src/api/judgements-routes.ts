@@ -128,6 +128,8 @@ function judgementJson(j: Judgement) {
     report_path: j.reportPath,
     events_path: j.eventsPath,
     verdict_path: j.verdictPath,
+    narrative: j.narrative,
+    narrative_schema_version: j.narrativeSchemaVersion,
     created_at: j.createdAt,
     ended_at: j.endedAt,
   };

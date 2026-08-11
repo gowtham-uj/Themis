@@ -252,6 +252,31 @@ describe("full mapping: post-change trajectory fixture", () => {
 });
 
 describe("edge mappings", () => {
+  it("deduplicates an identical terminal assistant message", () => {
+    const events = parseReaperTrajectory(
+      [
+        { kind: "session_start", timestamp: "2026-08-11T00:00:00.000Z", user_intent_summary: "test" },
+        { kind: "assistant_message", timestamp: "2026-08-11T00:00:01.000Z", content: "done", turn_index: 1 },
+        { kind: "run_end", timestamp: "2026-08-11T00:00:02.000Z", status: "completed", assistant_message: "done" },
+      ],
+      makeCtx(),
+    );
+    expect(events.filter((entry) => entry.type === "message")).toHaveLength(1);
+    expect(events.at(-1)?.type).toBe("run.end");
+  });
+
+  it("preserves a distinct terminal assistant message", () => {
+    const events = parseReaperTrajectory(
+      [
+        { kind: "session_start", timestamp: "2026-08-11T00:00:00.000Z", user_intent_summary: "test" },
+        { kind: "assistant_message", timestamp: "2026-08-11T00:00:01.000Z", content: "working", turn_index: 1 },
+        { kind: "run_end", timestamp: "2026-08-11T00:00:02.000Z", status: "completed", assistant_message: "done" },
+      ],
+      makeCtx(),
+    );
+    expect(events.filter((entry) => entry.type === "message")).toHaveLength(2);
+  });
+
   it("tool_call failed → tool.result{isError:true}", () => {
     const ctx = makeCtx();
     // Use a minimal state via parseReaperTrajectory
@@ -422,10 +447,10 @@ describe("edge mappings", () => {
 
     expect(turns.map((t) => t.turn)).toEqual([1, 2]);
     expect(thinkings.map((t) => t.turn)).toEqual([1, 2]);
-    // 3 messages: m1(turn1) + m2(turn2) + run_end final assistant_message(turn2,
-    // reused — must NOT advance to a spurious turn 3).
-    expect(msgs.map((m) => m.turn)).toEqual([1, 2, 2]);
-    expect(msgs[2]!.text).toBe("turn2 msg"); // run_end final message
+    // run_end repeats the already-emitted turn-2 message, so it is suppressed
+    // rather than duplicated or attributed to a spurious turn 3.
+    expect(msgs.map((m) => m.turn)).toEqual([1, 2]);
+    expect(msgs[1]!.text).toBe("turn2 msg");
   });
 
   it("isReaperTrajectoryEntry rejects non-envelopes", () => {

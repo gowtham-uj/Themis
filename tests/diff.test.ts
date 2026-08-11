@@ -183,10 +183,13 @@ describe("agent-internal state exclusion", () => {
       mkdirSync(join(dir, ".reaper/runs/x/logs"), { recursive: true });
       writeFileSync(join(dir, ".reaper/runs/x/logs/trajectory.jsonl"), "{}\n");
       writeFileSync(join(dir, ".reaper/latest-run.json"), "{}\n");
+      mkdirSync(join(dir, ".agenteval"), { recursive: true });
+      writeFileSync(join(dir, ".agenteval/reaper-result.json"), "{}\n");
 
       const res = await captureDiff(dir, { outPath: join(dir, "out.patch") });
       expect(res.rawDiff).toContain("src/app.js");
       expect(res.rawDiff).not.toContain(".reaper");
+      expect(res.rawDiff).not.toContain(".agenteval");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

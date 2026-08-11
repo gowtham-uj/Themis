@@ -180,6 +180,7 @@ class ParseState {
   startedAtMs: number | undefined;
   cumulativeUsage: Usage | undefined;
   sawRunEnd = false;
+  lastFullMessage: { turn: number; text: string } | undefined;
 
   nextSeq(): number {
     this.seq += 1;
@@ -293,6 +294,7 @@ export function mapReaperEntry(
           mode: "full",
           text,
         });
+        state.lastFullMessage = { turn, text };
       }
       break;
     }
@@ -308,6 +310,7 @@ export function mapReaperEntry(
           mode: "full",
           text,
         });
+        state.lastFullMessage = { turn, text };
       }
       break;
     }
@@ -491,13 +494,18 @@ export function mapReaperEntry(
       const finalMsg = asString(entry.assistant_message);
       if (finalMsg && finalMsg.length > 0) {
         const turn = state.turnOpened ? state.turn : state.ensureTurn();
-        out.push({
-          ...base(),
-          type: "message",
-          turn,
-          mode: "full",
-          text: finalMsg,
-        });
+        const duplicate =
+          state.lastFullMessage?.turn === turn && state.lastFullMessage.text === finalMsg;
+        if (!duplicate) {
+          out.push({
+            ...base(),
+            type: "message",
+            turn,
+            mode: "full",
+            text: finalMsg,
+          });
+          state.lastFullMessage = { turn, text: finalMsg };
+        }
       }
 
       out.push({

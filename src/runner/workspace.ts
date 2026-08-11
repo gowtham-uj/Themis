@@ -91,6 +91,22 @@ export async function ensureGitRepo(
   await gitInit(dir, env);
 }
 
+/** Commit the prepared canonical package seed so later diffs contain only trial changes. */
+export async function commitWorkspaceBaseline(
+  dir: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<string> {
+  await ensureGitRepo(dir, env);
+  const gitEnv = { ...process.env, ...env };
+  await execFileAsync("git", ["-C", dir, "add", "-A"], { env: gitEnv });
+  await execFileAsync(
+    "git",
+    ["-C", dir, "commit", "--allow-empty", "-m", "agenteval canonical package baseline"],
+    { env: gitEnv },
+  );
+  return gitRevParse(dir, "HEAD", env);
+}
+
 async function assertEmptyOrMissing(dir: string): Promise<void> {
   try {
     await access(dir);

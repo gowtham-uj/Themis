@@ -210,6 +210,7 @@ export interface BuildTaskSpecInput {
   tags?: string[];
   profile?: TaskProfile;
   agentCategory?: TaskSpec["agentCategory"];
+  categoryName?: string;
   referenceSolution?: string;
   checks?: Check[];
   /** Env this eval needs: greenfield/brownfield, image, setup script. */
@@ -255,6 +256,7 @@ export function buildTaskSpec(input: BuildTaskSpecInput): TaskSpec {
     ...(input.id !== undefined ? { id: input.id } : {}),
     ...(input.tags !== undefined ? { tags: input.tags } : {}),
     ...(input.agentCategory !== undefined ? { agentCategory: input.agentCategory } : {}),
+    ...(input.categoryName?.trim() ? { categoryName: input.categoryName.trim() } : {}),
     ...(input.referenceSolution !== undefined
       ? { referenceSolution: input.referenceSolution }
       : {}),
