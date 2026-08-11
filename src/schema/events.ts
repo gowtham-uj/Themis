@@ -36,7 +36,8 @@ export const PLAN_EVENT_TYPES: readonly string[] = EVENT_TYPES;
 
 export type EventType = (typeof EVENT_TYPES)[number];
 
-export type AgentId = "reapercode" | "pi";
+/** Stable adapter/agent identifier; extensible project adapters are not registry-bound. */
+export type AgentId = string;
 
 export type WorkspaceSource = "git" | "empty";
 
@@ -259,7 +260,6 @@ export class EventValidationError extends Error {
 }
 
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);
-const AGENT_IDS: ReadonlySet<string> = new Set(["reapercode", "pi"]);
 const WORKSPACE_SOURCES: ReadonlySet<string> = new Set(["git", "empty"]);
 const STOP_REASONS: ReadonlySet<string> = new Set([
   "stop",
@@ -504,7 +504,7 @@ export function validateCanonicalEvent(value: unknown): CanonicalEvent {
       return {
         ...base,
         type,
-        agent: requireEnum<AgentId>(value, "agent", AGENT_IDS, type),
+        agent: requireString(value, "agent", type),
         model: requireString(value, "model", type),
         provider: requireString(value, "provider", type),
         workspace: parseWorkspace(value.workspace, `${type}.workspace`),

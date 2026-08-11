@@ -448,6 +448,21 @@ async function executeTool(
         log: { accepted: false, error: message },
       };
     }
+    const submittedIds = submission.perEval.map((entry) => entry.runId);
+    const { missingRunIds, unknownRunIds, duplicateRunIds, exact } =
+      validateQueueSubmissionRunIds(submittedIds, selectedIds);
+    if (!exact) {
+      return {
+        response: {
+          accepted: false,
+          error: "per_eval must contain exactly one verdict for every selected run",
+          missingRunIds,
+          unknownRunIds,
+          duplicateRunIds,
+        },
+        log: { accepted: false, missingRunIds, unknownRunIds, duplicateRunIds },
+      };
+    }
     // Validate each per-eval verdict so the judge can correct and retry rather
     // than the whole analysis failing after submission.
     const validationErrors: string[] = [];
@@ -535,6 +550,36 @@ function missingEvidence(
     }
   }
   return missing;
+}
+
+/** Validate the terminating queue-judge submission covers each selected run exactly once. */
+export function validateQueueSubmissionRunIds(
+  submittedIds: string[],
+  selectedIds: string[],
+): {
+  exact: boolean;
+  missingRunIds: string[];
+  unknownRunIds: string[];
+  duplicateRunIds: string[];
+} {
+  const selected = new Set(selectedIds);
+  const counts = new Map<string, number>();
+  for (const runId of submittedIds) counts.set(runId, (counts.get(runId) ?? 0) + 1);
+  const missingRunIds = selectedIds.filter((runId) => !counts.has(runId));
+  const unknownRunIds = [...counts.keys()].filter((runId) => !selected.has(runId));
+  const duplicateRunIds = [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([runId]) => runId);
+  return {
+    exact:
+      submittedIds.length === selectedIds.length &&
+      missingRunIds.length === 0 &&
+      unknownRunIds.length === 0 &&
+      duplicateRunIds.length === 0,
+    missingRunIds,
+    unknownRunIds,
+    duplicateRunIds,
+  };
 }
 
 function parseSubmission(args: Record<string, unknown>): QueueSubmission {

@@ -107,6 +107,8 @@ export interface RunContainerSpec {
   argv: string[];
   /** Environment injected at container launch. */
   env: Record<string, string>;
+  /** Initial process working directory inside the container. Default `/workspace`. */
+  workdir?: string;
   /** Resource limits — pinned for reproducibility (plan/execution.md). */
   limits: { cpus?: number; memoryMiB?: number; pids?: number };
   /** Hard wall-clock timeout. On expiry the runtime SIGTERM→SIGKILL and wait() returns timedOut. */

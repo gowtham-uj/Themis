@@ -154,7 +154,10 @@ try {
   const bridge = await execBridge(projectId, queueId, "id -u; printf bridge-out; printf bridge-err >&2");
   assert(bridge.stdout.includes("0\nbridge-out"), "introspection must execute as root and stream stdout");
   assert(bridge.stderr === "bridge-err", "introspection must preserve exact stderr bytes");
-  assert(bridge.control.exit_code === 0, "introspection command must exit 0");
+  assert(
+    bridge.control.exit_code === 0,
+    `introspection command must exit 0: ${JSON.stringify(bridge.control)}`,
+  );
 
   const analysisResult = await json(
     "POST",

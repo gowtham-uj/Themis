@@ -118,4 +118,79 @@ describe("project agent adapter API", () => {
     });
     expect(wrongAgent.status).toBe(400);
   });
+
+  it("requires explicit valid shared adapter references and protects consumers", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "agenteval-shared-adapter-api-"));
+    dirs.push(dataDir);
+    const api = createServer({ dataDir, outboundDispatcher: null });
+    servers.push(api);
+    const port = await api.listen(0);
+    const base = `http://127.0.0.1:${port}`;
+
+    const owner = await request(base, "POST", "/api/projects", {
+      name: "Owner",
+      slug: `owner-${Date.now()}`,
+    });
+    const consumer = await request(base, "POST", "/api/projects", {
+      name: "Consumer",
+      slug: `consumer-${Date.now()}`,
+    });
+    const ownerId = owner.body.id as string;
+    const consumerId = consumer.body.id as string;
+    const created = await request(base, "POST", `/api/projects/${ownerId}/adapters`, {
+      ...adapterBody(),
+      shared: true,
+    });
+    expect(created.status).toBe(201);
+    const adapter = created.body.adapter as Record<string, unknown>;
+
+    const invalid = await request(base, "POST", `/api/projects/${consumerId}/queues`, {
+      name: "invalid",
+      shared_adapter_id: "missing-adapter",
+      model: "deepseek-v4-flash",
+      provider: "nuralwatt",
+    });
+    expect(invalid.status).toBe(400);
+
+    const queue = await request(base, "POST", `/api/projects/${consumerId}/queues`, {
+      name: "shared",
+      shared_adapter_id: adapter.id,
+      model: "deepseek-v4-flash",
+      provider: "nuralwatt",
+    });
+    expect(queue.status).toBe(201);
+    const queueRow = queue.body.queue as Record<string, unknown>;
+    expect(queueRow.agentId).toBe("my-cli-agent");
+    expect(queueRow.sharedAdapterId).toBe(adapter.id);
+
+    const mutate = await request(
+      base,
+      "PATCH",
+      `/api/projects/${ownerId}/adapters/${adapter.id as string}`,
+      { image: "registry.example/changed:latest" },
+    );
+    expect(mutate.status).toBe(409);
+    const remove = await request(
+      base,
+      "DELETE",
+      `/api/projects/${ownerId}/adapters/${adapter.id as string}`,
+    );
+    expect(remove.status).toBe(409);
+
+    const clear = await request(
+      base,
+      "PATCH",
+      `/api/projects/${consumerId}/queues/${queueRow.id as string}`,
+      { shared_adapter_id: null },
+    );
+    expect(clear.status).toBe(400);
+
+    const rename = await request(
+      base,
+      "PATCH",
+      `/api/projects/${ownerId}/adapters/${adapter.id as string}`,
+      { name: "Renamed shared adapter" },
+    );
+    expect(rename.status).toBe(200);
+  });
 });

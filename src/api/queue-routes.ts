@@ -66,6 +66,14 @@ function requireProject(queries: DbQueries, id: string): Project {
   return project;
 }
 
+function requireSharedAdapter(queries: DbQueries, projectId: string, adapterId: string) {
+  const adapter = queries.getProjectAgentAdapter(adapterId);
+  if (!adapter || !adapter.shared || !adapter.enabled || adapter.projectId === projectId) {
+    throw badRequest(`shared_adapter_id is unavailable: ${adapterId}`);
+  }
+  return adapter;
+}
+
 function requireQueue(
   queries: DbQueries,
   projectId: string,
@@ -263,27 +271,44 @@ export function registerQueueRoutes(router: Router): void {
       autoJudge?: boolean;
       shared_adapter_id?: string | null;
       sharedAdapterId?: string | null;
-    }>(req);    if (typeof body.name !== "string" || !body.name.trim()) {
+    }>(req);
+    if (typeof body.name !== "string" || !body.name.trim()) {
       throw badRequest("name is required");
+    }
+    const sharedAdapterId = body.shared_adapter_id ?? body.sharedAdapterId;
+    const sharedAdapter = typeof sharedAdapterId === "string"
+      ? requireSharedAdapter(app.queries, projectId, sharedAdapterId)
+      : null;
+    if (sharedAdapterId !== undefined && sharedAdapterId !== null && typeof sharedAdapterId !== "string") {
+      throw badRequest("shared_adapter_id must be a string or null");
     }
     const configuredAdapter = app.queries.listProjectAgentAdapters(projectId, {
       includeDisabled: true,
     })[0];
-    const agentId = configuredAdapter?.agentId ?? project.defaultAgentId;
+    if (!sharedAdapter && configuredAdapter && !configuredAdapter.enabled) {
+      throw badRequest("the project's configured adapter is disabled");
+    }
+    const agentId = sharedAdapter?.agentId ?? configuredAdapter?.agentId ?? project.defaultAgentId;
     const requestedAgentId = body.agent_id ?? body.agentId;
     if (requestedAgentId && requestedAgentId !== agentId) {
-      throw badRequest("queues must use the project's configured agent");
+      throw badRequest(
+        sharedAdapter
+          ? "agent_id must match the explicitly selected shared adapter"
+          : "queues must use the project's configured agent",
+      );
     }
-    const model = body.model ?? project.defaultModel;
-    const provider = body.provider ?? project.defaultProvider;
+    const sharedAgent = sharedAdapter ? app.queries.getAgent(sharedAdapter.agentId) : null;
+    const model = body.model ?? project.defaultModel ?? sharedAgent?.defaultModel;
+    const provider = body.provider ?? project.defaultProvider ?? sharedAgent?.defaultProvider;
     if (!agentId || !model || !provider) {
-      throw badRequest("configure the project agent adapter, model, and provider first");
+      throw badRequest("configure the queue agent adapter, model, and provider first");
     }
     const input: CreateEvalQueueInput = {
       name: body.name.trim(),
       agentId,
       model,
       provider,
+      sharedAdapterId: sharedAdapter?.id ?? null,
     };
     if (body.description !== undefined) input.description = body.description;
     const rawOverrides = body.adapter_overrides ?? body.adapterOverrides;
@@ -300,9 +325,8 @@ export function registerQueueRoutes(router: Router): void {
     if (judgeProvider !== undefined) input.judgeProvider = judgeProvider;
     const autoJudge = body.auto_judge ?? body.autoJudge;
     if (autoJudge !== undefined) input.autoJudge = autoJudge;
-    const sharedAdapterId = body.shared_adapter_id ?? body.sharedAdapterId;
-    if (sharedAdapterId !== undefined) input.sharedAdapterId = sharedAdapterId ?? null;
-    const queue = app.queries.createEvalQueue(projectId, input);    sendJson(res, 201, queueView(app, queue));
+    const queue = app.queries.createEvalQueue(projectId, input);
+    sendJson(res, 201, queueView(app, queue));
   });
 
   router.get("/api/projects/:id/queues", (_req, res, ctx) => {
@@ -333,7 +357,24 @@ export function registerQueueRoutes(router: Router): void {
       patch.description = body.description as string | null;
     }
     if (body.agent_id !== undefined || body.agentId !== undefined) {
-      throw badRequest("a queue cannot change the project's agent");
+      throw badRequest("a queue cannot directly change agent_id; select shared_adapter_id instead");
+    }
+    if (body.shared_adapter_id !== undefined || body.sharedAdapterId !== undefined) {
+      const requestedShared = body.shared_adapter_id ?? body.sharedAdapterId;
+      if (requestedShared === null) {
+        const configured = app.queries.listProjectAgentAdapters(queue.projectId)[0];
+        if (!configured) {
+          throw badRequest("cannot clear shared_adapter_id without an enabled project adapter");
+        }
+        patch.sharedAdapterId = null;
+        patch.agentId = configured.agentId;
+      } else if (typeof requestedShared === "string") {
+        const shared = requireSharedAdapter(app.queries, queue.projectId, requestedShared);
+        patch.sharedAdapterId = shared.id;
+        patch.agentId = shared.agentId;
+      } else {
+        throw badRequest("shared_adapter_id must be a string or null");
+      }
     }
     if (typeof body.model === "string") patch.model = body.model;
     if (typeof body.provider === "string") patch.provider = body.provider;

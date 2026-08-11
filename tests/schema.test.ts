@@ -183,6 +183,20 @@ describe("CanonicalEvent types + validation", () => {
     expect([...EVENT_TYPES].sort()).toEqual([...PLAN_EVENT_TYPES].sort());
   });
 
+  it("accepts project-defined adapter ids on run.start", () => {
+    const event = validateCanonicalEvent({
+      ...base(0),
+      type: "run.start",
+      agent: "codex-project-adapter",
+      model: "deepseek-v4-flash",
+      provider: "nuralwatt",
+      workspace: { source: "empty" },
+      params: {},
+    });
+    expect(event.type).toBe("run.start");
+    if (event.type === "run.start") expect(event.agent).toBe("codex-project-adapter");
+  });
+
   it("rejects missing envelope fields", () => {
     expect(isCanonicalEvent({ type: "log", level: "info", message: "x" })).toBe(
       false,

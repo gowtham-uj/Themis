@@ -255,10 +255,20 @@ export async function startRun(
   // built-in adapter only when the project has not created a declarative one.
   // An explicitly injected adapter (real-container config tests) short-circuits
   // this so they do not depend on a project adapter row.
-  const projectAdapter = opts.adapter
+  const queue = run.queueId ? queries.getEvalQueue(run.queueId) : null;
+  const sharedAdapter = !opts.adapter && queue?.sharedAdapterId
+    ? queries.getProjectAgentAdapter(queue.sharedAdapterId)
+    : null;
+  if (queue?.sharedAdapterId && (!sharedAdapter || !sharedAdapter.shared || !sharedAdapter.enabled)) {
+    throw new Error(`run ${run.id} references an unavailable shared adapter`);
+  }
+  if (sharedAdapter && sharedAdapter.agentId !== run.agentId) {
+    throw new Error(`run ${run.id} agent_id does not match its shared adapter`);
+  }
+  const projectAdapter = opts.adapter || sharedAdapter
     ? undefined
     : queries.getProjectAgentAdapterByAgentId(run.projectId, run.agentId);
-  if (!opts.adapter) {
+  if (!opts.adapter && !sharedAdapter) {
     const configuredAdapters = queries.listProjectAgentAdapters(run.projectId, {
       includeDisabled: true,
     });
@@ -273,7 +283,11 @@ export async function startRun(
   }
   const adapter: Adapter =
     opts.adapter ??
-    (projectAdapter ? createDeclarativeAdapter(projectAdapter) : getAdapter(run.agentId));
+    (sharedAdapter
+      ? createDeclarativeAdapter(sharedAdapter)
+      : projectAdapter
+        ? createDeclarativeAdapter(projectAdapter)
+        : getAdapter(run.agentId));
 
   // Prepare the workspace.
   //
@@ -480,14 +494,15 @@ export async function startRun(
       nonRoot: true,
     });
   } else {
-    const { argv, env } = adapter.command(ctx);
+    const command = adapter.command(ctx);
     handle = await runtime.run({
       image: adapter.image(ctx),
       workspaceDir,
-      argv: argv.length > 0 ? argv : ["node", "-e", "process.exit(0)"],
-      env,
+      argv: command.argv.length > 0 ? command.argv : ["node", "-e", "process.exit(0)"],
+      env: command.env,
+      ...(command.cwd ? { workdir: command.cwd } : {}),
       limits: { cpus: 1, memoryMiB: 512, pids: 128 },
-      timeoutMs,
+      timeoutMs: command.timeoutMs ?? timeoutMs,
       network: networkMode,
       ...(overrides?.ports ? { ports: overrides.ports } : {}),
       ...(sandbox ? { sandbox } : {}),

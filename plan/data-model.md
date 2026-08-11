@@ -107,6 +107,7 @@ CREATE TABLE eval_queues (
   judge_model TEXT, judge_provider TEXT, auto_judge INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'draft', -- draft|starting|running|paused|judging|completed|tainted|stopped|failed
   active_batch_id TEXT,
+  shared_adapter_id TEXT REFERENCES project_agent_adapters(id), -- explicit cross-project selection
   revision INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
@@ -125,7 +126,7 @@ CREATE TABLE eval_queue_items (
 -- Historical `queue_entries` backlog rows remain in existing databases for audit. Migration converts
 -- every unstarted row into an equivalent persistent queue; no new product flow writes that table.
 
--- Agents available (registered adapters) — GLOBAL, shared across projects
+-- Stable agent identities. Adapter definitions themselves are project-owned.
 CREATE TABLE agents (
   id TEXT PRIMARY KEY,
   display_name TEXT NOT NULL,
@@ -133,9 +134,9 @@ CREATE TABLE agents (
   default_provider TEXT
 );
 
--- Exactly one real CLI agent adapter may be configured per project. The definition is CRUD-able and
--- includes the connected git source/build recipe, provider/model wiring, command templates, parser,
--- and native evidence locations. Build metadata pins the exact source commit and OCI image id.
+-- At most one owned real CLI adapter per project. `shared=1` publishes this row for explicit selection
+-- by another project's eval_queue.shared_adapter_id. The definition includes source-build/npm setup,
+-- provider/model wiring, connection/configure/eval templates, parser, and native evidence locations.
 CREATE TABLE project_agent_adapters (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL UNIQUE REFERENCES projects(id),
@@ -145,10 +146,15 @@ CREATE TABLE project_agent_adapters (
   image TEXT NOT NULL,
   command_json TEXT NOT NULL,
   connection_check_json TEXT NOT NULL,
+  connection_check_derived INTEGER NOT NULL DEFAULT 0,
+  configure_json TEXT,
   evidence_json TEXT NOT NULL,
   parser_kind TEXT NOT NULL, parser_config_json TEXT,
   provider_config_json TEXT,
   source_repo TEXT, source_ref TEXT, containerfile TEXT,
+  generator_script TEXT,
+  install_type TEXT NOT NULL DEFAULT 'source-build',
+  shared INTEGER NOT NULL DEFAULT 0,
   build_status TEXT NOT NULL DEFAULT 'unbuilt',
   built_image_id TEXT, built_commit TEXT, build_log_path TEXT, last_built_at TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,

@@ -122,32 +122,31 @@ export async function startQueueContainer(
   const items = queries.listEvalQueueItems(queueId).filter((item) => item.enabled);
   if (items.length === 0) throw new Error(`queue ${queueId} has no enabled evals`);
 
-  const projectAdapter = queries.getProjectAgentAdapterByAgentId(
-    queue.projectId,
-    queue.agentId,
-  );
-  // Shared adapter: if the project doesn't own one, check if it explicitly
-  // references a shared adapter from the adapter store (by shared_adapter_id).
-  const sharedAdapterId = (queue as { sharedAdapterId?: string | null }).sharedAdapterId;
-  const sharedAdapter = !projectAdapter && sharedAdapterId
-    ? queries.getProjectAgentAdapter(sharedAdapterId)
+  const sharedAdapter = queue.sharedAdapterId
+    ? queries.getProjectAgentAdapter(queue.sharedAdapterId)
     : null;
-  const adapterDef = projectAdapter ?? sharedAdapter;
+  if (queue.sharedAdapterId && (!sharedAdapter || !sharedAdapter.shared || !sharedAdapter.enabled)) {
+    throw new Error(`referenced shared adapter ${queue.sharedAdapterId} is unavailable`);
+  }
+  if (sharedAdapter && sharedAdapter.agentId !== queue.agentId) {
+    throw new Error(`queue ${queue.id} agent_id does not match shared adapter ${sharedAdapter.id}`);
+  }
+  const projectAdapter = sharedAdapter
+    ? null
+    : queries.getProjectAgentAdapterByAgentId(queue.projectId, queue.agentId);
   if (projectAdapter && !projectAdapter.enabled) {
     throw new Error(`project agent adapter ${projectAdapter.id} is disabled`);
   }
-  if (adapterDef?.sourceRepo && adapterDef.buildStatus !== "ready") {
+  const adapterDef = sharedAdapter ?? projectAdapter;
+  if (adapterDef?.containerfile && adapterDef.buildStatus !== "ready") {
     throw new Error(
       `agent adapter ${adapterDef.id} image is not ready; build it through the adapter API first`,
     );
   }
-  if (sharedAdapter && (!sharedAdapter.shared || !sharedAdapter.enabled)) {
-    throw new Error(`referenced shared adapter ${sharedAdapter.id} is not shared or disabled`);
-  }
   const configuredAdapters = queries.listProjectAgentAdapters(queue.projectId, {
     includeDisabled: true,
   });
-  if (configuredAdapters.length > 0 && !projectAdapter) {
+  if (!sharedAdapter && configuredAdapters.length > 0 && !projectAdapter) {
     throw new Error(
       `queue ${queue.id} does not use project ${queue.projectId}'s configured agent`,
     );
@@ -187,24 +186,40 @@ export async function startQueueContainer(
     resolveAdapterOverrides(project, firstOverrides),
   );
   const image = queueAdapter.image(firstCtx);
+  const firstResolved = resolveAdapterOverrides(project, firstOverrides);
+  const containerNetwork = resolveNetworkMode(firstResolved?.network ?? queue.networkPolicy);
+  const containerPorts = queue.ports.length > 0 ? queue.ports : (firstResolved?.ports ?? []);
 
-  // A persistent queue cannot change images between evals. Reject such a queue
-  // before creating any durable execution rows.
+  // Container-level settings are immutable for the lifetime of a persistent
+  // queue. Reject item overrides that would only appear to change them.
   for (const item of items) {
     const task = tasks.get(item.taskId)!;
     const raw = mergeOverrides(queue.adapterOverrides, item.overrides);
+    const resolved = resolveAdapterOverrides(project, raw);
     const itemImage = queueAdapter.image(
       makeRunContext(
         `queue-image-${queue.id}-${item.id}`,
         queue,
         task,
         workspaceDir,
-        resolveAdapterOverrides(project, raw),
+        resolved,
       ),
     );
     if (itemImage !== image) {
       throw new Error(
         `queue ${queue.id} resolves multiple images (${image}, ${itemImage}); one persistent queue requires one image`,
+      );
+    }
+    const itemNetwork = resolveNetworkMode(resolved?.network ?? queue.networkPolicy);
+    if (itemNetwork !== containerNetwork) {
+      throw new Error(
+        `queue ${queue.id} resolves multiple network policies (${containerNetwork}, ${itemNetwork}); one persistent queue requires one network policy`,
+      );
+    }
+    const itemPorts = queue.ports.length > 0 ? queue.ports : (resolved?.ports ?? []);
+    if (JSON.stringify(itemPorts) !== JSON.stringify(containerPorts)) {
+      throw new Error(
+        `queue ${queue.id} resolves multiple port sets; one persistent queue requires one port set`,
       );
     }
   }
@@ -269,8 +284,6 @@ export async function startQueueContainer(
 
   let handle: ContainerHandle;
   try {
-    const firstResolved = resolveAdapterOverrides(project, firstOverrides);
-    const network = resolveNetworkMode(firstResolved?.network ?? queue.networkPolicy);
     const sandbox = {
       ...(project.sandbox ?? {}),
       ...(queue.sandbox ?? {}),
@@ -286,11 +299,8 @@ export async function startQueueContainer(
       env: {},
       limits: { cpus: 2, pids: 512 },
       timeoutMs: 0,
-      network,
-      ports:
-        queue.ports.length > 0
-          ? queue.ports
-          : (firstResolved?.ports ?? []),
+      network: containerNetwork,
+      ports: containerPorts,
       nonRoot: false,
       ...(Object.keys(sandbox).length > 0 ? { sandbox } : {}),
     });
@@ -458,17 +468,13 @@ export async function startQueueContainer(
       // Run the adapter's optional configure step (provider connection + model
       // selection) once before any eval. A non-zero exit taints the queue.
       if (queueAdapter.configure) {
-        const configureCtx: RunContext = {
-          runId: "configure",
-          project: { id: queue.projectId },
-          task: { prompt: "", workspace: { source: "empty" } },
-          model: queue.model,
-          provider: queue.provider,
-          params: {},
+        const configureCtx: RunContext = makeRunContext(
+          `configure-${batch.id}`,
+          queue,
+          firstTask,
           workspaceDir,
-          apiKeys: collectApiKeys(),
-          overrides: resolveAdapterOverrides(project, firstOverrides),
-        };
+          resolveAdapterOverrides(project, firstOverrides),
+        );
         const configureProbe = queueAdapter.configure(configureCtx);
         if (configureProbe) {
           const configureResult = await handle.exec({
@@ -479,9 +485,23 @@ export async function startQueueContainer(
             timeoutMs: configureProbe.timeoutMs ?? 120_000,
             maxOutputBytes: 1024 * 1024,
           });
-          const configureDir = join(dataDir, "projects", queue.projectId, "adapters", adapterDef?.id ?? queue.agentId);
+          const configureDir = join(
+            dataDir,
+            "projects",
+            queue.projectId,
+            "queues",
+            queue.id,
+            "batches",
+            batch.id,
+            "configure",
+          );
           await mkdir(configureDir, { recursive: true }).catch(() => undefined);
           await writeJson(join(configureDir, "configure.json"), {
+            adapterId: adapterDef?.id ?? queue.agentId,
+            provider: configureCtx.provider,
+            model: configureCtx.model,
+            command: configureProbe.command.argv,
+            cwd: configureProbe.cwd ?? "/workspace",
             exitCode: configureResult.exitCode,
             stdout: configureResult.stdout,
             stderr: configureResult.stderr,
@@ -500,7 +520,8 @@ export async function startQueueContainer(
         }
       }
 
-      for (const entry of expanded) {        if (live.stopRequested || tainted) break;
+      for (const entry of expanded) {
+        if (live.stopRequested || tainted) break;
         live.currentRunId = entry.run.id;
         live.currentQueueItemId = entry.item.id;
         queries.updateQueueContainer(containerRow.id, { state: "running" });
@@ -657,7 +678,10 @@ async function executeEval(input: {
     image: handle.image,
     network: resolveNetworkMode(overrides?.network ?? queue.networkPolicy),
     adapterOverrides: overrides ?? null,
-    sandbox: queue.sandbox ?? project.sandbox ?? null,
+    sandbox:
+      Object.keys({ ...(project.sandbox ?? {}), ...(queue.sandbox ?? {}) }).length > 0
+        ? { ...(project.sandbox ?? {}), ...(queue.sandbox ?? {}) }
+        : null,
     ports: handle.ports ?? [],
     runtimeContainerId: handle.id,
   });
@@ -697,7 +721,7 @@ async function executeEval(input: {
       seq: 0,
       ts: new Date().toISOString(),
       type: "run.start",
-      agent: input.adapter.id === "reapercode" ? "reapercode" : "pi",
+      agent: input.adapter.id,
       model: queue.model,
       provider: queue.provider,
       workspace: {
@@ -713,9 +737,9 @@ async function executeEval(input: {
     if (command.argv.length === 0) throw new Error(`adapter ${input.adapter.id} returned empty argv`);
     const session = await handle.startExec({
       argv: command.argv,
-      cwd: "/workspace",
+      cwd: command.cwd ?? "/workspace",
       env: command.env,
-      timeoutMs: input.timeoutMs,
+      timeoutMs: command.timeoutMs ?? input.timeoutMs,
     });
     input.setExec(session);
     agentStarted = true;
@@ -998,8 +1022,10 @@ function makeRunContext(
     runId,
     project: { id: queue.projectId },
     task: { prompt: task.prompt, workspace: task.workspace },
-    model: overrides?.model ?? queue.model,
-    provider: overrides?.provider ?? queue.provider,
+    // Queue provider/model are explicit, durable pins. Adapter override blobs may
+    // refine image/env/params/network/ports but must not silently change them.
+    model: queue.model,
+    provider: queue.provider,
     params: overrides?.params ?? {},
     workspaceDir,
     apiKeys: collectApiKeys(),

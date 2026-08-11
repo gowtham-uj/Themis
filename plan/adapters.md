@@ -19,26 +19,30 @@ interface RunContext {
 }
 
 interface Adapter {
-  id: "reapercode" | "pi" | string;
-  /** Docker image this adapter runs the agent in (honors project workspace_image / overrides). */
+  id: string;                         // extensible stable agent id
   image(ctx: RunContext): string;
-  /** argv + env to launch the agent headlessly inside the container. */
-  command(ctx: RunContext): { argv: string[]; env: Record<string, string> };
-  /**
-   * Consume the container's stdout/stderr (and/or a mounted trajectory file) and yield
-   * canonical events. The runner handles persistence, SSE fan-out, and diff capture.
-   */
+  connectionCheck(ctx: RunContext): AdapterConnectionCheck;
+  configure?(ctx: RunContext): AdapterConnectionCheck | null;
+  command(ctx: RunContext): {
+    argv: string[];
+    env: Record<string, string>;
+    cwd?: string;
+    timeoutMs?: number;
+  };
+  evidence(ctx: RunContext): { paths: string[]; requiredPaths?: string[] };
   parse(streams: AgentStreams, ctx: RunContext): AsyncIterable<CanonicalEvent>;
 }
 ```
 
-Adapters are **global** (registered once); projects refine them via `overrides` (default model, image
-tag, env, allowed tools, network policy) — see [projects.md](projects.md). Tasks themselves enter a
-project through its pluggable **task source**, not through the adapter.
+An adapter row is **owned by one project** (at most one owned row per project). An owner may mark it
+`shared`; another project's queue can then select that exact row through `shared_adapter_id`. There is
+no registry lookup or agent-id fallback. Built-in adapters remain compatibility defaults only for
+projects without a declarative adapter selection. See [adapter-generation-guide.md](adapter-generation-guide.md).
 
-The **runner** (shared, not per-agent) does: workspace prep → `docker run` with
-`image()`/`command()` → feed streams to `parse()` → append each event to `events.jsonl` + push to SSE
-→ on exit, `git diff` → `run.end`. Timeouts, resource limits, and retries live here too. Event payloads are persisted verbatim; redaction is deferred.
+The shared queue runner does: resolve exact adapter → start one persistent Podman container → real
+connection check → optional configure → for each ordered eval, prepare workspace → exec `command()` →
+raw/canonical capture → diff/checks/native evidence → cleanup/reset → immutable archive seal. Event
+payloads are persisted verbatim; redaction is deferred.
 
 ## Workspace prep (shared)
 
@@ -99,11 +103,15 @@ overrides for a project come from its settings, not from the task source.
 
 ## Adding a future agent
 
-1. Package it in a Docker image.
-2. Implement `image()` / `command()` for headless one-shot.
-3. Implement `parse()` mapping its output → canonical events.
-4. Register the adapter id (global). Done — every project can run it; UI, storage, judging, trends
-   all work unchanged. Per-project refinements are set via `overrides`, not by forking the adapter.
+1. Write a bash or Node.js generator following
+   [adapter-generation-guide.md](adapter-generation-guide.md).
+2. Choose `source-build` (pinned git source) or `npm` (pinned published package) and emit a real
+   Containerfile.
+3. Define real connection/configure/eval argv, provider credential mappings, and evidence paths.
+4. Emit canonical JSONL directly or install a wrapper that preserves native output and maps it.
+5. Generate, validate, build, start a queue, run at least two sequential evals, verify archives, and run
+   the real PI judge.
+6. Set `shared: true` only when other projects should be able to select this exact adapter row.
 
 ## Robustness rules (all adapters)
 

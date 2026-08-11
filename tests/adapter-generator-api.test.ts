@@ -1,7 +1,7 @@
 /** Adapter generator API: POST .../from-generator runs a user script that emits the adapter contract. */
 
 import { execSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -120,6 +120,115 @@ describe("adapter from-generator API", () => {
     const listBody = get.json as { adapters: Array<{ id: string; generatorScript: string | null }> };
     expect(listBody.adapters).toHaveLength(1);
     expect(listBody.adapters[0]!.generatorScript).toContain("#!/bin/bash");
+  });
+
+  it("runs a Node.js npm generator without a source repository", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "agenteval-gen-js-"));
+    dirs.push(dataDir);
+    const api = createServer({ dataDir, outboundDispatcher: null });
+    servers.push(api);
+    const port = await api.listen(0);
+    const base = `http://127.0.0.1:${port}`;
+    const project = api.queries.createProject({ name: "JS npm", slug: `js-npm-${Date.now()}` });
+    const generator = `#!/usr/bin/env node
+const adapter = {
+  agent_id: process.env.AGENTEVAL_AGENT_ID,
+  name: "Node npm agent",
+  install_type: "npm",
+  image: "localhost/node-npm:latest",
+  containerfile: "FROM docker.io/library/node:22-bookworm\\nRUN npm install -g example-agent@1.0.0\\n",
+  command: { argv: ["example-agent", "{{prompt}}"], cwd: "/workspace", timeout_ms: 12345 },
+  derive_connection_check: true,
+  parser_kind: "canonical-jsonl",
+  evidence: { paths: [".agent"] },
+  shared: true,
+};
+process.stdout.write(JSON.stringify(adapter));`;
+
+    const res = await http(base, "POST", `/api/projects/${project.id}/adapters/from-generator`, {
+      agent_id: "node-npm",
+      name: "Node npm agent",
+      generator,
+      install_type: "npm",
+      default_provider: "nuralwatt",
+      default_model: "deepseek-v4-flash",
+      build: false,
+    });
+
+    expect(res.status).toBe(201);
+    const adapter = (res.json as { adapter: { installType: string; sourceRepo: string | null; shared: boolean } }).adapter;
+    expect(adapter.installType).toBe("npm");
+    expect(adapter.sourceRepo).toBeNull();
+    expect(adapter.shared).toBe(true);
+  });
+
+  it("rejects a generator whose emitted agent_id differs from the request", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "agenteval-gen-id-"));
+    dirs.push(dataDir);
+    const api = createServer({ dataDir, outboundDispatcher: null });
+    servers.push(api);
+    const port = await api.listen(0);
+    const base = `http://127.0.0.1:${port}`;
+    const project = api.queries.createProject({ name: "Bad id", slug: `bad-id-${Date.now()}` });
+    const generator = `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  agent_id: "different",
+  name: "Different",
+  install_type: "npm",
+  image: "localhost/different:latest",
+  containerfile: "FROM docker.io/library/node:22-bookworm\\n",
+  command: { argv: ["agent", "{{prompt}}"] },
+  derive_connection_check: true,
+  parser_kind: "canonical-jsonl",
+  evidence: { paths: [] }
+}));`;
+    const res = await http(base, "POST", `/api/projects/${project.id}/adapters/from-generator`, {
+      agent_id: "requested",
+      name: "Requested",
+      generator,
+      install_type: "npm",
+      build: false,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("generates the pinned Codex and Claude Code npm adapters", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "agenteval-gen-examples-"));
+    dirs.push(dataDir);
+    const api = createServer({ dataDir, outboundDispatcher: null });
+    servers.push(api);
+    const port = await api.listen(0);
+    const base = `http://127.0.0.1:${port}`;
+
+    for (const example of [
+      { file: "codex.sh", id: "codex-cli", provider: "nuralwatt", model: "deepseek-v4-flash", bin: "agenteval-codex" },
+      { file: "claude-code.sh", id: "claude-code", provider: "anthropic", model: "claude-sonnet-5", bin: "agenteval-claude" },
+    ]) {
+      const project = api.queries.createProject({
+        name: `${example.id} example`,
+        slug: `${example.id}-${Date.now()}`,
+      });
+      const generator = await readFile(
+        join(import.meta.dirname, "..", "examples", "adapter-generators", example.file),
+        "utf8",
+      );
+      const res = await http(base, "POST", `/api/projects/${project.id}/adapters/from-generator`, {
+        agent_id: example.id,
+        name: example.id,
+        generator,
+        install_type: "npm",
+        default_provider: example.provider,
+        default_model: example.model,
+        build: false,
+      });
+      expect(res.status).toBe(201);
+      const adapter = (res.json as { adapter: { installType: string; sourceRepo: null; shared: boolean; command: { argv: string[] }; containerfile: string } }).adapter;
+      expect(adapter.installType).toBe("npm");
+      expect(adapter.sourceRepo).toBeNull();
+      expect(adapter.shared).toBe(true);
+      expect(adapter.command.argv[0]).toBe(example.bin);
+      expect(adapter.containerfile).toContain("npm install -g");
+    }
   });
 
   it("rejects a generator that emits invalid JSON", async () => {

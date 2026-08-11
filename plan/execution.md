@@ -56,9 +56,10 @@ After the agent finishes, diff capture depends on the task's **agent category**
 
 ## N repeats (variance)
 
-- A trigger with `repeats = N` creates one **batch** and **N runs**, each an independent container
-  with the **same** config but its own workspace copy.
-- Runs may execute concurrently up to a **concurrency cap** (host-resource-bound; configurable).
+- A queue item with `repeats = N` snapshots **N run rows** into one batch.
+- Repeats execute sequentially in that queue's one persistent container. `/workspace` is rebuilt/reset
+  for every run; native evidence is copied and the archive is sealed before reset.
+- Parallelism comes from multiple active queues, each with its own container.
 - Judgements are produced per run; the batch view aggregates scores (mean ± spread) so noise doesn't
   masquerade as regression. See [data-model.md](data-model.md).
 
@@ -96,11 +97,10 @@ Exposed as run-control actions (same surface as pause/resume/abort, [api.md](api
   stoppable before it OOMs the host.
 - **Pause/resume** (already specced) and **abort** — as in the run-control section below.
 - **Live bash introspection** — execute a bounded command through `ContainerHandle.exec` in the exact
-  already-running eval container. There is one agent container per run/attempt, so parallel project
-  evals expose multiple independently-addressed containers by `run_id`. The API never creates a
-  replacement when no container is alive: absent/queued/terminal runs return 409, and a project with
-  multiple live containers requires an explicit run id. Commands accepted before agent exit finish
-  before diff capture; no new command is accepted once finalization starts.
+  already-running queue container. There is one agent container per active queue, so parallel project
+  queues expose independently addressed containers by `queue_id`. The API never creates or restarts a
+  container for introspection: a missing/stopped queue container returns 409. A command accepted during
+  an eval is recorded as operator-originated evidence; drained containers remain inspectable until stopped.
 - **eBPF-backed** where available (cgroup + `tc`/`nftables` for net, `cgroup freezer` for pause), so
   control is enforced by the kernel, not cooperatively by the agent.
 

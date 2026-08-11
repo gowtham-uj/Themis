@@ -130,6 +130,21 @@ function parserKind(value: unknown): CliAdapterParserKind {
   return value as CliAdapterParserKind;
 }
 
+function installType(value: unknown): "source-build" | "npm" {
+  if (value === undefined || value === null) return "source-build";
+  if (value !== "source-build" && value !== "npm") {
+    throw badRequest("install_type must be source-build or npm");
+  }
+  return value;
+}
+
+function queuesReferencingAdapter(queries: DbQueries, adapterId: string) {
+  return queries
+    .listProjects({ includeArchived: true })
+    .flatMap((project) => queries.listEvalQueues(project.id))
+    .filter((queue) => queue.sharedAdapterId === adapterId);
+}
+
 interface AdapterBuildAppCtx {
   queries: DbQueries;
   dataDir: string;
@@ -326,13 +341,13 @@ export function registerAdapterRoutes(router: Router): void {
     }
     if (typeof body.enabled === "boolean") input.enabled = body.enabled;
     if (typeof body.shared === "boolean") input.shared = body.shared;
-    if (typeof body.install_type === "string") input.installType = body.install_type;
-    else if (typeof body.installType === "string") input.installType = body.installType;
+    input.installType = installType(body.install_type ?? body.installType);
     const configureVal = body.configure;
     if (configureVal === null || (configureVal && typeof configureVal === "object")) {
       input.configure = configureVal === null ? null : commandTemplate(configureVal, "configure");
     }
-    const defaultModel = body.default_model ?? body.defaultModel;    if (typeof defaultModel === "string") input.defaultModel = defaultModel;
+    const defaultModel = body.default_model ?? body.defaultModel;
+    if (typeof defaultModel === "string") input.defaultModel = defaultModel;
     const defaultProvider = body.default_provider ?? body.defaultProvider;
     if (typeof defaultProvider === "string") input.defaultProvider = defaultProvider;
 
@@ -379,6 +394,14 @@ export function registerAdapterRoutes(router: Router): void {
       throw conflict("stop all project queue containers before editing the agent adapter");
     }
     const body = await readJsonBody<Record<string, unknown>>(req);
+    const references = queuesReferencingAdapter(app.queries, existing.id);
+    const metadataOnly = new Set(["name", "description"]);
+    const changesExecutionContract = Object.keys(body).some((key) => !metadataOnly.has(key));
+    if (references.length > 0 && changesExecutionContract) {
+      throw conflict(
+        `adapter is referenced by ${references.length} queue(s); remove those shared_adapter_id references before changing its execution contract`,
+      );
+    }
     const patch: UpdateProjectAgentAdapterInput = {};
     if (typeof body.name === "string" && body.name.trim()) patch.name = body.name.trim();
     if (body.description === null || typeof body.description === "string") {
@@ -424,6 +447,28 @@ export function registerAdapterRoutes(router: Router): void {
       patch.containerfile = body.containerfile as string | null;
     }
     if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
+    if (typeof body.shared === "boolean") patch.shared = body.shared;
+    if (body.install_type !== undefined || body.installType !== undefined) {
+      patch.installType = installType(body.install_type ?? body.installType);
+    }
+    if (body.configure !== undefined) {
+      patch.configure = body.configure === null
+        ? null
+        : commandTemplate(body.configure, "configure");
+    }
+    const buildInputsChanged =
+      patch.image !== undefined ||
+      patch.sourceRepo !== undefined ||
+      patch.sourceRef !== undefined ||
+      patch.containerfile !== undefined ||
+      patch.installType !== undefined;
+    if (buildInputsChanged) {
+      patch.buildStatus = "unbuilt";
+      patch.builtImageId = null;
+      patch.builtCommit = null;
+      patch.buildLogPath = null;
+      patch.lastBuiltAt = null;
+    }
     const defaultModel = body.default_model ?? body.defaultModel;
     if (defaultModel === null || typeof defaultModel === "string") {
       patch.defaultModel = defaultModel as string | null;
@@ -450,6 +495,12 @@ export function registerAdapterRoutes(router: Router): void {
       const projectId = ctx.params.id!;
       requireProject(app.queries, projectId);
       const adapter = requireAdapter(app.queries, projectId, ctx.params.adapterId!);
+      const references = queuesReferencingAdapter(app.queries, adapter.id);
+      if (references.length > 0) {
+        throw conflict(
+          `adapter is referenced by ${references.length} queue(s); remove those shared_adapter_id references before rebuilding it`,
+        );
+      }
       if (app.queries.listEvalQueues(projectId).some((queue) => app.queries.getActiveQueueContainer(queue.id))) {
         throw conflict("stop all project queue containers before rebuilding the agent image");
       }
@@ -479,6 +530,8 @@ export function registerAdapterRoutes(router: Router): void {
         defaultProvider?: string;
         default_model?: string;
         defaultModel?: string;
+        install_type?: string;
+        installType?: string;
         build?: boolean;
       }>(req);
       const agentId = body.agent_id ?? body.agentId;
@@ -491,11 +544,13 @@ export function registerAdapterRoutes(router: Router): void {
       if (typeof body.generator !== "string" || !body.generator.trim()) {
         throw badRequest("generator (bash/JS script) is required");
       }
-      const sourceRepo = body.source_repo ?? body.sourceRepo;
-      if (typeof sourceRepo !== "string" || !sourceRepo.trim()) {
-        throw badRequest("source_repo is required");
+      const sourceRepoValue = body.source_repo ?? body.sourceRepo;
+      if (sourceRepoValue !== undefined && (typeof sourceRepoValue !== "string" || !sourceRepoValue.trim())) {
+        throw badRequest("source_repo must be a non-empty string when provided");
       }
+      const sourceRepo = typeof sourceRepoValue === "string" ? sourceRepoValue.trim() : null;
       const sourceRef = body.source_ref ?? body.sourceRef ?? null;
+      const requestedInstallType = installType(body.install_type ?? body.installType);
       const provider = body.default_provider ?? body.defaultProvider ?? "anthropic";
       const model = body.default_model ?? body.defaultModel ?? "";
       const shouldBuild = body.build !== false; // default: build after create
@@ -513,10 +568,21 @@ export function registerAdapterRoutes(router: Router): void {
 
       // Validate the emitted structure through the same validators as raw POST.
       const emitted = genResult.adapter;
+      const emittedAgentId = emitted.agent_id ?? emitted.agentId;
+      if (emittedAgentId !== agentId) {
+        throw badRequest(`generator agent_id must exactly match requested agent_id ${agentId}`);
+      }
+      const emittedName = typeof emitted.name === "string" ? emitted.name.trim() : "";
+      if (!emittedName) throw badRequest("generator output name is required");
+      const emittedImage = typeof emitted.image === "string" ? emitted.image.trim() : "";
+      if (!emittedImage) throw badRequest("generator output image is required");
+      const emittedInstallType = installType(
+        emitted.install_type ?? emitted.installType ?? requestedInstallType,
+      );
       const input: CreateProjectAgentAdapterInput = {
         agentId,
-        name: typeof emitted.name === "string" ? emitted.name : body.name,
-        image: typeof emitted.image === "string" ? emitted.image : `localhost/${agentId}:latest`,
+        name: emittedName,
+        image: emittedImage,
         command: commandTemplate(emitted.command, "command"),
         connectionCheck: commandTemplate(
           emitted.connection_check ?? emitted.connectionCheck ?? { argv: [] },
@@ -535,6 +601,7 @@ export function registerAdapterRoutes(router: Router): void {
         evidence: evidenceConfig(emitted.evidence),
         parserKind: parserKind(emitted.parser_kind ?? emitted.parserKind),
         generatorScript: body.generator,
+        installType: emittedInstallType,
       };
       if (typeof emitted.description === "string") input.description = emitted.description;
       if (typeof emitted.format_version === "number") input.formatVersion = emitted.format_version;
@@ -551,17 +618,31 @@ export function registerAdapterRoutes(router: Router): void {
         );
       }
       const emittedRepo = emitted.source_repo ?? emitted.sourceRepo;
-      if (typeof emittedRepo === "string") input.sourceRepo = emittedRepo;
-      else input.sourceRepo = sourceRepo;
+      if (emittedRepo !== undefined && emittedRepo !== null && (typeof emittedRepo !== "string" || !emittedRepo.trim())) {
+        throw badRequest("generator output source_repo must be a non-empty string when provided");
+      }
+      if (
+        sourceRepo &&
+        typeof emittedRepo === "string" &&
+        emittedRepo.trim() !== sourceRepo
+      ) {
+        throw badRequest("generator output source_repo must match the repository inspected by the generator");
+      }
+      const resolvedSourceRepo =
+        typeof emittedRepo === "string" ? emittedRepo.trim() : sourceRepo;
+      if (emittedInstallType === "source-build" && !resolvedSourceRepo) {
+        throw badRequest("source-build generator output requires source_repo");
+      }
+      input.sourceRepo = resolvedSourceRepo;
       const emittedRef = emitted.source_ref ?? emitted.sourceRef;
       if (emittedRef === null || typeof emittedRef === "string") input.sourceRef = emittedRef;
       else if (sourceRef) input.sourceRef = sourceRef;
-      if (typeof emitted.containerfile === "string") input.containerfile = emitted.containerfile;
+      if (typeof emitted.containerfile !== "string" || !emitted.containerfile.trim()) {
+        throw badRequest("generator output containerfile is required");
+      }
+      input.containerfile = emitted.containerfile;
       if (typeof emitted.enabled === "boolean") input.enabled = emitted.enabled;
       if (typeof emitted.shared === "boolean") input.shared = emitted.shared;
-      if (typeof (emitted.install_type ?? emitted.installType) === "string") {
-        input.installType = (emitted.install_type ?? emitted.installType) as string;
-      }
       const emittedConfigure = emitted.configure;
       if (emittedConfigure === null || (emittedConfigure && typeof emittedConfigure === "object")) {
         input.configure = emittedConfigure === null ? null : commandTemplate(emittedConfigure, "configure");
@@ -580,7 +661,7 @@ export function registerAdapterRoutes(router: Router): void {
         ...(input.defaultProvider ? { defaultProvider: input.defaultProvider } : {}),
       });
 
-      if (shouldBuild && adapter.sourceRepo && adapter.containerfile) {
+      if (shouldBuild) {
         const buildResult = await buildAdapter(app, projectId, adapter);
         sendJson(res, 201, { adapter: buildResult.adapter, build: buildResult.build, generator: { stdout: genResult.stdout.slice(0, 5000), stderr: genResult.stderr.slice(0, 2000) } });
       } else {
@@ -597,7 +678,8 @@ export function registerAdapterRoutes(router: Router): void {
 
   // --- Shared adapters: cross-project discovery ---
 
-  router.get("/api/adapters/store", (_req, res, ctx) => {    const app = appOf(ctx);
+  router.get("/api/adapters/store", (_req, res, ctx) => {
+    const app = appOf(ctx);
     sendJson(res, 200, { adapters: app.queries.listSharedAdapters() });
   });
 
@@ -614,10 +696,13 @@ export function registerAdapterRoutes(router: Router): void {
       const decAdapter = createDeclarativeAdapter(adapter);
       const command = decAdapter.command(ctx2);
       const connectionCheck = decAdapter.connectionCheck(ctx2);
+      const configure = decAdapter.configure?.(ctx2) ?? null;
       sendJson(res, 200, {
         command: {
           argv: command.argv,
           env: command.env,
+          ...(command.cwd ? { cwd: command.cwd } : {}),
+          ...(command.timeoutMs ? { timeout_ms: command.timeoutMs } : {}),
         },
         connection_check: {
           argv: connectionCheck.command.argv,
@@ -625,6 +710,14 @@ export function registerAdapterRoutes(router: Router): void {
           ...(connectionCheck.cwd ? { cwd: connectionCheck.cwd } : {}),
           ...(connectionCheck.timeoutMs ? { timeout_ms: connectionCheck.timeoutMs } : {}),
         },
+        configure: configure
+          ? {
+              argv: configure.command.argv,
+              env: configure.command.env,
+              ...(configure.cwd ? { cwd: configure.cwd } : {}),
+              ...(configure.timeoutMs ? { timeout_ms: configure.timeoutMs } : {}),
+            }
+          : null,
         image: decAdapter.image(ctx2),
         evidence: decAdapter.evidence(ctx2),
       });
@@ -636,6 +729,12 @@ export function registerAdapterRoutes(router: Router): void {
     const projectId = ctx.params.id!;
     requireProject(app.queries, projectId);
     const existing = requireAdapter(app.queries, projectId, ctx.params.adapterId!);
+    const references = queuesReferencingAdapter(app.queries, existing.id);
+    if (references.length > 0) {
+      throw conflict(
+        `adapter is referenced by ${references.length} queue(s); remove those shared_adapter_id references before deleting it`,
+      );
+    }
     if (app.queries.listEvalQueues(projectId).some((queue) => app.queries.getActiveQueueContainer(queue.id))) {
       throw conflict("stop all project queue containers before deleting the agent adapter");
     }

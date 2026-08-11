@@ -123,6 +123,8 @@ function renderCommand(
   return {
     argv: template.argv.map((value) => renderTemplate(value, ctx)),
     env,
+    ...(template.cwd ? { cwd: renderTemplate(template.cwd, ctx) } : {}),
+    ...(template.timeoutMs ? { timeoutMs: template.timeoutMs } : {}),
   };
 }
 

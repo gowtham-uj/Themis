@@ -1,17 +1,20 @@
 /** User-authored adapter generator: clone, provision env, run script, parse JSON. */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { prepareWorkspace } from "../runner/workspace.js";
 import type { CreateProjectAgentAdapterInput } from "../db/queries.js";
 
+const GENERATOR_TIMEOUT_MS = 120_000;
+const MAX_GENERATOR_OUTPUT_BYTES = 1024 * 1024;
+
 export interface RunAdapterGeneratorInput {
   projectId: string;
   agentId: string;
   generatorScript: string;
-  sourceRepo: string;
+  sourceRepo?: string | null;
   sourceRef?: string | null;
   provider: string;
   model: string;
@@ -41,15 +44,18 @@ export async function runAdapterGenerator(
   const credsDir = await mkdtemp(join(tmpdir(), "agenteval-gen-creds-"));
   const scriptFile = join(sourceDir, ".agenteval-generator");
   try {
-    // Clone the agent source so the generator can inspect it.
-    await prepareWorkspace(
-      {
-        source: "git",
-        repo: input.sourceRepo,
-        ...(input.sourceRef ? { ref: input.sourceRef } : {}),
-      },
-      { targetDir: sourceDir },
-    );
+    // Source-build generators inspect a real clone. npm-install generators may
+    // omit source_repo and emit their contract from an empty workspace.
+    if (input.sourceRepo) {
+      await prepareWorkspace(
+        {
+          source: "git",
+          repo: input.sourceRepo,
+          ...(input.sourceRef ? { ref: input.sourceRef } : {}),
+        },
+        { targetDir: sourceDir },
+      );
+    }
 
     // Provision one file per named credential.
     await mkdir(credsDir, { recursive: true });
@@ -61,10 +67,13 @@ export async function runAdapterGenerator(
     await writeFile(scriptFile, input.generatorScript, "utf8");
 
     const env: Record<string, string> = {
-      ...process.env,
+      PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+      HOME: process.env.HOME ?? tmpdir(),
+      TMPDIR: process.env.TMPDIR ?? tmpdir(),
+      LANG: process.env.LANG ?? "C.UTF-8",
       AGENTEVAL_PROJECT_ID: input.projectId,
       AGENTEVAL_AGENT_ID: input.agentId,
-      AGENTEVAL_SOURCE_REPO: input.sourceRepo,
+      AGENTEVAL_SOURCE_REPO: input.sourceRepo ?? "",
       AGENTEVAL_SOURCE_REF: input.sourceRef ?? "",
       AGENTEVAL_PROVIDER: input.provider,
       AGENTEVAL_MODEL: input.model,
@@ -99,17 +108,22 @@ export async function runAdapterGenerator(
   }
 }
 
-/** Detect script type from shebang and run it. */
-function runScript(
+/** Detect script type from shebang and run it with bounded time and output. */
+async function runScript(
   scriptFile: string,
   env: Record<string, string>,
 ): Promise<{ stdout: string; stderr: string }> {
+  const firstLine = (await readFile(scriptFile, "utf8")).split(/\r?\n/, 1)[0] ?? "";
+  const executable = /^#!.*\bnode(?:\s|$)/.test(firstLine) ? process.execPath : "bash";
   return new Promise((resolveFn, reject) => {
-    const child = spawn("bash", [scriptFile], {
+    const child = spawn(executable, [scriptFile], {
       env,
       cwd: resolve(scriptFile, ".."),
       stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     }) as unknown as {
+      pid?: number;
+      kill(signal?: NodeJS.Signals): boolean;
       stdout: NodeJS.ReadableStream;
       stderr: NodeJS.ReadableStream;
       on(event: "error", cb: (err: Error) => void): unknown;
@@ -117,12 +131,54 @@ function runScript(
     };
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
-    child.stdout.on("data", (c: Buffer) => stdoutChunks.push(c));
-    child.stderr.on("data", (c: Buffer) => stderrChunks.push(c));
-    child.on("error", reject);
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let failure: Error | null = null;
+    let settled = false;
+    const stop = (): void => {
+      try {
+        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        // already exited
+      }
+    };
+    const capture = (target: Buffer[], chunk: Buffer, stream: "stdout" | "stderr"): void => {
+      const used = stream === "stdout" ? stdoutBytes : stderrBytes;
+      const remaining = Math.max(0, MAX_GENERATOR_OUTPUT_BYTES - used);
+      if (remaining > 0) target.push(Buffer.from(chunk.subarray(0, remaining)));
+      if (stream === "stdout") stdoutBytes += chunk.length;
+      else stderrBytes += chunk.length;
+      if (used + chunk.length > MAX_GENERATOR_OUTPUT_BYTES && !failure) {
+        failure = new Error(
+          `adapter generator ${stream} exceeded ${MAX_GENERATOR_OUTPUT_BYTES} bytes`,
+        );
+        stop();
+      }
+    };
+    child.stdout.on("data", (c: Buffer) => capture(stdoutChunks, c, "stdout"));
+    child.stderr.on("data", (c: Buffer) => capture(stderrChunks, c, "stderr"));
+    const timer = setTimeout(() => {
+      failure = new Error(`adapter generator timed out after ${GENERATOR_TIMEOUT_MS}ms`);
+      stop();
+    }, GENERATOR_TIMEOUT_MS);
+    timer.unref?.();
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
     child.on("close", (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       const stdout = Buffer.concat(stdoutChunks).toString("utf8");
       const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (failure) {
+        reject(failure);
+        return;
+      }
       if (code !== 0) {
         reject(
           new Error(
@@ -144,8 +200,8 @@ export const GENERATOR_CONTRACT = {
   inputEnv: [
     "AGENTEVAL_PROJECT_ID",
     "AGENTEVAL_AGENT_ID",
-    "AGENTEVAL_SOURCE_REPO",
-    "AGENTEVAL_SOURCE_REF",
+    "AGENTEVAL_SOURCE_REPO (empty for npm install_type)",
+    "AGENTEVAL_SOURCE_REF (empty when not applicable)",
     "AGENTEVAL_PROVIDER",
     "AGENTEVAL_MODEL",
     "AGENTEVAL_CREDENTIALS_DIR (one file per credential name; values are secrets — never print)",
@@ -161,7 +217,8 @@ export const GENERATOR_CONTRACT = {
     "connection_check {argv,...} OR derive_connection_check: true",
     "evidence {paths, required_paths?}",
     "parser_kind (canonical-jsonl | pi-jsonl | reapercode-jsonl)",
-    "source_repo",
+    "install_type (source-build | npm)",
+    "source_repo (required for source-build; optional for npm)",
     "containerfile",
     "default_provider",
     "default_model",
@@ -200,5 +257,22 @@ cat <<JSON
   "enabled": true
 }
 JSON`,
+    node: `#!/usr/bin/env node
+const adapter = {
+  agent_id: process.env.AGENTEVAL_AGENT_ID,
+  name: "Published npm agent",
+  install_type: "npm",
+  image: \`localhost/agenteval-\${process.env.AGENTEVAL_AGENT_ID}:latest\`,
+  source_repo: null,
+  containerfile: "FROM node:22-bookworm\\nRUN npm install -g @scope/agent@1.2.3\\nWORKDIR /workspace\\n",
+  default_provider: process.env.AGENTEVAL_PROVIDER,
+  default_model: process.env.AGENTEVAL_MODEL,
+  command: { argv: ["agent", "{{prompt}}"], cwd: "/workspace", timeout_ms: 600000 },
+  derive_connection_check: true,
+  parser_kind: "canonical-jsonl",
+  evidence: { paths: [".agent-runs"] },
+  shared: false,
+};
+process.stdout.write(JSON.stringify(adapter));`,
   },
 } as const;

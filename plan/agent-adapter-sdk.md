@@ -1,9 +1,10 @@
 # Agent Adapter SDK — integrate a real CLI agent
 
-An agenteval **project is bound to one agent under test**. That agent is treated as a real CLI tool
-running inside the project's queue-owned Podman container. The project owns one adapter definition
-that teaches agenteval how to configure that CLI for a provider/model, verify the real connection,
-run prompts, parse live output, and collect the CLI's native logs and trajectories.
+An agenteval project may own one agent adapter definition. A queue either uses that owned real CLI
+agent or explicitly selects one enabled shared adapter-store row by `shared_adapter_id`; there is no
+implicit fallback. The selected agent runs inside the queue-owned Podman container. Its adapter teaches
+agenteval how to configure the CLI for a provider/model, verify the real connection, run prompts, parse
+live output, and collect native logs and trajectories.
 
 Adapters are project-scoped CRUD resources. They are not test doubles, model simulators, or agent
 implementations. Every connection check and eval invokes the real CLI and the real configured model
@@ -14,12 +15,12 @@ or failed explicitly; it is never replaced with a fake or mock.
 
 For each queue container, agenteval performs this order:
 
-1. Resolve the project's single enabled adapter and selected provider/model.
+1. Resolve the queue's owned adapter or explicit `shared_adapter_id`, plus its pinned provider/model.
 2. Start the adapter's pinned OCI image as the persistent queue container.
 3. Render and run `connection_check` through the real agent CLI.
-4. Parse the probe with the adapter parser and require both exit code 0 and at least one real model
-   message. Store the probe's raw stdout, stderr, canonical events, and result.
-5. Clear the shared workspace.
+4. Parse the probe and require both exit code 0 and at least one real model message. Store raw stdout,
+   stderr, canonical events, and result.
+5. Clear the shared workspace, then run optional `configure` once; persist its queue/batch-scoped result.
 6. For each ordered eval: prepare workspace → eval setup script → adapter command → live canonical
    parsing + raw stream capture → native evidence extraction → deterministic checks → eval cleanup →
    cleanup verification → residual-process kill → workspace reset → immutable archive seal.
@@ -31,11 +32,15 @@ configuration conventions, trajectory paths, or parser rules for a particular ag
 
 ## Creating an adapter — two paths
 
+The normative generator contract, npm/source-build recipes, explicit sharing semantics, wrapper guidance,
+and acceptance checklist live in [adapter-generation-guide.md](adapter-generation-guide.md).
+
 ### Path 1 (recommended): Generator script
 
-Write a bash or JS script that inspects your agent (the platform clones its repo to
-`$AGENTEVAL_WORKSPACE_DIR`) and **emits the adapter JSON contract on stdout**. The platform
-runs your script, validates the output, stores the adapter, and builds the real OCI image.
+Write a bash or Node.js script that **emits the adapter JSON contract on stdout**. For
+`install_type: "source-build"`, the platform clones source into `$AGENTEVAL_WORKSPACE_DIR` for
+inspection. For `install_type: "npm"`, `source_repo` may be omitted and the workspace is empty. The
+platform runs the script, validates the output, stores the adapter, and builds the real OCI image.
 
 ```
 POST /api/projects/:projectId/adapters/from-generator
@@ -152,10 +157,13 @@ Use this when you want full control over every field and don't want a generator 
 - `agent_id`: stable project-agent identifier used by queues and historical runs.
 - `name`: display name.
 - `image`: local/resulting OCI image tag used by queue containers.
-- `source_repo` / `source_ref`: real agent CLI git repository and optional pinned ref.
+- `install_type`: `source-build` or `npm`.
+- `source_repo` / `source_ref`: required real agent CLI git repository and optional pinned ref for
+  `source-build`; optional/null for `npm`.
 - `containerfile`: OCI build recipe stored with the adapter. It must install the real CLI plus
-  `/bin/bash`; the platform clones the repo and builds this recipe through Podman when the build API
-  is called. Build commit, image id, log path, status, and timestamp are persisted.
+  `/bin/bash`; source-build sends the checkout as context, while npm uses an empty context and lets the
+  recipe install a pinned package. Build commit (when applicable), image id, log path, status, and
+  timestamp are persisted.
 - `command.argv`: exact CLI argv template for an eval. No shell interpolation is performed.
 - `connection_check.argv`: a cheap real CLI/model probe. It must emit a model message in the same
   stream protocol used for evals. **Optional**: set `derive_connection_check: true` (or omit
@@ -227,13 +235,15 @@ POST   /api/projects/:projectId/queues/:queueId/items
 PUT    /api/projects/:projectId/queues/:queueId/container
 ```
 
-Creating the adapter sets the project's `default_agent_id` and optionally its default provider/model.
-Queues cannot select another agent: all queues in the project evaluate the one project-bound agent.
-Provider/model may be selected per queue while the agent identity and adapter remain fixed.
+Creating an owned adapter sets the project's `default_agent_id` and optionally its default
+provider/model. By default queues use that adapter. A queue may instead explicitly select an enabled
+cross-project shared adapter using `shared_adapter_id`; its stored `agent_id` must match that row.
+Provider/model are pinned per queue. No adapter is selected by agent-id fallback.
 
-Adapter edits and deletion are rejected while any project queue container is active. This prevents a
-live execution from changing its CLI contract halfway through a batch. Historical runs and archives
-retain their snapshotted agent/model/provider/image provenance.
+Adapter execution edits, rebuilds, disabling/unsharing, and deletion are rejected while any consumer
+queue references a shared adapter. They are also rejected while an owning-project queue container is
+active. This prevents a live or durable queue definition from silently changing its CLI contract.
+Historical runs and archives retain snapshotted agent/model/provider/image provenance.
 
 ## Privileged introspection bridge
 

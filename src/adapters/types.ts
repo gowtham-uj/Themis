@@ -56,6 +56,10 @@ export interface AgentStreams {
 export interface AdapterCommand {
   argv: string[];
   env: Record<string, string>;
+  /** Working directory inside the container. Default `/workspace`. */
+  cwd?: string;
+  /** Command-specific timeout. The runner default applies when omitted. */
+  timeoutMs?: number;
 }
 
 /** Real provider/model connectivity probe executed through the supported agent. */

@@ -469,7 +469,7 @@ export async function spawnLocalAgent(
   exitCode: number;
   durationMs: number;
 }> {
-  const { argv, env } = adapter.command(ctx);
+  const { argv, env, cwd } = adapter.command(ctx);
   if (argv.length === 0) {
     throw new Error(`Adapter ${adapter.id} returned empty argv`);
   }
@@ -477,7 +477,7 @@ export async function spawnLocalAgent(
   const started = Date.now();
 
   const child = spawn(file!, args, {
-    cwd: ctx.workspaceDir,
+    cwd: !cwd || cwd === "/workspace" ? ctx.workspaceDir : cwd,
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });

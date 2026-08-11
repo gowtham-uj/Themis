@@ -56,6 +56,12 @@ describe("adapter validate (dry-run)", () => {
         timeout_ms: 600000,
       },
       derive_connection_check: true,
+      configure: {
+        argv: ["my-agent", "configure", "--model", "{{model}}"],
+        env: { CONFIG_RUN: "{{run_id}}" },
+        cwd: "/workspace",
+        timeout_ms: 120000,
+      },
       evidence: { paths: [".runs"] },
       parser_kind: "canonical-jsonl",
       default_provider: "nuralwatt",
@@ -67,14 +73,20 @@ describe("adapter validate (dry-run)", () => {
     const result = await http(base, "POST", `/api/projects/${project.id}/adapters/${adapterId}/validate`);
     expect(result.status).toBe(200);
     const body = result.json as {
-      command: { argv: string[]; env: Record<string, string> };
+      command: { argv: string[]; env: Record<string, string>; cwd: string; timeout_ms: number };
       connection_check: { argv: string[] };
+      configure: { argv: string[]; env: Record<string, string>; cwd: string; timeout_ms: number };
     };
     expect(body.command.argv).toContain("sample-model");
     expect(body.command.argv).toContain("sample-provider");
     expect(body.command.argv).toContain("sample eval prompt");
     expect(body.command.argv).toContain("/workspace");
     expect(body.command.env.RUN_ID).toBe("sample-run-id");
+    expect(body.command.cwd).toBe("/workspace");
+    expect(body.command.timeout_ms).toBe(600000);
+    expect(body.configure.argv).toContain("sample-model");
+    expect(body.configure.env.CONFIG_RUN).toBe("sample-run-id");
+    expect(body.configure.timeout_ms).toBe(120000);
 
     // Derived connection check uses the command template with the probe prompt.
     expect(body.connection_check.argv).toContain("Reply with exactly AGENTEVAL_CONNECTION_OK. Do not use tools.");

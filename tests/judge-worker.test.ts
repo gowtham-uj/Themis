@@ -15,6 +15,7 @@ import {
   assembleJudgeUserPrompt,
   JUDGE_SYSTEM_PROMPT_VERSION,
 } from "../src/judge/prompt.ts";
+import { validateQueueSubmissionRunIds } from "../src/judge/queue-worker.ts";
 import { buildEventsPreview } from "../src/judge/worker.ts";
 import {
   extractJsonObject,
@@ -191,5 +192,19 @@ describe("what the judge is shown (regressions from a real run)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("requires exactly one queue-judge verdict per selected run", () => {
+    expect(validateQueueSubmissionRunIds(["run-a", "run-b"], ["run-a", "run-b"]).exact).toBe(true);
+    expect(validateQueueSubmissionRunIds(["run-a", "run-a"], ["run-a", "run-b"])).toMatchObject({
+      exact: false,
+      missingRunIds: ["run-b"],
+      duplicateRunIds: ["run-a"],
+    });
+    expect(validateQueueSubmissionRunIds(["run-a", "run-c"], ["run-a", "run-b"])).toMatchObject({
+      exact: false,
+      missingRunIds: ["run-b"],
+      unknownRunIds: ["run-c"],
+    });
   });
 });

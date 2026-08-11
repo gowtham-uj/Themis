@@ -96,7 +96,7 @@ const DDL: string[] = [
     auto_judge INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'draft',
     active_batch_id TEXT,
-    shared_adapter_id TEXT,
+    shared_adapter_id TEXT REFERENCES project_agent_adapters(id),
     revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL

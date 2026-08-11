@@ -114,7 +114,7 @@ export function buildPodmanRunArgs(
     );
   }
   for (const d of policy.devices) args.push("--device", d);
-  args.push("-w", policy.workdir ?? WORKSPACE_MOUNT);
+  args.push("-w", spec.workdir ?? policy.workdir ?? WORKSPACE_MOUNT);
 
   // ---- env ----
   // Values go through argv, not a shell, so no quoting concerns.

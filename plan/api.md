@@ -66,25 +66,30 @@ POST   /api/projects/:id/tasks/sync               pull the project's task source
 > the sense that their source of truth is the repo; edits round-trip through the source (PATCH returns
 > 409 with a pointer). `ui-builder` and `http-push` tasks are fullymutable through the API.
 
-### Project agent adapter — one real CLI agent per project
+### Project agent adapter — owned or explicitly shared
 
-Each project is bound to exactly one agent under test. Its adapter is a CRUD-able declarative CLI
-integration (see [agent-adapter-sdk.md](agent-adapter-sdk.md)). It records the real git source/ref,
-Containerfile build recipe, image, provider/model credential mapping, eval command, real connection
-check, parser kind, and native evidence paths.
+A project may own one CRUD-able declarative CLI integration (see
+[adapter-generation-guide.md](adapter-generation-guide.md)). It records source-build or npm install
+provenance, Containerfile, image, provider/model credential mapping, connection/configure/eval commands,
+parser kind, and native evidence paths. Another project can use it only when it is marked shared and a
+queue explicitly stores its row id.
 
 ```
 POST   /api/projects/:id/adapters
+POST   /api/projects/:id/adapters/from-generator
 GET    /api/projects/:id/adapters
 GET    /api/projects/:id/adapters/:adapterId
 PATCH  /api/projects/:id/adapters/:adapterId
-POST   /api/projects/:id/adapters/:adapterId/build   clone pinned source + real Podman image build
+POST   /api/projects/:id/adapters/:adapterId/validate
+POST   /api/projects/:id/adapters/:adapterId/build
 DELETE /api/projects/:id/adapters/:adapterId
+GET    /api/adapters/store
+GET    /api/adapters/generator-contract
 ```
 
-A project may have only one adapter. Adapter edits/build/deletion are rejected while any project queue
-container is active. Tests and production use the same real CLI/provider path; missing model access is a
-blocker, never a reason to substitute a fake.
+Execution edits/rebuild/deletion are rejected while an owning-project queue container is active or a
+consumer queue references the shared adapter. Tests and production use the same real CLI/provider path;
+missing model access is a blocker, never a reason to substitute a fake.
 
 ### Eval store
 
@@ -104,9 +109,10 @@ cleanup script, cleanup verification, timeouts, reference solution, and tags.
 
 ### Persistent eval queues and queue-owned containers
 
-A project may define any number of named queues for its one agent. Each active queue owns one persistent
-Podman container and processes its ordered eval references sequentially. Different queues provide
-parallelism. No eval creates its own container.
+A project may define any number of named queues. Each queue pins the owned adapter or an explicit
+`shared_adapter_id`, plus provider/model. Each active queue owns one persistent Podman container and
+processes its ordered eval references sequentially. Different queues provide parallelism. No eval
+creates its own container.
 
 ```
 POST   /api/projects/:id/queues

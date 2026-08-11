@@ -14,8 +14,9 @@
   restricted archive/submission tools. It uses the configured real provider/model and never a direct
   canned or mocked model path.
 - **Auth**: single shared login / small user table (self-hosted, few users). No org model.
-- **Multi-project**: every domain artifact is project-scoped; each project owns exactly one configured
-  CLI agent adapter and any number of eval queues.
+- **Multi-project**: every domain artifact is project-scoped; each project owns at most one configured
+  CLI agent adapter and any number of eval queues. A queue may instead explicitly pin one enabled shared
+  adapter-store entry by `shared_adapter_id`; cross-project fallback is never implicit.
 
 ## Components
 
@@ -46,10 +47,11 @@ The platform partitions everything by **project**. A project owns its tasks, run
 findings, and issues log as a self-contained, independently-backed-up unit, and — critically —
 **chooses how new evals enter it** via a pluggable **task source** (`ui-builder`, `repo-md`,
 `manifest-yaml`, `ci-artifact`, `http-push`). Different codebases therefore keep separate eval
-histories and distinct task-authoring flows without code changes to the core. Adapters and judge
-system-prompt versions are global and shared; per-project **adapter overrides** (default model, image,
-env, tools, network) and **check-runner templates** (`cargo test` vs `npm test`) refine them per
-codebase. See [projects.md](projects.md). This is multi-project, not multi-tenant: one deployment,
+histories and distinct task-authoring flows without code changes to the core. Owned adapters are project-linked. An owner may mark one shared for explicit selection by another
+project's queue; consumers store the adapter row id and do not copy or implicitly discover it at run
+time. Judge system-prompt versions are global. Per-project **adapter overrides** (image, env, tools,
+network) and **check-runner templates** (`cargo test` vs `npm test`) refine execution, while each queue's
+provider/model fields are durable pins. See [projects.md](projects.md). This is multi-project, not multi-tenant: one deployment,
 one user set, many projects.
 
 ## Adapter boundary (the "standard protocol")
@@ -67,20 +69,20 @@ writing one adapter. See [adapters.md](adapters.md).
 ## Run lifecycle
 
 ```
-author task ──► trigger run(agent, model, repeats=N)
+author evals ──► create queue(agent, provider, model) + ordered items/repeats
                      │
-                     ├─ for each repeat k in 1..N:
+                     ├─ start one persistent queue container
+                     │     real connection check → optional configure
+                     │
+                     ├─ for each snapshotted item/repeat, sequentially:
                      │     create run row (queued)
-                     │     Run Worker:
-                     │        prepare workspace (clone@commit | git init empty)
-                     │        docker run agent (adapter)
-                     │        stream native output ─► map ─► canonical events
-                     │            └─► append runs/<id>/events.jsonl  (immutable)
-                     │            └─► push to SSE subscribers (live UI)
-                     │        capture git diff ─► runs/<id>/diff.patch
-                     │        run.end{status,durationMs} ; mark run complete
+                     │     prepare/reset /workspace
+                     │     exec adapter command in the same container
+                     │     stream native output ─► raw logs + canonical events
+                     │     capture diff/checks/native evidence/cleanup
+                     │     seal immutable content-hash archive
                      │
-                     └─ (optionally) auto-enqueue a judgement per run
+                     └─ keep drained container alive for explicit operator inspection/stop
 ```
 
 ## Judge lifecycle (decoupled)
@@ -112,8 +114,9 @@ an append-only analysis revision with its own prompt/model/provider provenance.
 
 ## Security / sandboxing notes
 
-- Agents execute arbitrary code → **always in a container**, non-root user, no host mounts except the
-  run's workspace, resource limits (cpus, memory, pids), and a run **timeout**.
+- Agents execute arbitrary code → **always in a container**, with only the queue workspace and explicit
+  sandbox mounts, resource limits (where the host cgroup supports them), and command timeouts. The
+  sandbox policy/adapter image determines the agent user; the operator introspection bridge is explicitly root.
 - Network: default allow (agents install deps); optionally restrict to an allowlist per task.
 - API keys are injected into the container as environment variables at launch. Traces and artifacts
   are currently stored verbatim; redaction is deferred. See [execution.md](execution.md).

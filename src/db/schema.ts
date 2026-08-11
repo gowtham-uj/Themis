@@ -137,7 +137,7 @@ export const evalQueues = sqliteTable(
     autoJudge: integer("auto_judge").notNull().default(1),
     status: text("status").notNull().default("draft"),
     activeBatchId: text("active_batch_id"),
-    sharedAdapterId: text("shared_adapter_id"),
+    sharedAdapterId: text("shared_adapter_id").references(() => projectAgentAdapters.id),
     revision: integer("revision").notNull().default(1),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),

@@ -830,6 +830,7 @@ export interface UpdateEvalQueueInput {
   autoJudge?: boolean;
   status?: EvalQueueStatus | string;
   activeBatchId?: string | null;
+  sharedAdapterId?: string | null;
   incrementRevision?: boolean;
 }
 
@@ -1195,9 +1196,7 @@ export interface QueryStore {
     projectId: string,
     agentId: string,
   ): ProjectAgentAdapter | null;
-  /** Find a shared adapter by agent_id from any project (cross-project fallback). */
-  getSharedAdapterByAgentId(agentId: string): ProjectAgentAdapter | null;
-  /** List all shared adapters across all projects. */
+  /** List enabled adapter-store entries; consumers still select one exact row id. */
   listSharedAdapters(): ProjectAgentAdapter[];
   listProjectAgentAdapters(
     projectId: string,
@@ -2658,22 +2657,6 @@ export class SqliteQueries implements QueryStore {
     return row ? mapProjectAgentAdapter(row) : null;
   }
 
-  getSharedAdapterByAgentId(agentId: string): ProjectAgentAdapter | null {
-    const row = this.db
-      .select()
-      .from(projectAgentAdapters)
-      .where(
-        and(
-          eq(projectAgentAdapters.agentId, agentId),
-          eq(projectAgentAdapters.shared, 1),
-          eq(projectAgentAdapters.enabled, 1),
-        ),
-      )
-      .all()
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
-    return row ? mapProjectAgentAdapter(row) : null;
-  }
-
   listSharedAdapters(): ProjectAgentAdapter[] {
     return this.db
       .select()
@@ -3962,6 +3945,7 @@ export class SqliteQueries implements QueryStore {
     if (patch.autoJudge !== undefined) values.autoJudge = patch.autoJudge ? 1 : 0;
     if (patch.status !== undefined) values.status = patch.status;
     if (patch.activeBatchId !== undefined) values.activeBatchId = patch.activeBatchId;
+    if (patch.sharedAdapterId !== undefined) values.sharedAdapterId = patch.sharedAdapterId;
     if (patch.incrementRevision) values.revision = existing.revision + 1;
     this.db.update(evalQueues).set(values).where(eq(evalQueues.id, id)).run();
     return this.getEvalQueue(id)!;
@@ -5054,13 +5038,6 @@ export class MemoryQueries implements QueryStore {
     return adapter ? structuredClone(adapter) : null;
   }
 
-  getSharedAdapterByAgentId(agentId: string): ProjectAgentAdapter | null {
-    const shared = [...this.projectAgentAdapters.values()]
-      .filter((a) => a.agentId === agentId && a.shared && a.enabled)
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    return shared[0] ? structuredClone(shared[0]) : null;
-  }
-
   listSharedAdapters(): ProjectAgentAdapter[] {
     return [...this.projectAgentAdapters.values()]
       .filter((a) => a.shared && a.enabled)
@@ -6066,6 +6043,7 @@ export class MemoryQueries implements QueryStore {
       autoJudge: patch.autoJudge ?? existing.autoJudge,
       status: patch.status ?? existing.status,
       activeBatchId: patch.activeBatchId !== undefined ? patch.activeBatchId : existing.activeBatchId,
+      sharedAdapterId: patch.sharedAdapterId !== undefined ? patch.sharedAdapterId : existing.sharedAdapterId,
       revision: patch.incrementRevision ? existing.revision + 1 : existing.revision,
       updatedAt: nowIso(),
     };
