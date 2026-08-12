@@ -102,7 +102,7 @@ export async function runPiJudgeAgent(
   });
 
   const prompt = session.prompt(input.userPrompt);
-  const timeoutMs = input.timeoutMs ?? 30 * 60_000;
+  const timeoutMs = input.timeoutMs ?? 60 * 60_000;
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(

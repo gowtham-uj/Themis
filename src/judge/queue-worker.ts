@@ -291,7 +291,7 @@ async function runPendingJudge(
       timeoutMs:
         typeof input.judgeParams?.timeoutMs === "number"
           ? input.judgeParams.timeoutMs
-          : 30 * 60_000,
+          : 60 * 60_000,
       maxTokens:
         typeof input.judgeParams?.maxTokens === "number"
           ? input.judgeParams.maxTokens
