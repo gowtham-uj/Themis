@@ -1211,6 +1211,12 @@ async function verifyAdapterConnection(input: {
     argv: probe.command.argv,
     env: probe.command.env,
     cwd: probe.cwd ?? "/workspace",
+    // The connection-check probe (and configure, setup, cleanup) run as root: the
+    // host-created /workspace bind mount is root-owned, so a non-root probe
+    // (the image's USER 10001) cannot `mkdir /workspace/task`. Reaper drops to
+    // its own workspace user internally; running the probe container-side as
+    // root just grants the probe write access to its workspace scratch dir.
+    user: "root",
     timeoutMs: probe.timeoutMs ?? 60_000,
   });
   const stdoutChannel = new AsyncChannel<Buffer>();
