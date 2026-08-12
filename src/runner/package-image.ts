@@ -36,7 +36,7 @@ const SUITE_BASE_CONTAINERFILE = [
   "FROM docker.io/library/debian:bookworm-slim",
   "RUN apt-get update \\",
   " && apt-get install -y --no-install-recommends \\",
-  "      build-essential git sudo apt procps ca-certificates bash coreutils findutils \\",
+  "      build-essential libc6-dev git sudo apt procps ca-certificates bash coreutils findutils \\",
   " && rm -rf /var/lib/apt/lists/* \\",
   " && useradd --create-home --uid 10001 --shell /bin/bash agent \\",
   " && echo 'agent ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \\",
