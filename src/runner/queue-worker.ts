@@ -33,7 +33,7 @@ import {
   ProvisionError,
   verifyCleanupInContainer,
 } from "./env-provision.js";
-import { sealEvalArchive } from "./eval-archive.js";
+import { restructureSuiteArchive, sealEvalArchive } from "./eval-archive.js";
 import { analyzeEvidenceIntegrity } from "./evidence-integrity.js";
 import { deriveRunMetrics } from "./metrics.js";
 import { buildEvalAgentImage } from "./package-image.js";
@@ -1149,6 +1149,12 @@ async function executeEval(input: {
 
   let archiveError: string | null = null;
   try {
+    if (packageRuntime.suite) {
+      // Reorganize the retained evidence into a judge-friendly layout (high-signal
+      // traces at the top, platform logs and dig-more material in subfolders) so
+      // the judge meets the important files first walking top-down.
+      await restructureSuiteArchive(runDir);
+    }
     await sealEvalArchive(queries, runDir, {
       runId: run.id,
       projectId: queue.projectId,

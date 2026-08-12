@@ -109,7 +109,7 @@ describe("canonical eval packages", () => {
       expect(config.setupPath).toBe("/workspace/.agenteval/lifecycle-setup.sh");
       expect(config.cleanupPath).toBe("/workspace/.agenteval/lifecycle-cleanup.sh");
       expect(config.language).toBe("javascript");
-      expect(config.cleanupTimeoutMs).toBe(300_000);
+      expect(config.cleanupTimeoutMs).toBe(900_000);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -195,8 +195,14 @@ export function evalPackageRuntimeConfig(
     cleanupPath: cleanup
       ? (suite ? SUITE_LIFECYCLE_CLEANUP_PATH : runtimeEnvironmentPath(cleanup))
       : null,
-    setupTimeoutMs: Math.trunc(Number(suite ? (config.suite as { agent_timeout_seconds?: unknown }).agent_timeout_seconds ?? 300 : lifecycle.setup_timeout_seconds ?? timeouts.build_seconds ?? 300) * 1000),
-    cleanupTimeoutMs: Math.trunc(Number(suite ? 300 : lifecycle.cleanup_timeout_seconds ?? 120) * 1000),
+    setupTimeoutMs: Math.trunc(
+      Number(
+        suite
+          ? Math.max(900, Number((config.suite as { agent_timeout_seconds?: unknown }).agent_timeout_seconds) || 900)
+          : lifecycle.setup_timeout_seconds ?? timeouts.build_seconds ?? 300,
+      ) * 1000,
+    ),
+    cleanupTimeoutMs: Math.trunc(Number(suite ? 900 : lifecycle.cleanup_timeout_seconds ?? 120) * 1000),
     agentTimeoutMs: Math.trunc(Number(timeouts.agent_seconds ?? 120) * 1000),
     verifierCommand: stringArray(verifier.command),
     verifierTimeoutMs: Math.trunc(Number(timeouts.verifier_seconds ?? 300) * 1000),
