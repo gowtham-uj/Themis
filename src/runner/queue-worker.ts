@@ -15,10 +15,12 @@ import type {
 } from "../db/queries.js";
 import {
   AGENT_TASK_SUBDIR,
+  AGENT_TASK_WORKSPACE,
   evalEnvironmentDigest,
   loadEvalPackageRuntimeConfig,
   prepareEvalPackageWorkspace,
   restoreEvalLifecycleScript,
+  synthesizeSuiteLifecycleScripts,
   type EvalPackageRuntimeConfig,
 } from "../evals/package.js";
 import type { CanonicalEvent, RunStatus as EventRunStatus } from "../schema/events.js";
@@ -264,14 +266,19 @@ export async function startQueueContainer(
         `queue ${queue.id} resolves multiple adapter images (${adapterImage}, ${itemAdapterImage}); one persistent queue requires one image`,
       );
     }
-    const itemEnvironmentDigest = evalEnvironmentDigest(task.packageManifest!);
-    if (itemEnvironmentDigest !== firstEnvironmentDigest) {
-      throw new Error(
-        `queue ${queue.id} contains multiple agent environment digests; split them into separate queues`,
-      );
+    const itemPackageRuntime = packageRuntimes.get(task.id)!;
+    // Suite evals share one fat-base container image regardless of their
+    // per-eval environment (each installs its own toolchain via setup.sh), so
+    // the env-digest homogeneity check only applies to legacy canonical evals.
+    if (!itemPackageRuntime.suite) {
+      const itemEnvironmentDigest = evalEnvironmentDigest(task.packageManifest!);
+      if (itemEnvironmentDigest !== firstEnvironmentDigest) {
+        throw new Error(
+          `queue ${queue.id} contains multiple agent environment digests; split them into separate queues`,
+        );
+      }
     }
     const itemNetwork = resolveNetworkMode(resolved?.network ?? queue.networkPolicy);
-    const itemPackageRuntime = packageRuntimes.get(task.id)!;
     if (itemNetwork !== containerNetwork || itemPackageRuntime.network !== containerNetwork) {
       throw new Error(
         `queue ${queue.id} resolves incompatible queue/package network policies; one persistent queue requires one policy`,
@@ -700,18 +707,21 @@ async function executeEval(input: {
   if (!task.packagePath || !task.packageDigest || !task.packageManifest) {
     throw new Error(`eval ${task.id} is not a validated canonical eval package`);
   }
+  const packageRuntime = entry.packageRuntime;
   await prepareEvalPackageWorkspace({
     packagePath: task.packagePath,
     packageDigest: task.packageDigest,
     manifest: task.packageManifest,
     workspaceDir,
+    suite: packageRuntime.suite ?? false,
   });
   // The git baseline is committed at the graded root: workspaceDir for legacy,
   // workspaceDir/task (the suite's seed_repo home) for suite tasks, so diff
   // capture reports only the agent's changes to the task files.
-  const packageRuntime = entry.packageRuntime;
   const gitBaselineRoot = packageRuntime.suite ? join(workspaceDir, AGENT_TASK_SUBDIR) : workspaceDir;
-  let workspaceCommit: string | undefined = await commitWorkspaceBaseline(gitBaselineRoot);
+  // For suite, /workspace/task is empty until setup.sh seeds it at eval time,
+  // so the baseline is committed after setup (see the suite branch below).
+  let workspaceCommit: string | undefined = packageRuntime.suite ? undefined : await commitWorkspaceBaseline(gitBaselineRoot);
 
   const project = queries.getProject(queue.projectId);
   if (!project) throw new Error(`project not found: ${queue.projectId}`);
@@ -793,13 +803,20 @@ async function executeEval(input: {
   let agentStarted = false;
 
   try {
-    // Suite tasks are seeded on the host (prepareEvalPackageWorkspace copies
-    // seed_repo -> workspaceDir/task, mounted at /workspace/task) and the git
-    // baseline is committed at the workspace root; the suite setup.sh would
-    // re-seed from a path that does not exist in the container, so skip it.
-    if (packageRuntime.setupPath && !packageRuntime.suite) {
+    if (packageRuntime.suite) {
+      // Suite: synthesize the lifecycle wrappers (apt-install the language
+      // toolchain + run the author's setup.sh) into the workspace, then run
+      // setup as root. setup.sh seeds /workspace/task, so the baseline is
+      // committed only after a successful setup.
+      await synthesizeSuiteLifecycleScripts({
+        packagePath: task.packagePath!,
+        workspaceDir,
+        language: packageRuntime.language ?? null,
+      });
+    }
+    if (packageRuntime.setupPath) {
       const setup = await handle.exec({
-        argv: ["/bin/bash", packageRuntime.setupPath],
+        argv: ["/bin/bash", packageRuntime.setupPath, ...(packageRuntime.suite ? [AGENT_TASK_WORKSPACE] : [])],
         cwd: "/workspace",
         env: {
           ...packageRuntime.agentEnv,
@@ -820,9 +837,13 @@ async function executeEval(input: {
       if (setup.exitCode !== 0 || setup.timedOut) {
         throw new Error(
           setup.timedOut
-            ? "canonical eval setup timed out"
-            : `canonical eval setup exited ${setup.exitCode}`,
+            ? "eval setup timed out"
+            : `eval setup exited ${setup.exitCode}`,
         );
+      }
+      // Suite task dir was empty until setup seeded it; baseline now.
+      if (packageRuntime.suite) {
+        workspaceCommit = await commitWorkspaceBaseline(gitBaselineRoot);
       }
     }
     if (envSpec && (envSpec.setupScript || envSpec.commitBaseline !== false)) {
@@ -1001,15 +1022,25 @@ async function executeEval(input: {
     durationMs: 0,
     error: null as string | null,
   };
-  if (packageRuntime.cleanupPath && !packageRuntime.suite) {
+  if (packageRuntime.cleanupPath) {
     try {
-      await restoreEvalLifecycleScript({
-        packagePath: task.packagePath,
-        workspaceDir,
-        containerPath: packageRuntime.cleanupPath,
-      });
+      if (packageRuntime.suite) {
+        // Re-synthesize the trusted lifecycle wrapper (overwriting any
+        // tampered in-container copy) before running cleanup.
+        await synthesizeSuiteLifecycleScripts({
+          packagePath: task.packagePath!,
+          workspaceDir,
+          language: packageRuntime.language ?? null,
+        });
+      } else {
+        await restoreEvalLifecycleScript({
+          packagePath: task.packagePath,
+          workspaceDir,
+          containerPath: packageRuntime.cleanupPath,
+        });
+      }
       const result = await handle.exec({
-        argv: ["/bin/bash", packageRuntime.cleanupPath],
+        argv: ["/bin/bash", packageRuntime.cleanupPath, ...(packageRuntime.suite ? [AGENT_TASK_WORKSPACE] : [])],
         cwd: "/workspace",
         env: {
           ...packageRuntime.agentEnv,
@@ -1029,8 +1060,8 @@ async function executeEval(input: {
           result.exitCode === 0 && !result.timedOut
             ? null
             : result.timedOut
-              ? "canonical eval cleanup timed out"
-              : `canonical eval cleanup exited ${result.exitCode}`,
+              ? "eval cleanup timed out"
+              : `eval cleanup exited ${result.exitCode}`,
       };
     } catch (err) {
       packageCleanup = {

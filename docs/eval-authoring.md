@@ -69,23 +69,41 @@ disk_mb`. `official_reward` must be `"binary"`; `internet` must be `allow|allowl
 The platform maps each eval to `category_name="simple"` and `agent_category="coding"` (per the accepted
 category contract) regardless of the suite's own `category` value.
 
-## environment/Dockerfile
+## environment/Dockerfile (required, but not built as the agent image)
 
-A full language base image. It sets `WORKDIR /workspace/task`, copies `seed_repo/` and `instruction.md`
-into the image, drops to a non-root user (e.g. uid `10001`):
+The file `environment/Dockerfile` is still required for format compatibility (and must stay
+COPY-context-isolated, no `solution/`/`tests/`/`validation/` references), but the platform does **not**
+build it as the agent container image. Instead, all suite evals in a queue share **one platform-provided
+fat base image** (`debian:bookworm-slim` + build-essential + git + apt + sudo + non-root `agent` uid
+`10001`), overlaid once with the project's reaper adapter. Heterogeneous suite evals (python/node/gcc/
+bash/c) therefore run sequentially in a single persistent queue container.
 
-```dockerfile
-FROM python:3.12-slim-bookworm
-RUN useradd --create-home --uid 10001 agent
-WORKDIR /workspace/task
-COPY seed_repo/ /workspace/task/
-COPY instruction.md /workspace/instruction.md
-USER agent
-```
+The language toolchain is installed **at eval time** by the platform-synthesized `setup.sh` (below),
+derived from `task.toml`'s `language` field — `language` is the source of truth for the agent
+container's toolchain, not the Dockerfile.
 
-The platform **builds this Dockerfile unchanged** and then overlays the project's real agent adapter
-(the reaper CLI runtime) on top in a wrapper stage, so the agent container has both the task toolchain
-and reaper. `solution/`, `tests/`, and `validation/` are never part of this build context.
+## environment/setup.sh and environment/cleanup.sh
+
+Each eval's `setup.sh` / `cleanup.sh` provision and tear down that eval's dependencies at eval time
+inside the shared container:
+
+- The platform **synthesizes a wrapper** `lifecycle-setup.sh` that runs as `root`: it `apt-get install`s
+  the packages mapped from `language` (see map below), then runs the author's `environment/setup.sh`
+  body, then `chown`s `/workspace/task` to uid `10001` so the non-root agent can write it.
+- The author's `setup.sh` (argv[1]=target, default `/workspace/task`) runs with `cwd=/workspace/.agenteval`,
+  where the staged `seed_repo/` is available (it references `seed_repo` via `dirname $0/..`). It seeds
+  the target and `git init`s a baseline.
+- After the agent runs, the platform synthesizes `lifecycle-cleanup.sh` (restoring the trusted copy
+  defensively): it runs the author's `cleanup.sh` (deletes `/workspace/task`), then `apt-get purge` +
+  `autoremove` the toolchain — a best-effort restore between evals.
+
+Language → apt map: `python`→`[python3, python3-pip, python3-venv]`, `javascript`/`node`→`[nodejs, npm]`,
+`c`→`[gcc]`, `cpp`→`[g++]`, `bash`→ none (already present). Unknown languages install nothing (the eval
+runs only if the toolchain is already in the base).
+
+> One persistent container per queue: the setup/cleanup restore is best-effort. If a language's
+> packages leak shared libraries that a later eval happens to use, prefer moving that eval to a
+> homogeneous queue; but mixed simple-language suites are the intended shared-container case.
 
 ## Confidentiality boundary
 

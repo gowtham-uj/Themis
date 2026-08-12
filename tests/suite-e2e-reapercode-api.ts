@@ -86,6 +86,16 @@ try {
     assert(string(created.agent_category, "agent_category") === "coding", `eval ${key} must be coding`);
     console.log("created eval", key, taskId, "category=simple");
   }
+  // Confirm the queue exercises multiple languages (heterogeneous suite evals
+  // sharing one persistent container — the core of the fat-base model).
+  const languages = new Set<string>();
+  for (const [, files] of taskFiles) {
+    const toml = files.get("task.toml")?.toString("utf8") ?? "";
+    const m = toml.match(/^language\s*=\s*"([^"]+)"/m);
+    if (m) languages.add(m[1]);
+  }
+  console.log("queue language heterogeneity:", [...languages].join(", "));
+  assert(languages.size >= 2, `expected >=2 languages for heterogeneity, got ${languages.size}`);
   assert(createdIds.length === taskFiles.size, `expected ${taskFiles.size} evals, got ${createdIds.length}`);
 
   // ---- queue + add a representative subset ----

@@ -68,6 +68,8 @@ export interface EvalPackageRuntimeConfig {
   verifierCheckIds: string[];
   /** True for suite-format tasks; the agent workspace is /workspace/task. */
   suite?: boolean;
+  /** Declared language for suite tasks (drives the apt packages setup.sh installs). */
+  language: string | null;
 }
 
 export interface MaterializedEvalPackage {
@@ -173,19 +175,28 @@ export function evalPackageRuntimeConfig(
     }
   }
   const suite = isRecord(config.suite);
-  // Suite tasks always run their own environment/setup.sh + cleanup.sh (argv
-  // default /workspace/task). Non-suite (legacy canonical) tasks use the
-  // [lifecycle] table when present.
-  const setup = suite ? "environment/setup.sh" : text(lifecycle.setup);
-  const cleanup = suite ? "environment/cleanup.sh" : text(lifecycle.cleanup);
+  const language = suite
+    ? (text((config.suite as { language?: unknown }).language) ?? text((config as { task?: { language?: unknown } }).task?.language))
+    : null;
+  // Suite tasks run a platform-synthesized lifecycle wrapper that apt-installs
+  // the language toolchain (from `language`) and then invokes the author's
+  // environment/setup.sh + cleanup.sh. The wrappers are written to
+  // /workspace/.agenteval/lifecycle-{setup,cleanup}.sh at eval time. Non-suite
+  // (legacy canonical) tasks use the [lifecycle] table when present.
+  const setup = suite ? "lifecycle-setup.sh" : text(lifecycle.setup);
+  const cleanup = suite ? "lifecycle-cleanup.sh" : text(lifecycle.cleanup);
   const verifierChecks = arrayOfTables(verifier.checks)
     .map((entry) => ({ id: text(entry.id), kind: text(entry.kind) }))
     .filter((entry): entry is EvalPackageVerifierCheck => entry.id !== null && entry.kind !== null);
   return {
-    setupPath: setup ? runtimeEnvironmentPath(setup) : null,
-    cleanupPath: cleanup ? runtimeEnvironmentPath(cleanup) : null,
+    setupPath: setup
+      ? (suite ? SUITE_LIFECYCLE_SETUP_PATH : runtimeEnvironmentPath(setup))
+      : null,
+    cleanupPath: cleanup
+      ? (suite ? SUITE_LIFECYCLE_CLEANUP_PATH : runtimeEnvironmentPath(cleanup))
+      : null,
     setupTimeoutMs: Math.trunc(Number(suite ? (config.suite as { agent_timeout_seconds?: unknown }).agent_timeout_seconds ?? 300 : lifecycle.setup_timeout_seconds ?? timeouts.build_seconds ?? 300) * 1000),
-    cleanupTimeoutMs: Math.trunc(Number(suite ? 120 : lifecycle.cleanup_timeout_seconds ?? 120) * 1000),
+    cleanupTimeoutMs: Math.trunc(Number(suite ? 300 : lifecycle.cleanup_timeout_seconds ?? 120) * 1000),
     agentTimeoutMs: Math.trunc(Number(timeouts.agent_seconds ?? 120) * 1000),
     verifierCommand: stringArray(verifier.command),
     verifierTimeoutMs: Math.trunc(Number(timeouts.verifier_seconds ?? 300) * 1000),
@@ -200,6 +211,7 @@ export function evalPackageRuntimeConfig(
     verifierChecks,
     verifierCheckIds: verifierChecks.map((entry) => entry.id),
     suite,
+    language,
   };
 }
 
@@ -235,7 +247,7 @@ function wrapSuiteConfig(flat: Record<string, unknown>): Record<string, unknown>
   // model provider); `internet` governs the isolated verifier only.
   const networkPolicy = "allow";
   return {
-    suite: { id: taskId, version: taskVersion, name, primary_capability: primaryCapability },
+    suite: { id: taskId, version: taskVersion, name, primary_capability: primaryCapability, language },
     task: { id: taskId, version: taskVersion, name, category: "simple",
       language, tags: [primaryCapability, language].filter((entry): entry is string => Boolean(entry)),
       profile: "bugfix", agent_category: "coding" },
@@ -336,6 +348,10 @@ export async function prepareEvalPackageWorkspace(input: {
   packageDigest: string;
   manifest: Record<string, unknown>;
   workspaceDir: string;
+  /** When true (suite), stage seed_repo under .agenteval/seed_repo so the
+   *  author's setup.sh seeds /workspace/task at eval time (after apt-installing
+   *  its language toolchain). When false (legacy), seed directly into task/. */
+  suite?: boolean;
 }): Promise<void> {
   await verifyMaterializedEvalPackage(input);
   const taskRoot = join(input.workspaceDir, AGENT_TASK_SUBDIR);
@@ -343,8 +359,15 @@ export async function prepareEvalPackageWorkspace(input: {
   const repo = join(input.packagePath, "seed_repo");
   const entries = await readdir(repo).catch(() => []);
   if (entries.length === 0) throw new Error("eval package seed_repo is empty");
+  // Suite: stage seed_repo to .agenteval/seed_repo (sibling of environment/) so
+  // the author's setup.sh, which references seed_repo via `dirname $0/..`, can
+  // copy it into /workspace/task at eval time. Legacy: seed directly into task/.
+  const seedDest = input.suite
+    ? join(input.workspaceDir, ".agenteval", "seed_repo")
+    : taskRoot;
+  await mkdir(seedDest, { recursive: true });
   for (const name of entries) {
-    await cp(join(repo, name), join(taskRoot, name), {
+    await cp(join(repo, name), join(seedDest, name), {
       recursive: true,
       force: false,
       errorOnExist: true,
@@ -363,7 +386,7 @@ export async function prepareEvalPackageWorkspace(input: {
   }
   for (const protectedName of ["solution", "tests", "validation"]) {
     try {
-      await lstat(join(taskRoot, protectedName));
+      await lstat(join(seedDest, protectedName));
       throw new Error(`protected eval content leaked into agent workspace: ${protectedName}`);
     } catch (err) {
       if (isNotFound(err)) continue;
@@ -380,6 +403,77 @@ export const AGENT_TASK_SUBDIR = "task";
  * lands here; the separate verifier grades this path.
  */
 export const AGENT_TASK_WORKSPACE = "/workspace/task";
+
+/** In-container path of the platform-synthesized suite setup wrapper. */
+export const SUITE_LIFECYCLE_SETUP_PATH = "/workspace/.agenteval/lifecycle-setup.sh";
+/** In-container path of the platform-synthesized suite cleanup wrapper. */
+export const SUITE_LIFECYCLE_CLEANUP_PATH = "/workspace/.agenteval/lifecycle-cleanup.sh";
+
+/** Map a task.toml `language` value to the apt packages setup.sh must install. */
+export function languageToAptPackages(language: string | null): string[] {
+  if (!language) return [];
+  const lang = language.trim().toLowerCase();
+  if (lang === "python" || lang === "python3") return ["python3", "python3-pip", "python3-venv"];
+  if (lang === "javascript" || lang === "js" || lang === "node" || lang === "nodejs") return ["nodejs", "npm"];
+  if (lang === "c") return ["gcc"];
+  if (lang === "cpp" || lang === "c++") return ["g++"];
+  if (lang === "bash" || lang === "shell" || lang === "sh") return [];
+  return [];
+}
+
+/**
+ * Write the platform-synthesized suite lifecycle wrappers into the workspace:
+ *  - lifecycle-setup.sh: apt-get install the language toolchain, then run the
+ *    author's environment/setup.sh (which seeds /workspace/task), then chown
+ *    /workspace/task to the non-root agent (uid 10001).
+ *  - lifecycle-cleanup.sh: run the author's environment/cleanup.sh (delete
+ *    /workspace/task), then apt-get purge + autoremove the toolchain.
+ *
+ * Both run as root inside the persistent queue container. Runtime-only: the
+ * package on disk is left pristine (digest unchanged). Idempotent — safe to
+ * re-run before cleanup to restore a trusted copy after agent execution.
+ */
+export async function synthesizeSuiteLifecycleScripts(input: {
+  packagePath: string;
+  workspaceDir: string;
+  language: string | null;
+}): Promise<{ setupPath: string; cleanupPath: string }> {
+  const dir = join(input.workspaceDir, ".agenteval");
+  await mkdir(dir, { recursive: true });
+  const pkgs = languageToAptPackages(input.language).join(" ");
+  const installBlock = pkgs
+    ? `apt-get update\nif [ -n "${pkgs}" ]; then apt-get install -y --no-install-recommends ${pkgs}; fi`
+    : ": # no apt packages for this language";
+  const purgeBlock = pkgs
+    ? `if [ -n "${pkgs}" ]; then apt-get purge -y ${pkgs} && apt-get autoremove -y; fi`
+    : ": # no apt packages to purge";
+  const setupHostPath = join(dir, "lifecycle-setup.sh");
+  const cleanupHostPath = join(dir, "lifecycle-cleanup.sh");
+  await writeFile(setupHostPath, [
+    "#!/usr/bin/env bash",
+    "# Platform-synthesized suite setup: install the language toolchain for this",
+    "# eval, then run the author's setup.sh body (which seeds /workspace/task).",
+    "set -euo pipefail",
+    installBlock,
+    "# Run the author's setup body. cwd=/workspace/.agenteval so its",
+    "# `dirname $0/..`/seed_repo reference resolves to the staged copy.",
+    "cd /workspace/.agenteval",
+    '/workspace/.agenteval/environment/setup.sh "$@"',
+    "# setup ran as root; the non-root agent (uid 10001) must own its workspace.",
+    "[ -d /workspace/task ] && chown -R 10001:10001 /workspace/task || true",
+  ].join("\n") + "\n", "utf8");
+  await writeFile(cleanupHostPath, [
+    "#!/usr/bin/env bash",
+    "# Platform-synthesized suite cleanup: run the author's cleanup.sh, then",
+    "# remove the language toolchain this eval installed (best-effort restore).",
+    "set -euo pipefail",
+    '/workspace/.agenteval/environment/cleanup.sh "$@"',
+    purgeBlock,
+  ].join("\n") + "\n", "utf8");
+  await chmod(setupHostPath, 0o755);
+  await chmod(cleanupHostPath, 0o755);
+  return { setupPath: SUITE_LIFECYCLE_SETUP_PATH, cleanupPath: SUITE_LIFECYCLE_CLEANUP_PATH };
+}
 
 /**
  * Validate a suite-style eval task: flat task.toml, seed_repo workspace,

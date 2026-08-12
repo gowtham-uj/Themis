@@ -104,6 +104,83 @@ describe("canonical eval packages", () => {
       expect(config.verifierCommand).toEqual(["/verifier/test.sh"]);
       expect(config.suite).toBe(true);
       expect(config.verifierTimeoutMs).toBe(120_000);
+      // Suite lifecycle paths point at the platform-synthesized wrappers; the
+      // language drives the apt packages setup.sh installs.
+      expect(config.setupPath).toBe("/workspace/.agenteval/lifecycle-setup.sh");
+      expect(config.cleanupPath).toBe("/workspace/.agenteval/lifecycle-cleanup.sh");
+      expect(config.language).toBe("javascript");
+      expect(config.cleanupTimeoutMs).toBe(300_000);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("stages seed_repo under .agenteval/seed_repo for suite tasks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenteval-suite-stage-"));
+    const workspace = join(root, "workspace");
+    try {
+      const result = await materializeEvalPackage({
+        upload: validEvalPackageUpload(),
+        destination: join(root, "package"),
+      });
+      await prepareEvalPackageWorkspace({
+        packagePath: result.packagePath,
+        packageDigest: result.packageDigest,
+        manifest: result.manifest as unknown as Record<string, unknown>,
+        workspaceDir: workspace,
+        suite: true,
+      });
+      // Suite: seed_repo is staged at .agenteval/seed_repo (the author's
+      // setup.sh seeds /workspace/task at eval time); task/ is empty.
+      expect(await readFile(join(workspace, ".agenteval/seed_repo/src/value.js"), "utf8")).toContain("41");
+      await expect(readFile(join(workspace, "task/src/value.js"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(workspace, ".agenteval/environment/healthcheck.sh"), "utf8")).toContain("value.js");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("synthesizes suite lifecycle wrappers that install the language toolchain", async () => {
+    const { languageToAptPackages, synthesizeSuiteLifecycleScripts } = await import("../src/evals/package.ts");
+    expect(languageToAptPackages("python")).toEqual(["python3", "python3-pip", "python3-venv"]);
+    expect(languageToAptPackages("javascript")).toEqual(["nodejs", "npm"]);
+    expect(languageToAptPackages("c")).toEqual(["gcc"]);
+    expect(languageToAptPackages("cpp")).toEqual(["g++"]);
+    expect(languageToAptPackages("bash")).toEqual([]);
+    expect(languageToAptPackages(null)).toEqual([]);
+
+    const root = await mkdtemp(join(tmpdir(), "agenteval-synth-"));
+    const workspace = join(root, "workspace");
+    try {
+      const result = await materializeEvalPackage({
+        upload: validEvalPackageUpload(),
+        destination: join(root, "package"),
+      });
+      const { setupPath, cleanupPath } = await synthesizeSuiteLifecycleScripts({
+        packagePath: result.packagePath,
+        workspaceDir: workspace,
+        language: "python",
+      });
+      expect(setupPath).toBe("/workspace/.agenteval/lifecycle-setup.sh");
+      expect(cleanupPath).toBe("/workspace/.agenteval/lifecycle-cleanup.sh");
+      const setup = await readFile(join(workspace, ".agenteval/lifecycle-setup.sh"), "utf8");
+      expect(setup).toContain("apt-get install -y --no-install-recommends python3 python3-pip python3-venv");
+      expect(setup).toContain("/workspace/.agenteval/environment/setup.sh");
+      expect(setup).toContain("chown -R 10001:10001 /workspace/task");
+      const cleanup = await readFile(join(workspace, ".agenteval/lifecycle-cleanup.sh"), "utf8");
+      expect(cleanup).toContain("apt-get purge -y python3 python3-pip python3-venv");
+      expect(cleanup).toContain("/workspace/.agenteval/environment/cleanup.sh");
+
+      // bash: empty deps — wrappers still call the author scripts without apt.
+      const { setupPath: bashSetup } = await synthesizeSuiteLifecycleScripts({
+        packagePath: result.packagePath,
+        workspaceDir: workspace,
+        language: "bash",
+      });
+      const bashScript = await readFile(join(workspace, ".agenteval/lifecycle-setup.sh"), "utf8");
+      expect(bashScript).not.toContain("apt-get install");
+      expect(bashScript).toContain("/workspace/.agenteval/environment/setup.sh");
+      expect(bashSetup).toBe("/workspace/.agenteval/lifecycle-setup.sh");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

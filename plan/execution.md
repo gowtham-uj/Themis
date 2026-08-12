@@ -9,6 +9,16 @@ provider/model, and adapter contract.
 - A project is bound to one CLI agent adapter and may define many queues.
 - **One persistent container per active queue.** That container runs the queue's ordered evals one at a
   time. Different queues provide parallelism. No eval spins up its own container.
+- **Suite evals share one fat-base image across the whole queue.** The agent image is a platform-provided
+  Debian base (build-essential + git + apt + sudo, non-root uid `10001`) overlaid once with the project's
+  reaper adapter — keyed off the adapter image + base digest only, NOT per-eval environment. Heterogeneous
+  suite evals (python/node/gcc/bash/c) therefore resolve to the same image and run in one container. Each
+  eval's `setup.sh` `apt-get install`s its language toolchain (mapped from `task.toml`'s `language`) at eval
+  time; `cleanup.sh` `apt-get purge`s it after. Restore between evals is best-effort (a finding recorded
+  here, diverging from the prior per-eval-env-image model, per the user's directive: one persistent
+  container + setup-installs-deps). The per-eval `environment/Dockerfile` is required for format
+  compatibility but is not built as the agent image; `language` is the toolchain source of truth.
+  The verifier still builds its own per-language image from `tests/Dockerfile` in a separate offline container.
 - The adapter's git source + Containerfile are built through the API with real Podman; build provenance
   records source commit and image id.
 - `/workspace` is one host bind mount reused by that queue. It is reset between evals only after all

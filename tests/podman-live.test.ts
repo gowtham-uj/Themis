@@ -391,4 +391,70 @@ d("PodmanRuntime (live containers)", () => {
       rmSync(s.workspaceDir, { recursive: true, force: true });
     }
   }, 180_000);
+
+  it("suite fat base installs a language via setup.sh and purges it via cleanup.sh", async () => {
+    // Proves the one-container + per-eval setup/cleanup model: the shared fat
+    // base image carries no language; setup.sh apt-installs python3 as root,
+    // then cleanup.sh purges it — restoring the base for the next eval.
+    const rt = runtime();
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agenteval-fatbase-ws-"));
+    try {
+      // Synthesize a python setup/cleanup pair into the workspace, including a
+      // tiny author environment the wrapper invokes.
+      const { mkdirSync, writeFileSync, chmodSync } = await import("node:fs");
+      mkdirSync(join(workspaceDir, ".agenteval", "environment"), { recursive: true });
+      mkdirSync(join(workspaceDir, ".agenteval", "seed_repo"), { recursive: true });
+      writeFileSync(join(workspaceDir, ".agenteval", "environment", "setup.sh"),
+        "#!/usr/bin/env bash\nset -euo pipefail\necho AUTHOR_SETUP_RAN\n");
+      writeFileSync(join(workspaceDir, ".agenteval", "environment", "cleanup.sh"),
+        "#!/usr/bin/env bash\nset -euo pipefail\necho AUTHOR_CLEANUP_RAN\n");
+      chmodSync(join(workspaceDir, ".agenteval", "environment", "setup.sh"), 0o755);
+      chmodSync(join(workspaceDir, ".agenteval", "environment", "cleanup.sh"), 0o755);
+      const { synthesizeSuiteLifecycleScripts } = await import("../src/evals/package.ts");
+      const { setupPath, cleanupPath } = await synthesizeSuiteLifecycleScripts({
+        packagePath: workspaceDir,
+        workspaceDir,
+        language: "python",
+      });
+      expect(setupPath).toBe("/workspace/.agenteval/lifecycle-setup.sh");
+
+      // Use a stock Debian image as the fat base stand-in (build-essential absent,
+      // but apt + python3 install does not need it for this probe).
+      const s: RunContainerSpec = {
+        ...spec({ image: "docker.io/library/debian:bookworm-slim", workspaceDir,
+          argv: ["sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"] }),
+        timeoutMs: 0,
+        nonRoot: false,
+      };
+      const handle = await rt.run(s);
+      try {
+        const setupRes = await handle.exec({
+          argv: ["/bin/bash", setupPath, "/workspace/task"],
+          cwd: "/workspace", env: {}, user: "root", timeoutMs: 300_000,
+        });
+        expect(setupRes.exitCode).toBe(0);
+        const probe = await handle.exec({
+          argv: ["python3", "--version"], cwd: "/workspace", env: {}, timeoutMs: 30_000,
+        });
+        const probeOut = await drain(probe.stdout).catch(() => "");
+        expect(probeOut).toMatch(/Python 3\./);
+
+        const cleanRes = await handle.exec({
+          argv: ["/bin/bash", cleanupPath, "/workspace/task"],
+          cwd: "/workspace", env: {}, user: "root", timeoutMs: 300_000,
+        });
+        expect(cleanRes.exitCode).toBe(0);
+        const gone = await handle.exec({
+          argv: ["sh", "-c", "command -v python3 >/dev/null 2>&1 && echo MISSING_PURGE || echo PURGED"],
+          cwd: "/workspace", env: {}, timeoutMs: 30_000,
+        });
+        const goneOut = await drain(gone.stdout).catch(() => "");
+        expect(goneOut).toContain("PURGED");
+      } finally {
+        await handle.remove();
+      }
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  }, 600_000);
 });
