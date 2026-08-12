@@ -12,7 +12,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { and, eq, desc, isNotNull } from "drizzle-orm";
+import { and, eq, desc, inArray, isNotNull } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import type {
   AgentCategory,
@@ -1396,6 +1396,14 @@ export interface QueryStore {
   getQueueAnalysis(id: string): QueueAnalysis | null;
   listQueueAnalyses(queueId: string, opts?: { batchId?: string }): QueueAnalysis[];
   updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis;
+  /**
+   * All analyses in a non-terminal state (queued/running) across every queue —
+   * used to reconcile analyses orphaned by a prior process (e.g. a server crash
+   * or deploy that killed an in-flight judge) so they never stay `running`
+   * forever. Returns {id, queueId, projectId} rows so the recoverer can mark
+   * them failed or re-enqueue.
+   */
+  listOrphanedAnalyses(): Array<{ id: string; queueId: string; projectId: string; status: string }>;
   storeImprovementSteps(
     queueAnalysisId: string,
     projectId: string,
@@ -4322,6 +4330,18 @@ export class SqliteQueries implements QueryStore {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
+  listOrphanedAnalyses(): Array<{ id: string; queueId: string; projectId: string; status: string }> {
+    return this.db.select()
+      .from(queueAnalyses)
+      .where(inArray(queueAnalyses.status, ["queued", "running"]))
+      .all().map((row) => ({
+        id: row.id,
+        queueId: row.queueId,
+        projectId: row.projectId,
+        status: row.status,
+      }));
+  }
+
   updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis {
     if (!this.getQueueAnalysis(id)) throw notFound("queue analysis", id);
     const values: Partial<typeof queueAnalyses.$inferInsert> = {};
@@ -6595,6 +6615,12 @@ export class MemoryQueries implements QueryStore {
     return [...this.queueAnalyses.values()].filter((a) => a.queueId === queueId &&
       (!opts.batchId || a.batchId === opts.batchId))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((a) => structuredClone(a));
+  }
+
+  listOrphanedAnalyses(): Array<{ id: string; queueId: string; projectId: string; status: string }> {
+    return [...this.queueAnalyses.values()]
+      .filter((a) => a.status === "queued" || a.status === "running")
+      .map((a) => ({ id: a.id, queueId: a.queueId, projectId: a.projectId, status: a.status }));
   }
 
   updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis {

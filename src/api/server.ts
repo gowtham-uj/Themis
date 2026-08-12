@@ -198,6 +198,13 @@ export interface CreateServerOptions {
   defaultJudgeModel?: string;
   defaultJudgeProvider?: string;
   /**
+   * On startup, reconcile queued/running analyses orphaned by a prior process
+   * (crash/deploy that killed an in-flight judge) by marking them failed.
+   * Default true. Test harnesses that host a long-lived judge in-process and
+   * restart the server mid-run may disable this to avoid clobbering it.
+   */
+  reconcileOrphans?: boolean;
+  /**
    * Gate /api/* behind Bearer tokens. Default **false** (local-dev path):
    * existing tests that hit routes unauthenticated MUST keep working.
    * When true, require a valid non-revoked token except GET /api/health.
@@ -1526,6 +1533,21 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   const liveRuns = createLiveRunsMap();
   const liveQueueContainers = createLiveQueueContainersMap();
   const authEnabled = opts.authEnabled === true;
+
+  // Reconcile analyses orphaned by a prior process (a crash, deploy, or OOM
+  // that killed an in-flight judge mid-run). Any queued/running analysis left
+  // over can no longer be completed — its worker is gone — so mark it failed
+  // rather than leaving a permanent "running" zombie. This is the prod-grade
+  // guard so a judge death never silently wedges a queue report forever.
+  const orphanSweep = (): void => {
+    for (const row of opened.queries.listOrphanedAnalyses()) {
+      opened.queries.updateQueueAnalysis(row.id, {
+        status: "failed",
+        error: `judge worker interrupted before completion (reconciled at server startup); prior status: ${row.status}`,
+      });
+    }
+  };
+  if (opts.reconcileOrphans !== false) orphanSweep();
 
   // Outbound webhooks (P8c): default RealDeliverySink dispatcher unless
   // explicitly disabled (null) or a pre-built dispatcher is injected.
