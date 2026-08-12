@@ -1,7 +1,7 @@
 /** Reusable PI SDK host for real tool-using judge agents. */
 
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { appendFile, copyFile, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -10,6 +10,9 @@ import {
   type AgentSessionEvent,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+
+/** Directory containing judge skills (each <name>/SKILL.md), bundled with the platform. */
+const JUDGE_SKILLS_DIR = join(import.meta.dirname ?? "", "skill");
 
 export interface PiJudgeAgentInput {
   cwd: string;
@@ -46,6 +49,11 @@ export async function runPiJudgeAgent(
     mkdir(dirname(input.transcriptPath), { recursive: true }),
   ]);
 
+  // Seed the judge's bundled skills (master-core-design, report-generation)
+  // into the PI agent's skills directory so the underlying PI coding agent
+  // loads them as real skills the judge can invoke while authoring its report.
+  await seedJudgeSkills(input.agentDir);
+
   const provider = normalizeProviderId(input.provider);
   const modelRuntime = await createJudgeModelRuntime(
     provider,
@@ -61,7 +69,7 @@ export async function runPiJudgeAgent(
     cwd: input.cwd,
     agentDir: input.agentDir,
     noExtensions: true,
-    noSkills: true,
+    noSkills: false,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
@@ -200,4 +208,24 @@ function stringifyJson(value: AgentSessionEvent | Record<string, unknown>): stri
   return JSON.stringify(value, (_key, item: unknown) =>
     typeof item === "bigint" ? item.toString() : item,
   );
+}
+
+/**
+ * Copy the platform's bundled judge skills (master-core-design.md, SKILL.md)
+ * into `<agentDir>/skills/<name>/SKILL.md` so the underlying PI coding agent's
+ * `DefaultResourceLoader` discovers and loads them as real skills the judge
+ * can use while authoring its report. Idempotent per agent dir.
+ */
+async function seedJudgeSkills(agentDir: string): Promise<void> {
+  const skillsDir = join(agentDir, "skills");
+  await rm(skillsDir, { recursive: true, force: true });
+  await mkdir(skillsDir, { recursive: true });
+  const entries = await readdir(JUDGE_SKILLS_DIR).catch(() => []);
+  for (const name of entries) {
+    if (!name.endsWith(".md")) continue;
+    const stem = name.replace(/\.md$/i, "");
+    const target = join(skillsDir, stem === "SKILL" ? "report-generation" : stem, "SKILL.md");
+    await mkdir(dirname(target), { recursive: true });
+    await copyFile(join(JUDGE_SKILLS_DIR, name), target);
+  }
 }

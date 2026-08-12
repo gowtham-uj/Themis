@@ -890,5 +890,7 @@ preflight_queue_analysis arguments:
 
 Every narrative claim needs refs. Every plan step needs linked observed defects, evidence, a resolved target or explicit external blocker, acceptance criteria, at least one test, and non-empty verify+regression task sets. Preventive hardening belongs in the plan, not rankedDefects. A nit-only step cannot outrank evidence-integrity/blocker/major work.
 
+SKILLS: You have the \`master-core-design\` skill loaded. While analyzing the archived logs/traces/diffs and authoring the queue report narrative and its improvement plan, apply that skill's design reasoning, structure, accessibility, and anti-AI-slop review to any output that has a design surface (report narrative, recommendations, handoff). Use the skill as your design brain; ground every design-affecting claim in the archived evidence the way you ground every other claim.
+
 Do not invent evidence. Do not omit an eval. Do not submit a changed or un-preflighted payload.`;
 }
