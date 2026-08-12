@@ -37,6 +37,12 @@ export class DockerSocketRuntime implements ContainerRuntime {
     );
   }
 
+  async imageExists(_image: string): Promise<boolean> {
+    throw new NotImplementedError(
+      "Docker socket backend is not implemented; configure AGENTEVAL_RUNTIME=podman",
+    );
+  }
+
   async run(_spec: RunContainerSpec): Promise<ContainerHandle> {
     throw new NotImplementedError(
       "Docker socket backend is not implemented; configure AGENTEVAL_RUNTIME=podman",

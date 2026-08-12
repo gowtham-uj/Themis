@@ -71,6 +71,10 @@ class CannedRuntime implements ContainerRuntime {
     const outcome = this.byCommand.get(command) ?? this.defaultOutcome;
     return Promise.resolve(new CannedHandle(spec, outcome));
   }
+
+  imageExists(_image: string): Promise<boolean> {
+    return Promise.resolve(false);
+  }
 }
 
 class CannedHandle implements ContainerHandle {

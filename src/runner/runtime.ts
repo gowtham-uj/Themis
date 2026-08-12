@@ -154,6 +154,13 @@ export interface ContainerRuntime {
   /** Build a real CLI-agent image from a connected source repository. */
   buildImage(spec: BuildImageSpec): Promise<BuildImageResult>;
   /**
+   * Whether a local image with this tag/id is present in the backend's storage.
+   * Used by the adapter build cache to reuse an already-built CLI image when the
+   * source commit hasn't changed, instead of rebuilding from scratch. Never
+   * throws: an unavailable backend reports false, signaling the caller to build.
+   */
+  imageExists(image: string): Promise<boolean>;
+  /**
    * Pull the image if missing (registry policy), then launch and return a handle. The caller owns the
    * lifecycle: stream stdout via the handle, then `wait()`, then `remove()`.
    *

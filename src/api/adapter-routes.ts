@@ -227,6 +227,48 @@ async function buildAdapter(
       // npm install: create a minimal context dir with just the Containerfile.
       await mkdir(sourceDir, { recursive: true });
     }
+    // Cross-adapter reuse: if another adapter (any project, or shared) already
+    // built this exact source_repo + commit and its image still exists in the
+    // container backend, record that ready image onto this adapter instead of
+    // re-running the expensive `npm ci && npm run build`. This honors "reuse the
+    // CLI already built until the source gets a new commit" even for a brand-new
+    // adapter row whose built_commit is null on first build.
+    if (!isNpm && adapter.sourceRepo && commit) {
+      const donor = app.queries.findReadyAdapterForSourceCommit(
+        adapter.sourceRepo,
+        commit,
+      );
+      if (
+        donor &&
+        donor.id !== adapter.id &&
+        donor.builtImageId &&
+        (await resolveRuntime().imageExists(donor.image))
+      ) {
+        const updated = app.queries.updateProjectAgentAdapter(adapter.id, {
+          buildStatus: "ready",
+          builtImageId: donor.builtImageId,
+          builtCommit: commit,
+          buildLogPath: logPath,
+          lastBuiltAt: new Date().toISOString(),
+        });
+        await writeFile(
+          logPath,
+          `reused existing image ${donor.image} (id ${donor.builtImageId}) built from commit ${commit} of adapter ${donor.id}\n`,
+          "utf8",
+        );
+        return {
+          adapter: updated,
+          build: {
+            image: donor.image,
+            image_id: donor.builtImageId,
+            commit,
+            duration_ms: 0,
+            log_path: logPath,
+            reused_image: true,
+          },
+        };
+      }
+    }
     const containerfilePath = join(sourceDir, ".agenteval.Containerfile");
     await writeFile(containerfilePath, adapter.containerfile, "utf8");
     const result = await resolveRuntime().buildImage({

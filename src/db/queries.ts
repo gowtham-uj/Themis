@@ -12,7 +12,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { and, eq, desc } from "drizzle-orm";
+import { and, eq, desc, isNotNull } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import type {
   AgentCategory,
@@ -1260,6 +1260,16 @@ export interface QueryStore {
     projectId: string,
     opts?: { includeDisabled?: boolean },
   ): ProjectAgentAdapter[];
+  /**
+   * Find a ready-built adapter (any project, including shared) whose source repo
+   * and resolved commit match exactly, so a freshly-created adapter can reuse an
+   * already-built CLI image instead of rebuilding the same `npm ci && npm run
+   * build` from an unchanged commit. Returns the newest ready match, or null.
+   */
+  findReadyAdapterForSourceCommit(
+    sourceRepo: string,
+    commit: string,
+  ): ProjectAgentAdapter | null;
   updateProjectAgentAdapter(
     id: string,
     patch: UpdateProjectAgentAdapterInput,
@@ -2848,6 +2858,32 @@ export class SqliteQueries implements QueryStore {
       .map(mapProjectAgentAdapter)
       .filter((adapter) => opts.includeDisabled === true || adapter.enabled)
       .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  findReadyAdapterForSourceCommit(
+    sourceRepo: string,
+    commit: string,
+  ): ProjectAgentAdapter | null {
+    const rows = this.db
+      .select()
+      .from(projectAgentAdapters)
+      .where(
+        and(
+          eq(projectAgentAdapters.sourceRepo, sourceRepo),
+          eq(projectAgentAdapters.builtCommit, commit),
+          eq(projectAgentAdapters.buildStatus, "ready"),
+          isNotNull(projectAgentAdapters.builtImageId),
+        ),
+      )
+      .all()
+      .map(mapProjectAgentAdapter)
+      // newest ready build wins, so a re-tag of the same commit is preferred
+      .sort((a, b) =>
+        (b.lastBuiltAt ?? b.createdAt).localeCompare(
+          a.lastBuiltAt ?? a.createdAt,
+        ),
+      );
+    return rows[0] ?? null;
   }
 
   updateProjectAgentAdapter(
@@ -5378,6 +5414,27 @@ export class MemoryQueries implements QueryStore {
       )
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((adapter) => structuredClone(adapter));
+  }
+
+  findReadyAdapterForSourceCommit(
+    sourceRepo: string,
+    commit: string,
+  ): ProjectAgentAdapter | null {
+    const rows = [...this.projectAgentAdapters.values()]
+      .filter(
+        (adapter) =>
+          adapter.sourceRepo === sourceRepo &&
+          adapter.builtCommit === commit &&
+          adapter.buildStatus === "ready" &&
+          adapter.builtImageId !== null,
+      )
+      .sort((a, b) =>
+        (b.lastBuiltAt ?? b.createdAt).localeCompare(
+          a.lastBuiltAt ?? a.createdAt,
+        ),
+      )
+      .map((adapter) => structuredClone(adapter));
+    return rows[0] ?? null;
   }
 
   updateProjectAgentAdapter(

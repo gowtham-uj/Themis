@@ -542,6 +542,14 @@ export class PodmanRuntime implements ContainerRuntime {
     };
   }
 
+  async imageExists(image: string): Promise<boolean> {
+    const res = await runCli(
+      [...this.cmd(), "image", "inspect", image, "--format", "{{.Id}}"],
+      { timeoutMs: 30_000 },
+    );
+    return res.code === 0 && res.stdout.trim().length > 0;
+  }
+
   /**
    * Launch a container for `spec`.
    *
