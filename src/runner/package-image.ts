@@ -25,42 +25,10 @@ export interface BuiltEvalAgentImage {
   stderr: string;
 }
 
-/** Tag of the prebuilt reaper CLI runtime layer overlay stage. */
-export const REAPER_CLI_LAYER = "agenteval/reaper-cli-runtime:latest";
-
-/**
- * One-time build of the reaper CLI runtime layer: a self-contained node
- * runtime (for non-node suite base images) plus the reaper CLI install. This
- * image is used as `COPY --from=...` by every suite agent-image build.
- */
-export async function ensureReaperCliLayer(runtime: ContainerRuntime): Promise<void> {
-  const containerfile = `FROM docker.io/library/node:22-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends bash git sudo procps ca-certificates && rm -rf /var/lib/apt/lists/*
-WORKDIR /opt/reapercode
-COPY reaper-src/ /opt/reapercode/
-RUN npm ci && npm run build && ln -s /opt/reapercode/bin/reaper /usr/local/bin/reaper
-CMD ["reaper", "--help"]
-`;
-  const dir = "/tmp/agenteval-reaper-cli-layer";
-  await rm(dir, { recursive: true, force: true });
-  await mkdir(dir, { recursive: true });
-  await cp("/work/_inspect/reaper", join(dir, "reaper-src"), { recursive: true });
-  await writeFile(join(dir, "Containerfile"), containerfile, "utf8");
-  try {
-    await runtime.buildImage({
-      contextDir: dir,
-      containerfilePath: "Containerfile",
-      image: REAPER_CLI_LAYER,
-      timeoutMs: 15 * 60_000,
-    });
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-}
-
 /**
  * Build the agent image for one suite eval task. The suite's own environment
- * image is built unchanged; a wrapper stage overlays the reaper runtime.
+ * image is built unchanged; a wrapper stage overlays the reaper runtime from
+ * the project's real reaper CLI image.
  */
 export async function buildEvalAgentImage(input: {
   runtime: ContainerRuntime;
@@ -106,16 +74,19 @@ export async function buildEvalAgentImage(input: {
     timeoutMs: config.buildTimeoutMs,
   });
 
-  // Wrapper that overlays the reaper runtime onto the suite env image.
+  // Wrapper that overlays the reaper runtime onto the suite env image. The
+  // `adapterImage` (the project's real reaper CLI image) provides the runtime;
+  // we copy its reaper CLI + node modules onto the suite image so the agent
+  // container has both the task toolchain and reaper.
   const wrapperDir = join(input.buildRoot, `${key}-wrapper`);
   await rm(wrapperDir, { recursive: true, force: true });
   await mkdir(wrapperDir, { recursive: true });
   await writeFile(join(wrapperDir, "Containerfile.agenteval"), [
     `FROM ${suiteEnvImage}`,
     "USER root",
-    "COPY --from=agenteval/reaper-cli-runtime:latest /usr/local/lib/node_modules /usr/local/lib/node_modules",
-    "COPY --from=agenteval/reaper-cli-runtime:latest /usr/local/bin /usr/local/bin",
-    "COPY --from=agenteval/reaper-cli-runtime:latest /opt/reapercode /opt/reapercode",
+    `COPY --from=${input.adapterImage} /usr/local/lib/node_modules /usr/local/lib/node_modules`,
+    `COPY --from=${input.adapterImage} /usr/local/bin /usr/local/bin`,
+    `COPY --from=${input.adapterImage} /opt/reapercode /opt/reapercode`,
     "RUN ln -sf /opt/reapercode/bin/reaper /usr/local/bin/reaper",
     `USER 10001`,
   ].join("\n") + "\n", "utf8");

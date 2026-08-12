@@ -54,11 +54,16 @@ export async function runCanonicalPackageVerifier(input: {
   if (config.verifierCommand.length === 0) {
     throw new Error("canonical eval verifier command is empty");
   }
-  const verifierContext = join(task.packagePath, "tests");
+  // Suite verifier Dockerfiles COPY tests/ from the package root, so the build
+  // context is a package-root copy excluding protected dirs (solution/,
+  // validation/, seed_repo/). Legacy verifiers build from tests/ directly.
+  const verifierContext = config.suite
+    ? await verifierSuiteContext(task.packagePath)
+    : join(task.packagePath, "tests");
   const image = `agenteval/verifier:${task.packageDigest.slice(0, 24)}`;
   const build = await input.runtime.buildImage({
     contextDir: verifierContext,
-    containerfilePath: "Dockerfile",
+    containerfilePath: config.suite ? "tests/Dockerfile" : "Dockerfile",
     image,
     timeoutMs: config.buildTimeoutMs,
   });
@@ -70,8 +75,10 @@ export async function runCanonicalPackageVerifier(input: {
   const handle = await input.runtime.run({
     image,
     workspaceDir: input.workspaceDir,
-    // Suite verifier takes the graded submission path as argv[1].
-    argv: config.suite ? [config.verifierCommand[0]!, AGENT_TASK_WORKSPACE] : config.verifierCommand,
+    // The suite verifier image sets ENTRYPOINT /verifier/test.sh and takes the
+    // graded submission path as its argv[1] (CMD). Legacy verifiers pass the
+    // full command as argv.
+    argv: config.suite ? [AGENT_TASK_WORKSPACE] : config.verifierCommand,
     env: {
       AGENTEVAL_TRIAL_ID: input.runId,
       AGENTEVAL_VERIFIER_RESULTS: "/workspace/.agenteval/verifier-results.json",
@@ -252,6 +259,25 @@ function inferSuiteCheckKind(name: string): string {
   if (name === "public_tests") return "functional";
   if (name === "hidden_contract") return "hidden_test";
   return "test_suite";
+}
+
+import { cp } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+
+/** Build a package-root verifier context excluding solution/validation/seed_repo. */
+async function verifierSuiteContext(packageRoot: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "agenteval-verifier-ctx-"));
+  const { readdir } = await import("node:fs/promises");
+  for (const entry of await readdir(packageRoot)) {
+    if (entry === "solution" || entry === "validation" || entry === "seed_repo") continue;
+    await cp(join(packageRoot, entry), join(dir, entry), {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+    });
+  }
+  return dir;
 }
 
 async function drain(stream: AsyncIterable<Buffer>): Promise<Buffer> {
