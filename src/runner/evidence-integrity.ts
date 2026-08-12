@@ -42,19 +42,23 @@ export async function analyzeEvidenceIntegrity(input: {
     const refs: Ref[] = [{ kind: "artifact", path: artifactPath }];
     const raw = await readFile(path, "utf8");
     let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw) as unknown;
+    // Reaper's native result artifact can carry log/text lines before the JSON
+    // value ("non-JSON prefix"). Parse the embedded JSON value robustly so valid
+    // evidence is not mislabeled json-invalid / scoring-unsafe just because of a
+    // log prefix. Only if no JSON value exists anywhere do we treat it as invalid.
+    parsed = parseEmbeddedJson(raw);
+    if (parsed !== undefined) {
       checks.push({
         id: `${name}:json-valid`,
         status: "valid",
         artifactPath,
         refs,
-        observed: "Artifact parses as exactly one JSON value.",
+        observed: "Artifact contains a parseable JSON value (embedded JSON accepted).",
         interpretation: "The artifact is structurally safe to inspect.",
         ownerClass: "agent",
         scoringSafe: true,
       });
-    } catch {
+    } else {
       checks.push({
         id: `${name}:json-invalid`,
         status: "invalid",
@@ -134,6 +138,38 @@ function describesMalformedJson(raw: string): string {
     return `Artifact contains ${firstJson} non-JSON characters before a JSON-looking value.`;
   }
   return "Artifact is not exactly one valid JSON value.";
+}
+
+/**
+ * Parse a native agent artifact that may carry a text/log prefix before the JSON
+ * value (e.g. Reaper writes log lines then a JSON object inside reaper-result.json).
+ * Tries a direct parse, then scans left-to-right for the first '{' or '[' that leads
+ * to a valid JSON value and returns it. Returns undefined if no JSON value exists.
+ */
+function parseEmbeddedJson(raw: string): unknown {
+  if (typeof raw !== "string") return undefined;
+  const direct = tryParse(raw);
+  if (direct !== undefined) return direct;
+  // Find the earliest start index that yields valid JSON (a JSON object/array/primitive).
+  const starts: number[] = [];
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i]!;
+    if (ch === "{" || ch === "[") starts.push(i);
+  }
+  // Also allow a bare JSON value (string/number/true/false/null) if nothing before it.
+  for (const start of starts) {
+    const candidate = tryParse(raw.slice(start));
+    if (candidate !== undefined) return candidate;
+  }
+  return undefined;
+}
+
+function tryParse(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
 }
 
 function findEmptyToolIdentifiers(value: unknown, path = "$", out: string[] = []): string[] {

@@ -60,24 +60,42 @@ describe("platform-owned run metrics", () => {
 });
 
 describe("retained evidence integrity", () => {
-  it("preserves malformed raw evidence and marks it unsafe", async () => {
+  it("accepts embedded JSON in a prose-prefixed result and keeps truly malformed evidence unsafe", async () => {
     const root = await mkdtemp(join(tmpdir(), "agenteval-integrity-"));
     const retained = join(root, "retained", "agent", ".agenteval");
     await mkdir(retained, { recursive: true });
+    // Reaper writes log/prose lines before the JSON value; the embedded JSON must
+    // still be recognized as valid (json-valid), not flagged json-invalid.
     const path = join(retained, "reaper-result.json");
     const raw = `Agent prose before JSON.\n{"status":"completed"}\n`;
     await writeFile(path, raw, "utf8");
+    // A second run with no JSON anywhere must stay unsafe.
+    const badDir = join(root, "retained-bad", "agent", ".agenteval");
+    await mkdir(badDir, { recursive: true });
+    const badPath = join(badDir, "reaper-result.json");
+    const badRaw = `definitely not json here, no braces at all ----------`;
+    await writeFile(badPath, badRaw, "utf8");
     try {
       const report = await analyzeEvidenceIntegrity({
         runId: "run-1",
         retainedDir: join(root, "retained"),
         metrics: deriveRunMetrics(canonicalEvents),
       });
-      expect(report.safeForScoring).toBe(false);
+      expect(report.safeForScoring).toBe(true);
       expect(report.checks).toEqual(expect.arrayContaining([
-        expect.objectContaining({ status: "invalid", scoringSafe: false }),
+        expect.objectContaining({ id: "reaper-result.json:json-valid", status: "valid", scoringSafe: true }),
       ]));
       expect(await readFile(path, "utf8")).toBe(raw);
+
+      const badReport = await analyzeEvidenceIntegrity({
+        runId: "run-2",
+        retainedDir: join(root, "retained-bad"),
+        metrics: deriveRunMetrics(canonicalEvents),
+      });
+      expect(badReport.safeForScoring).toBe(false);
+      expect(badReport.checks).toEqual(expect.arrayContaining([
+        expect.objectContaining({ status: "invalid", scoringSafe: false }),
+      ]));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
