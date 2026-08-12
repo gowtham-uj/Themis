@@ -34,6 +34,7 @@ import {
   verifyCleanupInContainer,
 } from "./env-provision.js";
 import { restructureSuiteArchive, sealEvalArchive } from "./eval-archive.js";
+import { storeEvalArchive } from "./archive-store.js";
 import { classifyRunFailure } from "./run-failure.js";
 import { analyzeEvidenceIntegrity } from "./evidence-integrity.js";
 import { deriveRunMetrics } from "./metrics.js";
@@ -1178,6 +1179,39 @@ async function executeEval(input: {
       queueId: queue.id,
       batchId: run.batchId,
     });
+    // Central store: copy/record this eval's archive keyed by agent version, project,
+    // queue, and batch so all logs/traces live in one browsable place by which agent
+    // commit ran it. Best-effort; never fails the run.
+    try {
+      const rowRun = queries.getRun(run.id);
+      const rowTask = queries.getTask(task.id);
+      const theProject = queries.getProject(queue.projectId);
+      await storeEvalArchive({
+        dataDir: input.dataDir,
+        sealedArchiveDir: runDir,
+        entry: {
+          projectId: queue.projectId,
+          projectName: theProject?.name ?? null,
+          queueId: queue.id,
+          queueName: queue.name ?? null,
+          batchId: run.batchId,
+          runId: run.id,
+          taskId: task.id,
+          taskName: rowTask?.name ?? null,
+          agentId: rowRun?.agentId ?? null,
+          agentCommit: rowRun?.agentCommit ?? null,
+          agentImage: rowRun?.agentImage ?? null,
+          agentVersion: null,
+          model: queue.model,
+          provider: queue.provider,
+          status: status,
+          reward: null,
+          sealedAt: queries.getEvalArchive(run.id)?.sealedAt ?? null,
+        },
+      });
+    } catch (storeErr) {
+      // best-effort: not fatal
+    }
   } catch (err) {
     archiveError = err instanceof Error ? err.message : String(err);
   }
