@@ -194,6 +194,53 @@ async function buildAdapter(
       // fall through to a real build if ref resolution fails
     }
   }
+  // Cross-adapter reuse for a fresh adapter row (builtCommit null): resolve the
+  // commit WITHOUT a full clone, then reuse an already-built image if one
+  // exists for the same source_repo + commit — either recorded on another
+  // ready adapter row, or simply present in the container backend under this
+  // adapter's own image tag (an image can survive even when no DB row records
+  // it, e.g. across a fresh test DB). This honors "reuse the CLI already built
+  // until the source gets a new commit" even on a brand-new adapter/project.
+  if (!isNpm && adapter.sourceRepo && !adapter.builtImageId) {
+    try {
+      const resolved = await resolveRefCommit(adapter.sourceRepo, adapter.sourceRef ?? null);
+      if (resolved) {
+        const donor = app.queries.findReadyAdapterForSourceCommit(adapter.sourceRepo, resolved);
+        const reuseImage = donor && donor.id !== adapter.id && donor.builtImageId
+          ? await resolveRuntime().imageExists(donor.image)
+            ? { image: donor.image, imageId: donor.builtImageId }
+            : null
+          : null;
+        const reuse = reuseImage ?? (
+          await resolveRuntime().imageExists(adapter.image)
+            ? { image: adapter.image, imageId: null as string | null }
+            : null
+        );
+        if (reuse) {
+          const updated = app.queries.updateProjectAgentAdapter(adapter.id, {
+            buildStatus: "ready",
+            builtImageId: reuse.imageId ?? undefined,
+            builtCommit: resolved,
+            buildLogPath: null,
+            lastBuiltAt: new Date().toISOString(),
+          });
+          return {
+            adapter: updated,
+            build: {
+              image: reuse.image,
+              image_id: reuse.imageId,
+              commit: resolved,
+              duration_ms: 0,
+              reused_image: true,
+              log_path: null,
+            },
+          };
+        }
+      }
+    } catch {
+      // fall through to a real build if ref resolution / image lookup fails
+    }
+  }
 
   const sourceDir = join(
     app.dataDir,
