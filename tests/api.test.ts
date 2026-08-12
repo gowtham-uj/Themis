@@ -261,9 +261,9 @@ describe("REST API (P3c)", () => {
       category_name: string;
       package_digest: string;
     };
-    expect(task.name).toBe("Return 42");
+    expect(task.name).toBe("value-42");
     expect(task.rubric_version).toBe(1);
-    expect(task.category_name).toBe("javascript-bugfix");
+    expect(task.category_name).toBe("simple");
     expect(task.package_digest).toMatch(/^[a-f0-9]{64}$/);
 
     const immutablePatch = await http(

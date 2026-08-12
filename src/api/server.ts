@@ -25,6 +25,8 @@ import {
 } from "../db/queries.js";
 import {
   decodeEvalArchiveFile,
+  detectEvalLayout,
+  splitSuiteTasks,
   type EvalArchiveFormat,
 } from "../evals/archive.js";
 import {
@@ -301,6 +303,20 @@ async function createCanonicalEval(
   project: Project,
   upload: EvalPackageUpload,
 ): Promise<Task> {
+  const map = new Map<string, Buffer>();
+  for (const [path, value] of Object.entries(upload.files)) {
+    const encoded = typeof value === "string" ? { encoding: "utf8" as const, content: value } : value;
+    map.set(path, Buffer.from(encoded.content, encoded.encoding === "base64" ? "base64" : "utf8"));
+  }
+  return createSingleEvalFromFiles(app, project, map);
+}
+
+/** Materialize one eval package from a decoded file map and create its task row. */
+async function createSingleEvalFromFiles(
+  app: AppCtx,
+  project: Project,
+  files: Map<string, Buffer>,
+): Promise<Task> {
   const id = randomUUID();
   const packagePath = join(
     app.dataDir,
@@ -310,7 +326,14 @@ async function createCanonicalEval(
     id,
     "package",
   );
-  const materialized = await materializeEvalPackage({ upload, destination: packagePath });
+  const uploadFiles: EvalPackageUpload["files"] = {};
+  for (const [path, content] of files) {
+    uploadFiles[path] = { encoding: "base64", content: content.toString("base64") };
+  }
+  const materialized = await materializeEvalPackage({
+    upload: { files: uploadFiles },
+    destination: packagePath,
+  });
   try {
     return app.queries.createTask(project.id, materialized.taskSpec, {
       id,
@@ -324,6 +347,20 @@ async function createCanonicalEval(
     await rm(join(packagePath, ".."), { recursive: true, force: true });
     throw err;
   }
+}
+
+/** Materialize each task in a decoded suite into its own eval row. */
+async function createSuiteEvals(
+  app: AppCtx,
+  project: Project,
+  decoded: Map<string, Buffer>,
+): Promise<Task[]> {
+  const byTask = splitSuiteTasks(decoded);
+  const created: Task[] = [];
+  for (const [, taskFiles] of byTask) {
+    created.push(await createSingleEvalFromFiles(app, project, taskFiles));
+  }
+  return created;
 }
 
 async function readBinaryBody(
@@ -937,9 +974,22 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     await mkdir(quarantineDir, { recursive: true });
     await writeFile(archivePath, archive);
     try {
-      const upload = await decodeEvalArchiveFile(archivePath, format);
-      const created = await createCanonicalEval(app, project, upload);
-      sendJson(res, 201, taskJson(created));
+      const decodedUpload = await decodeEvalArchiveFile(archivePath, format);
+      const decoded = new Map<string, Buffer>();
+      for (const [path, value] of Object.entries(decodedUpload.files)) {
+        const encoded = typeof value === "string" ? { encoding: "utf8" as const, content: value } : value;
+        decoded.set(path, Buffer.from(encoded.content, encoded.encoding === "base64" ? "base64" : "utf8"));
+      }
+      if (detectEvalLayout(decoded) === "suite") {
+        const tasks = await createSuiteEvals(app, project, decoded);
+        sendJson(res, 201, {
+          count: tasks.length,
+          tasks: tasks.map(taskJson),
+        });
+      } else {
+        const created = await createSingleEvalFromFiles(app, project, decoded);
+        sendJson(res, 201, taskJson(created));
+      }
     } catch (err) {
       throw badRequest(err instanceof Error ? err.message : String(err));
     } finally {

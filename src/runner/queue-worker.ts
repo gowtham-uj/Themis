@@ -14,6 +14,7 @@ import type {
   Task,
 } from "../db/queries.js";
 import {
+  AGENT_TASK_SUBDIR,
   evalEnvironmentDigest,
   loadEvalPackageRuntimeConfig,
   prepareEvalPackageWorkspace,
@@ -697,8 +698,12 @@ async function executeEval(input: {
     manifest: task.packageManifest,
     workspaceDir,
   });
-  let workspaceCommit: string | undefined = await commitWorkspaceBaseline(workspaceDir);
+  // The git baseline is committed at the graded root: workspaceDir for legacy,
+  // workspaceDir/task (the suite's seed_repo home) for suite tasks, so diff
+  // capture reports only the agent's changes to the task files.
   const packageRuntime = entry.packageRuntime;
+  const gitBaselineRoot = packageRuntime.suite ? join(workspaceDir, AGENT_TASK_SUBDIR) : workspaceDir;
+  let workspaceCommit: string | undefined = await commitWorkspaceBaseline(gitBaselineRoot);
 
   const project = queries.getProject(queue.projectId);
   if (!project) throw new Error(`project not found: ${queue.projectId}`);
@@ -780,7 +785,11 @@ async function executeEval(input: {
   let agentStarted = false;
 
   try {
-    if (packageRuntime.setupPath) {
+    // Suite tasks are seeded on the host (prepareEvalPackageWorkspace copies
+    // seed_repo -> workspaceDir/task, mounted at /workspace/task) and the git
+    // baseline is committed at the workspace root; the suite setup.sh would
+    // re-seed from a path that does not exist in the container, so skip it.
+    if (packageRuntime.setupPath && !packageRuntime.suite) {
       const setup = await handle.exec({
         argv: ["/bin/bash", packageRuntime.setupPath],
         cwd: "/workspace",
@@ -910,7 +919,13 @@ async function executeEval(input: {
   }
 
   try {
-    const diff = await captureDiffByCategory(task.agentCategory, workspaceDir, {
+    // Suite tasks work inside the graded workspaceDir/task subdirectory; diff
+    // capture runs there so patch paths are repo-relative. Legacy tasks diff
+    // the workspace root.
+    const diffRoot = entry.packageRuntime.suite
+      ? join(workspaceDir, AGENT_TASK_SUBDIR)
+      : workspaceDir;
+    const diff = await captureDiffByCategory(task.agentCategory, diffRoot, {
       outPath:
         task.agentCategory === "coding" || task.agentCategory === "general"
           ? join(runDir, "diff.patch")
@@ -978,7 +993,7 @@ async function executeEval(input: {
     durationMs: 0,
     error: null as string | null,
   };
-  if (packageRuntime.cleanupPath) {
+  if (packageRuntime.cleanupPath && !packageRuntime.suite) {
     try {
       await restoreEvalLifecycleScript({
         packagePath: task.packagePath,

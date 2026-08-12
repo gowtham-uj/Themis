@@ -189,6 +189,42 @@ function assertSafeArchivePath(path: string): void {
   }
 }
 
+export type EvalLayout = "suite" | "single";
+
+/** Detect whether a decoded file map is a multi-task suite or a single eval. */
+export function detectEvalLayout(files: Map<string, Buffer>): EvalLayout {
+  for (const path of files.keys()) {
+    if (path === "tasks" || path.startsWith("tasks/")) return "suite";
+  }
+  return "single";
+}
+
+/**
+ * Partition a decoded suite file map into one normalized package per task.
+ * Suite archives place each task under `tasks/<task>/...`; top-level suite
+ * files (manifest.json, suite.py, README.md, TELEMETRY.md) are not per-task
+ * and are skipped. Returns Map<taskKey, files> where taskKey is the task dir name.
+ */
+export function splitSuiteTasks(files: Map<string, Buffer>): Map<string, Map<string, Buffer>> {
+  const byTask = new Map<string, Map<string, Buffer>>();
+  for (const [path, content] of files) {
+    if (!path.startsWith("tasks/")) continue;
+    const rest = path.slice("tasks/".length);
+    const slash = rest.indexOf("/");
+    if (slash <= 0) continue; // "tasks/<name>" bare dir marker
+    const taskKey = rest.slice(0, slash);
+    const inner = rest.slice(slash + 1);
+    let map = byTask.get(taskKey);
+    if (!map) {
+      map = new Map();
+      byTask.set(taskKey, map);
+    }
+    map.set(inner, content);
+  }
+  if (byTask.size === 0) throw new Error("suite archive contains no tasks under tasks/");
+  return byTask;
+}
+
 function normalizeSingleRoot(entries: Map<string, Buffer>): Map<string, Buffer> {
   const names = [...entries.keys()].filter(Boolean);
   if (names.length === 0) throw new Error("eval archive contains no files");

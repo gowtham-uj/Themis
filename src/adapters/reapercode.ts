@@ -684,7 +684,7 @@ export function buildReaperCommand(ctx: RunContext): AdapterCommand {
     "--prompt",
     ctx.task.prompt,
     "--workspace",
-    "/workspace",
+    "/workspace/task",
     "--provider",
     ctx.provider,
     "--model",
@@ -748,9 +748,11 @@ export const reaperCodeAdapter: Adapter = {
   },
   command: buildReaperCommand,
   evidence() {
+    // Reaper runs with --workspace /workspace/task, so its native evidence
+    // lands under task/.reaper inside the graded subdirectory.
     return {
-      paths: [".reaper"],
-      requiredPaths: [".reaper/runs"],
+      paths: ["task/.reaper"],
+      requiredPaths: ["task/.reaper/runs"],
     };
   },
   parse(streams, ctx) {

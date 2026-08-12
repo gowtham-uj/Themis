@@ -1,4 +1,9 @@
-/** Canonical Terminal-Bench/Harbor-style eval package ingest and validation. */
+/**
+ * Eval package ingest and validation for the suite format: flat task.toml,
+ * seed_repo workspace, environment/{setup,cleanup,healthcheck}, a separate
+ * verifier, and validation material. Legacy canonical packages are still
+ * readable/runnable but new evals must use this suite layout.
+ */
 
 import { createHash } from "node:crypto";
 import { chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
@@ -61,6 +66,8 @@ export interface EvalPackageRuntimeConfig {
   agentEnv: Record<string, string>;
   verifierChecks: EvalPackageVerifierCheck[];
   verifierCheckIds: string[];
+  /** True for suite-format tasks; the agent workspace is /workspace/task. */
+  suite?: boolean;
 }
 
 export interface MaterializedEvalPackage {
@@ -165,16 +172,20 @@ export function evalPackageRuntimeConfig(
       agentEnv[key] = String(value);
     }
   }
-  const setup = text(lifecycle.setup);
-  const cleanup = text(lifecycle.cleanup);
+  const suite = isRecord(config.suite);
+  // Suite tasks always run their own environment/setup.sh + cleanup.sh (argv
+  // default /workspace/task). Non-suite (legacy canonical) tasks use the
+  // [lifecycle] table when present.
+  const setup = suite ? "environment/setup.sh" : text(lifecycle.setup);
+  const cleanup = suite ? "environment/cleanup.sh" : text(lifecycle.cleanup);
   const verifierChecks = arrayOfTables(verifier.checks)
     .map((entry) => ({ id: text(entry.id), kind: text(entry.kind) }))
     .filter((entry): entry is EvalPackageVerifierCheck => entry.id !== null && entry.kind !== null);
   return {
     setupPath: setup ? runtimeEnvironmentPath(setup) : null,
     cleanupPath: cleanup ? runtimeEnvironmentPath(cleanup) : null,
-    setupTimeoutMs: Math.trunc(Number(lifecycle.setup_timeout_seconds ?? timeouts.build_seconds ?? 300) * 1000),
-    cleanupTimeoutMs: Math.trunc(Number(lifecycle.cleanup_timeout_seconds ?? 120) * 1000),
+    setupTimeoutMs: Math.trunc(Number(suite ? (config.suite as { agent_timeout_seconds?: unknown }).agent_timeout_seconds ?? 300 : lifecycle.setup_timeout_seconds ?? timeouts.build_seconds ?? 300) * 1000),
+    cleanupTimeoutMs: Math.trunc(Number(suite ? 120 : lifecycle.cleanup_timeout_seconds ?? 120) * 1000),
     agentTimeoutMs: Math.trunc(Number(timeouts.agent_seconds ?? 120) * 1000),
     verifierCommand: stringArray(verifier.command),
     verifierTimeoutMs: Math.trunc(Number(timeouts.verifier_seconds ?? 300) * 1000),
@@ -188,6 +199,7 @@ export function evalPackageRuntimeConfig(
     agentEnv,
     verifierChecks,
     verifierCheckIds: verifierChecks.map((entry) => entry.id),
+    suite,
   };
 }
 
@@ -201,7 +213,52 @@ export async function loadEvalPackageRuntimeConfig(input: {
   const raw = await readFile(join(input.packagePath, "task.toml"), "utf8");
   const parsed = parseToml(raw) as unknown;
   if (!isRecord(parsed)) throw new Error("stored eval package task.toml root must be a table");
+  // Suite-format task.toml is flat; wrap the flat keys into runtime tables.
+  if (text(parsed.id) !== null && typeof parsed.agent_timeout_seconds === "number") {
+    return evalPackageRuntimeConfig(wrapSuiteConfig(parsed));
+  }
   return evalPackageRuntimeConfig(parsed);
+}
+
+/** Wrap flat suite task.toml keys into the internal runtime-config tables. */
+function wrapSuiteConfig(flat: Record<string, unknown>): Record<string, unknown> {
+  const taskId = text(flat.id);
+  const taskVersion = scalarText(flat.version);
+  const name = text(flat.name);
+  const primaryCapability = text(flat.primary_capability);
+  const language = text(flat.language);
+  const agentTimeout = Number(flat.agent_timeout_seconds);
+  const verifierTimeout = Number(flat.verifier_timeout_seconds);
+  const cpuCores = Number(flat.cpu_cores);
+  const memoryMb = Number(flat.memory_mb);
+  const internet = text(flat.internet) ?? "disabled";
+  const networkPolicy = internet === "disabled" ? "offline" : internet === "allow" ? "allow" : internet;
+  return {
+    suite: { id: taskId, version: taskVersion, name, primary_capability: primaryCapability },
+    task: { id: taskId, version: taskVersion, name, category: "simple",
+      language, tags: [primaryCapability, language].filter((entry): entry is string => Boolean(entry)),
+      profile: "bugfix", agent_category: "coding" },
+    timeouts: {
+      agent_seconds: Math.trunc(agentTimeout),
+      verifier_seconds: Math.trunc(verifierTimeout),
+      build_seconds: Math.trunc(verifierTimeout * 2 + 300),
+    },
+    resources: {
+      cpu: Math.trunc(cpuCores),
+      ram_mb: Math.trunc(memoryMb),
+      disk_mb: Math.trunc(Number(flat.disk_mb)),
+      gpu: 0,
+    },
+    network: { policy: networkPolicy, allowlist: [], allow: networkPolicy === "allow" },
+    agent_env: {},
+    lifecycle: {},
+    verifier: {
+      separate: true,
+      dockerfile: "tests/Dockerfile",
+      command: ["/verifier/test.sh"],
+      checks: [],
+    },
+  };
 }
 
 /** Verify every stored package file against its immutable manifest and digest. */
@@ -267,7 +324,12 @@ export async function restoreEvalLifecycleScript(input: {
   await chmod(target, 0o755);
 }
 
-/** Copy only agent-visible package inputs into a fresh workspace. */
+/**
+ * Copy only agent-visible package inputs into the host workspace at
+ * `workspaceDir/task` (the suite's graded subdirectory). The git baseline is
+ * committed at `workspaceDir` so diff capture stays truthful; `solution/`,
+ * `tests/`, and `validation/` never reach the agent workspace.
+ */
 export async function prepareEvalPackageWorkspace(input: {
   packagePath: string;
   packageDigest: string;
@@ -275,29 +337,32 @@ export async function prepareEvalPackageWorkspace(input: {
   workspaceDir: string;
 }): Promise<void> {
   await verifyMaterializedEvalPackage(input);
-  const repo = join(input.packagePath, "environment", "repo");
-  const entries = await readdir(repo);
-  if (entries.length === 0) throw new Error("canonical eval environment/repo is empty");
+  const taskRoot = join(input.workspaceDir, AGENT_TASK_SUBDIR);
+  await mkdir(taskRoot, { recursive: true });
+  const repo = join(input.packagePath, "seed_repo");
+  const entries = await readdir(repo).catch(() => []);
+  if (entries.length === 0) throw new Error("eval package seed_repo is empty");
   for (const name of entries) {
-    await cp(join(repo, name), join(input.workspaceDir, name), {
+    await cp(join(repo, name), join(taskRoot, name), {
       recursive: true,
       force: false,
       errorOnExist: true,
     });
   }
+  // Copy the trusted environment scripts under workspaceDir/.agenteval/environment
+  // so cleanup can be restored from the trusted package after agent execution.
   const runtimeDir = join(input.workspaceDir, ".agenteval", "environment");
   await mkdir(runtimeDir, { recursive: true });
   for (const name of await readdir(join(input.packagePath, "environment"))) {
-    if (name === "repo") continue;
     await cp(join(input.packagePath, "environment", name), join(runtimeDir, name), {
       recursive: true,
       force: false,
       errorOnExist: true,
     });
   }
-  for (const protectedName of ["solution", "validation"]) {
+  for (const protectedName of ["solution", "tests", "validation"]) {
     try {
-      await lstat(join(input.workspaceDir, protectedName));
+      await lstat(join(taskRoot, protectedName));
       throw new Error(`protected eval content leaked into agent workspace: ${protectedName}`);
     } catch (err) {
       if (isNotFound(err)) continue;
@@ -306,7 +371,20 @@ export async function prepareEvalPackageWorkspace(input: {
   }
 }
 
-/** Validate package structure, task metadata, alignment, and isolation in memory. */
+/** AGENT_TASK_SUBDIR — where the suite's seed_repo lives inside the workspace. */
+export const AGENT_TASK_SUBDIR = "task";
+
+/**
+ * The suite-format agent workspace root inside the container. `seed_repo`
+ * lands here; the separate verifier grades this path.
+ */
+export const AGENT_TASK_WORKSPACE = "/workspace/task";
+
+/**
+ * Validate a suite-style eval task: flat task.toml, seed_repo workspace,
+ * environment/self-contained Dockerfile, tests/verifier.py, solution/,
+ * validation/. Builds internal `config` tables from the flat keys.
+ */
 export function inspectEvalPackage(files: Map<string, Buffer>): {
   validation: EvalPackageValidation;
   taskSpec: TaskSpec;
@@ -314,194 +392,172 @@ export function inspectEvalPackage(files: Map<string, Buffer>): {
 } {
   const errors: string[] = [];
   const warnings: string[] = [];
+
   for (const required of [
     "instruction.md",
     "task.toml",
     "README.md",
     "environment/Dockerfile",
-    "environment/entrypoint.sh",
+    "environment/setup.sh",
+    "environment/cleanup.sh",
     "environment/healthcheck.sh",
     "tests/Dockerfile",
     "tests/test.sh",
-    "validation/expected_results.json",
-    "validation/flake_report.json",
+    "tests/verifier.py",
+    "solution/solve.sh",
+    "solution/reference.patch",
+    "validation/expected.json",
+    "validation/known_bad.patch",
   ]) {
     if (!files.has(required)) errors.push(`missing required file ${required}`);
   }
-  requirePrefix(files, "environment/repo/", errors);
-  requirePrefix(files, "solution/", errors);
+  requirePrefix(files, "seed_repo/", errors);
+  requirePrefix(files, "solution/reference_files/", errors);
   requirePrefix(files, "tests/", errors);
-  requirePrefix(files, "validation/known_bad_patches/", errors);
+  requirePrefix(files, "validation/known_bad/", errors);
   validateNoGeneratedArtifacts(files, errors);
-  if (!files.has("solution/solve.sh") && !files.has("solution/reference.patch")) {
-    errors.push("solution/ requires solve.sh or reference.patch");
-  }
 
-  let config: Record<string, unknown> = {};
+  let flat: Record<string, unknown> = {};
   const taskToml = files.get("task.toml");
   if (taskToml) {
     try {
       const parsed = parseToml(taskToml.toString("utf8")) as unknown;
       if (!isRecord(parsed)) errors.push("task.toml root must be a table");
-      else config = parsed;
+      else flat = parsed;
     } catch (err) {
       errors.push(`task.toml is invalid: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  const task = table(config.task);
-  const lifecycle = table(config.lifecycle);
-  const timeouts = table(config.timeouts);
-  const resources = table(config.resources);
-  const network = table(config.network);
-  const artifacts = table(config.artifacts);
-  const verifier = table(config.verifier);
-  const explanations = table(config.explanations);
-  const digests = table(config.digests);
-  const taskId = text(task.id);
-  const taskVersion = scalarText(task.version);
-  const category = text(task.category);
-  const language = text(task.language);
-  if (!taskId) errors.push("task.toml [task].id is required");
-  if (!taskVersion) errors.push("task.toml [task].version is required");
-  if (!text(task.name)) errors.push("task.toml [task].name is required");
-  if (!category) errors.push("task.toml [task].category is required");
-  if (!language) errors.push("task.toml [task].language is required");
-  if (!stringArray(task.tags).length) errors.push("task.toml [task].tags must be non-empty");
-  for (const [section, key] of [
-    [timeouts, "agent_seconds"], [timeouts, "verifier_seconds"], [timeouts, "build_seconds"],
-    [resources, "cpu"], [resources, "ram_mb"], [resources, "disk_mb"],
-  ] as const) {
-    if (!positiveNumber(section[key])) errors.push(`task.toml missing positive ${key}`);
-  }
-  if (typeof resources.gpu !== "number" || !Number.isFinite(resources.gpu) || resources.gpu < 0) {
-    errors.push("task.toml [resources].gpu must be a non-negative number");
-  }
-  if (!text(network.policy) || !["allow", "allowlist", "offline"].includes(String(network.policy))) {
-    errors.push("task.toml [network].policy must be allow|allowlist|offline");
-  } else if (network.policy === "allowlist" && stringArray(network.allowlist).length === 0) {
-    errors.push("task.toml [network].allowlist must be non-empty when policy=allowlist");
-  }
-  if (!stringArray(artifacts.allowlist).length) errors.push("task.toml [artifacts].allowlist must be non-empty");
-  if (verifier.separate !== true) errors.push("task.toml [verifier].separate must be true");
-  if (text(verifier.dockerfile) !== "tests/Dockerfile") {
-    errors.push("task.toml [verifier].dockerfile must be tests/Dockerfile");
-  }
-  if (!stringArray(verifier.command).length) errors.push("task.toml [verifier].command must be argv[]");
-  for (const lifecycleKey of ["setup", "cleanup"] as const) {
-    const scriptPath = text(lifecycle[lifecycleKey]);
-    if (!scriptPath) continue;
-    let normalized: string;
-    try {
-      normalized = normalizePackagePath(scriptPath);
-    } catch (err) {
-      errors.push(err instanceof Error ? err.message : String(err));
-      continue;
-    }
-    if (!normalized.startsWith("environment/")) {
-      errors.push(`[lifecycle].${lifecycleKey} must point under environment/`);
-      continue;
-    }
-    const script = files.get(normalized)?.toString("utf8");
-    if (!script) errors.push(`missing lifecycle script ${normalized}`);
-    else if (!/set\s+-[^\n]*e[^\n]*u[^\n]*o\s+pipefail/.test(script)) {
-      errors.push(`${normalized} must be fail-fast with set -euo pipefail`);
-    }
-  }
-  for (const key of ["difficulty", "reference_solution", "verification"] as const) {
-    if (!text(explanations[key])) errors.push(`task.toml [explanations].${key} is required`);
-  }
-  if (!positiveNumber(explanations.expert_minutes)) {
-    errors.push("task.toml [explanations].expert_minutes must be positive");
-  }
-  for (const key of ["environment", "verifier", "dependencies"] as const) {
-    if (!text(digests[key])) errors.push(`task.toml [digests].${key} is required`);
-  }
+  // ---- flat suite keys ----
+  const taskId = text(flat.id);
+  const taskVersion = scalarText(flat.version);
+  const name = text(flat.name);
+  const suiteCategory = text(flat.category);
+  const primaryCapability = text(flat.primary_capability);
+  const language = text(flat.language);
+  const difficulty = text(flat.difficulty) ?? "easy";
+  const internet = text(flat.internet) ?? "disabled";
+  const agentTimeout = Number(flat.agent_timeout_seconds);
+  const verifierTimeout = Number(flat.verifier_timeout_seconds);
+  const cpuCores = Number(flat.cpu_cores);
+  const memoryMb = Number(flat.memory_mb);
+  const diskMb = Number(flat.disk_mb);
+  const officialReward = text(flat.official_reward) ?? "binary";
+  const publicTestCommand = text(flat.public_test_command);
 
-  const requirements = arrayOfTables(config.requirements);
-  const verifierChecks = arrayOfTables(verifier.checks);
-  const requirementIds = requirements.map((entry) => text(entry.id)).filter(isString);
-  const verifierCheckIds = verifierChecks.map((entry) => text(entry.id)).filter(isString);
-  if (requirements.length === 0) errors.push("task.toml requires [[requirements]] entries");
-  if (verifierChecks.length === 0) errors.push("task.toml [verifier].checks must list verifier checks");
-  rejectDuplicates(requirementIds, "requirement id", errors);
-  rejectDuplicates(verifierCheckIds, "verifier check id", errors);
-  verifierChecks.forEach((check, index) => {
-    if (!text(check.id)) errors.push(`verifier.checks[${index}].id is required`);
-    if (!text(check.kind)) errors.push(`verifier.checks[${index}].kind is required`);
-  });
-  const referencedChecks = new Set<string>();
-  requirements.forEach((requirement, index) => {
-    const id = text(requirement.id);
-    const statement = text(requirement.text);
-    const checks = stringArray(requirement.checks);
-    if (!id) errors.push(`requirements[${index}].id is required`);
-    if (!statement) errors.push(`requirements[${index}].text is required`);
-    if (!checks.length) errors.push(`requirements[${index}].checks must be non-empty`);
-    checks.forEach((check) => referencedChecks.add(check));
-  });
-  for (const checkId of verifierCheckIds) {
-    if (!referencedChecks.has(checkId)) errors.push(`verifier check ${checkId} has no instruction requirement`);
+  if (!taskId) errors.push("task.toml id is required");
+  if (!taskVersion) errors.push("task.toml version is required");
+  if (!name) errors.push("task.toml name is required");
+  if (!text(flat.runtime)) errors.push("task.toml runtime is required");
+  if (officialReward !== "binary") errors.push("task.toml official_reward must be 'binary'");
+  if (!positiveNumber(agentTimeout)) errors.push("task.toml agent_timeout_seconds must be positive");
+  if (!positiveNumber(verifierTimeout)) errors.push("task.toml verifier_timeout_seconds must be positive");
+  if (!positiveNumber(cpuCores)) errors.push("task.toml cpu_cores must be positive");
+  if (!positiveNumber(memoryMb)) errors.push("task.toml memory_mb must be positive");
+  if (!positiveNumber(diskMb)) errors.push("task.toml disk_mb must be positive");
+  if (!["allow", "allowlist", "offline", "disabled"].includes(String(internet))) {
+    errors.push("task.toml internet must be allow|allowlist|offline|disabled");
   }
-  for (const checkId of referencedChecks) {
-    if (!verifierCheckIds.includes(checkId)) errors.push(`instruction requirement references unknown verifier check ${checkId}`);
-  }
+  const networkPolicy = internet === "disabled" ? "offline" : internet === "allow" ? "allow" : internet;
+  if (!publicTestCommand) errors.push("task.toml public_test_command is required");
 
-  const agentEnv = table(config.agent_env);
-  for (const key of Object.keys(agentEnv)) {
-    if (/solution|answer|oracle|grader|verifier|hidden|test/i.test(key)) {
-      errors.push(`agent-visible environment variable name leaks protected grading intent: ${key}`);
-    }
-  }
+  // ---- wrap flat keys into the internal config tables the runtime reads ----
+  const config: Record<string, unknown> = {
+    task: {
+      id: taskId,
+      version: taskVersion,
+      name,
+      category: "simple",
+      language,
+      tags: [primaryCapability, language].filter((entry): entry is string => Boolean(entry)),
+      profile: "bugfix",
+      agent_category: "coding",
+    },
+    timeouts: {
+      agent_seconds: Math.trunc(agentTimeout),
+      verifier_seconds: Math.trunc(verifierTimeout),
+      build_seconds: Math.trunc(verifierTimeout * 2 + 300),
+    },
+    resources: {
+      cpu: Math.trunc(cpuCores),
+      ram_mb: Math.trunc(memoryMb),
+      disk_mb: Math.trunc(diskMb),
+      gpu: 0,
+    },
+    network: { policy: networkPolicy, allowlist: [], allow: networkPolicy === "allow" },
+    agent_env: {},
+    lifecycle: {},
+    verifier: {
+      separate: true,
+      dockerfile: "tests/Dockerfile",
+      command: ["/verifier/test.sh"],
+      checks: [],
+    },
+    // Informational suite metadata surfaced to the validator/API.
+    suite: {
+      id: taskId,
+      version: taskVersion,
+      name,
+      category: suiteCategory,
+      primary_capability: primaryCapability,
+      language,
+      runtime: text(flat.runtime),
+      difficulty,
+      official_reward: officialReward,
+      internet,
+      public_test_command: publicTestCommand,
+      agent_timeout_seconds: Math.trunc(agentTimeout),
+      verifier_timeout_seconds: Math.trunc(verifierTimeout),
+    },
+  };
+
   validateProtectedContentIsolation(files, errors);
-  validateJson(files, "validation/expected_results.json", errors);
-  validateJson(files, "validation/flake_report.json", errors);
+  validateJson(files, "validation/expected.json", errors);
   validateDockerfile(files.get("environment/Dockerfile"), "environment/Dockerfile", errors);
-  if (
-    files.has("environment/Dockerfile") &&
-    !/^\s*FROM\s+\$\{?AGENTEVAL_AGENT_IMAGE\}?(?:\s|$)/im.test(
-      files.get("environment/Dockerfile")!.toString("utf8"),
-    )
-  ) {
-    errors.push(
-      "environment/Dockerfile must inherit from FROM ${AGENTEVAL_AGENT_IMAGE}; the platform injects the selected adapter image without exposing grading content",
-    );
-  }
   validateDockerfile(files.get("tests/Dockerfile"), "tests/Dockerfile", errors);
+  for (const scriptName of ["setup.sh", "cleanup.sh", "healthcheck.sh"]) {
+    const script = files.get(`environment/${scriptName}`)?.toString("utf8") ?? "";
+    if (!/set\s+-[^\n]*e[^\n]*u[^\n]*o\s+pipefail/.test(script)) {
+      errors.push(`environment/${scriptName} must be fail-fast with set -euo pipefail`);
+    }
+  }
+  // The suite Dockerfile must COPY only agent-visible inputs (seed_repo,
+  // instruction.md) and never reach solution/tests/validation.
+  const envDocker = files.get("environment/Dockerfile")?.toString("utf8") ?? "";
+  if (/(solution|tests|validation|verifier\.py|reference)/.test(envDocker)) {
+    errors.push("environment/Dockerfile must not copy solution/, tests/, validation/, or grading content");
+  }
 
   const instruction = files.get("instruction.md")?.toString("utf8").trim() ?? "";
   if (!instruction) errors.push("instruction.md must be non-empty");
-  else if (!instruction.includes("/workspace/")) {
-    errors.push("instruction.md must identify enforced repository paths under /workspace/");
+  else if (instruction.includes("solution/") || instruction.includes("tests/") || instruction.includes("validation/")) {
+    errors.push("instruction.md must not reference hidden solution/tests/validation content");
   }
-  const criteria = requirements.map((requirement, index) => {
-    const statement = text(requirement.text) ?? `Requirement ${index + 1}`;
-    return {
-      id: text(requirement.id) ?? `A${index + 1}`,
-      axis: "A" as RubricAxis,
-      label: statement.slice(0, 120),
-      weight: requirements.length > 0 ? 1 / requirements.length : 1,
-      critical: requirement.critical !== false,
-      appliesTo: "coding" as const,
-      anchors: {
-        full: `The isolated verifier confirms: ${statement}`,
-        partial: `Some but not all verifier checks for this requirement pass: ${statement}`,
-        none: `The verifier does not confirm: ${statement}`,
-      },
-    };
-  });
-  const profile = validProfile(text(task.profile)) ?? "general";
-  const agentCategory = validAgentCategory(text(task.agent_category)) ?? "coding";
+
+  const criteria: TaskSpec["rubric"]["criteria"] = [{
+    id: "A1",
+    axis: "A",
+    label: `Complete ${name ?? taskId} to the spec in the instruction`,
+    weight: 1,
+    critical: true,
+    appliesTo: "coding",
+    anchors: {
+      full: "The isolated verifier confirms the expected behavior.",
+      partial: "Some verifier checks pass.",
+      none: "The verifier does not confirm the expected behavior.",
+    },
+  }];
   const taskSpec: TaskSpec = {
     id: taskId ?? undefined,
-    name: text(task.name) ?? taskId ?? "invalid-eval",
+    name: name ?? taskId ?? "invalid-eval",
     prompt: instruction,
     workspace: { source: "empty" },
-    rubric: { criteria, profile, version: numericVersion(task.version) },
-    tags: stringArray(task.tags),
-    profile,
-    agentCategory,
-    ...(category ? { categoryName: category } : {}),
+    rubric: { criteria, profile: "bugfix", version: numericVersion(taskVersion) },
+    tags: [primaryCapability, language].filter((entry): entry is string => Boolean(entry)),
+    profile: "bugfix",
+    agentCategory: "coding",
+    categoryName: "simple",
   };
 
   const validation: EvalPackageValidation = {
@@ -511,15 +567,29 @@ export function inspectEvalPackage(files: Map<string, Buffer>): {
     warnings,
     taskId,
     taskVersion,
-    category,
-    language,
-    verifierCheckIds,
-    requirementIds,
+    category: "simple",
+    language: language ?? null,
+    verifierCheckIds: [],
+    requirementIds: [],
     protectedPaths: ["solution/", "tests/", "validation/"],
     agentBuildContext: "environment/",
     verifierBuildContext: "tests/",
   };
   return { validation, taskSpec, config };
+}
+
+/** True when the task uses the suite flat format (id at root, no [task] table). */
+export function isSuiteTask(config: Record<string, unknown>): boolean {
+  return isRecord(config.suite) && text(config.suite.id) !== null;
+}
+
+/** Resolve the agent-visible build context files (exclude solution/tests/validation). */
+export function agentBuildContextPaths(files: Map<string, Buffer>): string[] {
+  return [...files.keys()].filter((path) =>
+    path === "instruction.md" ||
+    path.startsWith("environment/") ||
+    path.startsWith("seed_repo/") ||
+    path === "README.md");
 }
 
 /** Decode and path-normalize API package file uploads. */
@@ -586,14 +656,19 @@ function validateProtectedContentIsolation(files: Map<string, Buffer>, errors: s
       protectedHashes.add(sha256(content));
     }
   }
+  // The agent-visible repository ("seed_repo") may not nest or duplicate
+  // protected grading content: package-level solution/, validation/, the
+  // hidden verifier (tests/verifier.py, tests/Dockerfile), known_bad, expected,
+  // or reference material. A public tests/ subdir inside seed_repo is normal
+  // agent-visible source and is allowed.
   for (const [path, content] of files) {
-    if (!path.startsWith("environment/repo/")) continue;
-    const relative = path.slice("environment/repo/".length);
+    if (!path.startsWith("seed_repo/")) continue;
+    const relative = path.slice("seed_repo/".length);
     if (
       /(^|\/)(solution|validation|\.agenteval)(\/|$)/i.test(relative) ||
       /(^|\/)tests\/(oracle|hidden|private)(\/|$)/i.test(relative) ||
-      /(^|\/)(reference\.patch|solve\.sh|expected_results\.json|flake_report\.json)(\/|$)/i.test(relative) ||
-      /(^|\/)known_bad_patches(\/|$)/i.test(relative)
+      /(^|\/)tests\/(Dockerfile|verifier\.py)(\/|$)/i.test(relative) ||
+      /(^|\/)(reference\.patch|solve\.sh|expected\.json|known_bad)(\/|$)/i.test(relative)
     ) {
       errors.push(`protected grading content is nested in the agent repository: ${path}`);
       continue;

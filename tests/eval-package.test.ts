@@ -28,7 +28,9 @@ describe("canonical eval packages", () => {
         destination,
       });
       expect(result.validation.valid).toBe(true);
-      expect(result.validation.category).toBe("javascript-bugfix");
+      expect(result.validation.category).toBe("simple");
+      expect(result.taskSpec.categoryName).toBe("simple");
+      expect(result.taskSpec.agentCategory).toBe("coding");
       expect(result.packageDigest).toMatch(/^[a-f0-9]{64}$/);
       await verifyMaterializedEvalPackage({
         packagePath: result.packagePath,
@@ -41,17 +43,17 @@ describe("canonical eval packages", () => {
         manifest: result.manifest as unknown as Record<string, unknown>,
         workspaceDir: workspace,
       });
-      expect(await readFile(join(workspace, "src/value.js"), "utf8")).toContain("41");
-      await expect(readFile(join(workspace, "solution/solve.sh"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-      await expect(readFile(join(workspace, "tests/test.sh"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-      await expect(readFile(join(workspace, "validation/expected_results.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-      expect(await readFile(join(workspace, ".agenteval/environment/healthcheck.sh"), "utf8")).toContain("node --version");
+      // seed_repo is copied under workspace/task; protected dirs stay out.
+      expect(await readFile(join(workspace, "task/src/value.js"), "utf8")).toContain("41");
+      await expect(readFile(join(workspace, "task/solution/solve.sh"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(join(workspace, "task/tests/test.sh"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(join(workspace, "task/validation/expected.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(workspace, ".agenteval/environment/healthcheck.sh"), "utf8")).toContain("value.js");
 
-      await commitWorkspaceBaseline(workspace);
-      await writeFile(join(workspace, "src/value.js"), "export function value() { return 42; }\n");
-      const diff = await captureDiff(workspace, { outPath: join(root, "diff.patch") });
+      await commitWorkspaceBaseline(join(workspace, "task"));
+      await writeFile(join(workspace, "task/src/value.js"), "export function value() { return 42; }\n");
+      const diff = await captureDiff(join(workspace, "task"), { outPath: join(root, "diff.patch") });
       expect(diff.rawDiff).toContain("return 42");
-      expect(diff.rawDiff).not.toContain("tests/test_functional.js");
       expect(diff.rawDiff).not.toContain(".agenteval/environment");
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -61,9 +63,10 @@ describe("canonical eval packages", () => {
   it("allows public repository tests but rejects protected grading copies", async () => {
     const root = await mkdtemp(join(tmpdir(), "agenteval-public-tests-"));
     try {
+      // seed_repo may carry its own public tests/ dir.
       const accepted = await materializeEvalPackage({
         upload: validEvalPackageUpload({
-          "environment/repo/tests/public.test.js": "// public repository test\n",
+          "seed_repo/tests/public.test.js": "// public repository test\n",
         }),
         destination: join(root, "accepted"),
       });
@@ -71,7 +74,7 @@ describe("canonical eval packages", () => {
 
       await expect(materializeEvalPackage({
         upload: validEvalPackageUpload({
-          "environment/repo/tests/oracle/expected.json": "{\"value\":42}\n",
+          "seed_repo/solution/reference.patch": "nested solution",
         }),
         destination: join(root, "rejected"),
       })).rejects.toThrow(/protected grading content/);
@@ -92,19 +95,15 @@ describe("canonical eval packages", () => {
         packageDigest: result.packageDigest,
         manifest: {
           ...result.manifest,
-          taskConfig: {
-            timeouts: { agent_seconds: 9999 },
-            verifier: { command: ["/tampered"] },
-          },
+          taskConfig: { timeouts: { agent_seconds: 9999 }, verifier: { command: ["/tampered"] } },
         },
       });
-      expect(config.agentTimeoutMs).toBe(120_000);
-      expect(config.verifierCommand).toEqual(["/tests/test.sh"]);
-      expect(config.verifierChecks.map((check) => check.kind)).toEqual([
-        "functional",
-        "hidden_test",
-        "regression",
-      ]);
+      // Suite runtime settings come from the flat task.toml, not the tampered
+      // manifest.taskConfig blob.
+      expect(config.agentTimeoutMs).toBe(900_000);
+      expect(config.verifierCommand).toEqual(["/verifier/test.sh"]);
+      expect(config.suite).toBe(true);
+      expect(config.verifierTimeoutMs).toBe(120_000);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -120,26 +119,23 @@ describe("canonical eval packages", () => {
     expect(() => decodePackageFiles({ files: { "../solution.txt": "leak" } })).toThrow(/unsafe/);
   });
 
-  it("rejects duplicate verifier check ids", async () => {
+  it("rejects a suite task with invalid flat fields", async () => {
     const upload = validEvalPackageUpload();
     const taskToml = String(upload.files["task.toml"]);
-    upload.files["task.toml"] = taskToml.replace(
-      '{ id = "hidden-edge", kind = "hidden_test" }',
-      '{ id = "functional-value", kind = "hidden_test" }',
-    );
+    upload.files["task.toml"] = taskToml.replace("agent_timeout_seconds = 900", "agent_timeout_seconds = -5");
     await expect(materializeEvalPackage({
       upload,
-      destination: join(tmpdir(), `duplicate-check-${Date.now()}`),
-    })).rejects.toThrow(/duplicate verifier check id/);
+      destination: join(tmpdir(), `invalid-flat-${Date.now()}`),
+    })).rejects.toThrow(/agent_timeout_seconds must be positive/);
   });
 
-  it("rejects an environment Dockerfile that does not inherit the selected adapter image", async () => {
+  it("rejects an environment Dockerfile that copies protected grading content", async () => {
     await expect(materializeEvalPackage({
       upload: validEvalPackageUpload({
-        "environment/Dockerfile": "FROM node:22\n",
+        "environment/Dockerfile": "FROM node:24-bookworm-slim\nCOPY solution/ /solution\n",
       }),
-      destination: join(tmpdir(), `invalid-image-${Date.now()}`),
-    })).rejects.toThrow(/AGENTEVAL_AGENT_IMAGE/);
+      destination: join(tmpdir(), `invalid-env-${Date.now()}`),
+    })).rejects.toThrow(/must not copy solution/);
   });
 });
 

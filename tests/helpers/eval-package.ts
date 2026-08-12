@@ -1,89 +1,56 @@
-import type { EvalPackageUpload } from "../../src/evals/package.ts";
+import type { EvalPackageUpload } from "../../src/evals/package.js";
 
+/**
+ * Build a valid suite-format eval package (the format the platform now accepts):
+ * flat task.toml, seed_repo workspace, environment/{setup,cleanup,healthcheck},
+ * separate verifier in tests/verifier.py, solution/ + validation/.
+ */
 export function validEvalPackageUpload(overrides: Record<string, string> = {}): EvalPackageUpload {
   const files: Record<string, string> = {
-    "instruction.md": "Update /workspace/src/value.js so exported value() returns 42. Do not change the public interface.",
-    "task.toml": `[task]
-id = "value-42"
-version = 1
-name = "Return 42"
-category = "javascript-bugfix"
+    "instruction.md":
+      "Fix /workspace/task/src/value.js so value() returns 42. Do not change the public interface.",
+    "task.toml": `version = "1.0"
+id = "SIMPLE-TEST"
+name = "value-42"
+category = "simple_atomic"
+primary_capability = "localized_bug_fix"
 language = "javascript"
-tags = ["javascript", "bugfix"]
-profile = "bugfix"
-agent_category = "coding"
-
-[timeouts]
-agent_seconds = 120
-verifier_seconds = 120
-build_seconds = 300
-
-[resources]
-cpu = 1
-ram_mb = 512
-disk_mb = 1024
-gpu = 0
-
-[network]
-policy = "allow"
-
-[artifacts]
-allowlist = ["diff.patch", "verifier-results.json"]
-
-[agent_env]
-NODE_ENV = "test"
-
-[verifier]
-separate = true
-dockerfile = "tests/Dockerfile"
-command = ["/tests/test.sh"]
-checks = [
-  { id = "functional-value", kind = "functional" },
-  { id = "hidden-edge", kind = "hidden_test" },
-  { id = "regression-api", kind = "regression" }
-]
-
-[[requirements]]
-id = "R1"
-text = "Calling value() from /workspace/src/value.js must return 42."
-checks = ["functional-value", "hidden-edge"]
-critical = true
-
-[[requirements]]
-id = "R2"
-text = "The exported interface in /workspace/src/value.js must remain compatible."
-checks = ["regression-api"]
-critical = true
-
-[explanations]
-difficulty = "Requires locating and repairing the implementation while preserving its interface."
-reference_solution = "The reference changes only the return value implementation."
-verification = "An isolated verifier runs functional, hidden edge, and regression checks."
-expert_minutes = 5
-
-[digests]
-environment = "sha256:environment-placeholder"
-verifier = "sha256:verifier-placeholder"
-dependencies = "sha256:dependencies-placeholder"
+runtime = "node>=22"
+difficulty = "easy"
+official_reward = "binary"
+internet = "disabled"
+agent_timeout_seconds = 900
+verifier_timeout_seconds = 120
+cpu_cores = 2
+memory_mb = 2048
+disk_mb = 2048
+public_test_command = "npm test"
 `,
     "README.md": "# Return 42 eval\n",
-    "environment/Dockerfile": "FROM ${AGENTEVAL_AGENT_IMAGE}\nUSER root\nRUN node --version\n",
-    "environment/entrypoint.sh": "#!/bin/bash\nset -euo pipefail\nexec \"$@\"\n",
-    "environment/healthcheck.sh": "#!/bin/bash\nset -euo pipefail\nnode --version >/dev/null\n",
-    "environment/repo/package.json": "{\"scripts\":{\"test\":\"node --test\"}}\n",
-    "environment/repo/src/value.js": "export function value() { return 41; }\n",
-    "solution/solve.sh": "#!/bin/bash\nset -euo pipefail\nprintf 'export function value() { return 42; }\\n' > /workspace/src/value.js\n",
+    "seed_repo/package.json": "{\"name\":\"value42\",\"type\":\"module\",\"scripts\":{\"test\":\"node test.mjs\"}}",
+    "seed_repo/src/value.js": "export function value() { return 41; }\n",
+    "seed_repo/test.mjs": "import test from 'node:test'; import assert from 'node:assert/strict'; import { value } from './src/value.js'; test('value', () => assert.equal(value(), 42));\n",
+    "environment/Dockerfile": "FROM node:24-bookworm-slim\nUSER root\nWORKDIR /workspace/task\nCOPY seed_repo/ /workspace/task/\nCOPY instruction.md /workspace/instruction.md\nUSER 10001\n",
+    "environment/setup.sh": "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p \"${1:-/workspace/task}\"\n",
+    "environment/cleanup.sh": "#!/usr/bin/env bash\nset -euo pipefail\nrm -rf \"${1:-/workspace/task}\"\n",
+    "environment/healthcheck.sh": "#!/usr/bin/env bash\nset -euo pipefail\ntest -f /workspace/task/src/value.js\n",
+    "tests/Dockerfile": "FROM node:24-bookworm-slim\nWORKDIR /verifier\nCOPY tests/ /verifier/\nENTRYPOINT [\"/verifier/test.sh\"]\n",
+    "tests/test.sh": "#!/usr/bin/env bash\nset -euo pipefail\npython3 \"$(dirname \"${BASH_SOURCE[0]}\")/verifier.py\" \"${1:-/workspace/task}\"\n",
+    "tests/verifier.py": `import json,sys
+from pathlib import Path
+sub=Path(sys.argv[1]).resolve()
+checks=[]
+p=__import__("subprocess").run(["node","test.mjs"],cwd=sub,text=True,capture_output=True)
+checks.append(("public_tests",p.returncode==0,p.stderr[-1000:]))
+checks.append(("hidden_contract",True,""))
+print(json.dumps({"task_id":"SIMPLE-TEST","reward":1 if all(c[1] for c in checks) else 0,"passed":all(c[1] for c in checks),"checks":[{"name":n,"passed":b,"detail":d} for n,b,d in checks]}))
+`,
+    "solution/solve.sh": "#!/usr/bin/env bash\nset -euo pipefail\ncp -a \"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")/..\" && pwd)/solution/reference_files\"/. \"${1:-/workspace/task}\"/\n",
     "solution/reference.patch": "--- a/src/value.js\n+++ b/src/value.js\n@@\n-return 41\n+return 42\n",
-    "tests/Dockerfile": "FROM node:22-alpine\nCOPY . /tests\nRUN chmod +x /tests/test.sh\n",
-    "tests/test.sh": "#!/bin/sh\nset -eu\nnode /tests/test_functional.js\n",
-    "tests/test_functional.js": "import('/workspace/src/value.js').then(m => { if (m.value() !== 42) process.exit(1); });\n",
-    "tests/test_regressions.js": "// hidden regression verifier\n",
-    "tests/test_edge_cases.js": "// hidden edge verifier\n",
-    "tests/fixtures/input.json": "{}\n",
-    "tests/oracle/expected.json": "{\"value\":42}\n",
-    "validation/known_bad_patches/returns-41.patch": "--- a/src/value.js\n+++ b/src/value.js\n",
-    "validation/expected_results.json": "{\"oracle\":1,\"noop\":0}\n",
-    "validation/flake_report.json": "{\"runs\":5,\"passes\":5,\"flake_rate\":0}\n",
+    "solution/reference_files/package.json": "{\"name\":\"value42\",\"type\":\"module\"}",
+    "validation/expected.json": "{\"no_op_reward\":0,\"oracle_reward\":1,\"known_bad_reward\":0}",
+    "validation/known_bad.patch": "--- a/src/value.js\n+++ b/src/value.js\n@@\n-return 41\n+return 99\n",
+    "validation/known_bad/package.json": "{\"name\":\"value42\",\"type\":\"module\"}",
     ...overrides,
   };
   return { files };
