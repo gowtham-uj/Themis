@@ -719,6 +719,9 @@ async function executeEval(input: {
   // workspaceDir/task (the suite's seed_repo home) for suite tasks, so diff
   // capture reports only the agent's changes to the task files.
   const gitBaselineRoot = packageRuntime.suite ? join(workspaceDir, AGENT_TASK_SUBDIR) : workspaceDir;
+  // Host-side git on the rootful-podman bind mount hits git's 'dubious
+  // ownership' safe.directory check; trust the graded workspace.
+  const gitSafeDirEnv = { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "safe.directory", GIT_CONFIG_VALUE_0: "*" };
   // For suite, /workspace/task is empty until setup.sh seeds it at eval time,
   // so the baseline is committed after setup (see the suite branch below).
   let workspaceCommit: string | undefined = packageRuntime.suite ? undefined : await commitWorkspaceBaseline(gitBaselineRoot);
@@ -843,7 +846,7 @@ async function executeEval(input: {
       }
       // Suite task dir was empty until setup seeded it; baseline now.
       if (packageRuntime.suite) {
-        workspaceCommit = await commitWorkspaceBaseline(gitBaselineRoot);
+        workspaceCommit = await commitWorkspaceBaseline(gitBaselineRoot, gitSafeDirEnv);
       }
     }
     if (envSpec && (envSpec.setupScript || envSpec.commitBaseline !== false)) {

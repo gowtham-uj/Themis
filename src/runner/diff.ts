@@ -91,7 +91,14 @@ export async function captureDiff(
   options: CaptureDiffOptions = {},
 ): Promise<CaptureDiffResult> {
   // Stage everything (including untracked) so empty-init workspaces produce a full tree diff.
-  await execFileAsync("git", ["-C", workspaceDir, "add", "-A"]);
+  // Host-side git on the rootful-podman bind mount trips git's 'dubious ownership'
+  // safe.directory check; trust the graded workspace so diff capture succeeds.
+  const gitEnv = {
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "safe.directory",
+    GIT_CONFIG_VALUE_0: "*",
+  };
+  await execFileAsync("git", ["-C", workspaceDir, "add", "-A"], { env: gitEnv });
 
   const rawDiff = await gitDiffCached(
     workspaceDir,
@@ -264,6 +271,11 @@ async function gitDiffCached(
       ],
       {
         maxBuffer: 64 * 1024 * 1024,
+        env: {
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "safe.directory",
+          GIT_CONFIG_VALUE_0: "*",
+        },
         // git diff exits 0 even with changes; empty is fine.
       },
     );
