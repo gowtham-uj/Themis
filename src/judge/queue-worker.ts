@@ -1,7 +1,7 @@
 /** One real tool-using judge agent over immutable queue eval archives. */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readlink, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
@@ -259,9 +259,10 @@ async function runPendingJudge(
 
   try {
     const submissionState: { value: QueueSubmission | null } = { value: null };
+    const scratchPath = join(analysisDir, "judge-scratchpad.txt");
     const tools = createQueueJudgeTools(archives, selectedIds, evidenceIndexes, (accepted) => {
       submissionState.value = accepted;
-    });
+    }, scratchPath);
     await runPiJudgeAgent({
       cwd: analysisDir,
       agentDir: join(analysisDir, ".pi-agent"),
@@ -456,9 +457,23 @@ function queueJudgeToolSpecs(): QueueJudgeToolSpec[] {
       },
     },
     {
+      name: "judge_scratchpad",
+      description:
+        "Persist key findings, analysis points, verdicts-in-progress, and open questions to a durable scratchpad file that survives compaction. Use it BEFORE any long stretch of reading or any compaction: write a compact summary of what you have concluded so far, each eval's provisional verdict + evidence refs, and what remains. Append progressively; read it back after compaction to continue without re-reading archives. This file is your long-term memory across the session.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["append", "read"] },
+          content: { type: "string", description: "New findings to append (required for action=append)" },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      },
+    },
+    {
       name: "preflight_queue_analysis",
       description:
-        "Validate the complete queue-analysis v2 payload after every archive file has been fully read. Returns path-specific errors or an opaque submission token.",
+        "Validate the complete queue-analysis v2 payload. Returns path-specific errors or an opaque submission token.",
       parameters: {
         type: "object",
         properties: {
@@ -488,6 +503,7 @@ function createQueueJudgeTools(
   selectedIds: string[],
   evidenceIndexes: Map<string, QueueEvidenceIndex>,
   onSubmission: (submission: QueueSubmission) => void,
+  scratchPath: string,
 ): ToolDefinition[] {
   const preflightState: { token: string | null; submission: QueueSubmission | null } = {
     token: null,
@@ -516,6 +532,7 @@ function createQueueJudgeTools(
           selectedIds,
           evidenceIndexes,
           preflightState,
+          scratchPath,
         );
         if (outcome.submission) onSubmission(outcome.submission);
         return {
@@ -542,6 +559,7 @@ async function executeTool(
   selectedIds: string[],
   evidenceIndexes: Map<string, QueueEvidenceIndex>,
   preflightState: { token: string | null; submission: QueueSubmission | null },
+  scratchPath: string,
 ): Promise<{
   response: unknown;
   log: Record<string, unknown>;
@@ -604,6 +622,22 @@ async function executeTool(
         content: encoding === "base64" ? payload.toString("base64") : payload.toString("utf8"),
       },
       log: { runId: ctx.run.id, path, offset, end, totalBytes: entry.bytes },
+    };
+  }
+  if (name === "judge_scratchpad") {
+    const action = args.action === "read" ? "read" : "append";
+    if (action === "read") {
+      const content = await readFile(scratchPath, "utf8").catch(() => "");
+      return {
+        response: { content: content.slice(-200_000) },
+        log: { action, bytes: content.length },
+      };
+    }
+    const content = typeof args.content === "string" ? args.content : "";
+    await appendFile(scratchPath, `${content}\n`, "utf8");
+    return {
+      response: { appended: true },
+      log: { action, appendedBytes: content.length },
     };
   }
   if (name === "preflight_queue_analysis") {
