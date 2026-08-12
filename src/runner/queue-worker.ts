@@ -143,11 +143,27 @@ export async function startQueueContainer(
   if (sharedAdapter && sharedAdapter.agentId !== queue.agentId) {
     throw new Error(`queue ${queue.id} agent_id does not match shared adapter ${sharedAdapter.id}`);
   }
+  // Explicit adapter selection: a shared adapter, a project-owned adapter, or an
+  // explicitly chosen built-in (builtinAdapterId). No implicit fallback.
   const projectAdapter = sharedAdapter
     ? null
     : queries.getProjectAgentAdapterByAgentId(queue.projectId, queue.agentId);
+  if (!sharedAdapter && !projectAdapter && !queue.builtinAdapterId) {
+    throw new Error(
+      `queue ${queue.id} has no agent adapter selected: create a project adapter, reference a shared adapter, or explicitly set builtin_adapter_id (no implicit fallback)`,
+    );
+  }
   if (projectAdapter && !projectAdapter.enabled) {
     throw new Error(`project agent adapter ${projectAdapter.id} is disabled`);
+  }
+  if (queue.builtinAdapterId) {
+    try {
+      getAdapter(queue.builtinAdapterId);
+    } catch {
+      throw new Error(
+        `queue ${queue.id} builtin_adapter_id ${queue.builtinAdapterId} is not a registered built-in adapter`,
+      );
+    }
   }
   const adapterDef = sharedAdapter ?? projectAdapter;
   if (adapterDef?.containerfile && adapterDef.buildStatus !== "ready") {
@@ -155,17 +171,9 @@ export async function startQueueContainer(
       `agent adapter ${adapterDef.id} image is not ready; build it through the adapter API first`,
     );
   }
-  const configuredAdapters = queries.listProjectAgentAdapters(queue.projectId, {
-    includeDisabled: true,
-  });
-  if (!sharedAdapter && configuredAdapters.length > 0 && !projectAdapter) {
-    throw new Error(
-      `queue ${queue.id} does not use project ${queue.projectId}'s configured agent`,
-    );
-  }
   const queueAdapter = adapterDef
     ? createDeclarativeAdapter(adapterDef)
-    : getAdapter(queue.agentId);
+    : getAdapter(queue.builtinAdapterId!);
   const runtime = opts.runtime ?? resolveRuntime();
   const tasks = new Map<string, Task>();
   const packageRuntimes = new Map<string, EvalPackageRuntimeConfig>();

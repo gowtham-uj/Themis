@@ -97,6 +97,7 @@ const DDL: string[] = [
     status TEXT NOT NULL DEFAULT 'draft',
     active_batch_id TEXT,
     shared_adapter_id TEXT REFERENCES project_agent_adapters(id),
+    builtin_adapter_id TEXT,
     revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -571,6 +572,8 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE project_agent_adapters ADD COLUMN configure_json TEXT",
     "ALTER TABLE project_agent_adapters ADD COLUMN shared INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE eval_queues ADD COLUMN shared_adapter_id TEXT",
+    // v7: explicit built-in adapter opt-in; no implicit fallback.
+    "ALTER TABLE eval_queues ADD COLUMN builtin_adapter_id TEXT",
   ];
   for (const sql of alters) {
     try {

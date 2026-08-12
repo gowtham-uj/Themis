@@ -23,6 +23,7 @@ import type {
   ImprovementOwnerClass,
   ImprovementStepStatus,
 } from "../judge/queue-schema.js";
+import { listAdapters } from "../adapters/index.js";
 import { verifyEvalArchive } from "../runner/eval-archive.js";
 import { parsePorts } from "../runner/project-config.js";
 import {
@@ -309,6 +310,8 @@ export function registerQueueRoutes(router: Router): void {
       autoJudge?: boolean;
       shared_adapter_id?: string | null;
       sharedAdapterId?: string | null;
+      builtin_adapter_id?: string | null;
+      builtinAdapterId?: string | null;
     }>(req);
     if (typeof body.name !== "string" || !body.name.trim()) {
       throw badRequest("name is required");
@@ -326,20 +329,45 @@ export function registerQueueRoutes(router: Router): void {
     if (!sharedAdapter && configuredAdapter && !configuredAdapter.enabled) {
       throw badRequest("the project's configured adapter is disabled");
     }
-    const agentId = sharedAdapter?.agentId ?? configuredAdapter?.agentId ?? project.defaultAgentId;
+    const builtinAdapterId = body.builtin_adapter_id ?? body.builtinAdapterId;
+    if (builtinAdapterId !== undefined && builtinAdapterId !== null) {
+      if (typeof builtinAdapterId !== "string") {
+        throw badRequest("builtin_adapter_id must be a string or null");
+      }
+      if (!listAdapters().includes(builtinAdapterId)) {
+        throw badRequest(`builtin_adapter_id must name a registered built-in adapter: ${listAdapters().join(", ")}`);
+      }
+      if (sharedAdapter || configuredAdapter) {
+        throw badRequest("builtin_adapter_id cannot be combined with a project/shared adapter; choose one");
+      }
+    }
+    const agentId =
+      sharedAdapter?.agentId ??
+      builtinAdapterId ??
+      configuredAdapter?.agentId;
     const requestedAgentId = body.agent_id ?? body.agentId;
     if (requestedAgentId && requestedAgentId !== agentId) {
       throw badRequest(
         sharedAdapter
           ? "agent_id must match the explicitly selected shared adapter"
-          : "queues must use the project's configured agent",
+          : "queues must use the project's configured agent or explicitly select a builtin_adapter_id",
+      );
+    }
+    // No silent fallback: a queue must resolve to an adapter explicitly.
+    if (!agentId) {
+      throw badRequest(
+        "no agent adapter selected: create a project adapter, reference a shared adapter, or explicitly set builtin_adapter_id",
       );
     }
     const sharedAgent = sharedAdapter ? app.queries.getAgent(sharedAdapter.agentId) : null;
-    const model = body.model ?? project.defaultModel ?? sharedAgent?.defaultModel;
-    const provider = body.provider ?? project.defaultProvider ?? sharedAgent?.defaultProvider;
-    if (!agentId || !model || !provider) {
-      throw badRequest("configure the queue agent adapter, model, and provider first");
+    const model =
+      body.model ?? project.defaultModel ?? sharedAgent?.defaultModel ??
+      (builtinAdapterId ? app.queries.getAgent(builtinAdapterId)?.defaultModel ?? undefined : undefined);
+    const provider =
+      body.provider ?? project.defaultProvider ?? sharedAgent?.defaultProvider ??
+      (builtinAdapterId ? app.queries.getAgent(builtinAdapterId)?.defaultProvider ?? undefined : undefined);
+    if (!model || !provider) {
+      throw badRequest("configure the queue agent model and provider first");
     }
     const input: CreateEvalQueueInput = {
       name: body.name.trim(),
@@ -347,6 +375,7 @@ export function registerQueueRoutes(router: Router): void {
       model,
       provider,
       sharedAdapterId: sharedAdapter?.id ?? null,
+      builtinAdapterId: builtinAdapterId ?? null,
     };
     if (body.description !== undefined) input.description = body.description;
     const rawOverrides = body.adapter_overrides ?? body.adapterOverrides;
@@ -400,18 +429,47 @@ export function registerQueueRoutes(router: Router): void {
     if (body.shared_adapter_id !== undefined || body.sharedAdapterId !== undefined) {
       const requestedShared = body.shared_adapter_id ?? body.sharedAdapterId;
       if (requestedShared === null) {
-        const configured = app.queries.listProjectAgentAdapters(queue.projectId)[0];
-        if (!configured) {
-          throw badRequest("cannot clear shared_adapter_id without an enabled project adapter");
-        }
         patch.sharedAdapterId = null;
-        patch.agentId = configured.agentId;
+        // Clearing shared must leave an explicit adapter: a project adapter or a builtin.
+        if (body.builtin_adapter_id === undefined && body.builtinAdapterId === undefined) {
+          const configured = app.queries.listProjectAgentAdapters(queue.projectId)[0];
+          if (!configured) {
+            throw badRequest("clearing shared_adapter_id requires an enabled project adapter or builtin_adapter_id");
+          }
+          if (!configured.enabled) throw badRequest("the project's configured adapter is disabled");
+          patch.agentId = configured.agentId;
+        }
       } else if (typeof requestedShared === "string") {
         const shared = requireSharedAdapter(app.queries, queue.projectId, requestedShared);
         patch.sharedAdapterId = shared.id;
         patch.agentId = shared.agentId;
+        patch.builtinAdapterId = null;
       } else {
         throw badRequest("shared_adapter_id must be a string or null");
+      }
+    }
+    if (body.builtin_adapter_id !== undefined || body.builtinAdapterId !== undefined) {
+      const requestedBuiltin = body.builtin_adapter_id ?? body.builtinAdapterId;
+      if (requestedBuiltin === null) {
+        // Clearing builtin must leave an explicit adapter.
+        if (body.shared_adapter_id === undefined && body.sharedAdapterId === undefined) {
+          const configured = app.queries.listProjectAgentAdapters(queue.projectId)[0];
+          if (!configured) {
+            throw badRequest("clearing builtin_adapter_id requires an enabled project adapter or shared_adapter_id");
+          }
+          if (!configured.enabled) throw badRequest("the project's configured adapter is disabled");
+          patch.agentId = configured.agentId;
+          patch.builtinAdapterId = null;
+        }
+      } else if (typeof requestedBuiltin === "string") {
+        if (!listAdapters().includes(requestedBuiltin)) {
+          throw badRequest(`builtin_adapter_id must name a registered built-in: ${listAdapters().join(", ")}`);
+        }
+        patch.builtinAdapterId = requestedBuiltin;
+        patch.agentId = requestedBuiltin;
+        patch.sharedAdapterId = null;
+      } else {
+        throw badRequest("builtin_adapter_id must be a string or null");
       }
     }
     if (typeof body.model === "string") patch.model = body.model;

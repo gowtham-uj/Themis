@@ -814,6 +814,7 @@ export interface EvalQueue {
   status: EvalQueueStatus | string;
   activeBatchId: string | null;
   sharedAdapterId: string | null;
+  builtinAdapterId: string | null;
   revision: number;
   createdAt: string;
   updatedAt: string;
@@ -833,6 +834,7 @@ export interface CreateEvalQueueInput {
   judgeProvider?: string | null;
   autoJudge?: boolean;
   sharedAdapterId?: string | null;
+  builtinAdapterId?: string | null;
   id?: string;
 }
 
@@ -852,6 +854,7 @@ export interface UpdateEvalQueueInput {
   status?: EvalQueueStatus | string;
   activeBatchId?: string | null;
   sharedAdapterId?: string | null;
+  builtinAdapterId?: string | null;
   incrementRevision?: boolean;
 }
 
@@ -2201,6 +2204,7 @@ function mapEvalQueueRow(row: typeof evalQueues.$inferSelect): EvalQueue {
     status: row.status,
     activeBatchId: row.activeBatchId ?? null,
     sharedAdapterId: row.sharedAdapterId ?? null,
+    builtinAdapterId: row.builtinAdapterId ?? null,
     revision: row.revision ?? 1,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -4078,6 +4082,7 @@ export class SqliteQueries implements QueryStore {
       judgeProvider: input.judgeProvider ?? null,
       autoJudge: input.autoJudge === false ? 0 : 1, status: "draft",
       activeBatchId: null, sharedAdapterId: input.sharedAdapterId ?? null,
+      builtinAdapterId: input.builtinAdapterId ?? null,
       revision: 1, createdAt: ts, updatedAt: ts,
     }).run();
     return this.getEvalQueue(id)!;
@@ -4112,6 +4117,7 @@ export class SqliteQueries implements QueryStore {
     if (patch.status !== undefined) values.status = patch.status;
     if (patch.activeBatchId !== undefined) values.activeBatchId = patch.activeBatchId;
     if (patch.sharedAdapterId !== undefined) values.sharedAdapterId = patch.sharedAdapterId;
+    if (patch.builtinAdapterId !== undefined) values.builtinAdapterId = patch.builtinAdapterId;
     if (patch.incrementRevision) values.revision = existing.revision + 1;
     this.db.update(evalQueues).set(values).where(eq(evalQueues.id, id)).run();
     return this.getEvalQueue(id)!;
@@ -6331,6 +6337,7 @@ export class MemoryQueries implements QueryStore {
       judgeModel: input.judgeModel ?? null, judgeProvider: input.judgeProvider ?? null,
       autoJudge: input.autoJudge !== false, status: "draft", activeBatchId: null,
       sharedAdapterId: input.sharedAdapterId ?? null,
+      builtinAdapterId: input.builtinAdapterId ?? null,
       revision: 1, createdAt: ts, updatedAt: ts,
     };
     this.evalQueues.set(queue.id, queue);
@@ -6367,6 +6374,7 @@ export class MemoryQueries implements QueryStore {
       status: patch.status ?? existing.status,
       activeBatchId: patch.activeBatchId !== undefined ? patch.activeBatchId : existing.activeBatchId,
       sharedAdapterId: patch.sharedAdapterId !== undefined ? patch.sharedAdapterId : existing.sharedAdapterId,
+      builtinAdapterId: patch.builtinAdapterId !== undefined ? patch.builtinAdapterId : existing.builtinAdapterId,
       revision: patch.incrementRevision ? existing.revision + 1 : existing.revision,
       updatedAt: nowIso(),
     };

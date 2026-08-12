@@ -138,6 +138,8 @@ export const evalQueues = sqliteTable(
     status: text("status").notNull().default("draft"),
     activeBatchId: text("active_batch_id"),
     sharedAdapterId: text("shared_adapter_id").references(() => projectAgentAdapters.id),
+    /** Explicit built-in adapter id ("reapercode"|"pi") when the queue opts into a built-in; no implicit fallback. */
+    builtinAdapterId: text("builtin_adapter_id"),
     revision: integer("revision").notNull().default(1),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
@@ -838,4 +840,4 @@ export const schema = {
 export type Schema = typeof schema;
 
 /** Migration version stamped into pragma user_version / migrations table. */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
