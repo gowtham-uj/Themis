@@ -1311,6 +1311,13 @@ function collectApiKeys(): Record<string, string> {
   if (!keys.ANTHROPIC_API_KEY && keys.ANTHROPIC_AUTH_TOKEN) {
     keys.ANTHROPIC_API_KEY = keys.ANTHROPIC_AUTH_TOKEN;
   }
+  // The reaper CLI registers NeuroWatt under the provider id `nuralwatt`
+  // (one U) and reads its key from NURALWATT_API_KEY. Authors/operators
+  // commonly export NEURALWATT_API_KEY (two U's); mirror it under the spelling
+  // the agent expects so the connection check and real runs find the key.
+  if (!keys.NURALWATT_API_KEY && keys.NEURALWATT_API_KEY) {
+    keys.NURALWATT_API_KEY = keys.NEURALWATT_API_KEY;
+  }
   return keys;
 }
 
