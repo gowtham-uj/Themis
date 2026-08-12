@@ -15,6 +15,8 @@ export interface QueueReportEval {
   taskName: string;
   verdict: Verdict;
   narrative: EvalJudgementNarrative;
+  /** Platform-computed metrics for this eval (tokens, tool calls, tests, etc.). */
+  metrics?: Record<string, { value: string | number | null; unit: string; label: string }>;
 }
 
 /** Produce a portable narrative-first report from validated queue-analysis v2 data. */
@@ -80,9 +82,13 @@ function renderEval(entry: QueueReportEval): string {
   const boundaries = narrative.evidenceBoundaries
     .map((boundary) => `<li><span class="pill">${escapeHtml(boundary.status)}</span> ${escapeHtml(boundary.text)}${refs(boundary.refs)}</li>`)
     .join("");
+  const metricsTable = entry.metrics
+    ? `<table class="metrics"><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>${Object.values(entry.metrics).map((m) => `<tr><td>${escapeHtml(m.label)}</td><td>${m.value === null ? "—" : escapeHtml(String(m.value))} ${escapeHtml(m.unit)}</td></tr>`).join("")}</tbody></table>`
+    : "";
   return `<article class="eval">
     <div class="eval-head"><div><div class="eyebrow">${escapeHtml(entry.runId)}</div><h2>${escapeHtml(entry.taskName)}</h2></div><div class="score"><strong>${overall.score.toFixed(2)}</strong><span>${escapeHtml(overall.verdict)}</span></div></div>
     <section class="section"><div class="eyebrow">Narrative</div><h3>${escapeHtml(narrative.headline)}</h3><p class="judgement">${escapeHtml(narrative.judgement)}</p></section>
+    ${metricsTable ? `<section class="section"><div class="eyebrow">Metrics</div>${metricsTable}</section>` : ""}
     <section class="section"><div class="eyebrow">Execution timeline</div><ol class="timeline">${execution}</ol></section>
     <section class="section"><div class="eyebrow">Strengths</div>${claims(narrative.strengths)}</section>
     <section class="section"><div class="eyebrow">Concerns</div><ul class="claims">${concerns || "<li>No evidence-linked concerns.</li>"}</ul><h3>Evidence boundaries</h3><ul class="claims">${boundaries}</ul></section>

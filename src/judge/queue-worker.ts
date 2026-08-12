@@ -313,6 +313,7 @@ async function runPendingJudge(
       taskName: string;
       verdict: Verdict;
       narrative: QueueSubmission["perEval"][number]["narrative"];
+      metrics?: Record<string, { value: string | number | null; unit: string; label: string }>;
     }> = [];
     queries.transaction(() => {
       for (const runId of selectedIds) {
@@ -352,7 +353,35 @@ async function runPendingJudge(
           snapshot && typeof snapshot.name === "string"
             ? snapshot.name
             : (queries.getTask(ctx.run.taskId)?.name ?? ctx.run.taskId);
-        reportEvals.push({ runId, taskName, verdict, narrative: submitted.narrative });
+        // Inject the platform-computed metrics into the report so the per-eval
+        // block always shows the measured numbers (tokens, tool calls, tests,
+        // edit churn, verification rate, etc.) even if the judge's structured
+        // payload is thin. The judge's narrative contains its analysis of these.
+        const evalMetricsRow = queries.getEvalMetrics(runId);
+        const reportMetrics: Record<string, { value: string | number | null; unit: string; label: string }> = {};
+        if (evalMetricsRow) {
+          const m = evalMetricsRow.execution as Record<string, unknown>;
+          const mm = m?.measurements as Record<string, unknown> | undefined;
+          const pick = (key: string, label: string, unit: string): void => {
+            const v = mm?.[key] as { value?: unknown } | undefined;
+            if (v && typeof v.value === "number") reportMetrics[key] = { value: v.value, unit, label };
+            else if (v && v.value == null) reportMetrics[key] = { value: null, unit, label };
+          };
+          pick("tokens_used", "Tokens used", "tokens");
+          pick("tool_calls", "Tool calls", "calls");
+          pick("commands_executed", "Commands executed", "cmds");
+          pick("files_opened", "Files opened", "files");
+          pick("files_modified", "Files modified", "files");
+          pick("test_attempts", "Test attempts", "attempts");
+          pick("verification_rate", "Verification rate", "ratio");
+          pick("false_success", "False success flag", "bool");
+          pick("edit_churn", "Edit churn", "ratio");
+          pick("stalls_or_loops", "Stalls/loops", "count");
+          pick("wall_clock_ms", "Wall clock", "ms");
+          pick("patch_added_lines", "Lines added", "lines");
+          pick("patch_removed_lines", "Lines removed", "lines");
+        }
+        reportEvals.push({ runId, taskName, verdict, narrative: submitted.narrative, metrics: reportMetrics });
       }
       queries.storeImprovementSteps(
         analysis.id,
