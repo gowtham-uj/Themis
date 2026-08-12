@@ -30,6 +30,13 @@ provider/model, and adapter contract.
   workspace reset → immutable content-hash archive.
 - Cleanup, required-evidence, reset, or archive failure marks the queue tainted and preserves the live
   container for operator inspection; the next eval never starts in a contaminated workspace.
+- **Failure causes are documented, not just a generic "failed".** When a run fails, the worker scans the
+  recorded error plus the raw agent stdout/stderr for well-known provider/model signatures and writes a
+  human-readable reason to the run archive as `failure-classification.json` (`{category, reason}`) and onto
+  the run's `error`. Categories include `provider_quota_exhausted` (billing/credits hit), `provider_rate_limited`
+  (429/ratelimit), `context_length_exceeded` (token window), and `model_unavailable` (auth/model-not-found/
+  unavailable). An eval may also fail because the model/provider hit its token or credit limit mid-run
+  (e.g. NVAPI `402 payment_required`); that is a first-class, detected failure cause, not a silent error.
 - Completed queue containers remain alive and count against the live-container cap until explicitly
   stopped. Introspection never implicitly spawns or restarts them.
 - Queue launch applies pinned image, cpu/pid limits, network policy, ports, mounts, capabilities,

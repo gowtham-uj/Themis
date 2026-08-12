@@ -34,6 +34,7 @@ import {
   verifyCleanupInContainer,
 } from "./env-provision.js";
 import { restructureSuiteArchive, sealEvalArchive } from "./eval-archive.js";
+import { classifyRunFailure } from "./run-failure.js";
 import { analyzeEvidenceIntegrity } from "./evidence-integrity.js";
 import { deriveRunMetrics } from "./metrics.js";
 import { buildEvalAgentImage } from "./package-image.js";
@@ -1104,12 +1105,28 @@ async function executeEval(input: {
   const reset = await resetContainerWorkspace(handle);
   await writeJson(join(runDir, "workspace-reset.json"), reset);
 
+  // Document WHY a failed run failed — especially provider/model exhaustion
+  // (quota/credits, rate limit, context length) — by scanning the recorded error
+  // and the raw agent output, rather than leaving a generic "failed".
+  const classification = status === "failed"
+    ? await classifyRunFailure({ runDir, error: runError }).catch(() => null)
+    : null;
+  const failureReason = classification
+    ? `${runError ? `${runError} — ` : ""}${classification.reason}`
+    : runError;
+  await writeJson(join(runDir, "failure-classification.json"), {
+    status,
+    error: runError,
+    reason: failureReason,
+    category: classification?.category ?? null,
+  });
+
   const finalizedRun = queries.finalizeRun(run.id, {
     status,
     durationMs: Date.now() - startedAt,
     eventsPath,
     ...(diffPath ? { diffPath } : {}),
-    error: runError,
+    error: failureReason,
     controlState: status === "aborted" ? "aborted" : "done",
   });
 
