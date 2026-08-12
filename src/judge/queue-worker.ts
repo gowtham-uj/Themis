@@ -461,7 +461,7 @@ function queueJudgeToolSpecs(): QueueJudgeToolSpec[] {
     {
       name: "read_archive_file",
       description:
-        "Read exact bytes from one archive file. Continue with offsets until eof=true; every file must be fully read before submission.",
+        "Read exact bytes from one archive file. Continue with offsets until eof=true. The MANDATORY tier (see system prompt) must be fully read before submission; optional files are read for deeper investigation as needed.",
       parameters: {
         type: "object",
         properties: {
@@ -664,7 +664,7 @@ async function executeTool(
       return {
         response: {
           accepted: false,
-          error: "every archive file must be fully inspected before preflight",
+          error: "one or more MANDATORY-tier files (README, trajectory.jsonl, transcript.md, diff.patch, final-result.json, verifier-result.json, agent-stdout.log, platform/run.json, platform/run-metrics.json, platform/evidence-integrity.json) were not fully read for every run",
           missing,
         },
         log: { accepted: false, missingCount: missing.length },
@@ -763,6 +763,25 @@ function addCoverage(
   coverage.set(path, merged);
 }
 
+/**
+ * MANDATORY-tier files the judge must fully read before preflight, per eval.
+ * Everything else in the archive is optional further-investigation evidence and
+ * is NOT gated on full coverage — otherwise the judge is forced to over-read the
+ * entire archive (model-calls, retained/*, tool-logs) and exhaust its session.
+ */
+const MANDATORY_ARCHIVE_FILES = [
+  "README.md",
+  "trajectory.jsonl",
+  "transcript.md",
+  "diff.patch",
+  "final-result.json",
+  "verifier-result.json",
+  "agent-stdout.log",
+  "platform/run.json",
+  "platform/run-metrics.json",
+  "platform/evidence-integrity.json",
+];
+
 function missingEvidence(
   archives: Map<string, ArchiveCtx>,
   selectedIds: string[],
@@ -773,13 +792,18 @@ function missingEvidence(
     if (!ctx.listed) {
       missing.push({ runId, path: "archive.json", remainingBytes: 1 });
     }
-    for (const entry of ctx.manifest.files) {
-      const covered = (ctx.coverage.get(entry.path) ?? []).reduce(
+    // Only the MANDATORY tier must be fully covered. Optional files (model-calls,
+    // tool-logs, further-evidence, retained/*, platform housekeeping) are
+    // available for deeper investigation but do not block submission.
+    for (const path of MANDATORY_ARCHIVE_FILES) {
+      const entry = ctx.manifest.files.find((candidate) => candidate.path === path);
+      if (!entry) continue; // archive may not contain this file
+      const covered = (ctx.coverage.get(path) ?? []).reduce(
         (sum, [start, end]) => sum + Math.max(0, end - start),
         0,
       );
       if (covered < entry.bytes) {
-        missing.push({ runId, path: entry.path, remainingBytes: entry.bytes - covered });
+        missing.push({ runId, path, remainingBytes: entry.bytes - covered });
       }
     }
   }
