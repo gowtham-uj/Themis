@@ -62,7 +62,7 @@ async function main(): Promise<void> {
       all: true,
       judge_model: "deepseek-v4-flash",
       judge_provider: "neuralwatt",
-      judge_params: { maxTokens: 32768, timeoutMs: 90 * 60_000 },
+      judge_params: { timeoutMs: 90 * 60_000 }, // let the model's configured max tokens / context window govern output
     }),
   });
   const body = (await res.json()) as { analysis?: { id?: string } };
