@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, readlink, writeFile } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
   DbQueries,
@@ -20,6 +20,7 @@ import {
 } from "./prompt.js";
 import { deriveOutcomeMetrics } from "./eval-metrics.js";
 import { renderQueueReport } from "./queue-report.js";
+import { sealQueueRunArchive } from "./queue-run-archive.js";
 import {
   parseQueueSubmission,
   validateQueueSubmission,
@@ -394,6 +395,23 @@ async function runPendingJudge(
       }),
       "utf8",
     );
+    // Bundle the whole queue-run into one self-contained archive: the judge's own
+    // artifacts (events/session/scratchpad/verdict/report) plus every sealed eval
+    // archive the judge analyzed. One file holds the complete record.
+    try {
+      const evalArchiveDirs = selectedIds
+        .map((runId) => queries.getEvalArchive(runId)?.manifestPath)
+        .filter((p): p is string => Boolean(p))
+        .map((p) => dirname(p));
+      await sealQueueRunArchive({ analysisDir, evalArchiveDirs });
+    } catch (archiveErr) {
+      // Archive bundling is best-effort; never fail the completed analysis over it.
+      await appendFile(
+        join(analysisDir, "queue-run-archive.error.log"),
+        `${new Date().toISOString()} ${archiveErr instanceof Error ? archiveErr.message : String(archiveErr)}\n`,
+        "utf8",
+      ).catch(() => undefined);
+    }
     const completed = queries.updateQueueAnalysis(analysis.id, {
       status: "completed",
       verdictPath,
@@ -903,6 +921,7 @@ MANDATORY PROCESS (each archive uses a bounded, high-signal-first layout to avoi
 6. Build all four owner backlogs (agent/platform/judge/eval) that actually apply. Do not invent defects just to populate a class.
 7. Call preflight_queue_analysis with the complete payload. Correct every path-specific error.
 8. Call submit_queue_analysis exactly once with the successful preflight token. PRIORITIZE delivering a complete, defensible submit over exhaustive deep reads: a grounded report from the top-level + platform evidence is worth more than an incomplete transcript.
+9. SCRATCHPAD DISCIPLINE (critical for session survival): Before every long stretch of reading, before opening a large file, and especially BEFORE any compaction happens, call judge_scratchpad(action="append", ...) to persist: (a) every eval's provisional verdict + the evidence refs behind it, (b) key facts and analysis points you must not lose, (c) what still remains to do. If you sense the context growing large or the session may compact, write a compact but complete summary to the scratchpad FIRST. After a compaction, call judge_scratchpad(action="read") to restore your findings so you can continue and still reach preflight + submit. Never let the session outgrow the context without a scratchpad checkpoint.
 
 preflight_queue_analysis arguments:
 - per_eval: [{run_id, verdict, narrative}]. verdict is the standard schemaVersion:1 Verdict described above. narrative is:
