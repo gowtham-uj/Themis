@@ -384,7 +384,12 @@ export async function prepareEvalPackageWorkspace(input: {
       errorOnExist: true,
     });
   }
-  for (const protectedName of ["solution", "tests", "validation"]) {
+  // Defense-in-depth: only `solution/` and `validation/` are truly protected
+  // (the grader's secrets). `tests/` may legitimately appear in seed_repo as
+  // public repository tests (validated at ingest by validateProtectedContentIsolation,
+  // which forbids grading copies like verifier.py/oracle/hidden there), so it is
+  // not rejected here — matching the agent-visible workspace contract.
+  for (const protectedName of ["solution", "validation"]) {
     try {
       await lstat(join(seedDest, protectedName));
       throw new Error(`protected eval content leaked into agent workspace: ${protectedName}`);
