@@ -1141,9 +1141,23 @@ async function executeEval(input: {
     const diffText = diffPath
       ? await readFile(diffPath, "utf8").catch(() => undefined)
       : undefined;
+    // Verifier is ground truth for whether the eval actually passed. Read its
+    // official reward (persisted as verifier.json) so false_success is judged
+    // authoritatively (the agent claimed success the verifier did not confirm)
+    // instead of fragile shell-command heuristics.
+    let officialReward: number | null = null;
+    try {
+      const verifierRecord = JSON.parse(
+        await readFile(join(runDir, "verifier.json"), "utf8"),
+      ) as { officialReward?: unknown };
+      if (typeof verifierRecord.officialReward === "number") officialReward = verifierRecord.officialReward;
+    } catch {
+      // verifier may be absent (error path); fall back to heuristics
+    }
     const metrics = deriveRunMetrics(recordedEvents, {
       ...(diffText !== undefined ? { diffText } : {}),
       totalCost: finalizedRun.totalCost,
+      officialReward,
     });
     await writeJson(join(runDir, "run-metrics.json"), metrics);
     queries.upsertEvalMetrics({
