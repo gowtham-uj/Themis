@@ -231,8 +231,9 @@ function wrapSuiteConfig(flat: Record<string, unknown>): Record<string, unknown>
   const verifierTimeout = Number(flat.verifier_timeout_seconds);
   const cpuCores = Number(flat.cpu_cores);
   const memoryMb = Number(flat.memory_mb);
-  const internet = text(flat.internet) ?? "disabled";
-  const networkPolicy = internet === "disabled" ? "offline" : internet === "allow" ? "allow" : internet;
+  // Suite agent container network is always `allow` (reaper must reach the
+  // model provider); `internet` governs the isolated verifier only.
+  const networkPolicy = "allow";
   return {
     suite: { id: taskId, version: taskVersion, name, primary_capability: primaryCapability },
     task: { id: taskId, version: taskVersion, name, category: "simple",
@@ -459,7 +460,13 @@ export function inspectEvalPackage(files: Map<string, Buffer>): {
   if (!["allow", "allowlist", "offline", "disabled"].includes(String(internet))) {
     errors.push("task.toml internet must be allow|allowlist|offline|disabled");
   }
-  const networkPolicy = internet === "disabled" ? "offline" : internet === "allow" ? "allow" : internet;
+  // The suite `internet` field describes the TASK's intended network safety and
+  // is honored by the isolated verifier (always offline). But the agent
+  // container runs the real reaper CLI which must reach its model provider, so
+  // the suite agent container is always network `allow` (the verifier is forced
+  // offline independently in the verifier runner). `internet` is preserved as
+  // informational authoring metadata and to reject invalid values.
+  const networkPolicy = "allow";
   if (!publicTestCommand) errors.push("task.toml public_test_command is required");
 
   // ---- wrap flat keys into the internal config tables the runtime reads ----
