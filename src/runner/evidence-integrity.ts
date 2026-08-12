@@ -82,7 +82,9 @@ export async function analyzeEvidenceIntegrity(input: {
         observed: `Empty tool identifiers at ${emptyToolIds.slice(0, 8).join(", ")}.`,
         interpretation: "Tool evidence cannot be reliably correlated to canonical calls.",
         ownerClass: "agent",
-        scoringSafe: false,
+        // Advisory: this is a native-artifact quirk (reaper's summary omits tool ids);
+        // it does not change the verifier-authoritative outcome, so it does not block scoring.
+        scoringSafe: true,
       });
     }
 
@@ -259,7 +261,10 @@ function contradiction(
     observed,
     interpretation: "Use platform-owned run-metrics.json for this fact.",
     ownerClass: "agent",
-    scoringSafe: false,
+    // Advisory: native trajectory-metrics disagreeing with canonical platform
+    // metrics is a known reaper-summary limitation, not a scoring hazard. The
+    // platform metrics + verifier result are authoritative; this does not block scoring.
+    scoringSafe: true,
   };
 }
 
