@@ -1,9 +1,13 @@
 /** Project-scoped CRUD for one real CLI-agent adapter per project. */
 
+import { execFile } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { resolveRuntime } from "../runner/runtime.js";
-import { prepareWorkspace } from "../runner/workspace.js";
+import { normalizeRepoUrl, prepareWorkspace } from "../runner/workspace.js";
+
+const execFileAsync = promisify(execFile);
 import { runAdapterGenerator, GENERATOR_CONTRACT } from "../adapters/generator.js";
 import { createDeclarativeAdapter, renderTemplate } from "../adapters/declarative.js";
 import type { RunContext } from "../adapters/types.js";
@@ -165,6 +169,32 @@ async function buildAdapter(
   if (!isNpm && !adapter.sourceRepo) {
     throw badRequest("adapter source_repo is required before build (or set install_type to 'npm')");
   }
+  // Cache by source ref/commit: if this adapter already built the exact commit
+  // the source ref resolves to, reuse the existing image instead of re-cloning
+  // and re-running the expensive npm install/build. Only a NEW commit triggers
+  // a rebuild.
+  if (!isNpm && adapter.sourceRepo && adapter.builtCommit && adapter.builtImageId) {
+    try {
+      const resolved = await resolveRefCommit(adapter.sourceRepo, adapter.sourceRef ?? null);
+      if (resolved && resolved === adapter.builtCommit) {
+        app.queries.updateProjectAgentAdapter(adapter.id, { buildStatus: "ready" });
+        return {
+          adapter: app.queries.getProjectAgentAdapter(adapter.id)!,
+          build: {
+            image: adapter.image,
+            image_id: adapter.builtImageId,
+            commit: adapter.builtCommit,
+            duration_ms: 0,
+            cached: true,
+            log_path: null,
+          },
+        };
+      }
+    } catch {
+      // fall through to a real build if ref resolution fails
+    }
+  }
+
   const sourceDir = join(
     app.dataDir,
     "projects",
@@ -236,6 +266,28 @@ async function buildAdapter(
       lastBuiltAt: new Date().toISOString(),
     });
     throw err;
+  }
+}
+
+/**
+ * Resolve the commit a source ref points to WITHOUT a full clone, using a
+ * lightweight git query against a local repo path when possible. Returns null
+ * (or throws) when the ref cannot be resolved cheaply, signaling the caller to
+ * fall back to a real build.
+ */
+async function resolveRefCommit(repo: string, ref: string | null): Promise<string | null> {
+  const normalized = normalizeRepoUrl(repo);
+  try {
+    const target = ref ? ref.trim() : "HEAD";
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", normalized, "rev-parse", "--verify", `${target}^{commit}`],
+      { timeout: 15_000 },
+    );
+    const commit = stdout.trim();
+    return /^[0-9a-f]{40}$/i.test(commit) ? commit : null;
+  } catch {
+    return null;
   }
 }
 
