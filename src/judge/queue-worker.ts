@@ -940,6 +940,7 @@ MANDATORY PROCESS:
 8. Call preflight_queue_analysis with the complete payload. Correct every path-specific error.
 9. Call submit_queue_analysis exactly once with the successful preflight token. You MUST deliver a complete, defensible report covering EVERY eval. Skipping any eval's MANDATORY reading is a failure.
 10. SCRATCHPAD DISCIPLINE (retain, never skip): Before any long read, before opening a very large file, and ESPECIALLY before any compaction, call judge_scratchpad(action="append", ...) with that eval's findings + what remains. After compaction, judge_scratchpad(action="read") to restore and continue. Check the scratchpad between evals too, so later evals get the same depth as the first. Never let later-eval coverage drop because the early evals consumed the session — the scratchpad is how you keep even, deep coverage.
+   ALWAYS include a PROGRESS LINE in every scratchpad append/checkpoint: state clearly how many eval archives you have COMPLETED and how many REMAIN, e.g. "PROGRESS: 4/10 evals analyzed, 6 remaining — next up: cpp-config-parser". Keep it current at every checkpoint so after any compaction (or at the end) you and anyone reading the scratchpad know exactly where you are and what is left.
 
 preflight_queue_analysis arguments:
 - per_eval: [{run_id, verdict, narrative}]. verdict is the standard schemaVersion:1 Verdict described above. narrative is:
