@@ -120,6 +120,17 @@ export async function buildEvalAgentImage(input: {
     `USER 10001`,
   ].join("\n") + "\n", "utf8");
   const image = `agenteval/suite-base:${key.slice(0, 32)}`;
+  // The wrapper is content-addressed by adapter+base; if an image for this key
+  // already exists in the backend, reuse it instead of re-running the overlay build.
+  if (await input.runtime.imageExists(image)) {
+    return {
+      image,
+      imageId: image,
+      durationMs: 0,
+      stdout: "",
+      stderr: "",
+    };
+  }
   const result = await input.runtime.buildImage({
     contextDir: wrapperDir,
     containerfilePath: "Containerfile.agenteval",
