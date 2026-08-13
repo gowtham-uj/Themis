@@ -17,7 +17,7 @@ import type {
   MetaFinding,
   Ref,
   Verdict,
-} from "../judge/verdict.js";
+} from "../types.js";
 
 // ---------------------------------------------------------------------------
 // Row types (shared by the query layer)

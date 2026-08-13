@@ -13,7 +13,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { existsSync, watch as fsWatch } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Verdict } from "../judge/verdict.js";
+import type { Verdict } from "../types.js";
 import {
   judgeEventsPath,
   judgementDir,

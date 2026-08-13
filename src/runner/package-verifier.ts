@@ -11,7 +11,7 @@ import {
   type EvalPackageRuntimeConfig,
   type EvalPackageVerifierCheck,
 } from "../evals/package.js";
-import type { CheckResult } from "../judge/verdict.js";
+import type { CheckResult } from "../types.js";
 import type { ContainerRuntime } from "./runtime.js";
 
 export interface PackageVerifierResult {

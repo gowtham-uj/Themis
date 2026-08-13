@@ -1,3 +1,4 @@
+import { batchProgress, collectBatchBundles, summarizeBundles, buildEvalReport, renderEvalReport } from "../judge-stub.js";
 /**
  * Commit evaluation — run a project's eval suite against a specific revision.
  *
@@ -22,15 +23,11 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DbQueries, Run, Task } from "../db/queries.js";
-import { batchProgress } from "../judge/batch-completion.js";
-import { collectBatchBundles, summarizeBundles } from "../judge/eval-bundle.js";
 import { releaseDir } from "./auto-judge.js";
 import { badRequest, notFound } from "./errors.js";
 import { readJsonBody, sendJson, type RequestContext, type Router } from "./router.js";
 import { serveHtmlFile } from "./judgements-routes.js";
 import { GitHubClient, parseRepoRef } from "./github.js";
-import { buildEvalReport } from "../judge/eval-report.js";
-import { renderEvalReport } from "../judge/report/release-render.js";
 
 /** Minimal AppCtx surface these routes need. */
 export interface CommitEvalAppCtx {

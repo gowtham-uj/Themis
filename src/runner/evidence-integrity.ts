@@ -2,7 +2,7 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, relative, sep } from "node:path";
-import type { Ref } from "../judge/verdict.js";
+import type { Ref } from "../types.js";
 import type { RunMetrics } from "./metrics.js";
 
 export const EVIDENCE_INTEGRITY_SCHEMA_VERSION = 1 as const;
