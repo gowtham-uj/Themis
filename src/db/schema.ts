@@ -3,8 +3,6 @@
  * Source of truth: plan/data-model.md (SQL mirrored faithfully).
  *
  * Domain tables are project-scoped (project_id FK) except agents (global).
- * Judgements/scores/findings tables are defined here for later phases (P4/P6);
- * query methods for those are stubbed in queries.ts.
  */
 
 import {
@@ -41,7 +39,6 @@ export const projects = sqliteTable("projects", {
   defaultAgentId: text("default_agent_id").references(() => agents.id),
   defaultModel: text("default_model"),
   defaultProvider: text("default_provider"),
-  defaultJudgeModel: text("default_judge_model"),
   /** Base image for this project's workspaces. */
   workspaceImage: text("workspace_image"),
   /** Command templates per check kind: {test_suite:"cargo test", ...} */
@@ -52,8 +49,6 @@ export const projects = sqliteTable("projects", {
   networkPolicy: text("network_policy").default("allow"),
   /** Keep last N runs per task; null = unlimited. */
   retentionRuns: integer("retention_runs"),
-  /** What run artifacts survive judgement: keep|referenced|all. */
-  artifactRetention: text("artifact_retention").default("keep"),
   /** Per-project sandbox controls (capabilities, mounts, devices, ports…). */
   sandboxJson: text("sandbox_json"),
   archived: integer("archived").notNull().default(0),
@@ -114,6 +109,35 @@ export const projectAgentAdapters = sqliteTable(
 // Eval queues — persistent definitions, one live container per active queue
 // ---------------------------------------------------------------------------
 
+export const adapterBuilds = sqliteTable(
+  "adapter_builds",
+  {
+    /** Deterministic: `${adapterId}:${commit}`. */
+    id: text("id").primaryKey(),
+    /** Adapter this build materializes (project or shared adapter row id). */
+    adapterId: text("adapter_id")
+      .notNull()
+      .references(() => projectAgentAdapters.id),
+    commitSha: text("commit_sha").notNull(),
+    /** building|ready|failed */
+    status: text("status").notNull().default("building"),
+    /** Commit-addressed image tag; unique across adapters/commits. */
+    image: text("image"),
+    imageId: text("image_id"),
+    /** Deterministic agent version (stable short SHA unless trustworthy version extracted). */
+    agentVersion: text("agent_version"),
+    logPath: text("log_path"),
+    error: text("error"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    completedAt: text("completed_at"),
+  },
+  (t) => [
+    unique("uq_adapter_build_adapter_commit").on(t.adapterId, t.commitSha),
+    index("idx_adapter_builds_commit").on(t.commitSha),
+  ],
+);
+
 export const evalQueues = sqliteTable(
   "eval_queues",
   {
@@ -132,14 +156,13 @@ export const evalQueues = sqliteTable(
     sandboxJson: text("sandbox_json"),
     networkPolicy: text("network_policy").notNull().default("allow"),
     portsJson: text("ports_json"),
-    judgeModel: text("judge_model"),
-    judgeProvider: text("judge_provider"),
-    autoJudge: integer("auto_judge").notNull().default(1),
     status: text("status").notNull().default("draft"),
     activeBatchId: text("active_batch_id"),
     sharedAdapterId: text("shared_adapter_id").references(() => projectAgentAdapters.id),
     /** Explicit built-in adapter id ("reapercode"|"pi") when the queue opts into a built-in; no implicit fallback. */
     builtinAdapterId: text("builtin_adapter_id"),
+    /** resolved agent commit (full SHA) this queue builds/runs. Null for built-in adapters. */
+    agentCommit: text("agent_commit"),
     revision: integer("revision").notNull().default(1),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
@@ -156,6 +179,8 @@ export const watcherRules = sqliteTable("watcher_rules", {
   projectId: text("project_id")
     .notNull()
     .references(() => projects.id),
+  /** Queue this watcher owns; watcher fires that queue's agent-commit generation. */
+  queueId: text("queue_id").references(() => evalQueues.id),
   /** "agent" | "workspace" */
   role: text("role").notNull(),
   /** full url or "owner/name" */
@@ -185,51 +210,16 @@ export const watcherEvents = sqliteTable("watcher_events", {
   trigger: text("trigger").notNull(),
   ref: text("ref"),
   resolvedSha: text("resolved_sha"),
-  /** matched|ignored(semver)|deduped|enqueued|failed|building */
+  /** matched|ignored(semver)|deduped|pending|launching|launched|failed|building */
   status: text("status").notNull(),
   batchId: text("batch_id"),
+  queueId: text("queue_id").references(() => evalQueues.id),
+  /** Durable FIFO order for pending events awaiting a free queue generation. */
+  fifoSeq: integer("fifo_seq"),
+  /** resolvedSha for the generation this event (when launched) corresponds to. */
+  processedSha: text("processed_sha"),
   error: text("error"),
 });
-
-// ---------------------------------------------------------------------------
-// Eval queue (schema only for P8)
-// ---------------------------------------------------------------------------
-
-export const queueEntries = sqliteTable(
-  "queue_entries",
-  {
-    id: text("id").primaryKey(),
-    projectId: text("project_id")
-      .notNull()
-      .references(() => projects.id),
-    triggerRef: text("trigger_ref"),
-    /** "task" | "task_set" */
-    targetKind: text("target_kind").notNull(),
-    taskId: text("task_id"),
-    taskTagsJson: text("task_tags_json"),
-    agentId: text("agent_id")
-      .notNull()
-      .references(() => agents.id),
-    model: text("model"),
-    provider: text("provider"),
-    repeats: integer("repeats"),
-    paramsJson: text("params_json"),
-    adapterOverridesJson: text("adapter_overrides_json"),
-    autoJudge: integer("auto_judge"),
-    judgeModel: text("judge_model"),
-    priority: integer("priority").notNull().default(0),
-    position: real("position").notNull(),
-    /** queued|promoted|running|removed|failed */
-    status: text("status").notNull().default("queued"),
-    dedupKey: text("dedup_key"),
-    source: text("source"),
-    createdAt: text("created_at").notNull(),
-    promotedAt: text("promoted_at"),
-    promotedBatchId: text("promoted_batch_id"),
-    removedAt: text("removed_at"),
-  },
-  (t) => [index("idx_queue_project_status").on(t.projectId, t.status)],
-);
 
 // ---------------------------------------------------------------------------
 // Tasks (project-scoped)
@@ -299,6 +289,10 @@ export const evalQueueItems = sqliteTable(
     repeats: integer("repeats").notNull().default(1),
     enabled: integer("enabled").notNull().default(1),
     overridesJson: text("overrides_json"),
+    /** Number of repeats already claimed across all generations (immutable floor). */
+    claimedRepeats: integer("claimed_repeats").notNull().default(0),
+    /** Soft-deletion: deleted_at set instead of hard delete once execution history exists. */
+    deletedAt: text("deleted_at"),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
@@ -311,9 +305,8 @@ export const evalQueueItems = sqliteTable(
 
 export const runBatches = sqliteTable("run_batches", {
   id: text("id").primaryKey(),
-  taskId: text("task_id")
-    .notNull()
-    .references(() => tasks.id),
+  /** Null for multi-eval generations (one batch = many evals). Single-eval batches retain the task id. */
+  taskId: text("task_id").references(() => tasks.id),
   /** Denormalized for fast project filtering. */
   projectId: text("project_id")
     .notNull()
@@ -332,10 +325,19 @@ export const runBatches = sqliteTable("run_batches", {
   triggerRef: text("trigger_ref"),
   agentImage: text("agent_image"),
   agentCommit: text("agent_commit"),
+  /** Commit-addressed image + resolved agent commit snapshot (generation genesis). */
+  agentImageId: text("agent_image_id"),
+  agentVersion: text("agent_version"),
+  buildId: text("build_id"),
   /** Queue definition that created this immutable execution snapshot. */
   queueId: text("queue_id").references(() => evalQueues.id),
   queueRevision: integer("queue_revision"),
   createdAt: text("created_at").notNull(),
+  /** Immutable generation state; accepting until atomic empty-close flips it false. */
+  accepting: integer("accepting").notNull().default(1),
+  /** Queue definition revision observed at atomic empty-close. */
+  closedRevision: integer("closed_revision"),
+  closedAt: text("closed_at"),
 });
 
 export const queueContainers = sqliteTable(
@@ -353,6 +355,12 @@ export const queueContainers = sqliteTable(
       .references(() => runBatches.id),
     runtimeContainerId: text("runtime_container_id"),
     image: text("image").notNull(),
+    /** Commit-addressed image id + resolved agent commit (generation snapshot). */
+    imageId: text("image_id"),
+    agentCommit: text("agent_commit"),
+    agentVersion: text("agent_version"),
+    buildId: text("build_id"),
+    /** Generation container states: starting|running|idle|closing|completed|tainted|stopping|stopped|paused|failed */
     state: text("state").notNull(),
     portsJson: text("ports_json"),
     workspaceDir: text("workspace_dir").notNull(),
@@ -392,6 +400,8 @@ export const runs = sqliteTable("runs", {
   /** Exact eval-store version and full definition used by this execution. */
   evalVersion: integer("eval_version"),
   evalSnapshotJson: text("eval_snapshot_json"),
+  /** Immutable queue-item snapshot copied at claim time (repeats/overrides/position). */
+  itemSnapshotJson: text("item_snapshot_json"),
   /** queued|running|paused|resuming|completed|failed|aborted|timeout */
   status: text("status").notNull(),
   /** Resolved workspace sha (reproducibility). */
@@ -428,7 +438,7 @@ export const runs = sqliteTable("runs", {
 });
 
 // ---------------------------------------------------------------------------
-// Immutable eval archives + append-only queue judgement revisions
+// Immutable eval archives
 // ---------------------------------------------------------------------------
 
 export const evalArchives = sqliteTable("eval_archives", {
@@ -448,126 +458,7 @@ export const evalArchives = sqliteTable("eval_archives", {
   sealedAt: text("sealed_at").notNull(),
 });
 
-export const queueAnalyses = sqliteTable(
-  "queue_analyses",
-  {
-    id: text("id").primaryKey(),
-    queueId: text("queue_id")
-      .notNull()
-      .references(() => evalQueues.id),
-    projectId: text("project_id")
-      .notNull()
-      .references(() => projects.id),
-    batchId: text("batch_id")
-      .notNull()
-      .references(() => runBatches.id),
-    selectedRunIdsJson: text("selected_run_ids_json").notNull(),
-    evidenceHashesJson: text("evidence_hashes_json").notNull(),
-    judgeModel: text("judge_model").notNull(),
-    judgeProvider: text("judge_provider").notNull(),
-    judgeParamsJson: text("judge_params_json"),
-    judgePrompt: text("judge_prompt"),
-    systemPromptVersion: text("system_prompt_version").notNull(),
-    parentAnalysisId: text("parent_analysis_id"),
-    status: text("status").notNull(),
-    verdictPath: text("verdict_path"),
-    reportPath: text("report_path"),
-    eventsPath: text("events_path"),
-    rawResponsePath: text("raw_response_path"),
-    createdAt: text("created_at").notNull(),
-    startedAt: text("started_at"),
-    endedAt: text("ended_at"),
-    error: text("error"),
-  },
-  (t) => [index("idx_queue_analyses_queue_batch").on(t.queueId, t.batchId)],
-);
-
-// ---------------------------------------------------------------------------
-// Judgements + scores (schema only; queries stubbed until P4)
-// ---------------------------------------------------------------------------
-
-export const judgements = sqliteTable("judgements", {
-  id: text("id").primaryKey(),
-  runId: text("run_id")
-    .notNull()
-    .references(() => runs.id),
-  projectId: text("project_id")
-    .notNull()
-    .references(() => projects.id),
-  queueAnalysisId: text("queue_analysis_id").references(() => queueAnalyses.id),
-  judgeModel: text("judge_model").notNull(),
-  judgeProvider: text("judge_provider").notNull(),
-  judgePrompt: text("judge_prompt"),
-  systemPromptVersion: text("system_prompt_version").notNull(),
-  /** queued|running|completed|failed */
-  status: text("status").notNull(),
-  overallScore: real("overall_score"),
-  /** pass|fail|partial */
-  verdict: text("verdict"),
-  reportPath: text("report_path"),
-  eventsPath: text("events_path"),
-  verdictPath: text("verdict_path"),
-  narrativeJson: text("narrative_json"),
-  narrativeSchemaVersion: integer("narrative_schema_version"),
-  createdAt: text("created_at"),
-  endedAt: text("ended_at"),
-});
-
-export const scores = sqliteTable("scores", {
-  id: text("id").primaryKey(),
-  judgementId: text("judgement_id")
-    .notNull()
-    .references(() => judgements.id),
-  criterion: text("criterion").notNull(),
-  weight: real("weight").notNull(),
-  score: real("score").notNull(),
-  rationale: text("rationale"),
-});
-
-export const improvementSteps = sqliteTable(
-  "improvement_steps",
-  {
-    id: text("id").primaryKey(),
-    stepKey: text("step_key").notNull(),
-    queueAnalysisId: text("queue_analysis_id")
-      .notNull()
-      .references(() => queueAnalyses.id),
-    projectId: text("project_id")
-      .notNull()
-      .references(() => projects.id),
-    queueId: text("queue_id")
-      .notNull()
-      .references(() => evalQueues.id),
-    rank: integer("rank").notNull(),
-    ownerClass: text("class").notNull(),
-    priority: integer("priority").notNull(),
-    confidence: real("confidence").notNull(),
-    defectIdsJson: text("defect_ids_json").notNull(),
-    subsystem: text("subsystem").notNull(),
-    problem: text("problem").notNull(),
-    evidenceJson: text("evidence_json").notNull(),
-    targetJson: text("target_json").notNull(),
-    change: text("change").notNull(),
-    acceptanceCriteriaJson: text("acceptance_criteria_json").notNull(),
-    testsJson: text("tests_json").notNull(),
-    verifyTaskIdsJson: text("verify_task_ids_json").notNull(),
-    regressionTaskIdsJson: text("regression_task_ids_json").notNull(),
-    dependenciesJson: text("dependencies_json").notNull(),
-    nonGoalsJson: text("non_goals_json").notNull(),
-    preventive: integer("preventive").notNull().default(0),
-    status: text("status").notNull(),
-    blockingReason: text("blocking_reason"),
-    createdAt: text("created_at").notNull(),
-    updatedAt: text("updated_at").notNull(),
-  },
-  (t) => [
-    unique("improvement_steps_analysis_rank").on(t.queueAnalysisId, t.rank),
-    unique("improvement_steps_analysis_key").on(t.queueAnalysisId, t.stepKey),
-    index("idx_improvement_steps_analysis_status").on(t.queueAnalysisId, t.status),
-  ],
-);
-
-/** Versioned exact/derived/judge-derived per-eval metrics projection. */
+/** Versioned exact and derived per-eval metrics projection. */
 export const evalMetrics = sqliteTable("eval_metrics", {
   runId: text("run_id")
     .primaryKey()
@@ -581,67 +472,6 @@ export const evalMetrics = sqliteTable("eval_metrics", {
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });
-
-// ---------------------------------------------------------------------------
-// Findings (schema only; queries stubbed until P6)
-// ---------------------------------------------------------------------------
-
-export const findings = sqliteTable(
-  "findings",
-  {
-    fingerprint: text("fingerprint").primaryKey(),
-    taskId: text("task_id")
-      .notNull()
-      .references(() => tasks.id),
-    projectId: text("project_id")
-      .notNull()
-      .references(() => projects.id),
-    category: text("category").notNull(),
-    /** "defect" | "positive" | "meta" */
-    kind: text("kind").notNull(),
-    claim: text("claim").notNull(),
-    latestSeverity: text("latest_severity"),
-    latestConfidence: real("latest_confidence"),
-    firstSeenJudgement: text("first_seen_judgement"),
-    lastSeenJudgement: text("last_seen_judgement"),
-    firstSeenAt: text("first_seen_at"),
-    lastSeenAt: text("last_seen_at"),
-    occurrenceCount: integer("occurrence_count").notNull().default(1),
-    resolvedAt: text("resolved_at"),
-    /** open|resolved|regressed|wontfix */
-    status: text("status").notNull().default("open"),
-  },
-  (t) => [index("idx_findings_task").on(t.taskId)],
-);
-
-export const findingOccurrences = sqliteTable(
-  "finding_occurrences",
-  {
-    id: text("id").primaryKey(),
-    findingFingerprint: text("finding_fingerprint")
-      .notNull()
-      .references(() => findings.fingerprint),
-    judgementId: text("judgement_id")
-      .notNull()
-      .references(() => judgements.id),
-    runId: text("run_id")
-      .notNull()
-      .references(() => runs.id),
-    severity: text("severity").notNull(),
-    confidence: real("confidence").notNull(),
-    claim: text("claim").notNull(),
-    criterion: text("criterion"),
-    refsJson: text("refs_json").notNull(),
-    fixJson: text("fix_json"),
-    /** introduced|persisted|resolved */
-    status: text("status").notNull().default("introduced"),
-    createdAt: text("created_at").notNull(),
-  },
-  (t) => [
-    index("idx_occurrences_run").on(t.runId),
-    index("idx_occurrences_judgement").on(t.judgementId),
-  ],
-);
 
 // ---------------------------------------------------------------------------
 // Checks + users
@@ -713,63 +543,8 @@ export const apiTokens = sqliteTable(
   (t) => [index("idx_api_tokens_hash").on(t.tokenHash)],
 );
 
-// ---------------------------------------------------------------------------
-// Outbound webhook subscriptions + delivery log (P8c)
-// ---------------------------------------------------------------------------
-
-export const outboundSubscriptions = sqliteTable(
-  "outbound_subscriptions",
-  {
-    id: text("id").primaryKey(),
-    projectId: text("project_id")
-      .notNull()
-      .references(() => projects.id),
-    url: text("url").notNull(),
-    /** Per-subscription HMAC signing secret. NEVER returned after create. */
-    secret: text("secret").notNull(),
-    /** JSON array of event types; empty array = all events. */
-    eventTypesJson: text("event_types_json").notNull(),
-    enabled: integer("enabled").notNull().default(1),
-    createdAt: text("created_at").notNull(),
-    updatedAt: text("updated_at").notNull(),
-  },
-  (t) => [index("idx_outbound_subs_project").on(t.projectId)],
-);
-
-export const webhookDeliveries = sqliteTable(
-  "webhook_deliveries",
-  {
-    id: text("id").primaryKey(),
-    subscriptionId: text("subscription_id")
-      .notNull()
-      .references(() => outboundSubscriptions.id),
-    projectId: text("project_id")
-      .notNull()
-      .references(() => projects.id),
-    eventType: text("event_type").notNull(),
-    payloadJson: text("payload_json").notNull(),
-    /** pending|success|failed */
-    status: text("status").notNull(),
-    attempt: integer("attempt").notNull().default(0),
-    responseStatus: integer("response_status"),
-    /** Truncated response body (≤2KB). */
-    responseBody: text("response_body"),
-    error: text("error"),
-    deliveredAt: text("delivered_at"),
-    createdAt: text("created_at").notNull(),
-  },
-  (t) => [
-    index("idx_webhook_deliveries_project_created").on(
-      t.projectId,
-      t.createdAt,
-    ),
-    index("idx_webhook_deliveries_sub").on(t.subscriptionId),
-  ],
-);
-
 // Deterministic check results (P9, rubric.md §5). Run-keyed JSON mirror of the
-// verdict's checkResults array so API consumers can query pass-rates without
-// parsing the verdict body. One row per run (upserted on re-store).
+// Run-keyed deterministic check results for API consumers. One row per run.
 export const checkResults = sqliteTable(
   "check_results",
   {
@@ -780,28 +555,6 @@ export const checkResults = sqliteTable(
   (t) => [index("idx_check_results_run").on(t.runId)],
 );
 
-// Project-scoped reusable rubrics (plan/rubric.md §6). A task may embed its own
-// rubric_json or reference one of these; the project rubric is the shared,
-// versioned baseline. Editing the criteria bumps rubric_version (new baseline).
-export const projectRubrics = sqliteTable(
-  "project_rubrics",
-  {
-    id: text("id").primaryKey(),
-    projectId: text("project_id")
-      .notNull()
-      .references(() => projects.id),
-    name: text("name").notNull(),
-    description: text("description"),
-    rubricJson: text("rubric_json").notNull(),
-    rubricVersion: integer("rubric_version").notNull().default(1),
-    isDefault: integer("is_default").notNull().default(0),
-    archived: integer("archived").notNull().default(0),
-    createdAt: text("created_at").notNull(),
-    updatedAt: text("updated_at").notNull(),
-  },
-  (t) => [index("idx_project_rubrics_project").on(t.projectId)],
-);
-
 // ---------------------------------------------------------------------------
 // Schema registry (for drizzle + openDb)
 // ---------------------------------------------------------------------------
@@ -810,34 +563,25 @@ export const schema = {
   agents,
   projects,
   projectAgentAdapters,
+  adapterBuilds,
   evalQueues,
   watcherRules,
   watcherEvents,
-  queueEntries,
   tasks,
   evalQueueItems,
   runBatches,
   queueContainers,
   runs,
   evalArchives,
-  queueAnalyses,
-  judgements,
-  scores,
-  improvementSteps,
   evalMetrics,
-  findings,
-  findingOccurrences,
   checks,
   users,
   settings,
   apiTokens,
-  outboundSubscriptions,
-  webhookDeliveries,
   checkResults,
-  projectRubrics,
 };
 
 export type Schema = typeof schema;
 
 /** Migration version stamped into pragma user_version / migrations table. */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 9;

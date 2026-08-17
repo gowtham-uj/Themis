@@ -1,11 +1,11 @@
 /**
- * UI-builder task source (kind: "ui-builder").
+ * API-authored task source (legacy persisted kind: "ui-builder").
  *
- * The UI persists authored tasks directly to the DB (P3c). This source is a
+ * API clients persist authored tasks directly to the DB. This source is a
  * passthrough/readback: it re-reads `task.json` files under
  * `<projectDir>/tasks/<tid>/task.json` so a sync round-trips authored tasks.
  *
- * Also exports `buildTaskSpec` — the helper the create-task form calls to
+ * Also exports `buildTaskSpec` for API-authored task construction to
  * assemble a valid TaskSpec from form input.
  */
 
@@ -27,7 +27,7 @@ import type {
 import type { WorkspaceSpec } from "../adapters/types.js";
 
 // ---------------------------------------------------------------------------
-// Shared TaskSpec validation (used by UIBuilderSource + RepoMdSource)
+// Shared TaskSpec validation used by API-authored and repository sources
 // ---------------------------------------------------------------------------
 
 const AXES = new Set<RubricAxis>(["A", "B", "C", "D", "E", "F", "G", "H"]);
@@ -85,18 +85,6 @@ export function validateTaskSpec(spec: TaskSpec): ValidationResult {
     warnings.push("tags should be an array of strings");
   }
 
-  return { ok: errors.length === 0, errors, warnings };
-}
-
-/**
- * Validate a standalone Rubric (no surrounding task). Never throws.
- * Used by the project-rubric CRUD routes, which accept a rubric on its own
- * rather than as part of a TaskSpec.
- */
-export function validateRubricSpec(rubric: Rubric): ValidationResult {
-  const errors: string[] = [];
-  const warnings: string[] = [];
-  validateRubric(rubric, errors, warnings);
   return { ok: errors.length === 0, errors, warnings };
 }
 
@@ -187,7 +175,7 @@ function validateCriterion(
   }
 }
 
-/** Input shape for the UI create-task form. */
+/** Input shape for constructing an API-authored task. */
 export interface BuildTaskSpecInput {
   name: string;
   prompt: string;
@@ -220,7 +208,7 @@ export interface BuildTaskSpecInput {
 }
 
 /**
- * Assemble a valid TaskSpec from UI form input.
+ * Assemble a valid TaskSpec from API input.
  * Throws if the result fails validation (empty prompt, no criteria, missing anchors).
  */
 export function buildTaskSpec(input: BuildTaskSpecInput): TaskSpec {
@@ -281,7 +269,7 @@ export function buildTaskSpec(input: BuildTaskSpecInput): TaskSpec {
 }
 
 /**
- * Readback source for UI-authored tasks stored as task.json under projectDir/tasks/.
+ * Readback source for API-authored tasks stored as task.json under projectDir/tasks/.
  */
 export class UIBuilderSource implements TaskSource {
   readonly kind = "ui-builder" as const;

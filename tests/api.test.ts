@@ -10,13 +10,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  listProjects,
-  listTasks,
-  listRuns,
-} from "../src/ui/lib/api.ts";
 import { createServer, type ApiServer } from "../src/api/server.ts";
-import { runDirPath } from "../src/api/run-controller-bridge.ts";
+import { runDirPath } from "../src/runner/run-layout.ts";
 import type { Rubric } from "../src/domain.ts";
 import { validEvalPackageUpload } from "./helpers/eval-package.ts";
 
@@ -248,7 +243,7 @@ describe("REST API (P3c)", () => {
     const flatTask = await http(base, "POST", `/api/projects/${project.id}/tasks`, {
       body: { name: "legacy", prompt: "legacy", rubric: sampleRubric(1) },
     });
-    expect(flatTask.status).toBe(400);
+    expect(flatTask.status).toBe(404);
 
     const taskRes = await http(base, "POST", `/api/projects/${project.id}/evals`, {
       body: validEvalPackageUpload(),
@@ -307,12 +302,73 @@ describe("REST API (P3c)", () => {
     expect(body.provenance).toBeTruthy();
   });
 
-  it("report is 404 when no completed judgement exists (P5b)", async () => {
+  it("run detail does not leak host-internal filesystem paths", async () => {
     const { base, api } = await boot();
     const { runId } = await seedCompletedRun(api);
 
-    const report = await http(base, "GET", `/api/runs/${runId}/report?partial=1`);
-    expect(report.status).toBe(404);
+    const detail = await http(base, "GET", `/api/runs/${runId}`);
+    expect(detail.status).toBe(200);
+    const serialized = JSON.stringify(detail.json);
+    const dataDir = api.app.dataDir;
+    // The run's on-disk dir exists under dataDir; neither the DB-stored
+    // internal path (events_path/diff_path) nor the dataDir root may leak.
+    expect(serialized).not.toContain("events_path");
+    expect(serialized).not.toContain("diff_path");
+    expect(serialized).not.toContain(dataDir);
+    expect(serialized).not.toContain("/evals/");
+    expect(serialized).not.toContain("/runs/");
+  });
+
+  it("queue container detail does not leak the host workspace_dir", async () => {
+    const { base, api } = await boot();
+    const q = api.queries;
+    const project = q.createProject({
+      name: "Leak",
+      slug: `leak-${Date.now().toString(36)}`,
+      defaultModel: "deepseek-v4-flash",
+      defaultProvider: "nuralwatt",
+    });
+    q.registerAgent({ id: "pi", displayName: "Pi" });
+    const task = q.createTask(project.id, {
+      name: "task",
+      prompt: "prompt",
+      workspace: { source: "empty" },
+      rubric: sampleRubric(1),
+      profile: "bugfix",
+      agentCategory: "coding",
+    });
+    const batch = q.createBatch({
+      taskId: task.id,
+      projectId: project.id,
+      agentId: "pi",
+      model: "m",
+      provider: "p",
+      repeats: 1,
+    });
+    const queue = q.createEvalQueue(project.id, {
+      name: "q",
+      agentId: "pi",
+      model: "m",
+      provider: "p",
+    });
+    q.createEvalQueueItem(queue.id, { taskId: task.id });
+    q.createQueueContainer({
+      queueId: queue.id,
+      projectId: project.id,
+      batchId: batch.id,
+      image: "example/img",
+      imageId: "sha256:abc",
+      runtimeContainerId: "ctr-1",
+      state: "running",
+      workspaceDir: join(api.app.dataDir, "projects", project.id, "queues", queue.id, "workspace"),
+    });
+
+    const detail = await http(base, "GET", `/api/projects/${project.id}/queues/${queue.id}`);
+    expect(detail.status).toBe(200);
+    const serialized = JSON.stringify(detail.json);
+    expect(serialized).not.toContain("workspaceDir");
+    expect(serialized).not.toContain("/workspace");
+    expect(serialized).not.toContain(api.app.dataDir);
   });
 
   it("405 returns Allow + problem details", async () => {
@@ -347,20 +403,5 @@ describe("REST API (P3c)", () => {
     );
     const types = events.map((e) => (e as { type?: string }).type);
     expect(types).toContain("run.start");
-  });
-
-  // Integration (not mocked): the REAL UI api client against the REAL server.
-  it("UI client list accessors unwrap the real server's envelopes", async () => {
-    const { api, base } = await boot();
-    const { projectId, taskId, runId } = await seedCompletedRun(api);
-
-    const projects = await listProjects({ baseUrl: base });
-    expect(projects.some((p) => p.id === projectId)).toBe(true);
-
-    const tasks = await listTasks(projectId, { baseUrl: base });
-    expect(tasks.some((t) => t.id === taskId)).toBe(true);
-
-    const runs = await listRuns(projectId, { baseUrl: base });
-    expect(runs.some((r) => r.id === runId)).toBe(true);
   });
 });

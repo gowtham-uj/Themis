@@ -141,14 +141,14 @@ Supported script entrypoints:
 
 - `agent_id`: non-empty stable id; must equal request `agent_id`.
 - `name`: non-empty display name.
-- `install_type`: `source-build` or `npm`.
+- `install_type`: `source-build`, `npm`, or `binary`.
 - `image`: non-empty OCI image tag.
 - `containerfile`: non-empty build recipe for the real CLI.
 - `command.argv`: exact non-shell argv used for eval prompts.
 - `connection_check` or omission of it (omission derives a probe from `command`).
 - `parser_kind`: `canonical-jsonl`, `pi-jsonl`, or `reapercode-jsonl`.
 - `evidence.paths`: paths relative to `/workspace`.
-- `source_repo` for `source-build`; optional/null for `npm`.
+- `source_repo` for `source-build` and `binary`; optional/null for `npm`.
 
 `derive_connection_check` is accepted as the human-facing spelling. Internally the stored field is
 `connectionCheckDerived`. If no explicit `connection_check` is emitted, derivation is enabled.
@@ -162,6 +162,22 @@ and sends the checkout as the real Podman build context. The generated recipe no
 installs dependencies, builds the CLI, and exposes a stable executable in `PATH`.
 
 The resolved source commit and resulting image id are persisted as build provenance.
+
+### `binary`
+
+Same as `source-build` (clone `source_repo` at `source_ref` → build context), except the recipe COPYs a
+committed prebuilt artifact instead of running `npm ci`/`tsc`. This is for agents that publish a
+single-file bundle (e.g. ReaperCode's `bin/reaper.mjs`) so the image builds in seconds and reuses by
+commit + image id.
+
+```dockerfile
+FROM node:22-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends bash git sudo procps ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY bin/reaper.mjs /opt/reaper/bin/reaper.mjs
+RUN printf '#!/bin/sh\nexec node /opt/reaper/bin/reaper.mjs "$@"\n' > /usr/local/bin/reaper \
+    && chmod +x /usr/local/bin/reaper
+```
 
 ### `npm`
 
@@ -256,7 +272,7 @@ Do not discard unknown native records; store them in evidence even if they canno
 ## Evidence
 
 All paths are relative to `/workspace` and cannot escape it. Paths can be files or directories.
-`required_paths` should contain only evidence without which the judge cannot reliably reconstruct the
+`required_paths` should contain only evidence without which archive consumers cannot reliably reconstruct the
 run. Missing required evidence taints the queue and stops subsequent evals.
 
 At minimum preserve:
@@ -267,7 +283,7 @@ At minimum preserve:
 - any model usage metadata not represented in canonical events.
 
 Evidence is copied before eval cleanup and workspace reset, then included in the immutable content-hash
-archive read by the PI judge.
+archive retained for later analysis.
 
 ## Sharing
 
@@ -303,7 +319,7 @@ replace those queue references first.
 7. `PUT .../queues/:queueId/container` — one real queue container; connection check, configure, sequential evals.
 8. Inspect connection/configure artifacts and live root bridge if needed.
 9. Verify each immutable eval archive.
-10. Start queue analysis with a real PI judge and retrieve events, transcript, verdict, and HTML report.
+10. Retrieve the queue run archives, metrics, traces, and verifier results through the API.
 
 ## Acceptance checklist
 
@@ -318,5 +334,5 @@ replace those queue references first.
 - Raw stdout/stderr and native evidence are retained before cleanup.
 - Workspace cleanup/reset succeeds; the second eval has no first-eval workspace residue.
 - Archives verify byte-for-byte.
-- PI judge reads every archive file and accepts exactly one validated verdict per selected run.
-- Queue analysis persists `pi-judge-events.jsonl`, `pi-session.json`, `verdict.json`, and `report.html`.
+- Archive integrity verification succeeds for every selected run.
+- The central archive store retains the complete sealed evidence tree and manifest.

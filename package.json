@@ -2,7 +2,7 @@
   "name": "agenteval",
   "version": "0.0.0",
   "private": true,
-  "description": "General agent evaluation platform — run autonomous agents against eval tasks, capture rich traces, judge with a three-layer verdict (scores + localized diagnostics + located findings) + two-lens improvements synthesis, and track regressions across versions.",
+  "description": "API-only agent evaluation backend for adapter versioning, persistent Podman queues, deterministic verification, and immutable eval-result archives.",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -12,24 +12,14 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=1 vitest run",
     "test:watch": "AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=1 vitest",
-    "cli": "tsx src/cli/index.ts",
-    "lint": "eslint src --max-warnings 0",
-    "ui:dev": "next dev src/ui",
-    "ui:build": "next build src/ui",
-    "ui:start": "next start src/ui",
-    "ui:typecheck": "tsc -p src/ui/tsconfig.json --noEmit"
+    "serve": "tsx src/cli/serve.ts",
+    "lint": "eslint src --max-warnings 0"
   },
   "devDependencies": {
-    "@testing-library/jest-dom": "^7.0.0",
-    "@testing-library/react": "^16.3.2",
-    "@testing-library/user-event": "^14.6.3",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.0.0",
-    "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.4",
     "@types/yazl": "^3.3.1",
     "eslint": "^9.0.0",
-    "jsdom": "^30.0.1",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0",
@@ -38,15 +28,9 @@
   "dependencies": {
     "@earendil-works/pi-coding-agent": "file:../_inspect/pi/packages/coding-agent",
     "@types/yauzl": "^2.10.3",
-    "autoprefixer": "^10.5.4",
     "better-sqlite3": "^13.0.3",
     "drizzle-orm": "^0.45.2",
-    "next": "^15.5.22",
-    "postcss": "^8.5.26",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
     "smol-toml": "^1.7.1",
-    "tailwindcss": "^3.4.19",
     "tar": "^7.5.22",
     "yauzl": "^3.4.0"
   }

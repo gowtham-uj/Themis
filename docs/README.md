@@ -5,7 +5,7 @@ Use these documents to operate the backend/API platform without reading implemen
 - [Canonical eval authoring](./eval-authoring.md) — required package tree, `task.toml`, environment,
   solution/verifier isolation, lifecycle scripts, validation gates, JSON and archive creation.
 - [Platform API operator guide](./platform-api-guide.md) — projects, adapters, evals/categories, queues,
-  containers, introspection, archives, metrics, judgements, reports and improvement lifecycle.
+  containers, introspection, metrics, and central archive retrieval.
 - [Adapter generator authoring](../plan/adapter-generation-guide.md) — complete real CLI integration
   contract, generator request/output, provider wiring, parser/evidence and build validation.
 

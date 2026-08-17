@@ -1,10 +1,14 @@
 /**
- * ReaperCode adapter — maps trajectory JSONL → canonical events.
+ * ReaperCode adapter — maps live logs to canonical events.
  *
- * IMPORTANT: This adapter is built against the EXPECTED post-change trajectory
- * shape described in plan/reapercode-changes.md. The live tree at
- * /work/_inspect/reaper does NOT yet emit structured `thinking`, `run_end`, or
- * `--stream-events`. Live runs require those ReaperCode changes.
+ * Live Reaper (`76489a7`+) writes a unified Pi-style session tree:
+ *   task/.reaper/logs/<id>/session.jsonl     (session mutations; also --stream-events stdout)
+ *   task/.reaper/logs/<id>/conversation.md   (slim transcript: user + thinking + assistant prose)
+ *   task/.reaper/latest-run.json
+ * Run status/telemetry/model-call dumps are dev-only (REAPER_DEV=1).
+ * Thinking is on by default; assistant messages may carry tool_calls[].
+ * Trajectory kinds still exist in-process and are mapped onto those mutations.
+ * This adapter accepts both raw TrajectoryEntry JSONL and session mutations.
  *
  * Mapping table: plan/event-schema.md § "Mapping: ReaperCode → canonical".
  */
@@ -13,12 +17,8 @@ import type { CanonicalEvent, RunStatus, StopReason, Usage } from "../schema/eve
 import { linesFromStream, parseJsonlLine } from "../schema/jsonl.js";
 import type { Adapter, AdapterCommand, AgentStreams, RunContext } from "./types.js";
 
-/**
- * Live ReaperCode has not yet landed the required trajectory changes
- * (structured thinking, --stream-events, run_end). This adapter implements the
- * post-change contract; mark consumers accordingly.
- */
-export const ADAPTER_STATUS = "spec-ahead-of-reaper" as const;
+/** Live Reaper at main 541dce6+ emits session stream + slim conversation. */
+export const ADAPTER_STATUS = "live" as const;
 
 const DEFAULT_IMAGE = "agenteval/reapercode:latest";
 
@@ -248,7 +248,7 @@ export function mapReaperEntry(
       }
       const provider = asString(entry.provider) ?? ctx.provider;
       const model = asString(entry.model) ?? ctx.model;
-      const paramsFromEntry = asRecord(entry.params) ?? {};
+      const paramsFromEntry = asRecord(entry.run_params) ?? asRecord(entry.params) ?? {};
       out.push({
         ...base(),
         type: "run.start",
@@ -334,7 +334,7 @@ export function mapReaperEntry(
           args: entry.args ?? {},
         });
       } else if (status === "completed" || status === "failed") {
-        const isError = status === "failed";
+        const isError = status === "failed" || asBoolean(entry.is_error) === true;
         const rawOutput = isError
           ? (entry.error ?? entry.output ?? { message: "tool failed" })
           : (entry.output ?? null);
@@ -438,7 +438,7 @@ export function mapReaperEntry(
     }
 
     case "verification_summary": {
-      // Surfaced to judge as a signal via log.
+      // Surfaced to archive consumers as a signal via the log.
       const passFail = asString(entry.pass_fail) ?? "unknown";
       const attempt = asNumber(entry.attempt_count);
       const score = asNumber(entry.score);
@@ -491,7 +491,8 @@ export function mapReaperEntry(
 
       // Optional final assistant message carried on run_end. This reopens the
       // just-closed turn (if any) for the message — it does NOT open a new turn.
-      const finalMsg = asString(entry.assistant_message);
+      const finalMsg =
+        asString(entry.final_assistant_message) ?? asString(entry.assistant_message);
       if (finalMsg && finalMsg.length > 0) {
         const turn = state.turnOpened ? state.turn : state.ensureTurn();
         const duplicate =
@@ -519,6 +520,20 @@ export function mapReaperEntry(
     }
 
     // Unmapped but known trajectory kinds → debug log so nothing is silently dropped.
+    case "user_message": {
+      const text = asString(entry.content) ?? "";
+      const turn = state.ensureTurn(asNumber(entry.turn_index));
+      if (text.length > 0) {
+        out.push({
+          ...base(),
+          type: "log",
+          level: "info",
+          message: `reaper.user_message: ${text.slice(0, 500)}`,
+        });
+      }
+      break;
+    }
+
     case "state_transition":
     case "policy_decision":
     case "recovery_summary":
@@ -566,11 +581,172 @@ export function mapReaperEntry(
   return out;
 }
 
-/** True when a value looks like a Reaper trajectory envelope. */
+const SESSION_STREAM_KINDS = new Set(["header", "entry", "record", "lane", "fact"]);
+
+/** True when a value looks like a Reaper trajectory envelope (not a session mutation). */
 export function isReaperTrajectoryEntry(value: unknown): value is ReaperTrajectoryEntry {
   if (value === null || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
-  return typeof v.kind === "string" && typeof v.timestamp === "string";
+  if (typeof v.kind !== "string" || SESSION_STREAM_KINDS.has(v.kind)) return false;
+  return typeof v.timestamp === "string";
+}
+
+function isoFromSessionTs(ts: unknown): string {
+  if (typeof ts === "number" && Number.isFinite(ts)) {
+    const ms = ts < 1e12 ? ts * 1000 : ts;
+    return new Date(ms).toISOString();
+  }
+  if (typeof ts === "string" && ts.length > 0) return ts;
+  return new Date().toISOString();
+}
+
+/**
+ * Convert a Reaper session mutation (stdout / session.jsonl) into a
+ * TrajectoryEntry-shaped object the existing mapper understands.
+ */
+export function sessionMutationToTrajectory(raw: unknown): ReaperTrajectoryEntry | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const v = raw as Record<string, unknown>;
+  const kind = asString(v.kind);
+  if (!kind || kind === "header" || kind === "lane" || kind === "fact") return null;
+
+  const ts = isoFromSessionTs(v.timestamp);
+  const envelope = (): ReaperTrajectoryEntry => ({
+    event_id: asString(v.id) ?? `sess-${asNumber(v.seq) ?? 0}`,
+    run_id: asString(v.runId) ?? "",
+    session_id: "",
+    trace_id: "",
+    timestamp: ts,
+    log_schema_version: 1,
+    kind: "session_metrics",
+  });
+
+  if (kind === "record" && asString(v.type) === "operation_started") {
+    return {
+      ...envelope(),
+      kind: "session_start",
+      user_intent_summary: asString(v.user_intent_summary) ?? "run",
+      provider: asString(v.provider),
+      model: asString(v.model),
+      run_params: asRecord(v.run_params),
+    };
+  }
+  if (kind === "record" && asString(v.type) === "operation_finished") {
+    return {
+      ...envelope(),
+      kind: "run_end",
+      status: asString(v.outcome) ?? "completed",
+      final_assistant_message: asString(v.final_assistant_message) ?? "",
+      duration_ms: asNumber(v.duration_ms),
+    };
+  }
+  if (kind === "record" && asString(v.type) === "tool_started") {
+    return {
+      ...envelope(),
+      kind: "tool_call",
+      tool_name: asString(v.toolName) ?? "unknown",
+      decision_id: asString(v.toolCallId) ?? asString(v.resultEntryId) ?? asString(v.id) ?? "tool",
+      status: "started",
+      args: v.effectiveArgs ?? {},
+      turn_index: asNumber(v.turn_index),
+      duration_ms: asNumber(v.duration_ms),
+      is_error: asBoolean(v.is_error),
+    };
+  }
+  if (kind === "record" && asString(v.type) === "usage") {
+    const usage = asRecord(v.usage) ?? {};
+    const cum = asRecord(v.cumulative) ?? {};
+    return {
+      ...envelope(),
+      kind: "token_budget",
+      turn_input_tokens: asNumber(usage.input) ?? 0,
+      turn_output_tokens: asNumber(usage.output) ?? 0,
+      turn_cache_read_tokens: asNumber(usage.cacheRead) ?? 0,
+      turn_cache_write_tokens: asNumber(usage.cacheWrite) ?? 0,
+      turn_call_count: 1,
+      cumulative_input_tokens: asNumber(cum.input) ?? 0,
+      cumulative_output_tokens: asNumber(cum.output) ?? 0,
+      cumulative_cache_read_tokens: asNumber(cum.cacheRead) ?? 0,
+      cumulative_cache_write_tokens: asNumber(cum.cacheWrite) ?? 0,
+      cumulative_call_count: 1,
+      turn_reasoning_tokens: asNumber(v.turn_reasoning_tokens),
+      cost_usd: asNumber(v.cost_usd),
+      turn_index: asNumber(v.turn_index),
+    };
+  }
+  if (kind === "entry" && asString(v.type) === "message") {
+    const msg = asRecord(v.message) ?? {};
+    const role = asString(msg.role);
+    if (role === "thinking") {
+      return {
+        ...envelope(),
+        kind: "thinking",
+        content: asString(msg.content) ?? "",
+        turn_index: asNumber(msg.turn_index),
+      };
+    }
+    if (role === "assistant") {
+      return {
+        ...envelope(),
+        kind: "assistant_message",
+        content: asString(msg.content) ?? "",
+        turn_index: asNumber(msg.turn_index),
+        tool_names: Array.isArray(msg.tool_names) ? msg.tool_names : undefined,
+      };
+    }
+    if (role === "tool") {
+      return {
+        ...envelope(),
+        kind: "tool_call",
+        tool_name: asString(msg.name) ?? "unknown",
+        decision_id: asString(msg.tool_call_id) ?? asString(v.id) ?? "tool",
+        status: asString(msg.status) === "failed" || msg.is_error === true ? "failed" : "completed",
+        output: msg.content ?? null,
+        is_error: asBoolean(msg.is_error),
+        duration_ms: asNumber(msg.duration_ms),
+        turn_index: asNumber(msg.turn_index),
+      };
+    }
+  }
+  if (kind === "entry" && asString(v.type) === "custom") {
+    const customType = asString(v.customType);
+    const data = asRecord(v.data) ?? {};
+    if (customType === "model_response") {
+      return {
+        ...envelope(),
+        kind: "model_response",
+        source: asString(data.source) ?? "main",
+        assistant_message: asString(data.assistant_message) ?? "",
+        tool_call_count: asNumber(data.tool_call_count) ?? 0,
+        tool_calls: data.tool_calls,
+        turn_index: asNumber(data.turn_index),
+      };
+    }
+    if (customType === "engine_turn_complete") {
+      return {
+        ...envelope(),
+        kind: "engine_turn_complete",
+        source: asString(data.source) ?? "main",
+        assistant_message: asString(data.assistant_message) ?? "",
+        implicit: asBoolean(data.implicit) ?? false,
+        tool_result_count: asNumber(data.tool_result_count) ?? 0,
+        tool_results: data.tool_results,
+        turn_index: asNumber(data.turn_index),
+      };
+    }
+    if (customType === "session_metrics") {
+      return { ...envelope(), kind: "session_metrics", ...data };
+    }
+    if (customType) {
+      return { ...envelope(), kind: customType, ...data };
+    }
+  }
+  return null;
+}
+
+function coerceReaperLine(raw: unknown): ReaperTrajectoryEntry | null {
+  if (isReaperTrajectoryEntry(raw)) return raw;
+  return sessionMutationToTrajectory(raw);
 }
 
 /**
@@ -599,8 +775,9 @@ export function parseReaperTrajectory(
   const state = new ParseState();
   const events: CanonicalEvent[] = [];
   for (const raw of entries) {
-    if (!isReaperTrajectoryEntry(raw)) continue;
-    events.push(...mapReaperEntry(raw, ctx, state, options));
+    const entry = coerceReaperLine(raw);
+    if (!entry) continue;
+    events.push(...mapReaperEntry(entry, ctx, state, options));
   }
   return events;
 }
@@ -634,7 +811,8 @@ export async function* parseReaperStream(
       continue;
     }
     if (parsed === null) continue;
-    if (!isReaperTrajectoryEntry(parsed)) {
+    const entry = coerceReaperLine(parsed);
+    if (!entry) {
       yield {
         v: 1,
         runId: ctx.runId,
@@ -646,7 +824,7 @@ export async function* parseReaperStream(
       };
       continue;
     }
-    for (const ev of mapReaperEntry(parsed, ctx, state, options)) {
+    for (const ev of mapReaperEntry(entry, ctx, state, options)) {
       yield ev;
     }
   }
@@ -693,9 +871,19 @@ export function buildReaperCommand(ctx: RunContext): AdapterCommand {
     "--stream-events",
   ];
 
-  const effort = ctx.params.reasoningEffort;
-  if (typeof effort === "string" && effort.length > 0) {
+  // Model effort / thinking knobs are forwarded from the adapter's params
+  // (set at the adapter or queue level via adapter_overrides.params). Accept
+  // both camelCase and snake_case spellings so authors can use either.
+  const effort = ctx.params.reasoningEffort ?? ctx.params.reasoning_effort;
+  if (typeof effort === "string" && ["low", "medium", "high"].includes(effort)) {
     argv.push("--reasoning-effort", effort);
+  }
+  const thinking = ctx.params.thinking ?? ctx.params.thinking_mode;
+  if (typeof thinking === "string" && thinking.length > 0) {
+    const v = thinking.toLowerCase();
+    if (v === "on" || v === "enabled" || v === "off" || v === "disabled") {
+      argv.push("--thinking", v === "on" || v === "enabled" ? "on" : "off");
+    }
   }
   const maxTokens = ctx.params.maxTokens;
   if (typeof maxTokens === "number" && Number.isFinite(maxTokens)) {
@@ -726,8 +914,7 @@ export function reaperImage(ctx: RunContext): string {
 /**
  * The registered ReaperCode adapter.
  *
- * Status: {@link ADAPTER_STATUS} — live runs need ReaperCode changes from
- * plan/reapercode-changes.md (thinking + stream-events + run_end).
+ * Status: {@link ADAPTER_STATUS} — live Reaper main (`541dce6`+).
  */
 export const reaperCodeAdapter: Adapter = {
   id: "reapercode",
@@ -748,11 +935,86 @@ export const reaperCodeAdapter: Adapter = {
   },
   command: buildReaperCommand,
   evidence() {
-    // Reaper runs with --workspace /workspace/task, so its native evidence
-    // lands under task/.reaper inside the graded subdirectory.
+    // Reaper runs with --workspace /workspace/task, so its native evidence lands
+    // under task/.reaper inside the graded subdirectory. Authoritative layout
+    // (scratchpad.ts): .reaper/logs/<id>/{session.jsonl, conversation.md,
+    // model-calls/, artifacts/, result.json, …} + .reaper/latest-run.json +
+    // .reaper/tmp/. The whole task tree is still retained verbatim; this manifest
+    // only adds the role-typed map a judge uses to bind each archive file to the
+    // adapter version that produced it (snapshot onto the run at claim time).
+    //
+    // Always-on (no REAPER_DEV) evidence: session.jsonl (full session/trace),
+    // conversation.md (human transcript), latest-run.json (run pointer). The
+    // dev-gated extras — result.json, model-calls/, artifacts/ (bash logs,
+    // file-snapshots) — are declared but NOT required, so a normal run doesn't
+    // taint on their absence; a judge reads session.jsonl as the authoritative
+    // trace and falls back to the retained tree for those when present.
     return {
-      paths: ["task/.reaper"],
-      requiredPaths: ["task/.reaper/runs"],
+      paths: ["task"],
+      requiredPaths: ["task/.reaper/logs"],
+      manifest: [
+        {
+          id: "session",
+          role: "session",
+          path: "task/.reaper",
+          format: "dir",
+          required: true,
+          primary: true,
+          label: "Reaper session tree",
+        },
+        {
+          id: "trace",
+          role: "trace",
+          path: "task/.reaper/logs/*/session.jsonl",
+          format: "jsonl",
+          required: true,
+          primary: true,
+          select: "latest_mtime",
+          label: "Session mutation stream",
+          record: { kindField: "kind", tsField: "timestamp", idField: "id" },
+        },
+        {
+          id: "transcript",
+          role: "transcript",
+          path: "task/.reaper/logs/*/conversation.md",
+          format: "md",
+          required: true,
+          primary: true,
+          select: "latest_mtime",
+          label: "Slim conversation",
+        },
+        {
+          id: "result",
+          role: "result",
+          path: "task/.reaper/latest-run.json",
+          format: "json",
+          select: "latest_mtime",
+          label: "Latest run pointer",
+        },
+        {
+          id: "tool_calls",
+          role: "tool_calls",
+          path: "task/.reaper/logs/*/artifacts",
+          format: "dir",
+          select: "latest_mtime",
+          record: { childPattern: "call_*.log" },
+        },
+        {
+          id: "model_calls",
+          role: "model_calls",
+          path: "task/.reaper/logs/*/model-calls",
+          format: "dir",
+          select: "latest_mtime",
+        },
+        {
+          id: "tmp",
+          role: "tmp",
+          path: "task/.reaper/tmp",
+          format: "dir",
+          select: "all",
+          label: "Reaper scratch temp files",
+        },
+      ],
     };
   },
   parse(streams, ctx) {

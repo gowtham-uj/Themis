@@ -71,12 +71,53 @@ export interface AdapterConnectionCheck {
   timeoutMs?: number;
 }
 
+/** Role of a native evidence file so judges bind traces/logs without path folklore. */
+export type EvidenceRole =
+  | "trace"
+  | "tool_calls"
+  | "logs"
+  | "model_calls"
+  | "transcript"
+  | "result"
+  | "session"
+  | "tmp"
+  | "other";
+
+export interface EvidenceEntry {
+  /** Stable id unique within the manifest; the binding key a judge uses. */
+  id: string;
+  role: EvidenceRole;
+  /** Workspace-relative. Files or directories. Globs allowed. */
+  path: string;
+  format: "jsonl" | "json" | "md" | "txt" | "log" | "dir";
+  required?: boolean;
+  primary?: boolean;
+  /** Selection policy when `path` is a glob or a directory with siblings. */
+  select?: "latest_mtime" | "all";
+  label?: string;
+  record?: {
+    kindField?: string;
+    tsField?: string;
+    idField?: string;
+    kinds?: string[];
+    childPattern?: string;
+  };
+}
+
 /** Native agent evidence locations copied after each eval. */
 export interface AdapterEvidenceSpec {
   /** Paths relative to `/workspace`; files or directories are accepted. */
   paths: string[];
   /** Paths that must exist for evidence extraction to be considered complete. */
   requiredPaths?: string[];
+  /**
+   * Role-typed map of the adapter's native evidence. A judge binds each archive
+   * file to the adapter version that produced it through these roles (trace vs
+   * transcript vs tool_calls vs result …), not through path folklore. Snapshot
+   * onto the run at claim time so historical archives stay interpretable after
+   * the adapter changes.
+   */
+  manifest: EvidenceEntry[];
 }
 
 /**

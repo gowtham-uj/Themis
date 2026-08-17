@@ -6,11 +6,16 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { resolveRuntime } from "../runner/runtime.js";
 import { normalizeRepoUrl, prepareWorkspace } from "../runner/workspace.js";
+import {
+  ensureAdapterImageForCommit,
+  resolveAgentCommit,
+  type AdapterBuildService,
+} from "../runner/adapter-build.js";
 
 const execFileAsync = promisify(execFile);
 import { runAdapterGenerator, GENERATOR_CONTRACT } from "../adapters/generator.js";
 import { createDeclarativeAdapter, renderTemplate } from "../adapters/declarative.js";
-import type { RunContext } from "../adapters/types.js";
+import type { EvidenceEntry, EvidenceRole, RunContext } from "../adapters/types.js";
 import type {
   CliAdapterEvidenceConfig,
   CliAdapterParserKind,
@@ -116,7 +121,86 @@ function evidenceConfig(value: unknown): CliAdapterEvidenceConfig {
     }
     out.requiredPaths = [...required] as string[];
   }
+  const manifest = raw.manifest;
+  if (manifest !== undefined) {
+    if (!Array.isArray(manifest)) {
+      throw badRequest("evidence.manifest must be an array");
+    }
+    out.manifest = manifest.map((entry, index) => evidenceEntry(entry, `evidence.manifest[${index}]`));
+  }
   return out;
+}
+
+const EVIDENCE_ROLES = new Set<EvidenceRole>([
+  "trace", "tool_calls", "logs", "model_calls", "transcript", "result", "session", "tmp", "other",
+]);
+const EVIDENCE_FORMATS = new Set(["jsonl", "json", "md", "txt", "log", "dir"]);
+const EVIDENCE_SELECT = new Set(["latest_mtime", "all"]);
+
+function evidenceEntry(value: unknown, name: string): EvidenceEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw badRequest(`${name} must be an object`);
+  }
+  const raw = value as Record<string, unknown>;
+  const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : undefined;
+  if (!id) throw badRequest(`${name}.id must be a non-empty string`);
+  const role = raw.role;
+  if (typeof role !== "string" || !EVIDENCE_ROLES.has(role as EvidenceRole)) {
+    throw badRequest(`${name}.role must be one of ${[...EVIDENCE_ROLES].join(", ")}`);
+  }
+  const path = raw.path;
+  if (typeof path !== "string" || !path) throw badRequest(`${name}.path must be a non-empty string`);
+  const format = raw.format;
+  if (typeof format !== "string" || !EVIDENCE_FORMATS.has(format)) {
+    throw badRequest(`${name}.format must be one of ${[...EVIDENCE_FORMATS].join(", ")}`);
+  }
+  const entry: EvidenceEntry = {
+    id,
+    role: role as EvidenceRole,
+    path,
+    format: format as EvidenceEntry["format"],
+  };
+  if (raw.required !== undefined) {
+    if (typeof raw.required !== "boolean") throw badRequest(`${name}.required must be a boolean`);
+    entry.required = raw.required;
+  }
+  if (raw.primary !== undefined) {
+    if (typeof raw.primary !== "boolean") throw badRequest(`${name}.primary must be a boolean`);
+    entry.primary = raw.primary;
+  }
+  if (raw.select !== undefined) {
+    if (typeof raw.select !== "string" || !EVIDENCE_SELECT.has(raw.select)) {
+      throw badRequest(`${name}.select must be one of ${[...EVIDENCE_SELECT].join(", ")}`);
+    }
+    entry.select = raw.select as EvidenceEntry["select"];
+  }
+  if (raw.label !== undefined) {
+    if (typeof raw.label !== "string") throw badRequest(`${name}.label must be a string`);
+    entry.label = raw.label;
+  }
+  const record = raw.record;
+  if (record !== undefined) {
+    if (!record || typeof record !== "object" || Array.isArray(record)) {
+      throw badRequest(`${name}.record must be an object`);
+    }
+    const rec: NonNullable<EvidenceEntry["record"]> = {};
+    const r = record as Record<string, unknown>;
+    for (const key of ["kindField", "tsField", "idField", "childPattern"] as const) {
+      const v = r[key];
+      if (v !== undefined) {
+        if (typeof v !== "string") throw badRequest(`${name}.record.${key} must be a string`);
+        rec[key] = v;
+      }
+    }
+    if (r.kinds !== undefined) {
+      if (!Array.isArray(r.kinds) || !r.kinds.every((k) => typeof k === "string")) {
+        throw badRequest(`${name}.record.kinds must be a string array`);
+      }
+      rec.kinds = [...(r.kinds as string[])];
+    }
+    if (Object.keys(rec).length > 0) entry.record = rec;
+  }
+  return entry;
 }
 
 function recordOrNull(value: unknown, name: string): Record<string, unknown> | null {
@@ -134,10 +218,10 @@ function parserKind(value: unknown): CliAdapterParserKind {
   return value as CliAdapterParserKind;
 }
 
-function installType(value: unknown): "source-build" | "npm" {
+function installType(value: unknown): "source-build" | "npm" | "binary" {
   if (value === undefined || value === null) return "source-build";
-  if (value !== "source-build" && value !== "npm") {
-    throw badRequest("install_type must be source-build or npm");
+  if (value !== "source-build" && value !== "npm" && value !== "binary") {
+    throw badRequest("install_type must be source-build, npm, or binary");
   }
   return value;
 }
@@ -154,7 +238,13 @@ interface AdapterBuildAppCtx {
   dataDir: string;
 }
 
-/** Build (or rebuild) an adapter's OCI image from its source_repo + containerfile. */
+/**
+ * Build (or rebuild) an adapter's OCI image from its source_repo + containerfile.
+ *
+ * Source-build adapters go through the commit-addressed build service so the
+ * image is pinned + keyed to a reproducible commit. npm adapters keep the
+ * ref-based context build (no source repo to pin).
+ */
 async function buildAdapter(
   app: AdapterBuildAppCtx,
   projectId: string,
@@ -164,10 +254,51 @@ async function buildAdapter(
     throw badRequest("adapter containerfile is required before build");
   }
   // npm install type: no source repo needed — the Containerfile pulls the
-  // package from the npm registry during build. source-build: clone git repo.
+  // package from the npm registry during build. source-build + binary: clone
+  // the pinned git commit; binary copies a committed prebuilt artifact instead
+  // of running npm ci/tsc (the author's Containerfile does the COPY).
   const isNpm = adapter.installType === "npm";
-  if (!isNpm && !adapter.sourceRepo) {
+  const isGitBacked = !isNpm; // source-build | binary
+  if (isGitBacked && !adapter.sourceRepo) {
     throw badRequest("adapter source_repo is required before build (or set install_type to 'npm')");
+  }
+
+  // Git-backed (source-build / binary): pin the adapter's current source_ref to
+  // a full commit and use the commit-addressed build service so the image is
+  // reproducible + reusable by commit (adapter_builds).
+  const service: AdapterBuildService = {
+    queries: app.queries,
+    dataDir: app.dataDir,
+    runtime: resolveRuntime(),
+  };
+  if (isGitBacked && adapter.sourceRepo) {
+    const resolved = await resolveAgentCommit(service, adapter.sourceRepo, adapter.sourceRef ?? "");
+    if (!resolved) {
+      throw badRequest(
+        "cannot resolve adapter source_ref to a commit; run the adapter API with a resolvable ref or a pinned full SHA",
+      );
+    }
+    const build = await ensureAdapterImageForCommit(service, adapter, resolved.sha);
+    // Reflect the ready commit-addressed build onto the adapter row for the
+    // legacy built_* provenance columns (adapter_builds is the durable record).
+    const updated = app.queries.updateProjectAgentAdapter(adapter.id, {
+      buildStatus: "ready",
+      builtImageId: build.imageId ?? undefined,
+      builtCommit: build.commitSha,
+      buildLogPath: build.logPath ?? undefined,
+      lastBuiltAt: new Date().toISOString(),
+    });
+    return {
+      adapter: updated,
+      build: {
+        image: build.image ?? adapter.image,
+        image_id: build.imageId,
+        commit: build.commitSha,
+        agent_version: build.agentVersion,
+        build_id: build.id,
+        log_path: build.logPath,
+      },
+    };
   }
   // Cache by source ref/commit: if this adapter already built the exact commit
   // the source ref resolves to, reuse the existing image instead of re-cloning
@@ -771,8 +902,11 @@ export function registerAdapterRoutes(router: Router): void {
       }
       const resolvedSourceRepo =
         typeof emittedRepo === "string" ? emittedRepo.trim() : sourceRepo;
-      if (emittedInstallType === "source-build" && !resolvedSourceRepo) {
-        throw badRequest("source-build generator output requires source_repo");
+      if (
+        (emittedInstallType === "source-build" || emittedInstallType === "binary") &&
+        !resolvedSourceRepo
+      ) {
+        throw badRequest("source-build/binary generator output requires source_repo");
       }
       input.sourceRepo = resolvedSourceRepo;
       const emittedRef = emitted.source_ref ?? emitted.sourceRef;

@@ -95,30 +95,41 @@ export async function buildEvalAgentImage(input: {
     });
   }
 
-  // The agent image key is derived from the adapter image + the (constant) base
-  // digest only — NOT the per-eval environment digest — so heterogeneous suite
-  // evals resolve to the SAME image and can share one persistent queue container.
-  const key = createHash("sha256")
-    .update(input.adapterImage)
-    .update("\0")
-    .update(baseDigest)
-    .digest("hex");
-
-  // Wrapper that overlays the reaper runtime onto the fat base. The
-  // `adapterImage` (the project's real reaper CLI image) provides the runtime;
-  // we copy its reaper CLI + node modules onto the base.
-  const wrapperDir = join(input.buildRoot, `${key}-wrapper`);
-  await rm(wrapperDir, { recursive: true, force: true });
-  await mkdir(wrapperDir, { recursive: true });
-  await writeFile(join(wrapperDir, "Containerfile.agenteval"), [
+  // The agent image key is derived from the adapter image's immutable content id
+  // (when available) + the (constant) base digest + the overlay script itself —
+  // NOT the per-eval environment digest — so heterogeneous suite evals resolve
+  // to the SAME image and can share one persistent queue container. Keying by
+  // the image *id* (not the tag string) means retagging a tag to new content
+  // invalidates the cache; keying by the overlay script means an edit to how we
+  // assemble the agent image also invalidates it (not just the adapter image).
+  //
+  // Wrapper that overlays the agent runtime onto the fat base. The adapter image
+  // is self-contained: it carries the agent CLI (node_modules + built bin/, or a
+  // committed single-file bundle) and its own /usr/local/bin shims. Copy both
+  // trees verbatim; the shim already resolves the real entrypoint, so do NOT
+  // re-symlink over it (that broke the bundle layout where
+  // /opt/reapercode/bin/reaper does not exist).
+  const overlayScript = [
     `FROM ${fatBaseImage}`,
     "USER root",
     `COPY --from=${input.adapterImage} /usr/local/lib/node_modules /usr/local/lib/node_modules`,
     `COPY --from=${input.adapterImage} /usr/local/bin /usr/local/bin`,
     `COPY --from=${input.adapterImage} /opt/reapercode /opt/reapercode`,
-    "RUN ln -sf /opt/reapercode/bin/reaper /usr/local/bin/reaper",
     `USER 10001`,
-  ].join("\n") + "\n", "utf8");
+  ].join("\n") + "\n";
+  const adapterImageId = (await input.runtime.imageId?.(input.adapterImage)) ?? input.adapterImage;
+  const key = createHash("sha256")
+    .update(adapterImageId)
+    .update("\0")
+    .update(baseDigest)
+    .update("\0")
+    .update(overlayScript)
+    .digest("hex");
+
+  const wrapperDir = join(input.buildRoot, `${key}-wrapper`);
+  await rm(wrapperDir, { recursive: true, force: true });
+  await mkdir(wrapperDir, { recursive: true });
+  await writeFile(join(wrapperDir, "Containerfile.agenteval"), overlayScript, "utf8");
   const image = `agenteval/suite-base:${key.slice(0, 32)}`;
   // The wrapper is content-addressed by adapter+base; if an image for this key
   // already exists in the backend, reuse it instead of re-running the overlay build.

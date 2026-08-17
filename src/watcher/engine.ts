@@ -1,19 +1,23 @@
 /**
- * Watcher engine (P8a) — pure-ish match / semver / dedup / handle flow.
+ * Per-project agent-commit queue watcher engine.
  *
- * No HTTP, no disk I/O except via injected QueryStore. No real git network:
- * ref resolution goes through the RefResolver seam (test double in tests;
- * real git ls-remote / host API lands in P8b/c).
+ * A watcher belongs to a project and exactly one eval queue; the watcher's repo
+ * must equal that queue's source adapter's source repo. On an inbound commit it
+ * resolves the ref to a full SHA, deduplicates (watcher + SHA), and records a
+ * durable pending FIFO watcher_event. If the queue has no active generation, the
+ * event's commit is launched as an immutable generation override immediately;
+ * otherwise it stays pending. When a generation closes, the oldest pending event
+ * for that queue is auto-launched next and FIFO continues across generations with
+ * no intermediate commit dropped.
  *
- * Spec: plan/watcher.md (rules, triggers, dedup, semver, provenance).
+ * No HTTP, no disk I/O except via injected QueryStore; SHA resolution goes
+ * through the injected Resolver seam (real git ls-remote / host API).
  */
 
 import type {
   QueryStore,
-  WatcherAction,
-  WatcherEventStatus,
-  WatcherRole,
   WatcherRule,
+  WatcherEvent,
 } from "../db/queries.js";
 
 // ---------------------------------------------------------------------------
@@ -21,7 +25,7 @@ import type {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve a repo ref (tag/branch/sha) to a commit sha (+ optional image tag).
+ * Resolve a repo ref/commit to a concrete full SHA.
  * Real impl uses git ls-remote / host API; tests inject a canned double.
  */
 export interface RefResolver {
@@ -31,30 +35,34 @@ export interface RefResolver {
   ): Promise<{ sha: string; imageTag?: string }>;
 }
 
-/** Inbound event shape for matching + handling. */
-export interface WatcherInboundEvent {
-  projectId: string;
-  trigger: string;
-  ref?: string;
-  role: WatcherRole;
-  repo: string;
-  /** Optional agentId override when enqueueing; else project.defaultAgentId. */
-  agentId?: string;
-  model?: string;
-  provider?: string;
+/**
+ * Resolve a repo ref (tag/branch/sha) to a commit sha (+ optional image tag).
+ * Real impl uses git ls-remote / host API; tests inject a canned double.
+ * Retained for backward compatibility with server/tests; production watcher
+ * handling uses {@link WatcherSeams}.
+ */
+export interface RefResolver {
+  resolveRef(
+    repo: string,
+    ref: string,
+  ): Promise<{ sha: string; imageTag?: string }>;
 }
 
-export interface HandleWatcherEventResult {
-  results: Array<{
-    ruleId: string;
-    status: WatcherEventStatus | string;
-    batchIds?: string[];
-    error?: string;
-  }>;
+/**
+ * The set of seams a watcher event handler needs. Both resolution and launching
+ * are injectable so pure unit tests never touch git or the container backend.
+ */
+export interface WatcherSeams {
+  resolveSha(
+    repo: string,
+    ref: string,
+  ): Promise<{ sha: string }>;
+  hasActiveGeneration(queueId: string): boolean;
+  launch(queueId: string, commit: string): Promise<{ launched: boolean; batchId?: string }>;
 }
 
 // ---------------------------------------------------------------------------
-// Repo + ref matching
+// Repo + ref normalization (kept from the original engine)
 // ---------------------------------------------------------------------------
 
 /**
@@ -63,15 +71,11 @@ export interface HandleWatcherEventResult {
  */
 export function normalizeRepo(repo: string): string {
   let s = repo.trim().toLowerCase();
-  // strip protocol + host
   s = s.replace(/^https?:\/\//, "");
   s = s.replace(/^git@[^:]+:/, "");
-  // drop host path prefix (github.com/, gitlab.com/, ...)
   s = s.replace(/^[^/]+\/(?=[^/]+\/[^/]+)/, "");
-  // after host strip, may still have github.com/owner/name
   const parts = s.split("/").filter(Boolean);
   if (parts.length >= 2) {
-    // Prefer last two segments when path is host/owner/name
     const owner = parts[parts.length - 2]!;
     let name = parts[parts.length - 1]!;
     name = name.replace(/\.git$/, "");
@@ -85,6 +89,11 @@ export function repoMatches(ruleRepo: string, eventRepo: string): boolean {
   return normalizeRepo(ruleRepo) === normalizeRepo(eventRepo);
 }
 
+/** Direct repo-identity equality check (used by the signed hook repo validation). */
+export function isSameRepo(a: string, b: string): boolean {
+  return repoMatches(a, b);
+}
+
 /**
  * Tiny glob matcher supporting `*` (any run) and `?` (single char).
  * Anchored full-string match. Null/empty pattern matches any.
@@ -92,7 +101,6 @@ export function repoMatches(ruleRepo: string, eventRepo: string): boolean {
 export function globMatch(pattern: string | null | undefined, value: string | null | undefined): boolean {
   if (pattern == null || pattern === "") return true;
   if (value == null) return false;
-  // Escape regex specials except * and ?
   let re = "";
   for (const ch of pattern) {
     if (ch === "*") re += ".*";
@@ -103,43 +111,113 @@ export function globMatch(pattern: string | null | undefined, value: string | nu
   return new RegExp(`^${re}$`).test(value);
 }
 
-/** rule.ref is a glob (e.g. "v*") or exact branch; null = match any. */
-export function refMatches(
-  ruleRef: string | null | undefined,
-  eventRef: string | null | undefined,
-): boolean {
-  return globMatch(ruleRef, eventRef);
+// ---------------------------------------------------------------------------
+// Commit handler
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle an inbound commit for a queue watcher.
+ *
+ * 1. The rule must own exactly the target queue and the commit repo must equal
+ *    the queue adapter's source repo (validated by the caller via `validateRepo`).
+ * 2. Resolve the ref/commit to a full SHA.
+ * 3. Dedupe: if this watcher+SHA is already a queued/launched/pending/launching
+ *    event, record a `deduped` event and stop.
+ * 4. Otherwise enqueue a durable pending event with a per-queue FIFO seq.
+ * 5. If the queue has no active generation, launch it with the commit as an
+ *    immutable generation override (does NOT mutate queue.agentCommit).
+ *
+ * Returns the resulting event status per rule (single-rule path by design).
+ */
+export async function handleWatcherCommit(input: {
+  queries: QueryStore;
+  seams: WatcherSeams;
+  rule: WatcherRule;
+  queueId: string;
+  ref?: string;
+  /** Repo the commit arrived from (must equal the queue's source repo). */
+  eventRepo?: string;
+}): Promise<{ status: string; event: WatcherEvent }> {
+  const { queries, seams, rule, queueId, ref, eventRepo } = input;
+
+  const queue = queries.getEvalQueue(queueId);
+  if (!queue || queue.projectId !== rule.projectId) {
+    throw new Error("watcher rule queue is missing or not project-scoped");
+  }
+  if (eventRepo && !repoMatches(rule.repo, eventRepo)) {
+    throw new Error(
+      `webhook repo ${eventRepo} does not match watcher repo ${rule.repo}`,
+    );
+  }
+
+  const targetRef = ref ?? rule.ref ?? "HEAD";
+  const resolved = await seams.resolveSha(rule.repo, targetRef);
+  const sha = resolved.sha;
+
+  // Dedup: this watcher has already queued/launched/pending this exact SHA.
+  const already = queries.listWatcherEvents(rule.projectId, { ruleId: rule.id })
+    .some(
+      (e) =>
+        e.resolvedSha === sha &&
+        ["pending", "launching", "launched"].includes(e.status),
+    );
+  if (already) {
+    const ev = queries.recordWatcherEvent({
+      ruleId: rule.id,
+      projectId: rule.projectId,
+      queueId,
+      trigger: rule.trigger,
+      ref: targetRef,
+      resolvedSha: sha,
+      status: "deduped",
+    });
+    return { status: "deduped", event: ev };
+  }
+
+  // Durable pending FIFO event.
+  const fifoSeq = queries.nextWatcherFifoSeq(queueId);
+  const pending = queries.recordWatcherEvent({
+    ruleId: rule.id,
+    projectId: rule.projectId,
+    queueId,
+    trigger: rule.trigger,
+    ref: targetRef,
+    resolvedSha: sha,
+    status: "pending",
+    fifoSeq,
+  });
+
+  // Launch immediately when no generation is active. If an active generation
+  // exists, the pending event is auto-launched when it closes (FIFO).
+  if (!seams.hasActiveGeneration(queueId)) {
+    queries.markWatcherEventLaunching(pending.id);
+    const result = await seams.launch(queueId, sha);
+    if (result.launched && result.batchId) {
+      const launched = queries.markWatcherEventLaunched(pending.id, result.batchId, sha);
+      return { status: "launched", event: launched };
+    }
+    // Launch did not start (e.g. no enabled evals): revert to durable pending so
+    // the event is not dropped from the FIFO and can auto-launch later.
+    const reverted = queries.markWatcherEventPending(pending.id);
+    return { status: "pending", event: reverted };
+  }
+
+  return { status: "pending", event: pending };
 }
 
 /**
- * Match enabled rules against an inbound event.
- * Filters: enabled, role, repo (normalized), trigger, ref glob.
- * Deterministic: stable sort by createdAt ascending.
+ * Pick the next pending event for a queue. Returns null when none.
+ * Used by the generation-closure hook to continue the FIFO automatically.
  */
-export function matchRules(
-  rules: WatcherRule[],
-  event: {
-    trigger: string;
-    ref?: string;
-    role: WatcherRole;
-    repo: string;
-  },
-): WatcherRule[] {
-  const matched = rules.filter(
-    (r) =>
-      r.enabled &&
-      r.role === event.role &&
-      repoMatches(r.repo, event.repo) &&
-      r.trigger === event.trigger &&
-      refMatches(r.ref, event.ref),
-  );
-  return matched.sort((a, b) =>
-    a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0,
-  );
+export function nextPendingForQueue(
+  queries: QueryStore,
+  queueId: string,
+): WatcherEvent | null {
+  return queries.nextPendingWatcherEvent(queueId);
 }
 
 // ---------------------------------------------------------------------------
-// Semver filter
+// Ref/semver matching helpers (kept as pure functions; no run creation)
 // ---------------------------------------------------------------------------
 
 interface Semver {
@@ -152,23 +230,13 @@ interface Semver {
 export function parseSemver(refOrTag: string): Semver | null {
   let s = refOrTag.trim();
   if (s.startsWith("v") || s.startsWith("V")) s = s.slice(1);
-  // take core major.minor.patch (ignore pre-release / build for clause matching)
   const m = /^(\d+)\.(\d+)\.(\d+)/.exec(s);
   if (!m) {
-    // also accept major.minor
     const m2 = /^(\d+)\.(\d+)$/.exec(s);
     if (!m2) return null;
-    return {
-      major: Number(m2[1]),
-      minor: Number(m2[2]),
-      patch: 0,
-    };
+    return { major: Number(m2[1]), minor: Number(m2[2]), patch: 0 };
   }
-  return {
-    major: Number(m[1]),
-    minor: Number(m[2]),
-    patch: Number(m[3]),
-  };
+  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
 }
 
 function cmpSemver(a: Semver, b: Semver): number {
@@ -192,7 +260,6 @@ function parseClause(raw: string): SemverClause | null {
     if (!ver) return null;
     return { op, ver };
   }
-  // bare version => exact =
   const ver = parseSemver(s);
   if (!ver) return null;
   return { op: "=", ver };
@@ -212,8 +279,6 @@ function satisfiesClause(v: Semver, c: SemverClause): boolean {
     case "=":
       return d === 0;
     case "~":
-      // ~2.1 => >=2.1.0 <2.2.0 (compatible within minor)
-      // ~2.1.3 => >=2.1.3 <2.2.0
       if (v.major !== c.ver.major) return false;
       if (v.minor !== c.ver.minor) return false;
       return v.patch >= c.ver.patch;
@@ -224,8 +289,7 @@ function satisfiesClause(v: Semver, c: SemverClause): boolean {
 
 /**
  * Apply a whitespace-separated semver filter ("\>=2.0.0 <3.0.0", "=2.3.0", "~2.1").
- * No filter → true. Non-semver ref + filter present → false.
- * ALL clauses must be satisfied.
+ * No filter → true. Non-semver ref + filter present → false. ALL clauses satisfied.
  */
 export function applySemverFilter(
   refOrTag: string,
@@ -243,13 +307,9 @@ export function applySemverFilter(
   return clauses.every((c) => satisfiesClause(ver, c));
 }
 
-// ---------------------------------------------------------------------------
-// Dedup + shouldEnqueue
-// ---------------------------------------------------------------------------
-
 /**
  * Uniqueness key for "already enqueued this ref for this rule".
- * Format: ruleId:ref:sha
+ * Format: ruleId:ref:sha. Retained for API compatibility.
  */
 export function computeDedupKey(
   ruleId: string,
@@ -259,217 +319,76 @@ export function computeDedupKey(
   return `${ruleId}:${ref ?? ""}:${sha ?? ""}`;
 }
 
+interface MatchableRule {
+  id: string;
+  projectId: string;
+  queueId: string | null;
+  role: string;
+  repo: string;
+  trigger: string;
+  ref: string | null;
+  semverFilter: string | null;
+  webhookSecret: string | null;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** rule.ref is a glob (e.g. "v*") or exact branch; null = match any. */
+export function refMatches(
+  ruleRef: string | null | undefined,
+  eventRef: string | null | undefined,
+): boolean {
+  return globMatch(ruleRef, eventRef);
+}
+
 /**
- * For each matched rule, decide matched vs ignored(semver).
- * Dedup is a DB check at enqueue time (handleWatcherEvent), not here.
+ * Match enabled rules against an inbound event: enabled + repo (normalized).
+ * Trigger/ref/semver gating is handled by the caller. Deterministic by createdAt.
+ */
+export function matchRules(
+  rules: Array<Partial<MatchableRule>>,
+  event: {
+    trigger: string;
+    ref?: string;
+    repo: string;
+  },
+): Array<Partial<MatchableRule>> {
+  const matched = rules.filter(
+    (r) =>
+      r.enabled &&
+      r.repo !== undefined &&
+      repoMatches(r.repo, event.repo) &&
+      r.trigger === event.trigger &&
+      refMatches(r.ref, event.ref),
+  );
+  return matched.sort((a, b) =>
+    (a.createdAt ?? "") < (b.createdAt ?? "")
+      ? -1
+      : (a.createdAt ?? "") > (b.createdAt ?? "")
+        ? 1
+        : 0,
+  );
+}
+
+/**
+ * For each matched rule, decide matched vs ignored(semver). Pure; no run creation.
  */
 export function shouldEnqueue(
-  rules: WatcherRule[],
+  rules: Array<Partial<MatchableRule> & { id: string }>,
   event: { ref?: string },
   semverFn: (
     refOrTag: string,
     semverFilter?: string | null,
   ) => boolean = applySemverFilter,
-): Array<{ rule: WatcherRule; status: "matched" | "ignored" }> {
+): Array<{ rule: { id: string }; status: "matched" | "ignored" }> {
   return rules.map((rule) => {
     if (rule.semverFilter) {
       const ref = event.ref ?? "";
       if (!semverFn(ref, rule.semverFilter)) {
-        return { rule, status: "ignored" as const };
+        return { rule: { id: rule.id }, status: "ignored" as const };
       }
     }
-    return { rule, status: "matched" as const };
+    return { rule: { id: rule.id }, status: "matched" as const };
   });
-}
-
-// ---------------------------------------------------------------------------
-// handleWatcherEvent — higher-level enqueue flow
-// ---------------------------------------------------------------------------
-
-function mergeAdapterOverrides(
-  action: WatcherAction,
-  imageTag?: string,
-): Record<string, unknown> | undefined {
-  const base = action.adapterOverrides ? { ...action.adapterOverrides } : {};
-  if (imageTag) {
-    base.imageTag = imageTag;
-  }
-  return Object.keys(base).length > 0 ? base : undefined;
-}
-
-/**
- * Match rules → semver gate → resolve ref → dedup → createBatch/createRun
- * per action task set → record watcher_events.
- *
- * Errors are caught per-rule (one failing rule does not abort others).
- * Does NOT call startRun — creates batches/runs in "queued" state only.
- */
-export async function handleWatcherEvent(
-  queries: QueryStore,
-  resolver: RefResolver,
-  event: WatcherInboundEvent,
-): Promise<HandleWatcherEventResult> {
-  const rules = queries.listWatcherRules(event.projectId, {
-    includeDisabled: false,
-  });
-  const matched = matchRules(rules, {
-    trigger: event.trigger,
-    ref: event.ref,
-    role: event.role,
-    repo: event.repo,
-  });
-  const decisions = shouldEnqueue(matched, { ref: event.ref });
-  const results: HandleWatcherEventResult["results"] = [];
-
-  const project = queries.getProject(event.projectId);
-  const defaultAgentId =
-    event.agentId ?? project?.defaultAgentId ?? null;
-
-  for (const { rule, status } of decisions) {
-    if (status === "ignored") {
-      queries.recordWatcherEvent({
-        ruleId: rule.id,
-        projectId: event.projectId,
-        trigger: event.trigger,
-        ref: event.ref ?? null,
-        status: "ignored",
-      });
-      results.push({ ruleId: rule.id, status: "ignored" });
-      continue;
-    }
-
-    try {
-      const ref = event.ref ?? rule.ref ?? "HEAD";
-      const resolved = await resolver.resolveRef(rule.repo, ref);
-      const sha = resolved.sha;
-      const imageTag = resolved.imageTag ?? (event.ref || undefined);
-
-      // Dedup: already enqueued this rule+ref+sha?
-      const prior = queries.listWatcherEvents(event.projectId, {
-        ruleId: rule.id,
-      });
-      const already = prior.some(
-        (e) =>
-          e.status === "enqueued" &&
-          (e.ref ?? null) === (event.ref ?? null) &&
-          (e.resolvedSha ?? null) === sha,
-      );
-      if (already) {
-        queries.recordWatcherEvent({
-          ruleId: rule.id,
-          projectId: event.projectId,
-          trigger: event.trigger,
-          ref: event.ref ?? null,
-          resolvedSha: sha,
-          status: "deduped",
-        });
-        results.push({ ruleId: rule.id, status: "deduped" });
-        continue;
-      }
-
-      // Resolve agent + model + provider defaults.
-      const agentId = defaultAgentId;
-      if (!agentId) {
-        throw new Error(
-          `no agentId for watcher rule ${rule.id} (set project.defaultAgentId or pass agentId)`,
-        );
-      }
-      const agent = queries.getAgent(agentId);
-      const model =
-        event.model ??
-        project?.defaultModel ??
-        agent?.defaultModel ??
-        "unknown";
-      const provider =
-        event.provider ??
-        project?.defaultProvider ??
-        agent?.defaultProvider ??
-        "unknown";
-      const repeats = rule.action.repeats ?? 1;
-      // Image pin goes on batch/run agentImage (createBatch has no adapterOverrides column).
-      // mergeAdapterOverrides is available for queue-path callers / P8b.
-      const agentImage = imageTag ?? undefined;
-
-      // Resolve task set from action.
-      let tasks = queries.listTasks(event.projectId);
-      if (rule.action.enqueue === "subset") {
-        const tags = rule.action.taskTags ?? [];
-        if (tags.length > 0) {
-          const want = new Set(tags);
-          tasks = tasks.filter((t) =>
-            (t.tags ?? []).some((tag) => want.has(tag)),
-          );
-        }
-      }
-      if (tasks.length === 0) {
-        throw new Error(
-          `watcher rule ${rule.id}: no tasks to enqueue (enqueue=${rule.action.enqueue})`,
-        );
-      }
-
-      const batchIds: string[] = [];
-      for (const task of tasks) {
-        const batch = queries.createBatch({
-          taskId: task.id,
-          projectId: event.projectId,
-          agentId,
-          model,
-          provider,
-          params: {},
-          repeats,
-          trigger: event.trigger,
-          triggerRef: event.ref,
-          agentImage,
-          agentCommit: sha,
-        });
-        batchIds.push(batch.id);
-        for (let i = 0; i < repeats; i++) {
-          queries.createRun({
-            batchId: batch.id,
-            taskId: task.id,
-            projectId: event.projectId,
-            agentId,
-            model,
-            provider,
-            repeatIndex: i,
-            status: "queued",
-            trigger: event.trigger,
-            triggerRef: event.ref,
-            triggerRuleId: rule.id,
-            agentImage,
-            agentCommit: sha,
-          });
-        }
-      }
-
-      // Record one enqueued event; first batch id for the FK column.
-      queries.recordWatcherEvent({
-        ruleId: rule.id,
-        projectId: event.projectId,
-        trigger: event.trigger,
-        ref: event.ref ?? null,
-        resolvedSha: sha,
-        status: "enqueued",
-        batchId: batchIds[0] ?? null,
-      });
-      results.push({
-        ruleId: rule.id,
-        status: "enqueued",
-        batchIds,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      queries.recordWatcherEvent({
-        ruleId: rule.id,
-        projectId: event.projectId,
-        trigger: event.trigger,
-        ref: event.ref ?? null,
-        status: "failed",
-        error: message,
-      });
-      results.push({ ruleId: rule.id, status: "failed", error: message });
-    }
-  }
-
-  return { results };
 }

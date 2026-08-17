@@ -128,7 +128,7 @@ function coerceSandboxBody(body: unknown): Record<string, unknown> {
 
 /** Register project sandbox routes. */
 export function registerSandboxRoutes(router: Router): void {
-  // Presets are static; listing them lets a UI offer them without hardcoding.
+  // Presets are static; listing them lets API clients offer them without hardcoding.
   router.get("/api/sandbox/presets", (_req, res) => {
     sendJson(res, 200, {
       presets: Object.keys(SANDBOX_PRESETS).map((name) => {

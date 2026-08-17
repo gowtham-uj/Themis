@@ -36,7 +36,7 @@ message — nothing structured captures it:
    inherits the standard `{event_id, run_id, session_id, trace_id, timestamp, kind, level}` envelope
    and hash chain.
 
-**Why:** thinking traces are a primary signal for the eval/judge. Without this, ReaperCode runs lose
+**Why:** thinking traces are a primary signal for later eval analysis. Without this, ReaperCode runs lose
 them entirely.
 
 ---

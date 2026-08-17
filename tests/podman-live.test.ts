@@ -418,10 +418,12 @@ d("PodmanRuntime (live containers)", () => {
       });
       expect(setupPath).toBe("/workspace/.agenteval/lifecycle-setup.sh");
 
-      // Use a stock Debian image as the fat base stand-in (build-essential absent,
-      // but apt + python3 install does not need it for this probe).
+      // Use the production PI fat base (node:22-bookworm) as the stand-in: it
+      // ships git/sudo/apt that the platform-synthesized lifecycle scripts
+      // require (setup.sh runs `git config --system` for the bind-mount trust
+      // fix) but, like bookworm-slim, has no python3 until setup.sh installs it.
       const s: RunContainerSpec = {
-        ...spec({ image: "docker.io/library/debian:bookworm-slim", workspaceDir,
+        ...spec({ image: "docker.io/library/node:22-bookworm", workspaceDir,
           argv: ["sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"] }),
         timeoutMs: 0,
         nonRoot: false,

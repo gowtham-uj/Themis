@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * DbQueries facade over the persistence connection.
  *
@@ -7,13 +6,12 @@
  *  - MemoryQueries  — pure in-memory Maps (fallback when native sqlite is unavailable)
  *
  * Spec: plan/data-model.md. Domain I/O uses types from src/domain.ts.
- * Judgement/score/finding write APIs are intentionally stubbed (P4/P6 fill them).
  */
 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { and, eq, desc, inArray, isNotNull } from "drizzle-orm";
+import { and, eq, desc, inArray, isNotNull, max } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import type {
   AgentCategory,
@@ -21,27 +19,11 @@ import type {
   TaskProfile,
   TaskSpec,
 } from "../domain.js";
-import type { WorkspaceSpec } from "../adapters/types.js";
+import type { EvidenceEntry, WorkspaceSpec } from "../adapters/types.js";
 import type { PortMapping, ResolvedPort } from "../runner/runtime.js";
-import type {
-  CheckResult,
-  Verdict,
-  EvalJudgementNarrative,
-  ImprovementOwnerClass,
-  ImprovementStepStatus,
-  QueueImprovementStep,
-} from "../types.js";
+import type { CheckResult } from "../check-types.js";
 import {
-  ingestFindings as runIngestFindings,
-  type FindingDetail,
-  type FindingKind,
-  type FindingLifecycleStatus,
-  type FindingRow,
-  type FindingsIngestStore,
-  type OccurrenceRow,
-  type OccurrenceStatus,
-} from "./findings.js";
-import {
+  adapterBuilds,
   agents,
   apiTokens,
   checkResults,
@@ -49,45 +31,18 @@ import {
   evalMetrics,
   evalQueueItems,
   evalQueues,
-  findingOccurrences,
-  findings,
-  improvementSteps,
-  judgements,
-  outboundSubscriptions,
   projectAgentAdapters,
-  projectRubrics,
   projects,
-  queueAnalyses,
   queueContainers,
-  queueEntries,
   runBatches,
   runs,
-  scores,
   settings,
   tasks,
   users,
   watcherEvents,
   watcherRules,
-  webhookDeliveries,
   type Schema,
 } from "./schema.js";
-import { rubricsEqual } from "../tasks/index.js";
-
-function applyRecurrenceToVerdict(v: unknown, _f: unknown): unknown { return v; }
-import {
-  DEFAULT_ARTIFACT_RETENTION,
-  resolveRetentionPolicy,
-} from "../runner/artifact-retention.js";
-
-// Re-export finding row types for consumers.
-export type {
-  FindingDetail,
-  FindingKind,
-  FindingLifecycleStatus,
-  FindingRow,
-  OccurrenceRow,
-  OccurrenceStatus,
-} from "./findings.js";
 
 // ---------------------------------------------------------------------------
 // Domain row types (I/O of the query layer)
@@ -102,14 +57,12 @@ export interface Project {
   defaultAgentId: string | null;
   defaultModel: string | null;
   defaultProvider: string | null;
-  defaultJudgeModel: string | null;
   workspaceImage: string | null;
   checkRunners: Record<string, string> | null;
   adapterOverrides: Record<string, unknown> | null;
   networkPolicy: string;
   retentionRuns: number | null;
-  /** What run artifacts survive judgement: keep|referenced|all. */
-  artifactRetention: string;
+  /** Retention policy for generated run outputs. */
   /** Per-project sandbox controls; null when the project configures none. */
   sandbox: Record<string, unknown> | null;
   archived: boolean;
@@ -125,13 +78,11 @@ export interface CreateProjectInput {
   defaultAgentId?: string;
   defaultModel?: string;
   defaultProvider?: string;
-  defaultJudgeModel?: string;
   workspaceImage?: string;
   checkRunners?: Record<string, string>;
   adapterOverrides?: Record<string, unknown>;
   networkPolicy?: string;
   retentionRuns?: number | null;
-  artifactRetention?: string;
   sandbox?: Record<string, unknown> | null;
   id?: string;
 }
@@ -143,13 +94,11 @@ export interface UpdateProjectInput {
   defaultAgentId?: string | null;
   defaultModel?: string | null;
   defaultProvider?: string | null;
-  defaultJudgeModel?: string | null;
   workspaceImage?: string | null;
   checkRunners?: Record<string, string> | null;
   adapterOverrides?: Record<string, unknown> | null;
   networkPolicy?: string;
   retentionRuns?: number | null;
-  artifactRetention?: string;
   sandbox?: Record<string, unknown> | null;
 }
 
@@ -200,42 +149,6 @@ export interface UpdateTaskInput {
   sourceKind?: string | null;
 }
 
-/**
- * A project-scoped reusable rubric (plan/rubric.md §6). Tasks may embed their
- * own rubric; a project rubric is the shared, versioned baseline many tasks can
- * start from. Editing the criteria bumps `rubricVersion` (new comparison
- * baseline), exactly as a task rubric edit does.
- */
-export interface ProjectRubric {
-  id: string;
-  projectId: string;
-  name: string;
-  description: string | null;
-  rubric: Rubric;
-  rubricVersion: number;
-  /** Exactly one rubric per project may be the default (enforced on write). */
-  isDefault: boolean;
-  archived: boolean;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface CreateProjectRubricInput {
-  projectId: string;
-  name: string;
-  description?: string | null;
-  rubric: Rubric;
-  isDefault?: boolean;
-  id?: string;
-}
-
-export interface UpdateProjectRubricInput {
-  name?: string;
-  description?: string | null;
-  rubric?: Rubric;
-  isDefault?: boolean;
-}
-
 export interface Agent {
   id: string;
   displayName: string;
@@ -265,6 +178,8 @@ export interface CliCommandTemplate {
 export interface CliAdapterEvidenceConfig {
   paths: string[];
   requiredPaths?: string[];
+  /** Role-typed map of native evidence (see AdapterEvidenceSpec.manifest). */
+  manifest?: EvidenceEntry[];
 }
 
 /** Project-scoped declarative integration for one real CLI agent. */
@@ -357,7 +272,8 @@ export interface UpdateProjectAgentAdapterInput {
 
 export interface RunBatch {
   id: string;
-  taskId: string;
+  /** Null for multi-eval generations (one batch = many evals). */
+  taskId: string | null;
   projectId: string;
   agentId: string;
   model: string;
@@ -368,13 +284,21 @@ export interface RunBatch {
   triggerRef: string | null;
   agentImage: string | null;
   agentCommit: string | null;
+  agentImageId: string | null;
+  agentVersion: string | null;
+  buildId: string | null;
   queueId: string | null;
   queueRevision: number | null;
   createdAt: string;
+  /** Immutable generation state: accepting until atomic empty-close. */
+  accepting: boolean;
+  /** Queue revision observed at atomic empty-close. */
+  closedRevision: number | null;
+  closedAt: string | null;
 }
 
 export interface CreateBatchInput {
-  taskId: string;
+  taskId?: string | null;
   projectId: string;
   agentId: string;
   model: string;
@@ -385,6 +309,9 @@ export interface CreateBatchInput {
   triggerRef?: string;
   agentImage?: string;
   agentCommit?: string;
+  agentImageId?: string;
+  agentVersion?: string;
+  buildId?: string;
   queueId?: string | null;
   queueRevision?: number | null;
   id?: string;
@@ -424,6 +351,8 @@ export interface Run {
   repeatIndex: number;
   evalVersion: number | null;
   evalSnapshot: Record<string, unknown> | null;
+  /** Immutable queue-item snapshot captured at claim time. */
+  itemSnapshot: Record<string, unknown> | null;
   status: RunStatus | string;
   workspaceCommit: string | null;
   agentImage: string | null;
@@ -466,6 +395,8 @@ export interface CreateRunInput {
   repeatIndex: number;
   evalVersion?: number | null;
   evalSnapshot?: Record<string, unknown> | null;
+  /** Immutable queue-item snapshot captured at claim time. */
+  itemSnapshot?: Record<string, unknown> | null;
   status?: RunStatus | string;
   workspaceCommit?: string;
   agentImage?: string;
@@ -525,99 +456,10 @@ export interface CreateTaskOptions {
 }
 
 // ---------------------------------------------------------------------------
-// Judgements + scores (P4c)
-// ---------------------------------------------------------------------------
-
-export type JudgementStatus = "queued" | "running" | "completed" | "failed";
-
-/** pass|fail|partial — denormalized overall verdict level. */
-export type VerdictLevel = "pass" | "fail" | "partial";
-
-export interface Judgement {
-  id: string;
-  runId: string;
-  projectId: string;
-  queueAnalysisId: string | null;
-  judgeModel: string;
-  judgeProvider: string;
-  judgePrompt: string | null;
-  systemPromptVersion: string;
-  status: JudgementStatus | string;
-  overallScore: number | null;
-  /** Denormalized overall level: pass|fail|partial. */
-  verdict: VerdictLevel | string | null;
-  reportPath: string | null;
-  eventsPath: string | null;
-  verdictPath: string | null;
-  narrative: EvalJudgementNarrative | null;
-  narrativeSchemaVersion: number | null;
-  createdAt: string | null;
-  endedAt: string | null;
-}
-
-/** getJudgement: row + full verdict body loaded from verdict.json (when present). */
-export interface JudgementWithVerdict extends Judgement {
-  /** Structured verdict from disk; null until storeVerdict writes it. */
-  verdictBody: Verdict | null;
-}
-
-export interface CreateJudgementInput {
-  runId: string;
-  projectId: string;
-  queueAnalysisId?: string | null;
-  judgeModel: string;
-  judgeProvider: string;
-  judgePrompt?: string;
-  systemPromptVersion: string;
-  status: JudgementStatus;
-  id?: string;
-}
-
-export interface ScoreRow {
-  id: string;
-  judgementId: string;
-  criterion: string;
-  weight: number;
-  score: number;
-  rationale: string | null;
-}
-
-export interface CreateScoreInput {
-  criterion: string;
-  weight: number;
-  score: number;
-  rationale?: string;
-}
-
-export interface ListJudgementsFilter {
-  projectId?: string;
-  runId?: string;
-  status?: string;
-  /** Max rows (default 50, cap 200). */
-  limit?: number;
-  /** Opaque cursor (offset as decimal string) for pagination. */
-  cursor?: string;
-}
-
-export interface ListJudgementsResult {
-  judgements: Judgement[];
-  nextCursor: string | null;
-}
-
-/** Filter for listFindings (all fields optional; AND-combined). */
-export interface ListFindingsFilter {
-  projectId?: string;
-  taskId?: string;
-  status?: string;
-  kind?: FindingKind | string;
-  category?: string;
-}
-
-// ---------------------------------------------------------------------------
 // Watcher rules + events + eval queue (P8a)
 // ---------------------------------------------------------------------------
 
-export type WatcherRole = "agent" | "workspace";
+export type WatcherRole = "agent";
 export type WatcherTrigger =
   | "tag"
   | "commit"
@@ -625,42 +467,33 @@ export type WatcherTrigger =
   | "schedule"
   | "manual"
   | "webhook";
-/** matched|ignored|deduped|enqueued|failed|building — see plan/data-model.md */
+/** matched|ignored|deduped|pending|launching|launched|failed|building — see plan/data-model.md */
 export type WatcherEventStatus =
   | "matched"
   | "ignored"
   | "deduped"
-  | "enqueued"
+  | "pending"
+  | "launching"
+  | "launched"
   | "failed"
-  | "building";
-export type QueueTargetKind = "task" | "task_set";
-export type QueueEntryStatus =
-  | "queued"
-  | "promoted"
-  | "running"
-  | "removed"
-  | "failed";
+  | "building"
+  | "enqueued";
 
-/** Action payload stored as action_json on a watcher rule. */
-export interface WatcherAction {
-  enqueue: "all" | "subset";
-  taskTags?: string[];
-  repeats?: number;
-  adapterOverrides?: Record<string, unknown>;
-  autoJudge?: boolean;
-  judgeModel?: string;
-}
-
-/** Watcher rule domain row. webhookSecret is present only on create result. */
+/**
+ * Watcher rule domain row. A watcher belongs to a project + exactly one queue and
+ * fires that queue's agent-commit generations. webhookSecret is present only on
+ * create result. The legacy `role` column is retired to the constant "agent".
+ */
 export interface WatcherRule {
   id: string;
   projectId: string;
+  /** Queue this watcher owns; fires that queue's agent-commit generation. */
+  queueId: string | null;
   role: WatcherRole;
   repo: string;
   trigger: WatcherTrigger | string;
   ref: string | null;
   semverFilter: string | null;
-  action: WatcherAction;
   /** Plaintext secret; stripped (null) on get/list/update. Present only on create. */
   webhookSecret: string | null;
   enabled: boolean;
@@ -669,12 +502,12 @@ export interface WatcherRule {
 }
 
 export interface CreateWatcherRuleInput {
-  role: WatcherRole;
   repo: string;
   trigger: WatcherTrigger | string;
+  /** The queue this watcher fires. Required; must belong to the same project. */
+  queueId: string;
   ref?: string | null;
   semverFilter?: string | null;
-  action: WatcherAction;
   /** If absent, generated as newId()+"-"+newId() and returned once. */
   webhookSecret?: string;
   enabled?: boolean;
@@ -683,9 +516,9 @@ export interface CreateWatcherRuleInput {
 export interface UpdateWatcherRulePatch {
   ref?: string | null;
   semverFilter?: string | null;
-  action?: WatcherAction;
   enabled?: boolean;
   repo?: string;
+  queueId?: string | null;
 }
 
 export interface WatcherEvent {
@@ -698,6 +531,12 @@ export interface WatcherEvent {
   resolvedSha: string | null;
   status: WatcherEventStatus | string;
   batchId: string | null;
+  /** Queue this event targets (from the owning rule). */
+  queueId: string | null;
+  /** Durable FIFO order for pending events awaiting a free generation. */
+  fifoSeq: number | null;
+  /** resolvedSha of the generation this event launched (when launched). */
+  processedSha: string | null;
   error: string | null;
 }
 
@@ -709,79 +548,10 @@ export interface RecordWatcherEventInput {
   resolvedSha?: string | null;
   status: WatcherEventStatus | string;
   batchId?: string | null;
+  queueId?: string | null;
+  fifoSeq?: number | null;
+  processedSha?: string | null;
   error?: string | null;
-}
-
-/** Eval-queue domain row. JSON columns are parsed. */
-export interface QueueEntry {
-  id: string;
-  projectId: string;
-  triggerRef: string | null;
-  targetKind: QueueTargetKind | string;
-  taskId: string | null;
-  /** Parsed from task_tags_json. */
-  taskTags: string[] | null;
-  agentId: string;
-  model: string | null;
-  provider: string | null;
-  repeats: number | null;
-  /** Parsed from params_json. */
-  params: Record<string, unknown> | null;
-  /** Parsed from adapter_overrides_json. */
-  adapterOverrides: Record<string, unknown> | null;
-  /** int 1 === true; null when unset. */
-  autoJudge: boolean | null;
-  judgeModel: string | null;
-  priority: number;
-  position: number;
-  status: QueueEntryStatus | string;
-  dedupKey: string | null;
-  source: string | null;
-  createdAt: string;
-  promotedAt: string | null;
-  promotedBatchId: string | null;
-  removedAt: string | null;
-}
-
-export type QueuePositionSpec =
-  | number
-  | { after?: string }
-  | { before?: string };
-
-export interface CreateQueueEntryInput {
-  triggerRef?: string | null;
-  targetKind: QueueTargetKind;
-  taskId?: string | null;
-  taskTags?: string[];
-  agentId: string;
-  model?: string | null;
-  provider?: string | null;
-  repeats?: number | null;
-  params?: Record<string, unknown> | null;
-  adapterOverrides?: Record<string, unknown> | null;
-  autoJudge?: boolean | null;
-  judgeModel?: string | null;
-  priority?: number;
-  /** Absolute position, or relative {after|before} entry id. Omitted → append tail. */
-  position?: QueuePositionSpec;
-  dedupKey?: string | null;
-  source?: string | null;
-}
-
-export interface ReorderQueueEntryOpts {
-  position?: number;
-  after?: string;
-  before?: string;
-  priority?: number;
-}
-
-export interface PromoteQueueEntryResult {
-  entry: QueueEntry;
-  /** First batch created (also stored as promotedBatchId). */
-  batchId: string;
-  runIds: string[];
-  /** All batches when task_set fans out to multiple tasks. */
-  batchIds: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -793,7 +563,6 @@ export type EvalQueueStatus =
   | "starting"
   | "running"
   | "paused"
-  | "judging"
   | "completed"
   | "tainted"
   | "stopped"
@@ -811,13 +580,12 @@ export interface EvalQueue {
   sandbox: Record<string, unknown> | null;
   networkPolicy: string;
   ports: PortMapping[];
-  judgeModel: string | null;
-  judgeProvider: string | null;
-  autoJudge: boolean;
   status: EvalQueueStatus | string;
   activeBatchId: string | null;
   sharedAdapterId: string | null;
   builtinAdapterId: string | null;
+  /** Resolved agent commit (full SHA) this queue builds/runs; null for built-in adapters. */
+  agentCommit: string | null;
   revision: number;
   createdAt: string;
   updatedAt: string;
@@ -833,11 +601,9 @@ export interface CreateEvalQueueInput {
   sandbox?: Record<string, unknown> | null;
   networkPolicy?: string;
   ports?: PortMapping[];
-  judgeModel?: string | null;
-  judgeProvider?: string | null;
-  autoJudge?: boolean;
   sharedAdapterId?: string | null;
   builtinAdapterId?: string | null;
+  agentCommit?: string | null;
   id?: string;
 }
 
@@ -851,13 +617,11 @@ export interface UpdateEvalQueueInput {
   sandbox?: Record<string, unknown> | null;
   networkPolicy?: string;
   ports?: PortMapping[];
-  judgeModel?: string | null;
-  judgeProvider?: string | null;
-  autoJudge?: boolean;
   status?: EvalQueueStatus | string;
   activeBatchId?: string | null;
   sharedAdapterId?: string | null;
   builtinAdapterId?: string | null;
+  agentCommit?: string | null;
   incrementRevision?: boolean;
 }
 
@@ -870,6 +634,10 @@ export interface EvalQueueItem {
   repeats: number;
   enabled: boolean;
   overrides: Record<string, unknown> | null;
+  /** Repeats already claimed across all generations (immutable floor). */
+  claimedRepeats: number;
+  /** Soft-deletion timestamp; null = live. */
+  deletedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -892,13 +660,119 @@ export interface UpdateEvalQueueItemInput {
   overrides?: Record<string, unknown> | null;
 }
 
+// ---------------------------------------------------------------------------
+// Adapter builds — commit-addressed reusable image build records (SCHEMA v9)
+// ---------------------------------------------------------------------------
+
+export type AdapterBuildStatus = "building" | "ready" | "failed";
+
+export interface AdapterBuild {
+  id: string;
+  adapterId: string;
+  commitSha: string;
+  status: AdapterBuildStatus | string;
+  image: string | null;
+  imageId: string | null;
+  agentVersion: string | null;
+  logPath: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+}
+
+export interface CreateAdapterBuildInput {
+  id?: string;
+  adapterId: string;
+  commitSha: string;
+  status?: AdapterBuildStatus | string;
+  image?: string | null;
+  imageId?: string | null;
+  agentVersion?: string | null;
+  logPath?: string | null;
+}
+
+export interface UpdateAdapterBuildInput {
+  status?: AdapterBuildStatus | string;
+  image?: string | null;
+  imageId?: string | null;
+  agentVersion?: string | null;
+  logPath?: string | null;
+  error?: string | null;
+  completedAt?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Queue generation claim — atomic claim-or-empty-close (SCHEMA v9)
+// ---------------------------------------------------------------------------
+
+/** Generation immutable snapshot captured at claim time. */
+export interface GenerationSnapshot {
+  batchId: string;
+  queueId: string;
+  queueRevision: number;
+  queueContainerId: string;
+  agentCommit: string | null;
+  agentImage: string | null;
+  agentImageId: string | null;
+  agentVersion: string | null;
+  buildId: string | null;
+  model: string;
+  provider: string;
+  adapterOverrides: Record<string, unknown> | null;
+  networkPolicy: string;
+}
+
+export interface ClaimQueueWorkInput {
+  /** Active generation (run batch) to claim against. */
+  batchId: string;
+  queueId: string;
+  projectId: string;
+  queueContainerId: string;
+  /** Values stamped onto the generation's runs/archives at claim. */
+  snapshot: GenerationSnapshot;
+  /**
+   * Immutable item snapshot copied onto the claimed run. When omitted, the
+   * claim op snapshots the selected queue-item row itself.
+   */
+  itemSnapshot?: Record<string, unknown>;
+  /**
+   * Immutable eval snapshot copied onto the claimed run. When omitted (or the
+   * supplied taskId does not match the claimed item), the claim op loads and
+   * snapshots the claimed item's task from the store.
+   */
+  evalSnapshot?: Record<string, unknown>;
+  evalVersion?: number;
+  /** Expected task for the caller-supplied evalSnapshot. Ignored when the claimed item differs. */
+  taskId?: string;
+  /** Agent id. When omitted, resolved from the active generation's batch. */
+  agentId?: string;
+}
+
+export type ClaimQueueWorkResult =
+  | {
+      claimed: true;
+      run: Run;
+      queueItemId: string;
+      repeatIndex: number;
+    }
+  | {
+      claimed: false;
+      /** Generation was atomically closed as empty; queue may launch again. */
+      closed: true;
+      closedRevision: number | null;
+    };
+
 export type QueueContainerState =
   | "starting"
   | "running"
   | "idle"
+  | "closing"
   | "paused"
   | "stopping"
   | "stopped"
+  | "completed"
+  | "tainted"
   | "failed";
 
 export interface QueueContainer {
@@ -908,6 +782,11 @@ export interface QueueContainer {
   batchId: string;
   runtimeContainerId: string | null;
   image: string;
+  /** Commit-addressed image id + resolved agent commit (generation snapshot). */
+  imageId: string | null;
+  agentCommit: string | null;
+  agentVersion: string | null;
+  buildId: string | null;
   state: QueueContainerState | string;
   ports: ResolvedPort[];
   workspaceDir: string;
@@ -925,6 +804,10 @@ export interface CreateQueueContainerInput {
   batchId: string;
   runtimeContainerId?: string | null;
   image: string;
+  imageId?: string | null;
+  agentCommit?: string | null;
+  agentVersion?: string | null;
+  buildId?: string | null;
   state: QueueContainerState | string;
   ports?: ResolvedPort[];
   workspaceDir: string;
@@ -939,80 +822,6 @@ export interface UpdateQueueContainerInput {
   startedAt?: string | null;
   stoppedAt?: string | null;
   error?: string | null;
-}
-
-export type QueueAnalysisStatus = "queued" | "running" | "completed" | "failed";
-
-export interface QueueAnalysis {
-  id: string;
-  queueId: string;
-  projectId: string;
-  batchId: string;
-  selectedRunIds: string[];
-  evidenceHashes: Record<string, string>;
-  judgeModel: string;
-  judgeProvider: string;
-  judgeParams: Record<string, unknown> | null;
-  judgePrompt: string | null;
-  systemPromptVersion: string;
-  parentAnalysisId: string | null;
-  status: QueueAnalysisStatus | string;
-  verdictPath: string | null;
-  reportPath: string | null;
-  eventsPath: string | null;
-  rawResponsePath: string | null;
-  createdAt: string;
-  startedAt: string | null;
-  endedAt: string | null;
-  error: string | null;
-}
-
-export interface CreateQueueAnalysisInput {
-  id?: string;
-  queueId: string;
-  projectId: string;
-  batchId: string;
-  selectedRunIds: string[];
-  evidenceHashes: Record<string, string>;
-  judgeModel: string;
-  judgeProvider: string;
-  judgeParams?: Record<string, unknown> | null;
-  judgePrompt?: string | null;
-  systemPromptVersion: string;
-  parentAnalysisId?: string | null;
-  status?: QueueAnalysisStatus | string;
-}
-
-export interface UpdateQueueAnalysisInput {
-  status?: QueueAnalysisStatus | string;
-  verdictPath?: string | null;
-  reportPath?: string | null;
-  eventsPath?: string | null;
-  rawResponsePath?: string | null;
-  startedAt?: string | null;
-  endedAt?: string | null;
-  error?: string | null;
-}
-
-export interface ImprovementStepRecord extends QueueImprovementStep {
-  queueAnalysisId: string;
-  projectId: string;
-  queueId: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface ListImprovementStepsFilter {
-  queueAnalysisId: string;
-  class?: ImprovementOwnerClass;
-  priority?: number;
-  status?: ImprovementStepStatus;
-  defectId?: string;
-}
-
-export interface UpdateImprovementStepLifecycleInput {
-  status: ImprovementStepStatus;
-  blockingReason?: string | null;
 }
 
 export interface EvalMetricsRecord {
@@ -1124,8 +933,8 @@ export interface SettingRow {
 }
 
 /**
- * Portable project export rows (P9). Secrets stripped: watcher webhookSecret,
- * outbound subscription secret, and no api_tokens.
+ * Portable project export rows (P9). Secrets stripped: watcher webhookSecret
+ * (inbound), and no api_tokens.
  */
 export interface ProjectExportRows {
   project: Project;
@@ -1134,88 +943,6 @@ export interface ProjectExportRows {
   runs: Run[];
   /** Watcher rules with webhookSecret forced to null. */
   watchers: WatcherRule[];
-  queue: QueueEntry[];
-  /** Outbound webhook subs with secret forced to null. */
-  outboundWebhooks: OutboundSubscription[];
-}
-
-// ---- Outbound webhook subscriptions + deliveries (P8c) ----
-
-/** Event types an outbound subscription may filter on. Empty list = all. */
-export type OutboundEventType =
-  | "run.completed"
-  | "verdict.completed"
-  | "release.compared";
-
-/** Delivery attempt status. */
-export type WebhookDeliveryStatus = "pending" | "success" | "failed";
-
-/**
- * Outbound webhook subscription. `secret` is present ONLY on create result;
- * get/list/update always strip it to null.
- */
-export interface OutboundSubscription {
-  id: string;
-  projectId: string;
-  url: string;
-  /** Plaintext signing secret; null after create (stripped). */
-  secret: string | null;
-  /** Parsed event type filter; empty array means match-all. */
-  eventTypes: string[];
-  enabled: boolean;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface CreateOutboundSubscriptionInput {
-  url: string;
-  /** If absent, generated as newId()+"-"+newId() and returned once. */
-  secret?: string;
-  /** Empty / omitted = all event types. */
-  eventTypes?: string[];
-  enabled?: boolean;
-}
-
-export interface UpdateOutboundSubscriptionPatch {
-  url?: string;
-  eventTypes?: string[];
-  enabled?: boolean;
-}
-
-/** Recorded delivery attempt for an outbound webhook POST. */
-export interface WebhookDelivery {
-  id: string;
-  subscriptionId: string;
-  projectId: string;
-  eventType: string;
-  payload: unknown;
-  status: WebhookDeliveryStatus | string;
-  attempt: number;
-  responseStatus: number | null;
-  responseBody: string | null;
-  error: string | null;
-  deliveredAt: string | null;
-  createdAt: string;
-}
-
-export interface RecordWebhookDeliveryInput {
-  subscriptionId: string;
-  projectId: string;
-  eventType: string;
-  payload: unknown;
-  status: WebhookDeliveryStatus | string;
-  attempt: number;
-  responseStatus?: number | null;
-  responseBody?: string | null;
-  error?: string | null;
-  deliveredAt?: string | null;
-}
-
-export interface ListWebhookDeliveriesOpts {
-  subscriptionId?: string;
-  eventType?: string;
-  status?: string;
-  limit?: number;
 }
 
 /**
@@ -1273,6 +1000,18 @@ export interface QueryStore {
     sourceRepo: string,
     commit: string,
   ): ProjectAgentAdapter | null;
+  upsertAdapterBuild(input: CreateAdapterBuildInput): AdapterBuild;
+  getAdapterBuild(id: string): AdapterBuild | null;
+  getReadyAdapterBuild(
+    adapterId: string,
+    commitSha: string,
+  ): AdapterBuild | null;
+  listAdapterBuilds(
+    adapterId: string,
+    opts?: { status?: AdapterBuildStatus | string; limit?: number },
+  ): AdapterBuild[];
+  updateAdapterBuild(id: string, patch: UpdateAdapterBuildInput): AdapterBuild;
+
   updateProjectAgentAdapter(
     id: string,
     patch: UpdateProjectAgentAdapterInput,
@@ -1285,47 +1024,9 @@ export interface QueryStore {
   listRuns(filter: ListRunsFilter): Run[];
   updateRunControlState(id: string, update: ControlStateUpdate): Run;
   updateRunStatus(id: string, status: RunStatus | string): Run;
+  /** Persist the run's on-disk events path before the agent launches (SSE/NDJSON tail). */
+  setRunEventsPath(id: string, eventsPath: string): Run;
   finalizeRun(id: string, result: FinalizeRunInput): Run;
-
-  /** Create a judgement row + on-disk judgement.json snapshot. */
-  createJudgement(input: CreateJudgementInput): Judgement;
-  /** Insert per-criterion score rows (for trend charts). */
-  createScores(judgementId: string, scores: CreateScoreInput[]): ScoreRow[];
-  /**
-   * Persist a completed verdict: write verdict.json, mirror overall + per-criterion
-   * scores into SQLite, mark judgement completed, then ingest findings (P6a).
-   * Findings-ingest errors are caught + console.warn'd — they must not break
-   * verdict persistence (verdict.json remains the source of truth).
-   */
-  storeVerdict(
-    judgementId: string,
-    verdict: Verdict,
-    narrative?: EvalJudgementNarrative | null,
-  ): JudgementWithVerdict;
-  /** Load judgement row + verdict.json body (if present). */
-  getJudgement(id: string): JudgementWithVerdict | null;
-  /** List judgements with optional filters + cursor pagination. */
-  listJudgements(filter?: ListJudgementsFilter): ListJudgementsResult;
-  /** Update judgement status (and optional ended_at). */
-  setJudgementStatus(
-    id: string,
-    status: JudgementStatus | string,
-    endedAt?: string | null,
-  ): Judgement;
-
-  /**
-   * Ingest findings/positiveFindings/metaFindings from a verdict into the
-   * durable issues log (findings + finding_occurrences). Called by storeVerdict;
-   * also usable standalone. Rewrites verdict.json with Finding.recurring when
-   * an occurrence is "persisted" (same call, single-threaded).
-   */
-  ingestFindings(judgementId: string, verdict: Verdict): void;
-  /** List de-duplicated findings (issues log), filterable. */
-  listFindings(filter?: ListFindingsFilter): FindingRow[];
-  /** One finding + its occurrences, or null. */
-  getFinding(fingerprint: string): FindingDetail | null;
-  /** Occurrences for a fingerprint (newest first). */
-  listOccurrences(findingFingerprint: string): OccurrenceRow[];
 
   // ---- watcher rules + events (P8a) ----
   /** Create a watcher rule. Returns webhookSecret once (only time it surfaces). */
@@ -1354,27 +1055,25 @@ export interface QueryStore {
     projectId: string,
     opts?: { ruleId?: string; limit?: number },
   ): WatcherEvent[];
-
-  // ---- eval queue (P8a) ----
-  /** Enqueue an eval. Fractional position + default dedupKey when applicable. */
-  createQueueEntry(projectId: string, input: CreateQueueEntryInput): QueueEntry;
-  getQueueEntry(id: string): QueueEntry | null;
-  /** Sorted by priority DESC then position ASC (stable run order). */
-  listQueueEntries(
-    projectId: string,
-    opts?: { status?: string },
-  ): QueueEntry[];
-  /** Recompute fractional position and/or priority. */
-  reorderQueueEntry(id: string, opts: ReorderQueueEntryOpts): QueueEntry;
   /**
-   * Resolve a queued entry into run_batch(es) + runs (status queued).
-   * Does not start runs — promotion only creates queued work for the runner.
+   * Next durable pending event for a queue, oldest FIFO sequence first.
+   * A watcher event is `pending` (fifo_seq set) until a generation is free to
+   * launch it, then it transitions to launching/launched atomically.
    */
-  promoteQueueEntry(id: string): PromoteQueueEntryResult;
-  /** Soft-remove (status=removed). Idempotent if already removed. */
-  removeQueueEntry(id: string): QueueEntry;
-  /** Soft-remove all status=queued entries. Leaves promoted/running untouched. */
-  drainQueue(projectId: string): { removed: number };
+  nextPendingWatcherEvent(queueId: string): WatcherEvent | null;
+  /**
+   * The next durable FIFO sequence number for a queue's watcher events. Never
+   * reused; monotonic per queue so pending events retain a stable FIFO order.
+   */
+  nextWatcherFifoSeq(queueId: string): number;
+  /** Transition a pending watcher event to `launching` (a generation is preparing its commit). */
+  markWatcherEventLaunching(id: string): WatcherEvent;
+  /** Revert a `launching` event back to durable `pending` (launch did not start). */
+  markWatcherEventPending(id: string): WatcherEvent;
+  /** Mark a pending/launching watcher event as launched against a generation (SHA swap). */
+  markWatcherEventLaunched(id: string, batchId: string, sha: string): WatcherEvent;
+  /** Dedupe check: has the queue already processed this exact SHA as a queued event? */
+  watcherEventExistsForSha(ruleId: string, sha: string): boolean;
 
   // ---- persistent eval queues + containers ----
   createEvalQueue(projectId: string, input: CreateEvalQueueInput): EvalQueue;
@@ -1386,6 +1085,8 @@ export interface QueryStore {
   createEvalQueueItem(queueId: string, input: CreateEvalQueueItemInput): EvalQueueItem;
   getEvalQueueItem(id: string): EvalQueueItem | null;
   listEvalQueueItems(queueId: string, opts?: { includeDisabled?: boolean }): EvalQueueItem[];
+  /** Queue ids that reference a given eval (live, non-deleted items) — for the eval store's "used by" view and delete guard. */
+  listEvalQueuesUsingTask(projectId: string, taskId: string): EvalQueue[];
   updateEvalQueueItem(id: string, patch: UpdateEvalQueueItemInput): EvalQueueItem;
   deleteEvalQueueItem(id: string): void;
 
@@ -1395,30 +1096,17 @@ export interface QueryStore {
   listQueueContainers(queueId: string): QueueContainer[];
   updateQueueContainer(id: string, patch: UpdateQueueContainerInput): QueueContainer;
 
-  createQueueAnalysis(input: CreateQueueAnalysisInput): QueueAnalysis;
-  getQueueAnalysis(id: string): QueueAnalysis | null;
-  listQueueAnalyses(queueId: string, opts?: { batchId?: string }): QueueAnalysis[];
-  updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis;
   /**
-   * All analyses in a non-terminal state (queued/running) across every queue —
-   * used to reconcile analyses orphaned by a prior process (e.g. a server crash
-   * or deploy that killed an in-flight judge) so they never stay `running`
-   * forever. Returns {id, queueId, projectId} rows so the recoverer can mark
-   * them failed or re-enqueue.
+   * Atomic claim-or-empty-close for a queue generation.
+   * Claims the next enabled, non-deleted queue item repeat (position, id order),
+   * comparing against already-claimed runs for the generation; creates exactly
+   * one queue-backed run with immutable eval/item snapshots. When no work
+   * remains, atomically marks the generation `closing` and stops accepting.
+   * SQLite runs this under BEGIN IMMEDIATE; MemoryQueries is synchronous/atomic.
    */
-  listOrphanedAnalyses(): Array<{ id: string; queueId: string; projectId: string; status: string }>;
-  storeImprovementSteps(
-    queueAnalysisId: string,
-    projectId: string,
-    queueId: string,
-    steps: QueueImprovementStep[],
-  ): ImprovementStepRecord[];
-  listImprovementSteps(filter: ListImprovementStepsFilter): ImprovementStepRecord[];
-  updateImprovementStepLifecycle(
-    queueAnalysisId: string,
-    id: string,
-    patch: UpdateImprovementStepLifecycleInput,
-  ): ImprovementStepRecord;
+  claimQueueWork(input: ClaimQueueWorkInput): ClaimQueueWorkResult;
+  /** List runs claimed for a queue generation (used by atomic claim comparison). */
+  listRunsByBatch(batchId: string): Run[];
 
   upsertEvalMetrics(input: {
     runId: string;
@@ -1475,64 +1163,17 @@ export interface QueryStore {
 
   // ---- Project export (P9) ----
   /**
-   * Assemble portable DB rows for a project. Secrets stripped (webhook secrets,
-   * outbound secrets). Does NOT include api_tokens. Throws if project missing.
+   * Assemble portable DB rows for a project. Secrets stripped (inbound webhook
+   * secrets); does NOT include api_tokens. Throws if project missing.
    */
   exportRows(projectId: string): ProjectExportRows;
-
-  // ---- Outbound webhooks (P8c) ----
-  /**
-   * Create an outbound subscription. Returns the sub WITH secret surfaced ONCE
-   * (only time). Auto-generates secret when input.secret is absent.
-   */
-  createOutboundSubscription(
-    projectId: string,
-    input: CreateOutboundSubscriptionInput,
-  ): OutboundSubscription;
-  /** Get a subscription with secret stripped to null. */
-  getOutboundSubscription(id: string): OutboundSubscription | null;
-  /**
-   * Return the raw signing secret for outbound HMAC. NEVER log the return value.
-   * Returns null when the subscription is missing.
-   */
-  getOutboundSubscriptionWithSecret(id: string): string | null;
-  /** List project subscriptions with secrets stripped. */
-  listOutboundSubscriptions(projectId: string): OutboundSubscription[];
-  /** Patch a subscription (secret never touchable). Secret stripped on return. */
-  updateOutboundSubscription(
-    id: string,
-    patch: UpdateOutboundSubscriptionPatch,
-  ): OutboundSubscription;
-  /** Hard-delete a subscription. */
-  deleteOutboundSubscription(id: string): void;
-  /** Insert a delivery log row. */
-  recordWebhookDelivery(input: RecordWebhookDeliveryInput): WebhookDelivery;
-  /** Newest-createdAt-first delivery list with optional filters. */
-  listWebhookDeliveries(
-    projectId: string,
-    opts?: ListWebhookDeliveriesOpts,
-  ): WebhookDelivery[];
 
   /** Persist deterministic check results for a run (P9 DB mirror). */
   storeCheckResults(runId: string, results: CheckResult[]): void;
   /** Load persisted check results for a run (P9 DB mirror). */
   getCheckResults(runId: string): CheckResult[];
 
-  /** Create a project-scoped reusable rubric. */
-  createProjectRubric(input: CreateProjectRubricInput): ProjectRubric;
-  /** Fetch one project rubric by id (null when missing). */
-  getProjectRubric(id: string): ProjectRubric | null;
-  /** List a project's rubrics, newest first; archived excluded by default. */
-  listProjectRubrics(
-    projectId: string,
-    opts?: { includeArchived?: boolean },
-  ): ProjectRubric[];
-  /** The project's default rubric, if one is marked (null otherwise). */
-  getDefaultProjectRubric(projectId: string): ProjectRubric | null;
-  /** Patch a project rubric; a semantic rubric edit bumps rubricVersion. */
-  updateProjectRubric(id: string, patch: UpdateProjectRubricInput): ProjectRubric;
-  /** Soft-delete (archive) a project rubric. */
-  archiveProjectRubric(id: string): ProjectRubric;
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,22 +1186,6 @@ function nowIso(): string {
 
 function newId(): string {
   return randomUUID();
-}
-
-function canTransitionImprovementStatus(
-  from: ImprovementStepStatus,
-  to: ImprovementStepStatus,
-): boolean {
-  if (from === to) return true;
-  const allowed: Record<ImprovementStepStatus, ImprovementStepStatus[]> = {
-    proposed: ["ready", "blocked", "rejected"],
-    ready: ["in_progress", "blocked", "rejected"],
-    blocked: ["ready", "rejected"],
-    in_progress: ["verified", "blocked", "rejected"],
-    verified: ["in_progress"],
-    rejected: [],
-  };
-  return allowed[from].includes(to);
 }
 
 function parseJson<T>(raw: string | null | undefined, fallback: T): T {
@@ -1643,61 +1268,6 @@ export function runSnapshotPath(
   return join(dataDir, "projects", projectId, "runs", runId, "run.json");
 }
 
-/** On-disk dir for a judgement: <dataDir>/projects/<pid>/judgements/<jid>. */
-export function judgementDir(
-  dataDir: string,
-  projectId: string,
-  judgementId: string,
-): string {
-  return join(dataDir, "projects", projectId, "judgements", judgementId);
-}
-
-export function judgementSnapshotPath(
-  dataDir: string,
-  projectId: string,
-  judgementId: string,
-): string {
-  return join(judgementDir(dataDir, projectId, judgementId), "judgement.json");
-}
-
-export function verdictPath(
-  dataDir: string,
-  projectId: string,
-  judgementId: string,
-): string {
-  return join(judgementDir(dataDir, projectId, judgementId), "verdict.json");
-}
-
-export function judgeEventsPath(
-  dataDir: string,
-  projectId: string,
-  judgementId: string,
-): string {
-  return join(judgementDir(dataDir, projectId, judgementId), "judge.jsonl");
-}
-
-/**
- * Read verdict.json from disk (null when missing / unparseable).
- */
-export function readVerdictFromDisk(
-  dataDir: string,
-  projectId: string,
-  judgementId: string,
-  dbPath?: string | null,
-): Verdict | null {
-  const path =
-    dbPath && dbPath.length > 0
-      ? dbPath
-      : verdictPath(dataDir, projectId, judgementId);
-  if (!existsSync(path)) return null;
-  try {
-    const raw = readFileSync(path, "utf8");
-    return JSON.parse(raw) as Verdict;
-  } catch {
-    return null;
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Row mappers (SQLite / drizzle)
 // ---------------------------------------------------------------------------
@@ -1714,13 +1284,11 @@ function mapProject(row: typeof projects.$inferSelect): Project {
     defaultAgentId: row.defaultAgentId,
     defaultModel: row.defaultModel,
     defaultProvider: row.defaultProvider,
-    defaultJudgeModel: row.defaultJudgeModel,
     workspaceImage: row.workspaceImage,
     checkRunners: parseJson(row.checkRunnersJson, null),
     adapterOverrides: parseJson(row.adapterOverridesJson, null),
     networkPolicy: row.networkPolicy ?? "allow",
     retentionRuns: row.retentionRuns,
-    artifactRetention: row.artifactRetention ?? "keep",
     sandbox: parseJson(row.sandboxJson, null),
     archived: row.archived === 1,
     createdAt: row.createdAt,
@@ -1814,7 +1382,7 @@ function mapProjectAgentAdapter(
 function mapBatch(row: typeof runBatches.$inferSelect): RunBatch {
   return {
     id: row.id,
-    taskId: row.taskId,
+    taskId: row.taskId ?? null,
     projectId: row.projectId,
     agentId: row.agentId,
     model: row.model,
@@ -1825,10 +1393,56 @@ function mapBatch(row: typeof runBatches.$inferSelect): RunBatch {
     triggerRef: row.triggerRef,
     agentImage: row.agentImage,
     agentCommit: row.agentCommit,
+    agentImageId: row.agentImageId ?? null,
+    agentVersion: row.agentVersion ?? null,
+    buildId: row.buildId ?? null,
     queueId: row.queueId ?? null,
     queueRevision: row.queueRevision ?? null,
     createdAt: row.createdAt,
+    accepting: (row.accepting ?? 1) === 1,
+    closedRevision: row.closedRevision ?? null,
+    closedAt: row.closedAt ?? null,
   };
+}
+
+function mapAdapterBuildRow(
+  row: typeof adapterBuilds.$inferSelect,
+): AdapterBuild {
+  return {
+    id: row.id,
+    adapterId: row.adapterId,
+    commitSha: row.commitSha,
+    status: row.status,
+    image: row.image ?? null,
+    imageId: row.imageId ?? null,
+    agentVersion: row.agentVersion ?? null,
+    logPath: row.logPath ?? null,
+    error: row.error ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    completedAt: row.completedAt ?? null,
+  };
+}
+
+function taskSnapshotFromRow(row: typeof tasks.$inferSelect): string {
+  return stringifyJson({
+    id: row.id,
+    name: row.name,
+    prompt: row.prompt,
+    workspace: { source: row.workspaceSource, ...(row.workspaceRepo ? { repo: row.workspaceRepo } : {}), ...(row.workspaceRef ? { ref: row.workspaceRef } : {}) },
+    rubric: parseJson(row.rubricJson, null),
+    version: row.version,
+    rubricVersion: row.rubricVersion,
+    agentCategory: row.agentCategory,
+    categoryName: row.categoryName,
+    profile: row.profile,
+    checks: parseJson(row.checksJson, null),
+    env: parseJson(row.envJson, null),
+    packagePath: row.packagePath,
+    packageDigest: row.packageDigest,
+    packageManifest: parseJson(row.packageManifestJson, null),
+    packageValidation: parseJson(row.packageValidationJson, null),
+  }) as string;
 }
 
 function mapRun(row: typeof runs.$inferSelect): Run {
@@ -1846,6 +1460,7 @@ function mapRun(row: typeof runs.$inferSelect): Run {
     repeatIndex: row.repeatIndex,
     evalVersion: row.evalVersion ?? null,
     evalSnapshot: parseJson(row.evalSnapshotJson, null),
+    itemSnapshot: parseJson(row.itemSnapshotJson, null),
     status: row.status,
     workspaceCommit: row.workspaceCommit,
     agentImage: row.agentImage,
@@ -1874,227 +1489,37 @@ function mapRun(row: typeof runs.$inferSelect): Run {
   };
 }
 
-function mapJudgement(row: typeof judgements.$inferSelect): Judgement {
-  return {
-    id: row.id,
-    runId: row.runId,
-    projectId: row.projectId,
-    queueAnalysisId: row.queueAnalysisId ?? null,
-    judgeModel: row.judgeModel,
-    judgeProvider: row.judgeProvider,
-    judgePrompt: row.judgePrompt,
-    systemPromptVersion: row.systemPromptVersion,
-    status: row.status,
-    overallScore: row.overallScore,
-    verdict: row.verdict,
-    reportPath: row.reportPath,
-    eventsPath: row.eventsPath,
-    verdictPath: row.verdictPath,
-    narrative: parseJson<EvalJudgementNarrative | null>(row.narrativeJson, null),
-    narrativeSchemaVersion: row.narrativeSchemaVersion ?? null,
-    createdAt: row.createdAt,
-    endedAt: row.endedAt,
-  };
-}
-
-function mapScore(row: typeof scores.$inferSelect): ScoreRow {
-  return {
-    id: row.id,
-    judgementId: row.judgementId,
-    criterion: row.criterion,
-    weight: row.weight,
-    score: row.score,
-    rationale: row.rationale,
-  };
-}
-
-function mapFinding(row: typeof findings.$inferSelect): FindingRow {
-  return {
-    fingerprint: row.fingerprint,
-    taskId: row.taskId,
-    projectId: row.projectId,
-    category: row.category,
-    kind: row.kind as FindingKind,
-    claim: row.claim,
-    latestSeverity: row.latestSeverity,
-    latestConfidence: row.latestConfidence,
-    firstSeenJudgement: row.firstSeenJudgement,
-    lastSeenJudgement: row.lastSeenJudgement,
-    firstSeenAt: row.firstSeenAt,
-    lastSeenAt: row.lastSeenAt,
-    occurrenceCount: row.occurrenceCount ?? 1,
-    resolvedAt: row.resolvedAt,
-    status: row.status,
-  };
-}
-
-function mapOccurrence(
-  row: typeof findingOccurrences.$inferSelect,
-): OccurrenceRow {
-  return {
-    id: row.id,
-    findingFingerprint: row.findingFingerprint,
-    judgementId: row.judgementId,
-    runId: row.runId,
-    severity: row.severity,
-    confidence: row.confidence,
-    claim: row.claim,
-    criterion: row.criterion,
-    refsJson: row.refsJson,
-    fixJson: row.fixJson,
-    status: row.status,
-    createdAt: row.createdAt,
-  };
-}
-
-function clampLimit(n: number | undefined): number {
-  const v = Number.isFinite(n) ? Number(n) : 50;
-  return Math.max(1, Math.min(200, Math.floor(v) || 50));
-}
-
-function parseCursorOffset(cursor: string | undefined): number {
-  if (cursor == null || cursor === "") return 0;
-  const n = Number(cursor);
-  if (!Number.isFinite(n) || n < 0) return 0;
-  return Math.floor(n);
-}
-
 function notFound(kind: string, id: string): Error {
   return new Error(`${kind} not found: ${id}`);
 }
 
-/** Map a project_rubrics row to the domain shape (rubric_json parsed). */
-function mapProjectRubric(
-  row: typeof projectRubrics.$inferSelect,
-): ProjectRubric {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    name: row.name,
-    description: row.description,
-    rubric: parseJson<Rubric>(row.rubricJson, {
-      criteria: [],
-      profile: "bugfix",
-      version: 1,
-    } as Rubric),
-    rubricVersion: row.rubricVersion,
-    isDefault: row.isDefault === 1,
-    archived: row.archived === 1,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-  };
-}
-
 /**
- * Newest-first ordering shared by both project-rubric list impls
- * (createdAt desc, id desc as a stable tiebreak for same-ms inserts).
+ * A queue generation container is "active" unless it has reached a terminal
+ * disposition (stopped/failed, or its stop timestamp is set). Deliberately NOT
+ * keyed on runtimeContainerId: a container row is created in `starting` state
+ * before the runtime handle exists, and the one-active-generation guard must
+ * hold across that whole window or two generations can start for one queue.
  */
-function sortProjectRubrics(rows: ProjectRubric[]): ProjectRubric[] {
-  return rows.sort((a, b) => {
-    if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
-    return b.id.localeCompare(a.id);
-  });
+function isActiveContainerState(c: QueueContainer): boolean {
+  if (c.stoppedAt !== null) return false;
+  return c.state !== "stopped" && c.state !== "failed";
 }
-
-/** Default gap for fractional queue positions (leave room for inserts). */
-const QUEUE_POSITION_GAP = 1000;
 
 /** Strip webhook secret so it is never leaked after create. */
 function stripWebhookSecret(rule: WatcherRule): WatcherRule {
   return { ...rule, webhookSecret: null };
 }
 
-/** Parse watcher action_json with a safe default. */
-function parseWatcherAction(raw: string | null | undefined): WatcherAction {
-  const parsed = parseJson<Partial<WatcherAction>>(raw, {});
-  return {
-    enqueue: parsed.enqueue === "subset" ? "subset" : "all",
-    ...(parsed.taskTags !== undefined ? { taskTags: parsed.taskTags } : {}),
-    ...(parsed.repeats !== undefined ? { repeats: parsed.repeats } : {}),
-    ...(parsed.adapterOverrides !== undefined
-      ? { adapterOverrides: parsed.adapterOverrides }
-      : {}),
-    ...(parsed.autoJudge !== undefined ? { autoJudge: parsed.autoJudge } : {}),
-    ...(parsed.judgeModel !== undefined ? { judgeModel: parsed.judgeModel } : {}),
-  };
-}
-
-function defaultQueueDedupKey(
-  triggerRef: string | null | undefined,
-  targetKind: string,
-  taskId: string | null | undefined,
-  taskTags: string[] | null | undefined,
-): string {
-  const refPart = triggerRef ?? "";
-  if (targetKind === "task") {
-    return `${refPart}:task:${taskId ?? ""}`;
-  }
-  return `${refPart}:tags:${(taskTags ?? []).join(",")}`;
-}
-
-/**
- * Fractional indexing for queue order (spreadsheet-row style).
- * - absolute number → use as-is
- * - {after:id} → midpoint between that entry and its next neighbor (or tail gap)
- * - {before:id} → midpoint between previous neighbor and that entry (or head gap)
- * - omitted → append after max (or QUEUE_POSITION_GAP when empty)
- */
-function computeFractionalPosition(
-  entries: Array<{ id: string; position: number }>,
-  opts?: QueuePositionSpec,
-): number {
-  const sorted = [...entries].sort((a, b) => a.position - b.position);
-  if (typeof opts === "number" && Number.isFinite(opts)) {
-    return opts;
-  }
-  if (sorted.length === 0) {
-    return QUEUE_POSITION_GAP;
-  }
-  const afterId =
-    opts && typeof opts === "object" && "after" in opts ? opts.after : undefined;
-  const beforeId =
-    opts && typeof opts === "object" && "before" in opts ? opts.before : undefined;
-
-  if (afterId) {
-    const idx = sorted.findIndex((e) => e.id === afterId);
-    if (idx < 0) {
-      return sorted[sorted.length - 1]!.position + QUEUE_POSITION_GAP;
-    }
-    const a = sorted[idx]!.position;
-    if (idx + 1 < sorted.length) {
-      return (a + sorted[idx + 1]!.position) / 2;
-    }
-    return a + QUEUE_POSITION_GAP;
-  }
-
-  if (beforeId) {
-    const idx = sorted.findIndex((e) => e.id === beforeId);
-    if (idx < 0) {
-      // Unknown anchor → insert at head (gap below min).
-      const min = sorted[0]!.position;
-      return min > 0 ? min / 2 : min - QUEUE_POSITION_GAP;
-    }
-    const b = sorted[idx]!.position;
-    if (idx === 0) {
-      return b > 0 ? b / 2 : b - QUEUE_POSITION_GAP;
-    }
-    return (sorted[idx - 1]!.position + b) / 2;
-  }
-
-  // Default: append at tail.
-  return sorted[sorted.length - 1]!.position + QUEUE_POSITION_GAP;
-}
-
 function mapWatcherRuleRow(row: typeof watcherRules.$inferSelect): WatcherRule {
   return {
     id: row.id,
     projectId: row.projectId,
-    role: row.role as WatcherRole,
+    queueId: row.queueId ?? null,
+    role: "agent",
     repo: row.repo,
     trigger: row.trigger,
     ref: row.ref ?? null,
     semverFilter: row.semverFilter ?? null,
-    action: parseWatcherAction(row.actionJson),
     webhookSecret: row.webhookSecret ?? null,
     enabled: row.enabled === 1,
     createdAt: row.createdAt,
@@ -2115,6 +1540,9 @@ function mapWatcherEventRow(
     resolvedSha: row.resolvedSha ?? null,
     status: row.status,
     batchId: row.batchId ?? null,
+    queueId: row.queueId ?? null,
+    fifoSeq: row.fifoSeq ?? null,
+    processedSha: row.processedSha ?? null,
     error: row.error ?? null,
   };
 }
@@ -2143,59 +1571,6 @@ function mapUserRow(row: typeof users.$inferSelect): User {
   };
 }
 
-/** Strip outbound subscription secret so it is never leaked after create. */
-function stripOutboundSecret(sub: OutboundSubscription): OutboundSubscription {
-  return { ...sub, secret: null };
-}
-
-/** Parse event_types_json (JSON array of strings; empty = match-all). */
-function parseEventTypes(raw: string | null | undefined): string[] {
-  const parsed = parseJson<unknown>(raw, []);
-  if (!Array.isArray(parsed)) return [];
-  return parsed.filter((x): x is string => typeof x === "string");
-}
-
-/** Truncate response body stored on delivery rows (cap at 2KB). */
-function truncateResponseBody(body: string | null | undefined): string | null {
-  if (body == null) return null;
-  if (body.length <= 2048) return body;
-  return body.slice(0, 2048);
-}
-
-function mapOutboundSubscriptionRow(
-  row: typeof outboundSubscriptions.$inferSelect,
-): OutboundSubscription {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    url: row.url,
-    secret: row.secret ?? null,
-    eventTypes: parseEventTypes(row.eventTypesJson),
-    enabled: row.enabled === 1,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-  };
-}
-
-function mapWebhookDeliveryRow(
-  row: typeof webhookDeliveries.$inferSelect,
-): WebhookDelivery {
-  return {
-    id: row.id,
-    subscriptionId: row.subscriptionId,
-    projectId: row.projectId,
-    eventType: row.eventType,
-    payload: parseJson<unknown>(row.payloadJson, null),
-    status: row.status,
-    attempt: row.attempt,
-    responseStatus: row.responseStatus ?? null,
-    responseBody: row.responseBody ?? null,
-    error: row.error ?? null,
-    deliveredAt: row.deliveredAt ?? null,
-    createdAt: row.createdAt,
-  };
-}
-
 /**
  * Generate plaintext `aev_` + 32 url-safe base64 chars and its sha256 hex.
  * Plaintext must never be written to the DB.
@@ -2219,13 +1594,11 @@ function mapEvalQueueRow(row: typeof evalQueues.$inferSelect): EvalQueue {
     sandbox: parseJson(row.sandboxJson, null),
     networkPolicy: row.networkPolicy ?? "allow",
     ports: parseJson<PortMapping[]>(row.portsJson, []),
-    judgeModel: row.judgeModel ?? null,
-    judgeProvider: row.judgeProvider ?? null,
-    autoJudge: row.autoJudge === 1,
     status: row.status,
     activeBatchId: row.activeBatchId ?? null,
     sharedAdapterId: row.sharedAdapterId ?? null,
     builtinAdapterId: row.builtinAdapterId ?? null,
+    agentCommit: row.agentCommit ?? null,
     revision: row.revision ?? 1,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -2244,6 +1617,8 @@ function mapEvalQueueItemRow(
     repeats: row.repeats,
     enabled: row.enabled === 1,
     overrides: parseJson(row.overridesJson, null),
+    claimedRepeats: row.claimedRepeats ?? 0,
+    deletedAt: row.deletedAt ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -2259,75 +1634,16 @@ function mapQueueContainerRow(
     batchId: row.batchId,
     runtimeContainerId: row.runtimeContainerId ?? null,
     image: row.image,
+    imageId: row.imageId ?? null,
+    agentCommit: row.agentCommit ?? null,
+    agentVersion: row.agentVersion ?? null,
+    buildId: row.buildId ?? null,
     state: row.state,
     ports: parseJson<ResolvedPort[]>(row.portsJson, []),
     workspaceDir: row.workspaceDir,
     startedAt: row.startedAt ?? null,
     stoppedAt: row.stoppedAt ?? null,
     error: row.error ?? null,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-  };
-}
-
-function mapQueueAnalysisRow(
-  row: typeof queueAnalyses.$inferSelect,
-): QueueAnalysis {
-  return {
-    id: row.id,
-    queueId: row.queueId,
-    projectId: row.projectId,
-    batchId: row.batchId,
-    selectedRunIds: parseJson<string[]>(row.selectedRunIdsJson, []),
-    evidenceHashes: parseJson<Record<string, string>>(
-      row.evidenceHashesJson,
-      {},
-    ),
-    judgeModel: row.judgeModel,
-    judgeProvider: row.judgeProvider,
-    judgeParams: parseJson(row.judgeParamsJson, null),
-    judgePrompt: row.judgePrompt ?? null,
-    systemPromptVersion: row.systemPromptVersion,
-    parentAnalysisId: row.parentAnalysisId ?? null,
-    status: row.status,
-    verdictPath: row.verdictPath ?? null,
-    reportPath: row.reportPath ?? null,
-    eventsPath: row.eventsPath ?? null,
-    rawResponsePath: row.rawResponsePath ?? null,
-    createdAt: row.createdAt,
-    startedAt: row.startedAt ?? null,
-    endedAt: row.endedAt ?? null,
-    error: row.error ?? null,
-  };
-}
-
-function mapImprovementStepRow(
-  row: typeof improvementSteps.$inferSelect,
-): ImprovementStepRecord {
-  return {
-    id: row.stepKey,
-    queueAnalysisId: row.queueAnalysisId,
-    projectId: row.projectId,
-    queueId: row.queueId,
-    rank: row.rank,
-    class: row.ownerClass as ImprovementOwnerClass,
-    priority: row.priority as QueueImprovementStep["priority"],
-    confidence: row.confidence,
-    defectIds: parseJson<string[]>(row.defectIdsJson, []),
-    subsystem: row.subsystem,
-    problem: row.problem,
-    evidence: parseJson(row.evidenceJson, []),
-    target: parseJson(row.targetJson, { kind: "external", system: "unknown", blocker: "missing target" }),
-    change: row.change,
-    acceptanceCriteria: parseJson<string[]>(row.acceptanceCriteriaJson, []),
-    tests: parseJson(row.testsJson, []),
-    verifyTaskIds: parseJson<string[]>(row.verifyTaskIdsJson, []),
-    regressionTaskIds: parseJson<string[]>(row.regressionTaskIdsJson, []),
-    dependencies: parseJson<string[]>(row.dependenciesJson, []),
-    nonGoals: parseJson<string[]>(row.nonGoalsJson, []),
-    preventive: row.preventive === 1,
-    status: row.status as ImprovementStepStatus,
-    ...(row.blockingReason ? { blockingReason: row.blockingReason } : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -2358,56 +1674,6 @@ function mapEvalArchiveRow(row: typeof evalArchives.$inferSelect): EvalArchive {
   };
 }
 
-function mapQueueEntryRow(row: typeof queueEntries.$inferSelect): QueueEntry {
-  const auto =
-    row.autoJudge == null ? null : row.autoJudge === 1 ? true : false;
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    triggerRef: row.triggerRef ?? null,
-    targetKind: row.targetKind,
-    taskId: row.taskId ?? null,
-    taskTags: parseJson<string[] | null>(row.taskTagsJson, null),
-    agentId: row.agentId,
-    model: row.model ?? null,
-    provider: row.provider ?? null,
-    repeats: row.repeats ?? null,
-    params: parseJson<Record<string, unknown> | null>(row.paramsJson, null),
-    adapterOverrides: parseJson<Record<string, unknown> | null>(
-      row.adapterOverridesJson,
-      null,
-    ),
-    autoJudge: auto,
-    judgeModel: row.judgeModel ?? null,
-    priority: row.priority ?? 0,
-    position: row.position,
-    status: row.status,
-    dedupKey: row.dedupKey ?? null,
-    source: row.source ?? null,
-    createdAt: row.createdAt,
-    promotedAt: row.promotedAt ?? null,
-    promotedBatchId: row.promotedBatchId ?? null,
-    removedAt: row.removedAt ?? null,
-  };
-}
-
-function sortQueueEntries(entries: QueueEntry[]): QueueEntry[] {
-  return [...entries].sort((a, b) => {
-    if (b.priority !== a.priority) return b.priority - a.priority;
-    if (a.position !== b.position) return a.position - b.position;
-    return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0;
-  });
-}
-
-function tasksMatchingTags(
-  all: Task[],
-  tags: string[] | null | undefined,
-): Task[] {
-  if (!tags || tags.length === 0) return [...all];
-  const want = new Set(tags);
-  return all.filter((t) => (t.tags ?? []).some((tag) => want.has(tag)));
-}
-
 // ---------------------------------------------------------------------------
 // SqliteQueries
 // ---------------------------------------------------------------------------
@@ -2419,10 +1685,8 @@ export class SqliteQueries implements QueryStore {
   ) {}
 
   transaction<T>(operation: () => T): T {
-    return this.db.transaction(() => operation());
+    return operation();
   }
-
-  // ---- projects ----
 
   createProject(input: CreateProjectInput): Project {
     const id = input.id ?? newId();
@@ -2437,15 +1701,11 @@ export class SqliteQueries implements QueryStore {
       defaultAgentId: input.defaultAgentId ?? null,
       defaultModel: input.defaultModel ?? null,
       defaultProvider: input.defaultProvider ?? null,
-      defaultJudgeModel: input.defaultJudgeModel ?? null,
       workspaceImage: input.workspaceImage ?? null,
       checkRunnersJson: stringifyJson(input.checkRunners ?? null),
       adapterOverridesJson: stringifyJson(input.adapterOverrides ?? null),
       networkPolicy: input.networkPolicy ?? "allow",
       retentionRuns: input.retentionRuns ?? null,
-      artifactRetention: resolveRetentionPolicy(
-        input.artifactRetention ?? DEFAULT_ARTIFACT_RETENTION,
-      ),
       sandboxJson: stringifyJson(input.sandbox ?? null),
       archived: 0,
       createdAt: ts,
@@ -2499,10 +1759,6 @@ export class SqliteQueries implements QueryStore {
           patch.defaultProvider !== undefined
             ? patch.defaultProvider
             : existing.defaultProvider,
-        defaultJudgeModel:
-          patch.defaultJudgeModel !== undefined
-            ? patch.defaultJudgeModel
-            : existing.defaultJudgeModel,
         workspaceImage:
           patch.workspaceImage !== undefined
             ? patch.workspaceImage
@@ -2520,10 +1776,6 @@ export class SqliteQueries implements QueryStore {
           patch.retentionRuns !== undefined
             ? patch.retentionRuns
             : existing.retentionRuns,
-        artifactRetention:
-          patch.artifactRetention !== undefined
-            ? resolveRetentionPolicy(patch.artifactRetention)
-            : existing.artifactRetention,
         sandboxJson:
           patch.sandbox !== undefined
             ? stringifyJson(patch.sandbox)
@@ -2960,6 +2212,115 @@ export class SqliteQueries implements QueryStore {
     this.db.delete(projectAgentAdapters).where(eq(projectAgentAdapters.id, id)).run();
   }
 
+  // ---- adapter builds (commit-addressed, SCHEMA v9) ----
+
+  upsertAdapterBuild(input: CreateAdapterBuildInput): AdapterBuild {
+    const id = input.id ?? `${input.adapterId}:${input.commitSha}`;
+    const existing = this.getAdapterBuild(id);
+    const ts = nowIso();
+    if (existing) {
+      this.db
+        .update(adapterBuilds)
+        .set({
+          status: input.status ?? existing.status,
+          image: input.image !== undefined ? input.image : existing.image,
+          imageId: input.imageId !== undefined ? input.imageId : existing.imageId,
+          agentVersion:
+            input.agentVersion !== undefined
+              ? input.agentVersion
+              : existing.agentVersion,
+          logPath: input.logPath !== undefined ? input.logPath : existing.logPath,
+          completedAt:
+            input.status === "ready" || input.status === "failed"
+              ? nowIso()
+              : existing.completedAt,
+          updatedAt: ts,
+        })
+        .where(eq(adapterBuilds.id, id))
+        .run();
+    } else {
+      this.db
+        .insert(adapterBuilds)
+        .values({
+          id,
+          adapterId: input.adapterId,
+          commitSha: input.commitSha,
+          status: input.status ?? "building",
+          image: input.image ?? null,
+          imageId: input.imageId ?? null,
+          agentVersion: input.agentVersion ?? null,
+          logPath: input.logPath ?? null,
+          error: null,
+          createdAt: ts,
+          updatedAt: ts,
+          completedAt: null,
+        })
+        .run();
+    }
+    const row = this.getAdapterBuild(id);
+    if (!row) throw notFound("adapter build", id);
+    return row;
+  }
+
+  getAdapterBuild(id: string): AdapterBuild | null {
+    const row = this.db.select().from(adapterBuilds).where(eq(adapterBuilds.id, id)).get();
+    return row ? mapAdapterBuildRow(row) : null;
+  }
+
+  getReadyAdapterBuild(adapterId: string, commitSha: string): AdapterBuild | null {
+    const row = this.db
+      .select()
+      .from(adapterBuilds)
+      .where(
+        and(
+          eq(adapterBuilds.adapterId, adapterId),
+          eq(adapterBuilds.commitSha, commitSha),
+          eq(adapterBuilds.status, "ready"),
+        ),
+      )
+      .get();
+    return row ? mapAdapterBuildRow(row) : null;
+  }
+
+  listAdapterBuilds(
+    adapterId: string,
+    opts: { status?: AdapterBuildStatus | string; limit?: number } = {},
+  ): AdapterBuild[] {
+    const conditions = [eq(adapterBuilds.adapterId, adapterId)];
+    if (opts.status) conditions.push(eq(adapterBuilds.status, opts.status));
+    const rows = this.db
+      .select()
+      .from(adapterBuilds)
+      .where(and(...conditions))
+      .orderBy(desc(adapterBuilds.createdAt))
+      .limit(opts.limit ?? 200)
+      .all();
+    return rows.map(mapAdapterBuildRow);
+  }
+
+  updateAdapterBuild(id: string, patch: UpdateAdapterBuildInput): AdapterBuild {
+    if (!this.getAdapterBuild(id)) throw notFound("adapter build", id);
+    const values: Partial<typeof adapterBuilds.$inferInsert> = { updatedAt: nowIso() };
+    if (patch.status !== undefined) values.status = patch.status;
+    if (patch.image !== undefined) values.image = patch.image;
+    if (patch.imageId !== undefined) values.imageId = patch.imageId;
+    if (patch.agentVersion !== undefined) values.agentVersion = patch.agentVersion;
+    if (patch.logPath !== undefined) values.logPath = patch.logPath;
+    if (patch.error !== undefined) values.error = patch.error;
+    if (patch.completedAt !== undefined) values.completedAt = patch.completedAt;
+    if (patch.status === "ready" || patch.status === "failed") {
+      values.completedAt = patch.completedAt ?? nowIso();
+    }
+    this.db
+      .update(adapterBuilds)
+      .set(values)
+      .where(eq(adapterBuilds.id, id))
+      .run();
+    const row = this.getAdapterBuild(id);
+    if (!row) throw notFound("adapter build", id);
+    return row;
+  }
+
   // ---- batches + runs ----
 
   createBatch(input: CreateBatchInput): RunBatch {
@@ -2969,7 +2330,7 @@ export class SqliteQueries implements QueryStore {
       .insert(runBatches)
       .values({
         id,
-        taskId: input.taskId,
+        taskId: input.taskId ?? null,
         projectId: input.projectId,
         agentId: input.agentId,
         model: input.model,
@@ -2980,6 +2341,9 @@ export class SqliteQueries implements QueryStore {
         triggerRef: input.triggerRef ?? null,
         agentImage: input.agentImage ?? null,
         agentCommit: input.agentCommit ?? null,
+        agentImageId: input.agentImageId ?? null,
+        agentVersion: input.agentVersion ?? null,
+        buildId: input.buildId ?? null,
         queueId: input.queueId ?? null,
         queueRevision: input.queueRevision ?? null,
         createdAt: ts,
@@ -3012,6 +2376,7 @@ export class SqliteQueries implements QueryStore {
         repeatIndex: input.repeatIndex,
         evalVersion: input.evalVersion ?? null,
         evalSnapshotJson: stringifyJson(input.evalSnapshot ?? null),
+        itemSnapshotJson: stringifyJson(input.itemSnapshot ?? null),
         status: input.status ?? "queued",
         workspaceCommit: input.workspaceCommit ?? null,
         agentImage: input.agentImage ?? null,
@@ -3116,6 +2481,20 @@ export class SqliteQueries implements QueryStore {
     return row;
   }
 
+  setRunEventsPath(id: string, eventsPath: string): Run {
+    const existing = this.getRun(id);
+    if (!existing) throw notFound("run", id);
+    this.db
+      .update(runs)
+      .set({ eventsPath })
+      .where(eq(runs.id, id))
+      .run();
+    const row = this.getRun(id);
+    if (!row) throw notFound("run", id);
+    writeSnapshot(runSnapshotPath(this.dataDir, row.projectId, row.id), row);
+    return row;
+  }
+
   finalizeRun(id: string, result: FinalizeRunInput): Run {
     const existing = this.getRun(id);
     if (!existing) throw notFound("run", id);
@@ -3162,480 +2541,6 @@ export class SqliteQueries implements QueryStore {
     return row;
   }
 
-  // ---- judgements + scores (P4c) ----
-
-  createJudgement(input: CreateJudgementInput): Judgement {
-    const id = input.id ?? newId();
-    const ts = nowIso();
-    const eventsPath = judgeEventsPath(this.dataDir, input.projectId, id);
-    const jVerdictPath = verdictPath(this.dataDir, input.projectId, id);
-    this.db
-      .insert(judgements)
-      .values({
-        id,
-        runId: input.runId,
-        projectId: input.projectId,
-        queueAnalysisId: input.queueAnalysisId ?? null,
-        judgeModel: input.judgeModel,
-        judgeProvider: input.judgeProvider,
-        judgePrompt: input.judgePrompt ?? null,
-        systemPromptVersion: input.systemPromptVersion,
-        status: input.status,
-        overallScore: null,
-        verdict: null,
-        reportPath: null,
-        eventsPath,
-        verdictPath: jVerdictPath,
-        createdAt: ts,
-        endedAt: null,
-      })
-      .run();
-    const row = this.db
-      .select()
-      .from(judgements)
-      .where(eq(judgements.id, id))
-      .get();
-    if (!row) throw new Error("failed to create judgement");
-    const mapped = mapJudgement(row);
-    writeSnapshot(
-      judgementSnapshotPath(this.dataDir, mapped.projectId, mapped.id),
-      mapped,
-    );
-    // Ensure the judgement dir exists so judge.jsonl can be appended later.
-    try {
-      mkdirSync(judgementDir(this.dataDir, mapped.projectId, mapped.id), {
-        recursive: true,
-      });
-    } catch {
-      // best-effort
-    }
-    return mapped;
-  }
-
-  createScores(
-    judgementId: string,
-    scoreInputs: CreateScoreInput[],
-  ): ScoreRow[] {
-    const existing = this.db
-      .select()
-      .from(judgements)
-      .where(eq(judgements.id, judgementId))
-      .get();
-    if (!existing) throw notFound("judgement", judgementId);
-    const out: ScoreRow[] = [];
-    for (const s of scoreInputs) {
-      const id = newId();
-      this.db
-        .insert(scores)
-        .values({
-          id,
-          judgementId,
-          criterion: s.criterion,
-          weight: s.weight,
-          score: s.score,
-          rationale: s.rationale ?? null,
-        })
-        .run();
-      const row = this.db
-        .select()
-        .from(scores)
-        .where(eq(scores.id, id))
-        .get();
-      if (row) out.push(mapScore(row));
-    }
-    return out;
-  }
-
-  storeVerdict(
-    judgementId: string,
-    verdict: Verdict,
-    narrative: EvalJudgementNarrative | null = null,
-  ): JudgementWithVerdict {
-    const existing = this.db
-      .select()
-      .from(judgements)
-      .where(eq(judgements.id, judgementId))
-      .get();
-    if (!existing) throw notFound("judgement", judgementId);
-    const projectId = existing.projectId;
-    const jVerdictPath =
-      existing.verdictPath ??
-      verdictPath(this.dataDir, projectId, judgementId);
-    const eventsPath =
-      existing.eventsPath ??
-      judgeEventsPath(this.dataDir, projectId, judgementId);
-
-    // Write verdict.json first (source of truth on disk).
-    writeSnapshot(jVerdictPath, verdict);
-
-    // Replace any existing per-criterion scores with the verdict's criteria.
-    this.db.delete(scores).where(eq(scores.judgementId, judgementId)).run();
-    const scoreInputs: CreateScoreInput[] = (verdict.criteria ?? []).map(
-      (c) => ({
-        criterion: c.criterion,
-        weight: c.weight,
-        score: c.score,
-        rationale: c.feedback,
-      }),
-    );
-    this.createScores(judgementId, scoreInputs);
-
-    const endedAt = nowIso();
-    this.db
-      .update(judgements)
-      .set({
-        status: "completed",
-        overallScore: verdict.overall?.score ?? null,
-        verdict: verdict.overall?.verdict ?? null,
-        verdictPath: jVerdictPath,
-        eventsPath,
-        narrativeJson: narrative ? JSON.stringify(narrative) : null,
-        narrativeSchemaVersion: narrative?.schemaVersion ?? null,
-        endedAt,
-      })
-      .where(eq(judgements.id, judgementId))
-      .run();
-
-    // P6a: ingest findings after score mirror. Errors are swallowed so a
-    // findings-ingest glitch cannot break verdict persistence. Goes through the
-    // public ingestFindings method so tests can force-fail it for isolation.
-    try {
-      this.ingestFindings(judgementId, verdict);
-    } catch (err) {
-      console.warn(
-        `[findings] ingest failed for judgement ${judgementId}:`,
-        err,
-      );
-    }
-
-    const row = this.db
-      .select()
-      .from(judgements)
-      .where(eq(judgements.id, judgementId))
-      .get();
-    if (!row) throw notFound("judgement", judgementId);
-    const mapped = mapJudgement(row);
-    writeSnapshot(
-      judgementSnapshotPath(this.dataDir, mapped.projectId, mapped.id),
-      mapped,
-    );
-    // Prefer the post-ingest on-disk body (may include Finding.recurring).
-    const verdictBody =
-      readVerdictFromDisk(
-        this.dataDir,
-        mapped.projectId,
-        mapped.id,
-        jVerdictPath,
-      ) ?? verdict;
-    return { ...mapped, verdictBody };
-  }
-
-  /**
-   * Resolve taskId from the run, run pure ingest, rewrite verdict.json with
-   * recurrence annotations. Shared by storeVerdict + public ingestFindings.
-   */
-  private ingestFindingsAndRewrite(
-    judgementId: string,
-    runId: string,
-    projectId: string,
-    jVerdictPath: string,
-    verdict: Verdict,
-  ): Verdict {
-    const run = this.getRun(runId);
-    if (!run) {
-      throw new Error(
-        `cannot ingest findings: run not found for judgement ${judgementId} (runId=${runId})`,
-      );
-    }
-    const store = this.asFindingsStore();
-    const result = runIngestFindings(store, {
-      judgementId,
-      runId,
-      projectId,
-      taskId: run.taskId,
-      verdict,
-    });
-    const withRecurring = (applyRecurrenceToVerdict as any)(
-      verdict,
-      result.recurringByFindingId,
-    );
-    // Rewrite verdict.json in the SAME call (single-threaded SQLite) so the
-    // report + API see Finding.recurring without a separate race-prone pass.
-    writeSnapshot(jVerdictPath, withRecurring);
-    return withRecurring;
-  }
-
-  /** Public entry — re-ingests a stored judgement's verdict (or a fresh one). */
-  ingestFindings(judgementId: string, verdict: Verdict): void {
-    const existing = this.db
-      .select()
-      .from(judgements)
-      .where(eq(judgements.id, judgementId))
-      .get();
-    if (!existing) throw notFound("judgement", judgementId);
-    const jVerdictPath =
-      existing.verdictPath ??
-      verdictPath(this.dataDir, existing.projectId, judgementId);
-    this.ingestFindingsAndRewrite(
-      judgementId,
-      existing.runId,
-      existing.projectId,
-      jVerdictPath,
-      verdict,
-    );
-  }
-
-  /** Adapter: SqliteQueries → FindingsIngestStore for the pure state machine. */
-  private asFindingsStore(): FindingsIngestStore {
-    const self = this;
-    return {
-      findFindingForTask(taskId, fingerprint) {
-        const row = self.db
-          .select()
-          .from(findings)
-          .where(eq(findings.fingerprint, fingerprint))
-          .get();
-        if (!row) return null;
-        // Fingerprints are task-scoped: only match when taskId agrees.
-        if (row.taskId !== taskId) return null;
-        return mapFinding(row);
-      },
-      insertFinding(row) {
-        self.db
-          .insert(findings)
-          .values({
-            fingerprint: row.fingerprint,
-            taskId: row.taskId,
-            projectId: row.projectId,
-            category: row.category,
-            kind: row.kind,
-            claim: row.claim,
-            latestSeverity: row.latestSeverity,
-            latestConfidence: row.latestConfidence,
-            firstSeenJudgement: row.firstSeenJudgement,
-            lastSeenJudgement: row.lastSeenJudgement,
-            firstSeenAt: row.firstSeenAt,
-            lastSeenAt: row.lastSeenAt,
-            occurrenceCount: row.occurrenceCount,
-            resolvedAt: row.resolvedAt,
-            status: row.status,
-          })
-          .run();
-      },
-      updateFinding(fingerprint, patch) {
-        self.db
-          .update(findings)
-          .set({
-            ...(patch.claim !== undefined ? { claim: patch.claim } : {}),
-            ...(patch.latestSeverity !== undefined
-              ? { latestSeverity: patch.latestSeverity }
-              : {}),
-            ...(patch.latestConfidence !== undefined
-              ? { latestConfidence: patch.latestConfidence }
-              : {}),
-            ...(patch.lastSeenJudgement !== undefined
-              ? { lastSeenJudgement: patch.lastSeenJudgement }
-              : {}),
-            ...(patch.lastSeenAt !== undefined
-              ? { lastSeenAt: patch.lastSeenAt }
-              : {}),
-            ...(patch.occurrenceCount !== undefined
-              ? { occurrenceCount: patch.occurrenceCount }
-              : {}),
-            ...(patch.resolvedAt !== undefined
-              ? { resolvedAt: patch.resolvedAt }
-              : {}),
-            ...(patch.status !== undefined ? { status: patch.status } : {}),
-            ...(patch.firstSeenJudgement !== undefined
-              ? { firstSeenJudgement: patch.firstSeenJudgement }
-              : {}),
-            ...(patch.firstSeenAt !== undefined
-              ? { firstSeenAt: patch.firstSeenAt }
-              : {}),
-          })
-          .where(eq(findings.fingerprint, fingerprint))
-          .run();
-      },
-      insertOccurrence(row) {
-        self.db
-          .insert(findingOccurrences)
-          .values({
-            id: row.id,
-            findingFingerprint: row.findingFingerprint,
-            judgementId: row.judgementId,
-            runId: row.runId,
-            severity: row.severity,
-            confidence: row.confidence,
-            claim: row.claim,
-            criterion: row.criterion,
-            refsJson: row.refsJson,
-            fixJson: row.fixJson,
-            status: row.status,
-            createdAt: row.createdAt,
-          })
-          .run();
-      },
-      listFindingsForTask(taskId) {
-        return self.db
-          .select()
-          .from(findings)
-          .where(eq(findings.taskId, taskId))
-          .all()
-          .map(mapFinding);
-      },
-      getJudgementRunId(judgementId) {
-        const row = self.db
-          .select()
-          .from(judgements)
-          .where(eq(judgements.id, judgementId))
-          .get();
-        return row?.runId ?? null;
-      },
-      now: () => nowIso(),
-      newId: () => newId(),
-    };
-  }
-
-  listFindings(filter: ListFindingsFilter = {}): FindingRow[] {
-    let rows = this.db.select().from(findings).all().map(mapFinding);
-    if (filter.projectId) {
-      rows = rows.filter((f) => f.projectId === filter.projectId);
-    }
-    if (filter.taskId) {
-      rows = rows.filter((f) => f.taskId === filter.taskId);
-    }
-    if (filter.status) {
-      rows = rows.filter((f) => f.status === filter.status);
-    }
-    if (filter.kind) {
-      rows = rows.filter((f) => f.kind === filter.kind);
-    }
-    if (filter.category) {
-      rows = rows.filter((f) => f.category === filter.category);
-    }
-    // Newest lastSeen first, then fingerprint for stability.
-    rows.sort((a, b) => {
-      const ta = a.lastSeenAt ?? "";
-      const tb = b.lastSeenAt ?? "";
-      if (ta !== tb) return tb.localeCompare(ta);
-      return a.fingerprint.localeCompare(b.fingerprint);
-    });
-    return rows;
-  }
-
-  getFinding(fingerprint: string): FindingDetail | null {
-    const row = this.db
-      .select()
-      .from(findings)
-      .where(eq(findings.fingerprint, fingerprint))
-      .get();
-    if (!row) return null;
-    const base = mapFinding(row);
-    const occurrences = this.listOccurrences(fingerprint);
-    return { ...base, occurrences };
-  }
-
-  listOccurrences(findingFingerprint: string): OccurrenceRow[] {
-    const rows = this.db
-      .select()
-      .from(findingOccurrences)
-      .where(eq(findingOccurrences.findingFingerprint, findingFingerprint))
-      .all()
-      .map(mapOccurrence);
-    // Newest first.
-    rows.sort((a, b) => {
-      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
-      return b.id.localeCompare(a.id);
-    });
-    return rows;
-  }
-
-  getJudgement(id: string): JudgementWithVerdict | null {
-    const row = this.db
-      .select()
-      .from(judgements)
-      .where(eq(judgements.id, id))
-      .get();
-    if (!row) return null;
-    const mapped = mapJudgement(row);
-    const body = readVerdictFromDisk(
-      this.dataDir,
-      mapped.projectId,
-      mapped.id,
-      mapped.verdictPath,
-    );
-    return { ...mapped, verdictBody: body };
-  }
-
-  listJudgements(filter: ListJudgementsFilter = {}): ListJudgementsResult {
-    const limit = clampLimit(filter.limit);
-    const offset = parseCursorOffset(filter.cursor);
-
-    // Filter in-app so MemoryQueries and Sqlite stay aligned without
-    // complex dynamic WHERE composition for every filter combo.
-    let rows = this.db.select().from(judgements).all().map(mapJudgement);
-    if (filter.projectId) {
-      rows = rows.filter((j) => j.projectId === filter.projectId);
-    }
-    if (filter.runId) {
-      rows = rows.filter((j) => j.runId === filter.runId);
-    }
-    if (filter.status) {
-      rows = rows.filter((j) => j.status === filter.status);
-    }
-    // Newest first (createdAt desc, then id).
-    rows.sort((a, b) => {
-      const ca = a.createdAt ?? "";
-      const cb = b.createdAt ?? "";
-      if (ca !== cb) return cb.localeCompare(ca);
-      return b.id.localeCompare(a.id);
-    });
-    const page = rows.slice(offset, offset + limit);
-    const nextOffset = offset + page.length;
-    const nextCursor =
-      nextOffset < rows.length ? String(nextOffset) : null;
-    return { judgements: page, nextCursor };
-  }
-
-  setJudgementStatus(
-    id: string,
-    status: JudgementStatus | string,
-    endedAt?: string | null,
-  ): Judgement {
-    const existing = this.db
-      .select()
-      .from(judgements)
-      .where(eq(judgements.id, id))
-      .get();
-    if (!existing) throw notFound("judgement", id);
-    const patch: {
-      status: string;
-      endedAt?: string | null;
-    } = { status };
-    if (endedAt !== undefined) {
-      patch.endedAt = endedAt;
-    } else if (status === "completed" || status === "failed") {
-      patch.endedAt = existing.endedAt ?? nowIso();
-    }
-    this.db
-      .update(judgements)
-      .set(patch)
-      .where(eq(judgements.id, id))
-      .run();
-    const row = this.db
-      .select()
-      .from(judgements)
-      .where(eq(judgements.id, id))
-      .get();
-    if (!row) throw notFound("judgement", id);
-    const mapped = mapJudgement(row);
-    writeSnapshot(
-      judgementSnapshotPath(this.dataDir, mapped.projectId, mapped.id),
-      mapped,
-    );
-    return mapped;
-  }
-
   // ---- watcher rules + events (P8a) ----
 
   createWatcherRule(
@@ -3655,12 +2560,13 @@ export class SqliteQueries implements QueryStore {
       .values({
         id,
         projectId,
-        role: input.role,
+        queueId: input.queueId ?? null,
+        role: "agent",
         repo: input.repo,
         trigger: input.trigger,
         ref: input.ref ?? null,
         semverFilter: input.semverFilter ?? null,
-        actionJson: JSON.stringify(input.action),
+        actionJson: "{}",
         webhookSecret: secret,
         enabled,
         createdAt: ts,
@@ -3732,10 +2638,6 @@ export class SqliteQueries implements QueryStore {
         patch.semverFilter !== undefined
           ? patch.semverFilter
           : existing.semverFilter,
-      actionJson:
-        patch.action !== undefined
-          ? JSON.stringify(patch.action)
-          : existing.actionJson,
       enabled:
         patch.enabled !== undefined
           ? patch.enabled
@@ -3743,6 +2645,8 @@ export class SqliteQueries implements QueryStore {
             : 0
           : existing.enabled,
       repo: patch.repo !== undefined ? patch.repo : existing.repo,
+      queueId:
+        patch.queueId !== undefined ? patch.queueId : existing.queueId,
       updatedAt: nowIso(),
     };
     this.db
@@ -3778,6 +2682,9 @@ export class SqliteQueries implements QueryStore {
         resolvedSha: input.resolvedSha ?? null,
         status: input.status,
         batchId: input.batchId ?? null,
+        queueId: input.queueId ?? null,
+        fifoSeq: input.fifoSeq ?? null,
+        processedSha: input.processedSha ?? null,
         error: input.error ?? null,
       })
       .run();
@@ -3813,305 +2720,106 @@ export class SqliteQueries implements QueryStore {
     return events;
   }
 
-  // ---- eval queue (P8a) ----
-
-  createQueueEntry(
-    projectId: string,
-    input: CreateQueueEntryInput,
-  ): QueueEntry {
-    if (!this.getProject(projectId)) throw notFound("project", projectId);
-    const existing = this.db
-      .select()
-      .from(queueEntries)
-      .where(eq(queueEntries.projectId, projectId))
-      .all()
-      .map(mapQueueEntryRow);
-    const position = computeFractionalPosition(
-      existing.map((e) => ({ id: e.id, position: e.position })),
-      input.position,
-    );
-    const taskTags = input.taskTags ?? null;
-    let dedupKey: string | null;
-    if (input.dedupKey !== undefined) {
-      dedupKey = input.dedupKey;
-    } else if (input.source === "manual") {
-      dedupKey = null;
-    } else {
-      dedupKey = defaultQueueDedupKey(
-        input.triggerRef ?? null,
-        input.targetKind,
-        input.taskId ?? null,
-        taskTags,
-      );
-    }
-    const id = newId();
-    const ts = nowIso();
-    this.db
-      .insert(queueEntries)
-      .values({
-        id,
-        projectId,
-        triggerRef: input.triggerRef ?? null,
-        targetKind: input.targetKind,
-        taskId: input.taskId ?? null,
-        taskTagsJson: taskTags ? JSON.stringify(taskTags) : null,
-        agentId: input.agentId,
-        model: input.model ?? null,
-        provider: input.provider ?? null,
-        repeats: input.repeats ?? null,
-        paramsJson:
-          input.params !== undefined && input.params !== null
-            ? JSON.stringify(input.params)
-            : null,
-        adapterOverridesJson:
-          input.adapterOverrides !== undefined &&
-          input.adapterOverrides !== null
-            ? JSON.stringify(input.adapterOverrides)
-            : null,
-        autoJudge:
-          input.autoJudge === undefined || input.autoJudge === null
-            ? null
-            : input.autoJudge
-              ? 1
-              : 0,
-        judgeModel: input.judgeModel ?? null,
-        priority: input.priority ?? 0,
-        position,
-        status: "queued",
-        dedupKey,
-        source: input.source ?? null,
-        createdAt: ts,
-        promotedAt: null,
-        promotedBatchId: null,
-        removedAt: null,
-      })
-      .run();
-    const row = this.getQueueEntry(id);
-    if (!row) throw new Error("failed to create queue entry");
-    return row;
-  }
-
-  getQueueEntry(id: string): QueueEntry | null {
-    const row = this.db
-      .select()
-      .from(queueEntries)
-      .where(eq(queueEntries.id, id))
-      .get();
-    return row ? mapQueueEntryRow(row) : null;
-  }
-
-  listQueueEntries(
-    projectId: string,
-    opts: { status?: string } = {},
-  ): QueueEntry[] {
+  nextPendingWatcherEvent(queueId: string): WatcherEvent | null {
     const rows = this.db
       .select()
-      .from(queueEntries)
-      .where(eq(queueEntries.projectId, projectId))
+      .from(watcherEvents)
+      .where(and(eq(watcherEvents.queueId, queueId), isNotNull(watcherEvents.fifoSeq)))
       .all()
-      .map(mapQueueEntryRow);
-    const filtered =
-      opts.status !== undefined
-        ? rows.filter((e) => e.status === opts.status)
-        : rows;
-    return sortQueueEntries(filtered);
+      .map(mapWatcherEventRow)
+      .filter((e) => e.status === "pending");
+    rows.sort((a, b) => (a.fifoSeq ?? Infinity) - (b.fifoSeq ?? Infinity));
+    return rows[0] ?? null;
   }
 
-  reorderQueueEntry(id: string, opts: ReorderQueueEntryOpts): QueueEntry {
-    const existing = this.getQueueEntry(id);
-    if (!existing) throw notFound("queue entry", id);
-    const siblings = this.db
+  markWatcherEventLaunching(id: string): WatcherEvent {
+    const existing = this.db
       .select()
-      .from(queueEntries)
-      .where(eq(queueEntries.projectId, existing.projectId))
-      .all()
-      .map(mapQueueEntryRow)
-      .filter((e) => e.id !== id);
-    let position = existing.position;
-    if (opts.position !== undefined) {
-      position = opts.position;
-    } else if (opts.after !== undefined || opts.before !== undefined) {
-      const spec: QueuePositionSpec =
-        opts.after !== undefined
-          ? { after: opts.after }
-          : { before: opts.before };
-      position = computeFractionalPosition(
-        siblings.map((e) => ({ id: e.id, position: e.position })),
-        spec,
-      );
-    }
-    const priority =
-      opts.priority !== undefined ? opts.priority : existing.priority;
+      .from(watcherEvents)
+      .where(eq(watcherEvents.id, id))
+      .get();
+    if (!existing) throw notFound("watcher event", id);
     this.db
-      .update(queueEntries)
-      .set({ position, priority })
-      .where(eq(queueEntries.id, id))
+      .update(watcherEvents)
+      .set({ status: "launching" })
+      .where(eq(watcherEvents.id, id))
       .run();
-    const row = this.getQueueEntry(id);
-    if (!row) throw notFound("queue entry", id);
-    return row;
+    const row = this.db
+      .select()
+      .from(watcherEvents)
+      .where(eq(watcherEvents.id, id))
+      .get();
+    if (!row) throw notFound("watcher event", id);
+    return mapWatcherEventRow(row);
   }
 
-  promoteQueueEntry(id: string): PromoteQueueEntryResult {
-    const entry = this.getQueueEntry(id);
-    if (!entry) throw notFound("queue entry", id);
-    if (entry.status === "promoted") {
-      // Idempotent-ish: return existing promotion metadata when available.
-      if (entry.promotedBatchId) {
-        const runIds = this.listRuns({ batchId: entry.promotedBatchId }).map(
-          (r) => r.id,
-        );
-        return {
-          entry,
-          batchId: entry.promotedBatchId,
-          runIds,
-          batchIds: [entry.promotedBatchId],
-        };
-      }
-    }
-    if (entry.status !== "queued") {
-      throw new Error(
-        `cannot promote queue entry ${id}: status is ${entry.status}`,
-      );
-    }
-
-    let targetTasks: Task[] = [];
-    if (entry.targetKind === "task") {
-      if (!entry.taskId) {
-        throw new Error(
-          `cannot promote queue entry ${id}: target_kind=task but taskId is missing`,
-        );
-      }
-      const t = this.getTask(entry.taskId);
-      if (!t || t.projectId !== entry.projectId) {
-        throw new Error(
-          `cannot promote queue entry ${id}: task not found: ${entry.taskId}`,
-        );
-      }
-      targetTasks = [t];
-    } else {
-      const all = this.listTasks(entry.projectId);
-      targetTasks = tasksMatchingTags(all, entry.taskTags);
-      if (targetTasks.length === 0) {
-        throw new Error(
-          `cannot promote queue entry ${id}: no tasks match tags ${(entry.taskTags ?? []).join(",") || "(none)"}`,
-        );
-      }
-    }
-
-    const project = this.getProject(entry.projectId);
-    const agent = this.getAgent(entry.agentId);
-    const model =
-      entry.model ?? project?.defaultModel ?? agent?.defaultModel ?? "unknown";
-    const provider =
-      entry.provider ??
-      project?.defaultProvider ??
-      agent?.defaultProvider ??
-      "unknown";
-    const repeats = entry.repeats ?? 1;
-    const params = entry.params ?? {};
-    const agentImage =
-      entry.adapterOverrides &&
-      typeof entry.adapterOverrides.imageTag === "string"
-        ? String(entry.adapterOverrides.imageTag)
-        : undefined;
-    // Queue entries are not watcher rules — triggerRuleId stays null.
-    const trigger =
-      entry.source === "watcher"
-        ? "webhook"
-        : entry.source === "manual"
-          ? "manual"
-          : entry.source === "ci"
-            ? "manual"
-            : entry.source === "api"
-              ? "manual"
-              : entry.source ?? "manual";
-
-    const batchIds: string[] = [];
-    const runIds: string[] = [];
-    for (const task of targetTasks) {
-      const batch = this.createBatch({
-        taskId: task.id,
-        projectId: entry.projectId,
-        agentId: entry.agentId,
-        model,
-        provider,
-        params,
-        repeats,
-        trigger,
-        triggerRef: entry.triggerRef ?? undefined,
-        agentImage,
-      });
-      batchIds.push(batch.id);
-      for (let i = 0; i < repeats; i++) {
-        const run = this.createRun({
-          batchId: batch.id,
-          taskId: task.id,
-          projectId: entry.projectId,
-          agentId: entry.agentId,
-          model,
-          provider,
-          repeatIndex: i,
-          status: "queued",
-          trigger,
-          triggerRef: entry.triggerRef ?? undefined,
-          agentImage,
-          // Queue promote: triggerRuleId null (not a rule).
-          triggerRuleId: undefined,
-        });
-        runIds.push(run.id);
-      }
-    }
-
-    const firstBatchId = batchIds[0]!;
-    const promotedAt = nowIso();
+  markWatcherEventPending(id: string): WatcherEvent {
+    const existing = this.db
+      .select()
+      .from(watcherEvents)
+      .where(eq(watcherEvents.id, id))
+      .get();
+    if (!existing) throw notFound("watcher event", id);
     this.db
-      .update(queueEntries)
-      .set({
-        status: "promoted",
-        promotedAt,
-        promotedBatchId: firstBatchId,
-      })
-      .where(eq(queueEntries.id, id))
+      .update(watcherEvents)
+      .set({ status: "pending" })
+      .where(eq(watcherEvents.id, id))
       .run();
-    const updated = this.getQueueEntry(id);
-    if (!updated) throw notFound("queue entry", id);
-    return {
-      entry: updated,
-      batchId: firstBatchId,
-      runIds,
-      batchIds,
-    };
+    const row = this.db
+      .select()
+      .from(watcherEvents)
+      .where(eq(watcherEvents.id, id))
+      .get();
+    if (!row) throw notFound("watcher event", id);
+    return mapWatcherEventRow(row);
   }
 
-  removeQueueEntry(id: string): QueueEntry {
-    const existing = this.getQueueEntry(id);
-    if (!existing) throw notFound("queue entry", id);
-    if (existing.status === "removed") {
-      return existing;
-    }
-    const removedAt = nowIso();
+  markWatcherEventLaunched(
+    id: string,
+    batchId: string,
+    sha: string,
+  ): WatcherEvent {
+    const existing = this.db
+      .select()
+      .from(watcherEvents)
+      .where(eq(watcherEvents.id, id))
+      .get();
+    if (!existing) throw notFound("watcher event", id);
     this.db
-      .update(queueEntries)
-      .set({ status: "removed", removedAt })
-      .where(eq(queueEntries.id, id))
+      .update(watcherEvents)
+      .set({ status: "launched", batchId, processedSha: sha })
+      .where(eq(watcherEvents.id, id))
       .run();
-    const row = this.getQueueEntry(id);
-    if (!row) throw notFound("queue entry", id);
-    return row;
+    const row = this.db
+      .select()
+      .from(watcherEvents)
+      .where(eq(watcherEvents.id, id))
+      .get();
+    if (!row) throw notFound("watcher event", id);
+    return mapWatcherEventRow(row);
   }
 
-  drainQueue(projectId: string): { removed: number } {
-    const queued = this.listQueueEntries(projectId, { status: "queued" });
-    const removedAt = nowIso();
-    for (const e of queued) {
-      this.db
-        .update(queueEntries)
-        .set({ status: "removed", removedAt })
-        .where(eq(queueEntries.id, e.id))
-        .run();
-    }
-    return { removed: queued.length };
+  nextWatcherFifoSeq(queueId: string): number {
+    const row = this.db
+      .select({ m: max(watcherEvents.fifoSeq) })
+      .from(watcherEvents)
+      .where(eq(watcherEvents.queueId, queueId))
+      .get();
+    return (row?.m ?? 0) + 1;
+  }
+
+  watcherEventExistsForSha(ruleId: string, sha: string): boolean {
+    const row = this.db
+      .select()
+      .from(watcherEvents)
+      .where(
+        and(
+          eq(watcherEvents.ruleId, ruleId),
+          eq(watcherEvents.processedSha, sha),
+        ),
+      )
+      .get();
+    return row !== undefined;
   }
 
   // ---- persistent eval queues + containers ----
@@ -4125,11 +2833,10 @@ export class SqliteQueries implements QueryStore {
       adapterOverridesJson: stringifyJson(input.adapterOverrides ?? null),
       sandboxJson: stringifyJson(input.sandbox ?? null),
       networkPolicy: input.networkPolicy ?? "allow",
-      portsJson: stringifyJson(input.ports ?? []), judgeModel: input.judgeModel ?? null,
-      judgeProvider: input.judgeProvider ?? null,
-      autoJudge: input.autoJudge === false ? 0 : 1, status: "draft",
+      portsJson: stringifyJson(input.ports ?? []), status: "draft",
       activeBatchId: null, sharedAdapterId: input.sharedAdapterId ?? null,
       builtinAdapterId: input.builtinAdapterId ?? null,
+      agentCommit: input.agentCommit ?? null,
       revision: 1, createdAt: ts, updatedAt: ts,
     }).run();
     return this.getEvalQueue(id)!;
@@ -4158,13 +2865,11 @@ export class SqliteQueries implements QueryStore {
     if (patch.sandbox !== undefined) values.sandboxJson = stringifyJson(patch.sandbox);
     if (patch.networkPolicy !== undefined) values.networkPolicy = patch.networkPolicy;
     if (patch.ports !== undefined) values.portsJson = stringifyJson(patch.ports);
-    if (patch.judgeModel !== undefined) values.judgeModel = patch.judgeModel;
-    if (patch.judgeProvider !== undefined) values.judgeProvider = patch.judgeProvider;
-    if (patch.autoJudge !== undefined) values.autoJudge = patch.autoJudge ? 1 : 0;
     if (patch.status !== undefined) values.status = patch.status;
     if (patch.activeBatchId !== undefined) values.activeBatchId = patch.activeBatchId;
     if (patch.sharedAdapterId !== undefined) values.sharedAdapterId = patch.sharedAdapterId;
     if (patch.builtinAdapterId !== undefined) values.builtinAdapterId = patch.builtinAdapterId;
+    if (patch.agentCommit !== undefined) values.agentCommit = patch.agentCommit;
     if (patch.incrementRevision) values.revision = existing.revision + 1;
     this.db.update(evalQueues).set(values).where(eq(evalQueues.id, id)).run();
     return this.getEvalQueue(id)!;
@@ -4201,7 +2906,8 @@ export class SqliteQueries implements QueryStore {
     this.db.insert(evalQueueItems).values({
       id, queueId, projectId: queue.projectId, taskId: input.taskId, position,
       repeats: Math.max(1, input.repeats ?? 1), enabled: input.enabled === false ? 0 : 1,
-      overridesJson: stringifyJson(input.overrides ?? null), createdAt: ts, updatedAt: ts,
+      overridesJson: stringifyJson(input.overrides ?? null),
+      claimedRepeats: 0, deletedAt: null, createdAt: ts, updatedAt: ts,
     }).run();
     this.updateEvalQueue(queueId, { incrementRevision: true });
     return this.getEvalQueueItem(id)!;
@@ -4214,8 +2920,24 @@ export class SqliteQueries implements QueryStore {
 
   listEvalQueueItems(queueId: string, opts: { includeDisabled?: boolean } = {}): EvalQueueItem[] {
     return this.db.select().from(evalQueueItems).where(eq(evalQueueItems.queueId, queueId)).all()
-      .map(mapEvalQueueItemRow).filter((i) => opts.includeDisabled === true || i.enabled)
+      .map(mapEvalQueueItemRow)
+      .filter((i) => (opts.includeDisabled === true || i.enabled) && i.deletedAt === null)
       .sort((a, b) => a.position - b.position || a.createdAt.localeCompare(b.createdAt));
+  }
+
+  listEvalQueuesUsingTask(projectId: string, taskId: string): EvalQueue[] {
+    const rows = this.db
+      .select()
+      .from(evalQueueItems)
+      .where(and(eq(evalQueueItems.projectId, projectId), eq(evalQueueItems.taskId, taskId)))
+      .all()
+      .map(mapEvalQueueItemRow)
+      .filter((i) => i.deletedAt === null);
+    const ids = [...new Set(rows.map((r) => r.queueId))];
+    return ids
+      .map((id) => this.getEvalQueue(id))
+      .filter((q): q is EvalQueue => q !== null)
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
 
   updateEvalQueueItem(id: string, patch: UpdateEvalQueueItemInput): EvalQueueItem {
@@ -4245,7 +2967,12 @@ export class SqliteQueries implements QueryStore {
   deleteEvalQueueItem(id: string): void {
     const existing = this.getEvalQueueItem(id);
     if (!existing) throw notFound("eval queue item", id);
-    this.db.delete(evalQueueItems).where(eq(evalQueueItems.id, id)).run();
+    // Soft delete: prevents future claims without breaking run provenance/FKs.
+    this.db
+      .update(evalQueueItems)
+      .set({ deletedAt: nowIso(), enabled: 0, updatedAt: nowIso() })
+      .where(eq(evalQueueItems.id, id))
+      .run();
     this.updateEvalQueue(existing.queueId, { incrementRevision: true });
   }
 
@@ -4257,6 +2984,8 @@ export class SqliteQueries implements QueryStore {
     this.db.insert(queueContainers).values({
       id, queueId: input.queueId, projectId: input.projectId, batchId: input.batchId,
       runtimeContainerId: input.runtimeContainerId ?? null, image: input.image,
+      imageId: input.imageId ?? null, agentCommit: input.agentCommit ?? null,
+      agentVersion: input.agentVersion ?? null, buildId: input.buildId ?? null,
       state: input.state, portsJson: stringifyJson(input.ports ?? []), workspaceDir: input.workspaceDir,
       startedAt: input.startedAt ?? null, stoppedAt: null, error: input.error ?? null,
       createdAt: ts, updatedAt: ts,
@@ -4270,9 +2999,7 @@ export class SqliteQueries implements QueryStore {
   }
 
   getActiveQueueContainer(queueId: string): QueueContainer | null {
-    return this.listQueueContainers(queueId).find(
-      (c) => c.state !== "stopped" && c.runtimeContainerId !== null && c.stoppedAt === null,
-    ) ?? null;
+    return this.listQueueContainers(queueId).find((c) => isActiveContainerState(c)) ?? null;
   }
 
   listQueueContainers(queueId: string): QueueContainer[] {
@@ -4293,153 +3020,157 @@ export class SqliteQueries implements QueryStore {
     return this.getQueueContainer(id)!;
   }
 
-  createQueueAnalysis(input: CreateQueueAnalysisInput): QueueAnalysis {
-    const id = input.id ?? newId();
-    const ts = nowIso();
-    this.db.insert(queueAnalyses).values({
-      id,
-      queueId: input.queueId,
-      projectId: input.projectId,
-      batchId: input.batchId,
-      selectedRunIdsJson: JSON.stringify(input.selectedRunIds),
-      evidenceHashesJson: JSON.stringify(input.evidenceHashes),
-      judgeModel: input.judgeModel,
-      judgeProvider: input.judgeProvider,
-      judgeParamsJson: stringifyJson(input.judgeParams ?? null),
-      judgePrompt: input.judgePrompt ?? null,
-      systemPromptVersion: input.systemPromptVersion,
-      parentAnalysisId: input.parentAnalysisId ?? null,
-      status: input.status ?? "queued",
-      verdictPath: null,
-      reportPath: null,
-      eventsPath: null,
-      rawResponsePath: null,
-      createdAt: ts,
-      startedAt: null,
-      endedAt: null,
-      error: null,
-    }).run();
-    return this.getQueueAnalysis(id)!;
+  listRunsByBatch(batchId: string): Run[] {
+    return this.db
+      .select()
+      .from(runs)
+      .where(eq(runs.batchId, batchId))
+      .all()
+      .map(mapRun);
   }
 
-  getQueueAnalysis(id: string): QueueAnalysis | null {
-    const row = this.db.select().from(queueAnalyses).where(eq(queueAnalyses.id, id)).get();
-    return row ? mapQueueAnalysisRow(row) : null;
-  }
-
-  listQueueAnalyses(queueId: string, opts: { batchId?: string } = {}): QueueAnalysis[] {
-    return this.db.select().from(queueAnalyses).where(eq(queueAnalyses.queueId, queueId)).all()
-      .map(mapQueueAnalysisRow).filter((a) => !opts.batchId || a.batchId === opts.batchId)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  }
-
-  listOrphanedAnalyses(): Array<{ id: string; queueId: string; projectId: string; status: string }> {
-    return this.db.select()
-      .from(queueAnalyses)
-      .where(inArray(queueAnalyses.status, ["queued", "running"]))
-      .all().map((row) => ({
-        id: row.id,
-        queueId: row.queueId,
-        projectId: row.projectId,
-        status: row.status,
-      }));
-  }
-
-  updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis {
-    if (!this.getQueueAnalysis(id)) throw notFound("queue analysis", id);
-    const values: Partial<typeof queueAnalyses.$inferInsert> = {};
-    if (patch.status !== undefined) values.status = patch.status;
-    if (patch.verdictPath !== undefined) values.verdictPath = patch.verdictPath;
-    if (patch.reportPath !== undefined) values.reportPath = patch.reportPath;
-    if (patch.eventsPath !== undefined) values.eventsPath = patch.eventsPath;
-    if (patch.rawResponsePath !== undefined) values.rawResponsePath = patch.rawResponsePath;
-    if (patch.startedAt !== undefined) values.startedAt = patch.startedAt;
-    if (patch.endedAt !== undefined) values.endedAt = patch.endedAt;
-    if (patch.error !== undefined) values.error = patch.error;
-    this.db.update(queueAnalyses).set(values).where(eq(queueAnalyses.id, id)).run();
-    return this.getQueueAnalysis(id)!;
-  }
-
-  storeImprovementSteps(
-    queueAnalysisId: string,
-    projectId: string,
-    queueId: string,
-    steps: QueueImprovementStep[],
-  ): ImprovementStepRecord[] {
-    const ts = nowIso();
-    this.db.transaction((tx) => {
-      tx.delete(improvementSteps)
-        .where(eq(improvementSteps.queueAnalysisId, queueAnalysisId))
-        .run();
-      for (const step of steps) {
-        tx.insert(improvementSteps).values({
-          id: `${queueAnalysisId}:${step.id}`,
-          stepKey: step.id,
-          queueAnalysisId,
-          projectId,
-          queueId,
-          rank: step.rank,
-          ownerClass: step.class,
-          priority: step.priority,
-          confidence: step.confidence,
-          defectIdsJson: JSON.stringify(step.defectIds),
-          subsystem: step.subsystem,
-          problem: step.problem,
-          evidenceJson: JSON.stringify(step.evidence),
-          targetJson: JSON.stringify(step.target),
-          change: step.change,
-          acceptanceCriteriaJson: JSON.stringify(step.acceptanceCriteria),
-          testsJson: JSON.stringify(step.tests),
-          verifyTaskIdsJson: JSON.stringify(step.verifyTaskIds),
-          regressionTaskIdsJson: JSON.stringify(step.regressionTaskIds),
-          dependenciesJson: JSON.stringify(step.dependencies),
-          nonGoalsJson: JSON.stringify(step.nonGoals),
-          preventive: step.preventive ? 1 : 0,
-          status: step.status,
-          blockingReason: step.blockingReason ?? null,
-          createdAt: ts,
-          updatedAt: ts,
-        }).run();
-      }
-    });
-    return this.listImprovementSteps({ queueAnalysisId });
-  }
-
-  listImprovementSteps(filter: ListImprovementStepsFilter): ImprovementStepRecord[] {
-    return this.db.select().from(improvementSteps)
-      .where(eq(improvementSteps.queueAnalysisId, filter.queueAnalysisId)).all()
-      .map(mapImprovementStepRow)
-      .filter((step) =>
-        (!filter.class || step.class === filter.class) &&
-        (filter.priority === undefined || step.priority === filter.priority) &&
-        (!filter.status || step.status === filter.status) &&
-        (!filter.defectId || step.defectIds.includes(filter.defectId)))
-      .sort((a, b) => a.rank - b.rank);
-  }
-
-  updateImprovementStepLifecycle(
-    queueAnalysisId: string,
-    id: string,
-    patch: UpdateImprovementStepLifecycleInput,
-  ): ImprovementStepRecord {
-    const storageId = `${queueAnalysisId}:${id}`;
-    const row = this.db.select().from(improvementSteps)
-      .where(eq(improvementSteps.id, storageId)).get();
-    if (!row) throw notFound("improvement step", id);
-    if (!canTransitionImprovementStatus(row.status as ImprovementStepStatus, patch.status)) {
-      throw new Error(`invalid improvement step transition ${row.status} -> ${patch.status}`);
-    }
-    if (patch.status === "blocked" && !patch.blockingReason?.trim()) {
-      throw new Error("blockingReason is required when status=blocked");
-    }
-    this.db.update(improvementSteps).set({
-      status: patch.status,
-      blockingReason: patch.status === "blocked" ? patch.blockingReason!.trim() : null,
-      updatedAt: nowIso(),
-    }).where(eq(improvementSteps.id, storageId)).run();
-    return mapImprovementStepRow(
-      this.db.select().from(improvementSteps).where(eq(improvementSteps.id, storageId)).get()!,
+  claimQueueWork(input: ClaimQueueWorkInput): ClaimQueueWorkResult {
+    return this.db.transaction(
+      (tx) => this.claimQueueWorkInner(tx, input),
+      { behavior: "immediate" },
     );
+  }
+
+  /** Inner claim logic bound to a transaction handle (BEGIN IMMEDIATE). */
+  private claimQueueWorkInner(
+    tx: BetterSQLite3Database<Schema>,
+    input: ClaimQueueWorkInput,
+  ): ClaimQueueWorkResult {
+    // 1. Load the active generation and confirm it is still accepting.
+    const batchRow = tx.select().from(runBatches).where(eq(runBatches.id, input.batchId)).get();
+    if (!batchRow) throw notFound("run batch", input.batchId);
+    if ((batchRow.accepting ?? 1) !== 1) {
+      throw Object.assign(
+        new Error(`queue generation ${input.batchId} is closed; start a new generation`),
+        { code: "GENERATION_CLOSED" },
+      );
+    }
+
+    // 2. Select enabled, non-deleted queue items in position, id order.
+    const items = tx
+      .select()
+      .from(evalQueueItems)
+      .where(eq(evalQueueItems.queueId, input.queueId))
+      .all()
+      .map(mapEvalQueueItemRow)
+      .filter((i) => i.enabled && i.deletedAt === null)
+      .sort(
+        (a, b) =>
+          a.position - b.position ||
+          a.id.localeCompare(b.id),
+      );
+
+    // 3. Compare each item's repeats with runs already claimed for the generation.
+    const claimed = tx
+      .select()
+      .from(runs)
+      .where(eq(runs.batchId, input.batchId))
+      .all()
+      .map(mapRun);
+    const claimedPerItem = new Map<string, number>();
+    for (const run of claimed) {
+      if (!run.queueItemId) continue;
+      claimedPerItem.set(run.queueItemId, (claimedPerItem.get(run.queueItemId) ?? 0) + 1);
+    }
+
+    let claim: { item: EvalQueueItem; repeatIndex: number } | null = null;
+    for (const item of items) {
+      const claimedCount = claimedPerItem.get(item.id) ?? 0;
+      if (claimedCount < item.repeats) {
+        claim = { item, repeatIndex: claimedCount };
+        break;
+      }
+    }
+
+    // 5. If no work exists, atomically mark the generation closing.
+    if (!claim) {
+      const closedRevision = input.snapshot.queueRevision;
+      tx.update(runBatches)
+        .set({
+          accepting: 0,
+          closedRevision,
+          closedAt: nowIso(),
+        })
+        .where(eq(runBatches.id, input.batchId))
+        .run();
+      return { claimed: false, closed: true, closedRevision };
+    }
+
+    // 4. Create exactly one queue-backed run with immutable eval/item snapshots.
+    // The claim op does not know which item will be claimed until the atomic
+    // selection above, so it resolves the eval + item snapshots for THAT item.
+    const runId = newId();
+    const { item, repeatIndex } = claim;
+    const agentId = input.agentId ?? batchRow.agentId;
+    const taskForItem = tx
+      .select()
+      .from(tasks)
+      .where(eq(tasks.id, item.taskId))
+      .get();
+    if (!taskForItem) throw notFound("task", item.taskId);
+    const evalSnapshot =
+      input.evalSnapshot !== undefined && input.taskId === item.taskId
+        ? stringifyJson(input.evalSnapshot)
+        : taskSnapshotFromRow(taskForItem);
+    const evalVersion =
+      input.evalVersion ?? taskForItem.version ?? 1;
+    const itemSnapshot = stringifyJson(input.itemSnapshot ?? {
+      id: item.id,
+      queueId: item.queueId,
+      taskId: item.taskId,
+      position: item.position,
+      repeats: item.repeats,
+      enabled: item.enabled ? 1 : 0,
+      overrides: item.overrides,
+      claimedRepeats: item.claimedRepeats,
+    });
+    const run = mapRun(
+      tx
+        .insert(runs)
+        .values({
+          id: runId,
+          batchId: input.batchId,
+          taskId: item.taskId,
+          projectId: input.projectId,
+          queueId: input.queueId,
+          queueItemId: item.id,
+          queueContainerId: input.queueContainerId,
+          agentId,
+          model: input.snapshot.model,
+          provider: input.snapshot.provider,
+          repeatIndex,
+          evalVersion,
+          evalSnapshotJson: evalSnapshot,
+          itemSnapshotJson: itemSnapshot,
+          status: "queued",
+          agentImage: input.snapshot.agentImage,
+          agentCommit: input.snapshot.agentCommit,
+          agentImageSource: "built",
+          adapterOverridesJson: stringifyJson(input.snapshot.adapterOverrides),
+          trigger: "eval-queue",
+          triggerRef: input.queueId,
+          controlState: "running",
+        })
+        .returning()
+        .get(),
+    );
+
+    // Bump the item's immutable claimed-repeat floor.
+    tx.update(evalQueueItems)
+      .set({
+        claimedRepeats: item.claimedRepeats + 1,
+        updatedAt: nowIso(),
+      })
+      .where(eq(evalQueueItems.id, item.id))
+      .run();
+
+    writeSnapshot(runSnapshotPath(this.dataDir, run.projectId, run.id), run);
+    return { claimed: true, run, queueItemId: item.id, repeatIndex };
   }
 
   upsertEvalMetrics(input: {
@@ -4685,200 +3416,14 @@ export class SqliteQueries implements QueryStore {
     const runList = this.listRuns({ projectId });
     // Secrets stripped on list.
     const watchers = this.listWatcherRules(projectId, { includeDisabled: true });
-    const queue = this.listQueueEntries(projectId);
-    const outboundWebhooks = this.listOutboundSubscriptions(projectId);
     return {
       project,
       tasks: taskList,
       runs: runList,
       watchers,
-      queue,
-      outboundWebhooks,
     };
   }
 
-  // ---- Outbound webhooks (P8c) ----
-
-  createOutboundSubscription(
-    projectId: string,
-    input: CreateOutboundSubscriptionInput,
-  ): OutboundSubscription {
-    if (!this.getProject(projectId)) throw notFound("project", projectId);
-    const id = newId();
-    const ts = nowIso();
-    const secret =
-      input.secret !== undefined && input.secret !== ""
-        ? input.secret
-        : `${newId()}-${newId()}`;
-    const eventTypes = Array.isArray(input.eventTypes) ? input.eventTypes : [];
-    const enabled = input.enabled === false ? 0 : 1;
-    this.db
-      .insert(outboundSubscriptions)
-      .values({
-        id,
-        projectId,
-        url: input.url,
-        secret,
-        eventTypesJson: JSON.stringify(eventTypes),
-        enabled,
-        createdAt: ts,
-        updatedAt: ts,
-      })
-      .run();
-    const row = this.db
-      .select()
-      .from(outboundSubscriptions)
-      .where(eq(outboundSubscriptions.id, id))
-      .get();
-    if (!row) throw new Error("failed to create outbound subscription");
-    // Return WITH secret present — only create surfaces it.
-    return mapOutboundSubscriptionRow(row);
-  }
-
-  getOutboundSubscription(id: string): OutboundSubscription | null {
-    const row = this.db
-      .select()
-      .from(outboundSubscriptions)
-      .where(eq(outboundSubscriptions.id, id))
-      .get();
-    return row ? stripOutboundSecret(mapOutboundSubscriptionRow(row)) : null;
-  }
-
-  /**
-   * Raw signing secret for outbound HMAC. NEVER log the return value.
-   */
-  getOutboundSubscriptionWithSecret(id: string): string | null {
-    const row = this.db
-      .select()
-      .from(outboundSubscriptions)
-      .where(eq(outboundSubscriptions.id, id))
-      .get();
-    if (!row) return null;
-    const secret = row.secret;
-    if (secret == null || secret === "") return null;
-    return secret;
-  }
-
-  listOutboundSubscriptions(projectId: string): OutboundSubscription[] {
-    const rows = this.db
-      .select()
-      .from(outboundSubscriptions)
-      .where(eq(outboundSubscriptions.projectId, projectId))
-      .all();
-    return rows
-      .map(mapOutboundSubscriptionRow)
-      .map(stripOutboundSecret);
-  }
-
-  updateOutboundSubscription(
-    id: string,
-    patch: UpdateOutboundSubscriptionPatch,
-  ): OutboundSubscription {
-    const existing = this.db
-      .select()
-      .from(outboundSubscriptions)
-      .where(eq(outboundSubscriptions.id, id))
-      .get();
-    if (!existing) throw notFound("outbound subscription", id);
-    const next = {
-      url: patch.url !== undefined ? patch.url : existing.url,
-      eventTypesJson:
-        patch.eventTypes !== undefined
-          ? JSON.stringify(patch.eventTypes)
-          : existing.eventTypesJson,
-      enabled:
-        patch.enabled !== undefined
-          ? patch.enabled
-            ? 1
-            : 0
-          : existing.enabled,
-      updatedAt: nowIso(),
-    };
-    this.db
-      .update(outboundSubscriptions)
-      .set(next)
-      .where(eq(outboundSubscriptions.id, id))
-      .run();
-    const row = this.db
-      .select()
-      .from(outboundSubscriptions)
-      .where(eq(outboundSubscriptions.id, id))
-      .get();
-    if (!row) throw notFound("outbound subscription", id);
-    return stripOutboundSecret(mapOutboundSubscriptionRow(row));
-  }
-
-  deleteOutboundSubscription(id: string): void {
-    // Cascade-delete deliveries first so FK integrity holds.
-    this.db
-      .delete(webhookDeliveries)
-      .where(eq(webhookDeliveries.subscriptionId, id))
-      .run();
-    this.db
-      .delete(outboundSubscriptions)
-      .where(eq(outboundSubscriptions.id, id))
-      .run();
-  }
-
-  recordWebhookDelivery(input: RecordWebhookDeliveryInput): WebhookDelivery {
-    const id = newId();
-    const ts = nowIso();
-    this.db
-      .insert(webhookDeliveries)
-      .values({
-        id,
-        subscriptionId: input.subscriptionId,
-        projectId: input.projectId,
-        eventType: input.eventType,
-        payloadJson: JSON.stringify(input.payload ?? null),
-        status: input.status,
-        attempt: input.attempt,
-        responseStatus: input.responseStatus ?? null,
-        responseBody: truncateResponseBody(input.responseBody ?? null),
-        error: input.error ?? null,
-        deliveredAt: input.deliveredAt ?? null,
-        createdAt: ts,
-      })
-      .run();
-    const row = this.db
-      .select()
-      .from(webhookDeliveries)
-      .where(eq(webhookDeliveries.id, id))
-      .get();
-    if (!row) throw new Error("failed to record webhook delivery");
-    return mapWebhookDeliveryRow(row);
-  }
-
-  listWebhookDeliveries(
-    projectId: string,
-    opts: ListWebhookDeliveriesOpts = {},
-  ): WebhookDelivery[] {
-    let rows = this.db
-      .select()
-      .from(webhookDeliveries)
-      .where(eq(webhookDeliveries.projectId, projectId))
-      .all()
-      .map(mapWebhookDeliveryRow);
-    if (opts.subscriptionId !== undefined) {
-      rows = rows.filter((d) => d.subscriptionId === opts.subscriptionId);
-    }
-    if (opts.eventType !== undefined) {
-      rows = rows.filter((d) => d.eventType === opts.eventType);
-    }
-    if (opts.status !== undefined) {
-      rows = rows.filter((d) => d.status === opts.status);
-    }
-    // Newest first.
-    rows.sort((a, b) => {
-      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
-      return b.id.localeCompare(a.id);
-    });
-    const limit =
-      opts.limit != null && Number.isFinite(opts.limit)
-        ? Math.max(1, Math.min(200, Math.floor(opts.limit)))
-        : 50;
-    return rows.slice(0, limit);
-  }
 
   storeCheckResults(runId: string, results: CheckResult[]): void {
     // Upsert: replace any existing row for this run (one row per run).
@@ -4920,127 +3465,7 @@ export class SqliteQueries implements QueryStore {
     }
   }
 
-  // ---- project rubrics ----
 
-  createProjectRubric(input: CreateProjectRubricInput): ProjectRubric {
-    const project = this.getProject(input.projectId);
-    if (!project) throw notFound("project", input.projectId);
-    const id = input.id ?? newId();
-    const ts = nowIso();
-    // Only one default per project — demote any incumbent first.
-    if (input.isDefault) this.clearDefaultRubric(input.projectId);
-    this.db
-      .insert(projectRubrics)
-      .values({
-        id,
-        projectId: input.projectId,
-        name: input.name,
-        description: input.description ?? null,
-        rubricJson: JSON.stringify(input.rubric),
-        rubricVersion: input.rubric.version ?? 1,
-        isDefault: input.isDefault ? 1 : 0,
-        archived: 0,
-        createdAt: ts,
-        updatedAt: ts,
-      })
-      .run();
-    const row = this.getProjectRubric(id);
-    if (!row) throw new Error("failed to create project rubric");
-    return row;
-  }
-
-  /** Demote whichever rubric currently holds the default flag for a project. */
-  private clearDefaultRubric(projectId: string): void {
-    this.db
-      .update(projectRubrics)
-      .set({ isDefault: 0 })
-      .where(eq(projectRubrics.projectId, projectId))
-      .run();
-  }
-
-  getProjectRubric(id: string): ProjectRubric | null {
-    const row = this.db
-      .select()
-      .from(projectRubrics)
-      .where(eq(projectRubrics.id, id))
-      .get();
-    return row ? mapProjectRubric(row) : null;
-  }
-
-  listProjectRubrics(
-    projectId: string,
-    opts: { includeArchived?: boolean } = {},
-  ): ProjectRubric[] {
-    const rows = this.db
-      .select()
-      .from(projectRubrics)
-      .where(eq(projectRubrics.projectId, projectId))
-      .all()
-      .map(mapProjectRubric)
-      .filter((r) => (opts.includeArchived ? true : !r.archived));
-    return sortProjectRubrics(rows);
-  }
-
-  getDefaultProjectRubric(projectId: string): ProjectRubric | null {
-    return (
-      this.listProjectRubrics(projectId).find((r) => r.isDefault) ?? null
-    );
-  }
-
-  updateProjectRubric(
-    id: string,
-    patch: UpdateProjectRubricInput,
-  ): ProjectRubric {
-    const existing = this.getProjectRubric(id);
-    if (!existing) throw notFound("project rubric", id);
-    // A semantic rubric edit establishes a new comparison baseline; a rename or
-    // description tweak does not (same rule as task rubrics — plan/rubric.md).
-    const rubricChanged =
-      patch.rubric !== undefined && !rubricsEqual(existing.rubric, patch.rubric);
-    const nextVersion = rubricChanged
-      ? Math.max(existing.rubricVersion, patch.rubric?.version ?? 0) + 1
-      : existing.rubricVersion;
-    const nextRubric = patch.rubric ?? existing.rubric;
-    if (patch.isDefault) this.clearDefaultRubric(existing.projectId);
-    this.db
-      .update(projectRubrics)
-      .set({
-        name: patch.name ?? existing.name,
-        description:
-          patch.description !== undefined
-            ? patch.description
-            : existing.description,
-        rubricJson: JSON.stringify({ ...nextRubric, version: nextVersion }),
-        rubricVersion: nextVersion,
-        isDefault:
-          patch.isDefault !== undefined
-            ? patch.isDefault
-              ? 1
-              : 0
-            : existing.isDefault
-              ? 1
-              : 0,
-        updatedAt: nowIso(),
-      })
-      .where(eq(projectRubrics.id, id))
-      .run();
-    const row = this.getProjectRubric(id);
-    if (!row) throw notFound("project rubric", id);
-    return row;
-  }
-
-  archiveProjectRubric(id: string): ProjectRubric {
-    const existing = this.getProjectRubric(id);
-    if (!existing) throw notFound("project rubric", id);
-    this.db
-      .update(projectRubrics)
-      .set({ archived: 1, isDefault: 0, updatedAt: nowIso() })
-      .where(eq(projectRubrics.id, id))
-      .run();
-    const row = this.getProjectRubric(id);
-    if (!row) throw notFound("project rubric", id);
-    return row;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -5052,52 +3477,34 @@ export class MemoryQueries implements QueryStore {
   private tasks = new Map<string, Task>();
   private agents = new Map<string, Agent>();
   private projectAgentAdapters = new Map<string, ProjectAgentAdapter>();
+  private adapterBuilds = new Map<string, AdapterBuild>();
   private batches = new Map<string, RunBatch>();
   private runs = new Map<string, Run>();
-  private judgements = new Map<string, Judgement>();
-  private scores = new Map<string, ScoreRow>();
-  private findings = new Map<string, FindingRow>();
-  private occurrences = new Map<string, OccurrenceRow>();
   private watcherRules = new Map<string, WatcherRule>();
   private watcherEvents = new Map<string, WatcherEvent>();
-  private queueEntries = new Map<string, QueueEntry>();
   private evalQueues = new Map<string, EvalQueue>();
   private evalQueueItems = new Map<string, EvalQueueItem>();
   private queueContainers = new Map<string, QueueContainer>();
-  private queueAnalyses = new Map<string, QueueAnalysis>();
-  private improvementSteps = new Map<string, ImprovementStepRecord>();
   private evalMetrics = new Map<string, EvalMetricsRecord>();
   private evalArchives = new Map<string, EvalArchive>();
   private apiTokens = new Map<string, ApiToken>();
-  private outboundSubscriptions = new Map<string, OutboundSubscription>();
-  private webhookDeliveries = new Map<string, WebhookDelivery>();
   private users = new Map<string, User>();
   private settings = new Map<string, SettingRow>();
   private checkResultsByRun = new Map<string, CheckResult[]>();
-  private projectRubrics = new Map<string, ProjectRubric>();
 
-  constructor(private readonly dataDir: string) {}
+  constructor(private readonly dataDir: string) {
+    // Built-in agents must exist for builtin_adapter_id queues (same invariant as
+    // SqliteQueries seedBuiltinAgents). In-memory store seeds them eagerly.
+    for (const agent of [
+      { id: "reapercode", displayName: "ReaperCode", defaultModel: "deepseek-v4-flash", defaultProvider: "nuralwatt" },
+      { id: "pi", displayName: "pi coding agent", defaultModel: "deepseek-v4-flash", defaultProvider: "nuralwatt" },
+    ]) {
+      this.agents.set(agent.id, agent);
+    }
+  }
 
   transaction<T>(operation: () => T): T {
-    const snapshot = {
-      judgements: structuredClone(this.judgements),
-      scores: structuredClone(this.scores),
-      findings: structuredClone(this.findings),
-      occurrences: structuredClone(this.occurrences),
-      improvementSteps: structuredClone(this.improvementSteps),
-      evalMetrics: structuredClone(this.evalMetrics),
-    };
-    try {
-      return operation();
-    } catch (error) {
-      this.judgements = snapshot.judgements;
-      this.scores = snapshot.scores;
-      this.findings = snapshot.findings;
-      this.occurrences = snapshot.occurrences;
-      this.improvementSteps = snapshot.improvementSteps;
-      this.evalMetrics = snapshot.evalMetrics;
-      throw error;
-    }
+    return operation();
   }
 
   createProject(input: CreateProjectInput): Project {
@@ -5111,15 +3518,11 @@ export class MemoryQueries implements QueryStore {
       defaultAgentId: input.defaultAgentId ?? null,
       defaultModel: input.defaultModel ?? null,
       defaultProvider: input.defaultProvider ?? null,
-      defaultJudgeModel: input.defaultJudgeModel ?? null,
       workspaceImage: input.workspaceImage ?? null,
       checkRunners: input.checkRunners ?? null,
       adapterOverrides: input.adapterOverrides ?? null,
       networkPolicy: input.networkPolicy ?? "allow",
       retentionRuns: input.retentionRuns ?? null,
-      artifactRetention: resolveRetentionPolicy(
-        input.artifactRetention ?? DEFAULT_ARTIFACT_RETENTION,
-      ),
       sandbox: input.sandbox ?? null,
       archived: false,
       createdAt: ts,
@@ -5163,10 +3566,6 @@ export class MemoryQueries implements QueryStore {
         patch.defaultProvider !== undefined
           ? patch.defaultProvider
           : existing.defaultProvider,
-      defaultJudgeModel:
-        patch.defaultJudgeModel !== undefined
-          ? patch.defaultJudgeModel
-          : existing.defaultJudgeModel,
       workspaceImage:
         patch.workspaceImage !== undefined
           ? patch.workspaceImage
@@ -5184,10 +3583,6 @@ export class MemoryQueries implements QueryStore {
         patch.retentionRuns !== undefined
           ? patch.retentionRuns
           : existing.retentionRuns,
-      artifactRetention:
-        patch.artifactRetention !== undefined
-          ? resolveRetentionPolicy(patch.artifactRetention)
-          : existing.artifactRetention,
       sandbox: patch.sandbox !== undefined ? patch.sandbox : existing.sandbox,
       updatedAt: nowIso(),
     };
@@ -5520,10 +3915,106 @@ export class MemoryQueries implements QueryStore {
     if (!this.projectAgentAdapters.delete(id)) throw notFound("project agent adapter", id);
   }
 
+  // ---- adapter builds (commit-addressed, SCHEMA v9) ----
+
+  upsertAdapterBuild(input: CreateAdapterBuildInput): AdapterBuild {
+    const id = input.id ?? `${input.adapterId}:${input.commitSha}`;
+    const existing = this.adapterBuilds.get(id);
+    const ts = nowIso();
+    const build: AdapterBuild = existing
+      ? {
+          ...existing,
+          status: input.status ?? existing.status,
+          image: input.image !== undefined ? input.image : existing.image,
+          imageId: input.imageId !== undefined ? input.imageId : existing.imageId,
+          agentVersion:
+            input.agentVersion !== undefined
+              ? input.agentVersion
+              : existing.agentVersion,
+          logPath: input.logPath !== undefined ? input.logPath : existing.logPath,
+          completedAt:
+            input.status === "ready" || input.status === "failed"
+              ? nowIso()
+              : existing.completedAt,
+          updatedAt: ts,
+        }
+      : {
+          id,
+          adapterId: input.adapterId,
+          commitSha: input.commitSha,
+          status: input.status ?? "building",
+          image: input.image ?? null,
+          imageId: input.imageId ?? null,
+          agentVersion: input.agentVersion ?? null,
+          logPath: input.logPath ?? null,
+          error: null,
+          createdAt: ts,
+          updatedAt: ts,
+          completedAt: null,
+        };
+    this.adapterBuilds.set(id, build);
+    return structuredClone(build);
+  }
+
+  getAdapterBuild(id: string): AdapterBuild | null {
+    const b = this.adapterBuilds.get(id);
+    return b ? structuredClone(b) : null;
+  }
+
+  getReadyAdapterBuild(adapterId: string, commitSha: string): AdapterBuild | null {
+    const matches = [...this.adapterBuilds.values()].filter(
+      (b) =>
+        b.adapterId === adapterId &&
+        b.commitSha === commitSha &&
+        b.status === "ready",
+    );
+    matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return matches[0] ? structuredClone(matches[0]) : null;
+  }
+
+  listAdapterBuilds(
+    adapterId: string,
+    opts: { status?: AdapterBuildStatus | string; limit?: number } = {},
+  ): AdapterBuild[] {
+    let list = [...this.adapterBuilds.values()].filter(
+      (b) => b.adapterId === adapterId,
+    );
+    if (opts.status) list = list.filter((b) => b.status === opts.status);
+    list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    if (opts.limit !== undefined) list = list.slice(0, opts.limit);
+    return list.map((b) => structuredClone(b));
+  }
+
+  updateAdapterBuild(id: string, patch: UpdateAdapterBuildInput): AdapterBuild {
+    const existing = this.adapterBuilds.get(id);
+    if (!existing) throw notFound("adapter build", id);
+    const next: AdapterBuild = {
+      ...existing,
+      status: patch.status ?? existing.status,
+      image: patch.image !== undefined ? patch.image : existing.image,
+      imageId: patch.imageId !== undefined ? patch.imageId : existing.imageId,
+      agentVersion:
+        patch.agentVersion !== undefined
+          ? patch.agentVersion
+          : existing.agentVersion,
+      logPath: patch.logPath !== undefined ? patch.logPath : existing.logPath,
+      error: patch.error !== undefined ? patch.error : existing.error,
+      completedAt:
+        patch.completedAt !== undefined
+          ? patch.completedAt
+          : patch.status === "ready" || patch.status === "failed"
+            ? nowIso()
+            : existing.completedAt,
+      updatedAt: nowIso(),
+    };
+    this.adapterBuilds.set(id, next);
+    return structuredClone(next);
+  }
+
   createBatch(input: CreateBatchInput): RunBatch {
     const batch: RunBatch = {
       id: input.id ?? newId(),
-      taskId: input.taskId,
+      taskId: input.taskId ?? null,
       projectId: input.projectId,
       agentId: input.agentId,
       model: input.model,
@@ -5534,9 +4025,15 @@ export class MemoryQueries implements QueryStore {
       triggerRef: input.triggerRef ?? null,
       agentImage: input.agentImage ?? null,
       agentCommit: input.agentCommit ?? null,
+      agentImageId: input.agentImageId ?? null,
+      agentVersion: input.agentVersion ?? null,
+      buildId: input.buildId ?? null,
       queueId: input.queueId ?? null,
       queueRevision: input.queueRevision ?? null,
       createdAt: nowIso(),
+      accepting: true,
+      closedRevision: null,
+      closedAt: null,
     };
     this.batches.set(batch.id, batch);
     return { ...batch };
@@ -5557,6 +4054,7 @@ export class MemoryQueries implements QueryStore {
       repeatIndex: input.repeatIndex,
       evalVersion: input.evalVersion ?? null,
       evalSnapshot: input.evalSnapshot ?? null,
+      itemSnapshot: input.itemSnapshot ?? null,
       status: input.status ?? "queued",
       workspaceCommit: input.workspaceCommit ?? null,
       agentImage: input.agentImage ?? null,
@@ -5634,6 +4132,15 @@ export class MemoryQueries implements QueryStore {
     return { ...next };
   }
 
+  setRunEventsPath(id: string, eventsPath: string): Run {
+    const existing = this.runs.get(id);
+    if (!existing) throw notFound("run", id);
+    const next = { ...existing, eventsPath };
+    this.runs.set(id, next);
+    writeSnapshot(runSnapshotPath(this.dataDir, next.projectId, next.id), next);
+    return { ...next };
+  }
+
   finalizeRun(id: string, result: FinalizeRunInput): Run {
     const existing = this.runs.get(id);
     if (!existing) throw notFound("run", id);
@@ -5675,324 +4182,6 @@ export class MemoryQueries implements QueryStore {
     return { ...next };
   }
 
-  // ---- judgements + scores (P4c) ----
-
-  createJudgement(input: CreateJudgementInput): Judgement {
-    const id = input.id ?? newId();
-    const ts = nowIso();
-    const eventsPath = judgeEventsPath(this.dataDir, input.projectId, id);
-    const jVerdictPath = verdictPath(this.dataDir, input.projectId, id);
-    const j: Judgement = {
-      id,
-      runId: input.runId,
-      projectId: input.projectId,
-      queueAnalysisId: input.queueAnalysisId ?? null,
-      judgeModel: input.judgeModel,
-      judgeProvider: input.judgeProvider,
-      judgePrompt: input.judgePrompt ?? null,
-      systemPromptVersion: input.systemPromptVersion,
-      status: input.status,
-      overallScore: null,
-      verdict: null,
-      reportPath: null,
-      eventsPath,
-      verdictPath: jVerdictPath,
-      narrative: null,
-      narrativeSchemaVersion: null,
-      createdAt: ts,
-      endedAt: null,
-    };
-    this.judgements.set(id, j);
-    writeSnapshot(
-      judgementSnapshotPath(this.dataDir, j.projectId, j.id),
-      j,
-    );
-    try {
-      mkdirSync(judgementDir(this.dataDir, j.projectId, j.id), {
-        recursive: true,
-      });
-    } catch {
-      // best-effort
-    }
-    return { ...j };
-  }
-
-  createScores(
-    judgementId: string,
-    scoreInputs: CreateScoreInput[],
-  ): ScoreRow[] {
-    if (!this.judgements.has(judgementId)) {
-      throw notFound("judgement", judgementId);
-    }
-    const out: ScoreRow[] = [];
-    for (const s of scoreInputs) {
-      const row: ScoreRow = {
-        id: newId(),
-        judgementId,
-        criterion: s.criterion,
-        weight: s.weight,
-        score: s.score,
-        rationale: s.rationale ?? null,
-      };
-      this.scores.set(row.id, row);
-      out.push({ ...row });
-    }
-    return out;
-  }
-
-  storeVerdict(
-    judgementId: string,
-    verdict: Verdict,
-    narrative: EvalJudgementNarrative | null = null,
-  ): JudgementWithVerdict {
-    const existing = this.judgements.get(judgementId);
-    if (!existing) throw notFound("judgement", judgementId);
-    const jVerdictPath =
-      existing.verdictPath ??
-      verdictPath(this.dataDir, existing.projectId, judgementId);
-    const eventsPath =
-      existing.eventsPath ??
-      judgeEventsPath(this.dataDir, existing.projectId, judgementId);
-
-    writeSnapshot(jVerdictPath, verdict);
-
-    // Replace prior scores for this judgement.
-    for (const [sid, s] of [...this.scores.entries()]) {
-      if (s.judgementId === judgementId) this.scores.delete(sid);
-    }
-    this.createScores(
-      judgementId,
-      (verdict.criteria ?? []).map((c: any) => ({
-        criterion: c.criterion,
-        weight: c.weight,
-        score: c.score,
-        rationale: c.feedback,
-      })),
-    );
-
-    const next: Judgement = {
-      ...existing,
-      status: "completed",
-      overallScore: verdict.overall?.score ?? null,
-      verdict: verdict.overall?.verdict ?? null,
-      verdictPath: jVerdictPath,
-      eventsPath,
-      narrative,
-      narrativeSchemaVersion: narrative?.schemaVersion ?? null,
-      endedAt: nowIso(),
-    };
-    this.judgements.set(judgementId, next);
-    writeSnapshot(
-      judgementSnapshotPath(this.dataDir, next.projectId, next.id),
-      next,
-    );
-
-    // P6a: ingest findings after score mirror (error-isolated). Goes through the
-    // public ingestFindings method so tests can force-fail it for isolation.
-    try {
-      this.ingestFindings(judgementId, verdict);
-    } catch (err) {
-      console.warn(
-        `[findings] ingest failed for judgement ${judgementId}:`,
-        err,
-      );
-    }
-
-    const verdictBody =
-      readVerdictFromDisk(
-        this.dataDir,
-        next.projectId,
-        next.id,
-        jVerdictPath,
-      ) ?? verdict;
-    return { ...next, verdictBody };
-  }
-
-  private ingestFindingsAndRewrite(
-    judgementId: string,
-    runId: string,
-    projectId: string,
-    jVerdictPath: string,
-    verdict: Verdict,
-  ): Verdict {
-    const run = this.getRun(runId);
-    if (!run) {
-      throw new Error(
-        `cannot ingest findings: run not found for judgement ${judgementId} (runId=${runId})`,
-      );
-    }
-    const result = runIngestFindings(this.asFindingsStore(), {
-      judgementId,
-      runId,
-      projectId,
-      taskId: run.taskId,
-      verdict,
-    });
-    const withRecurring = (applyRecurrenceToVerdict as any)(
-      verdict,
-      result.recurringByFindingId,
-    );
-    writeSnapshot(jVerdictPath, withRecurring);
-    return withRecurring;
-  }
-
-  ingestFindings(judgementId: string, verdict: Verdict): void {
-    const existing = this.judgements.get(judgementId);
-    if (!existing) throw notFound("judgement", judgementId);
-    const jVerdictPath =
-      existing.verdictPath ??
-      verdictPath(this.dataDir, existing.projectId, judgementId);
-    this.ingestFindingsAndRewrite(
-      judgementId,
-      existing.runId,
-      existing.projectId,
-      jVerdictPath,
-      verdict,
-    );
-  }
-
-  private asFindingsStore(): FindingsIngestStore {
-    const self = this;
-    return {
-      findFindingForTask(taskId, fingerprint) {
-        const row = self.findings.get(fingerprint);
-        if (!row || row.taskId !== taskId) return null;
-        return { ...row };
-      },
-      insertFinding(row) {
-        self.findings.set(row.fingerprint, { ...row });
-      },
-      updateFinding(fingerprint, patch) {
-        const existing = self.findings.get(fingerprint);
-        if (!existing) return;
-        self.findings.set(fingerprint, { ...existing, ...patch });
-      },
-      insertOccurrence(row) {
-        self.occurrences.set(row.id, { ...row });
-      },
-      listFindingsForTask(taskId) {
-        return [...self.findings.values()]
-          .filter((f) => f.taskId === taskId)
-          .map((f) => ({ ...f }));
-      },
-      getJudgementRunId(judgementId) {
-        return self.judgements.get(judgementId)?.runId ?? null;
-      },
-      now: () => nowIso(),
-      newId: () => newId(),
-    };
-  }
-
-  listFindings(filter: ListFindingsFilter = {}): FindingRow[] {
-    let rows = [...this.findings.values()];
-    if (filter.projectId) {
-      rows = rows.filter((f) => f.projectId === filter.projectId);
-    }
-    if (filter.taskId) {
-      rows = rows.filter((f) => f.taskId === filter.taskId);
-    }
-    if (filter.status) {
-      rows = rows.filter((f) => f.status === filter.status);
-    }
-    if (filter.kind) {
-      rows = rows.filter((f) => f.kind === filter.kind);
-    }
-    if (filter.category) {
-      rows = rows.filter((f) => f.category === filter.category);
-    }
-    rows.sort((a, b) => {
-      const ta = a.lastSeenAt ?? "";
-      const tb = b.lastSeenAt ?? "";
-      if (ta !== tb) return tb.localeCompare(ta);
-      return a.fingerprint.localeCompare(b.fingerprint);
-    });
-    return rows.map((f) => ({ ...f }));
-  }
-
-  getFinding(fingerprint: string): FindingDetail | null {
-    const row = this.findings.get(fingerprint);
-    if (!row) return null;
-    return {
-      ...row,
-      occurrences: this.listOccurrences(fingerprint),
-    };
-  }
-
-  listOccurrences(findingFingerprint: string): OccurrenceRow[] {
-    const rows = [...this.occurrences.values()].filter(
-      (o) => o.findingFingerprint === findingFingerprint,
-    );
-    rows.sort((a, b) => {
-      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
-      return b.id.localeCompare(a.id);
-    });
-    return rows.map((o) => ({ ...o }));
-  }
-
-  getJudgement(id: string): JudgementWithVerdict | null {
-    const j = this.judgements.get(id);
-    if (!j) return null;
-    const body = readVerdictFromDisk(
-      this.dataDir,
-      j.projectId,
-      j.id,
-      j.verdictPath,
-    );
-    return { ...j, verdictBody: body };
-  }
-
-  listJudgements(filter: ListJudgementsFilter = {}): ListJudgementsResult {
-    const limit = clampLimit(filter.limit);
-    const offset = parseCursorOffset(filter.cursor);
-    let rows = [...this.judgements.values()];
-    if (filter.projectId) {
-      rows = rows.filter((j) => j.projectId === filter.projectId);
-    }
-    if (filter.runId) {
-      rows = rows.filter((j) => j.runId === filter.runId);
-    }
-    if (filter.status) {
-      rows = rows.filter((j) => j.status === filter.status);
-    }
-    rows.sort((a, b) => {
-      const ca = a.createdAt ?? "";
-      const cb = b.createdAt ?? "";
-      if (ca !== cb) return cb.localeCompare(ca);
-      return b.id.localeCompare(a.id);
-    });
-    const page = rows.slice(offset, offset + limit).map((j) => ({ ...j }));
-    const nextOffset = offset + page.length;
-    const nextCursor =
-      nextOffset < rows.length ? String(nextOffset) : null;
-    return { judgements: page, nextCursor };
-  }
-
-  setJudgementStatus(
-    id: string,
-    status: JudgementStatus | string,
-    endedAt?: string | null,
-  ): Judgement {
-    const existing = this.judgements.get(id);
-    if (!existing) throw notFound("judgement", id);
-    let nextEnded = existing.endedAt;
-    if (endedAt !== undefined) {
-      nextEnded = endedAt;
-    } else if (status === "completed" || status === "failed") {
-      nextEnded = existing.endedAt ?? nowIso();
-    }
-    const next: Judgement = {
-      ...existing,
-      status,
-      endedAt: nextEnded,
-    };
-    this.judgements.set(id, next);
-    writeSnapshot(
-      judgementSnapshotPath(this.dataDir, next.projectId, next.id),
-      next,
-    );
-    return { ...next };
-  }
-
   // ---- watcher rules + events (P8a) ----
 
   createWatcherRule(
@@ -6008,12 +4197,12 @@ export class MemoryQueries implements QueryStore {
     const rule: WatcherRule = {
       id: newId(),
       projectId,
-      role: input.role,
+      queueId: input.queueId ?? null,
+      role: "agent",
       repo: input.repo,
       trigger: input.trigger,
       ref: input.ref ?? null,
       semverFilter: input.semverFilter ?? null,
-      action: { ...input.action },
       webhookSecret: secret,
       enabled: input.enabled === false ? false : true,
       createdAt: ts,
@@ -6021,12 +4210,12 @@ export class MemoryQueries implements QueryStore {
     };
     this.watcherRules.set(rule.id, rule);
     // Return WITH secret present — only create surfaces it.
-    return { ...rule, action: { ...rule.action } };
+    return { ...rule };
   }
 
   getWatcherRule(id: string): WatcherRule | null {
     const r = this.watcherRules.get(id);
-    return r ? stripWebhookSecret({ ...r, action: { ...r.action } }) : null;
+    return r ? stripWebhookSecret({ ...r }) : null;
   }
 
   /**
@@ -6048,7 +4237,7 @@ export class MemoryQueries implements QueryStore {
         (r) =>
           r.projectId === projectId && (opts.includeDisabled || r.enabled),
       )
-      .map((r) => stripWebhookSecret({ ...r, action: { ...r.action } }));
+      .map((r) => stripWebhookSecret({ ...r }));
   }
 
   updateWatcherRule(
@@ -6064,17 +4253,16 @@ export class MemoryQueries implements QueryStore {
         patch.semverFilter !== undefined
           ? patch.semverFilter
           : existing.semverFilter,
-      action:
-        patch.action !== undefined ? { ...patch.action } : { ...existing.action },
       enabled:
         patch.enabled !== undefined ? patch.enabled : existing.enabled,
       repo: patch.repo !== undefined ? patch.repo : existing.repo,
+      queueId: patch.queueId !== undefined ? patch.queueId : existing.queueId,
       updatedAt: nowIso(),
       // Secret is never touchable via update.
       webhookSecret: existing.webhookSecret,
     };
     this.watcherRules.set(id, next);
-    return stripWebhookSecret({ ...next, action: { ...next.action } });
+    return stripWebhookSecret({ ...next });
   }
 
   deleteWatcherRule(id: string): void {
@@ -6092,6 +4280,9 @@ export class MemoryQueries implements QueryStore {
       resolvedSha: input.resolvedSha ?? null,
       status: input.status,
       batchId: input.batchId ?? null,
+      queueId: input.queueId ?? null,
+      fifoSeq: input.fifoSeq ?? null,
+      processedSha: input.processedSha ?? null,
       error: input.error ?? null,
     };
     this.watcherEvents.set(event.id, event);
@@ -6118,289 +4309,61 @@ export class MemoryQueries implements QueryStore {
     return events.map((e) => ({ ...e }));
   }
 
-  // ---- eval queue (P8a) ----
-
-  createQueueEntry(
-    projectId: string,
-    input: CreateQueueEntryInput,
-  ): QueueEntry {
-    if (!this.projects.has(projectId)) throw notFound("project", projectId);
-    const existing = [...this.queueEntries.values()].filter(
-      (e) => e.projectId === projectId,
+  nextPendingWatcherEvent(queueId: string): WatcherEvent | null {
+    const pending = [...this.watcherEvents.values()].filter(
+      (e) => e.queueId === queueId && e.status === "pending" && e.fifoSeq != null,
     );
-    const position = computeFractionalPosition(
-      existing.map((e) => ({ id: e.id, position: e.position })),
-      input.position,
-    );
-    const taskTags = input.taskTags ?? null;
-    let dedupKey: string | null;
-    if (input.dedupKey !== undefined) {
-      dedupKey = input.dedupKey;
-    } else if (input.source === "manual") {
-      dedupKey = null;
-    } else {
-      dedupKey = defaultQueueDedupKey(
-        input.triggerRef ?? null,
-        input.targetKind,
-        input.taskId ?? null,
-        taskTags,
-      );
-    }
-    const entry: QueueEntry = {
-      id: newId(),
-      projectId,
-      triggerRef: input.triggerRef ?? null,
-      targetKind: input.targetKind,
-      taskId: input.taskId ?? null,
-      taskTags: taskTags ? [...taskTags] : null,
-      agentId: input.agentId,
-      model: input.model ?? null,
-      provider: input.provider ?? null,
-      repeats: input.repeats ?? null,
-      params:
-        input.params !== undefined && input.params !== null
-          ? { ...input.params }
-          : null,
-      adapterOverrides:
-        input.adapterOverrides !== undefined && input.adapterOverrides !== null
-          ? { ...input.adapterOverrides }
-          : null,
-      autoJudge:
-        input.autoJudge === undefined ? null : input.autoJudge,
-      judgeModel: input.judgeModel ?? null,
-      priority: input.priority ?? 0,
-      position,
-      status: "queued",
-      dedupKey,
-      source: input.source ?? null,
-      createdAt: nowIso(),
-      promotedAt: null,
-      promotedBatchId: null,
-      removedAt: null,
-    };
-    this.queueEntries.set(entry.id, entry);
-    return {
-      ...entry,
-      taskTags: entry.taskTags ? [...entry.taskTags] : null,
-      params: entry.params ? { ...entry.params } : null,
-      adapterOverrides: entry.adapterOverrides
-        ? { ...entry.adapterOverrides }
-        : null,
-    };
+    pending.sort((a, b) => (a.fifoSeq ?? Infinity) - (b.fifoSeq ?? Infinity));
+    return pending[0] ? { ...pending[0] } : null;
   }
 
-  getQueueEntry(id: string): QueueEntry | null {
-    const e = this.queueEntries.get(id);
-    if (!e) return null;
-    return {
-      ...e,
-      taskTags: e.taskTags ? [...e.taskTags] : null,
-      params: e.params ? { ...e.params } : null,
-      adapterOverrides: e.adapterOverrides
-        ? { ...e.adapterOverrides }
-        : null,
-    };
+  nextWatcherFifoSeq(queueId: string): number {
+    let maxSeq = 0;
+    for (const e of this.watcherEvents.values()) {
+      if (e.queueId === queueId && e.fifoSeq != null && e.fifoSeq > maxSeq) {
+        maxSeq = e.fifoSeq;
+      }
+    }
+    return maxSeq + 1;
   }
 
-  listQueueEntries(
-    projectId: string,
-    opts: { status?: string } = {},
-  ): QueueEntry[] {
-    let entries = [...this.queueEntries.values()].filter(
-      (e) => e.projectId === projectId,
-    );
-    if (opts.status !== undefined) {
-      entries = entries.filter((e) => e.status === opts.status);
-    }
-    return sortQueueEntries(entries).map((e) => ({
-      ...e,
-      taskTags: e.taskTags ? [...e.taskTags] : null,
-      params: e.params ? { ...e.params } : null,
-      adapterOverrides: e.adapterOverrides
-        ? { ...e.adapterOverrides }
-        : null,
-    }));
+  markWatcherEventLaunching(id: string): WatcherEvent {
+    const existing = this.watcherEvents.get(id);
+    if (!existing) throw notFound("watcher event", id);
+    const next: WatcherEvent = { ...existing, status: "launching" };
+    this.watcherEvents.set(id, next);
+    return { ...next };
   }
 
-  reorderQueueEntry(id: string, opts: ReorderQueueEntryOpts): QueueEntry {
-    const existing = this.queueEntries.get(id);
-    if (!existing) throw notFound("queue entry", id);
-    const siblings = [...this.queueEntries.values()].filter(
-      (e) => e.projectId === existing.projectId && e.id !== id,
-    );
-    let position = existing.position;
-    if (opts.position !== undefined) {
-      position = opts.position;
-    } else if (opts.after !== undefined || opts.before !== undefined) {
-      const spec: QueuePositionSpec =
-        opts.after !== undefined
-          ? { after: opts.after }
-          : { before: opts.before };
-      position = computeFractionalPosition(
-        siblings.map((e) => ({ id: e.id, position: e.position })),
-        spec,
-      );
-    }
-    const next: QueueEntry = {
+  markWatcherEventPending(id: string): WatcherEvent {
+    const existing = this.watcherEvents.get(id);
+    if (!existing) throw notFound("watcher event", id);
+    const next: WatcherEvent = { ...existing, status: "pending" };
+    this.watcherEvents.set(id, next);
+    return { ...next };
+  }
+
+  markWatcherEventLaunched(
+    id: string,
+    batchId: string,
+    sha: string,
+  ): WatcherEvent {
+    const existing = this.watcherEvents.get(id);
+    if (!existing) throw notFound("watcher event", id);
+    const next: WatcherEvent = {
       ...existing,
-      position,
-      priority:
-        opts.priority !== undefined ? opts.priority : existing.priority,
+      status: "launched",
+      batchId,
+      processedSha: sha,
     };
-    this.queueEntries.set(id, next);
-    return this.getQueueEntry(id)!;
+    this.watcherEvents.set(id, next);
+    return { ...next };
   }
 
-  promoteQueueEntry(id: string): PromoteQueueEntryResult {
-    const entry = this.queueEntries.get(id);
-    if (!entry) throw notFound("queue entry", id);
-    if (entry.status === "promoted" && entry.promotedBatchId) {
-      const runIds = this.listRuns({ batchId: entry.promotedBatchId }).map(
-        (r) => r.id,
-      );
-      return {
-        entry: this.getQueueEntry(id)!,
-        batchId: entry.promotedBatchId,
-        runIds,
-        batchIds: [entry.promotedBatchId],
-      };
-    }
-    if (entry.status !== "queued") {
-      throw new Error(
-        `cannot promote queue entry ${id}: status is ${entry.status}`,
-      );
-    }
-
-    let targetTasks: Task[] = [];
-    if (entry.targetKind === "task") {
-      if (!entry.taskId) {
-        throw new Error(
-          `cannot promote queue entry ${id}: target_kind=task but taskId is missing`,
-        );
-      }
-      const t = this.getTask(entry.taskId);
-      if (!t || t.projectId !== entry.projectId) {
-        throw new Error(
-          `cannot promote queue entry ${id}: task not found: ${entry.taskId}`,
-        );
-      }
-      targetTasks = [t];
-    } else {
-      const all = this.listTasks(entry.projectId);
-      targetTasks = tasksMatchingTags(all, entry.taskTags);
-      if (targetTasks.length === 0) {
-        throw new Error(
-          `cannot promote queue entry ${id}: no tasks match tags ${(entry.taskTags ?? []).join(",") || "(none)"}`,
-        );
-      }
-    }
-
-    const project = this.getProject(entry.projectId);
-    const agent = this.getAgent(entry.agentId);
-    const model =
-      entry.model ?? project?.defaultModel ?? agent?.defaultModel ?? "unknown";
-    const provider =
-      entry.provider ??
-      project?.defaultProvider ??
-      agent?.defaultProvider ??
-      "unknown";
-    const repeats = entry.repeats ?? 1;
-    const params = entry.params ?? {};
-    const agentImage =
-      entry.adapterOverrides &&
-      typeof entry.adapterOverrides.imageTag === "string"
-        ? String(entry.adapterOverrides.imageTag)
-        : undefined;
-    const trigger =
-      entry.source === "watcher"
-        ? "webhook"
-        : entry.source === "manual"
-          ? "manual"
-          : entry.source === "ci"
-            ? "manual"
-            : entry.source === "api"
-              ? "manual"
-              : entry.source ?? "manual";
-
-    const batchIds: string[] = [];
-    const runIds: string[] = [];
-    for (const task of targetTasks) {
-      const batch = this.createBatch({
-        taskId: task.id,
-        projectId: entry.projectId,
-        agentId: entry.agentId,
-        model,
-        provider,
-        params,
-        repeats,
-        trigger,
-        triggerRef: entry.triggerRef ?? undefined,
-        agentImage,
-      });
-      batchIds.push(batch.id);
-      for (let i = 0; i < repeats; i++) {
-        const run = this.createRun({
-          batchId: batch.id,
-          taskId: task.id,
-          projectId: entry.projectId,
-          agentId: entry.agentId,
-          model,
-          provider,
-          repeatIndex: i,
-          status: "queued",
-          trigger,
-          triggerRef: entry.triggerRef ?? undefined,
-          agentImage,
-          triggerRuleId: undefined,
-        });
-        runIds.push(run.id);
-      }
-    }
-
-    const firstBatchId = batchIds[0]!;
-    const next: QueueEntry = {
-      ...entry,
-      status: "promoted",
-      promotedAt: nowIso(),
-      promotedBatchId: firstBatchId,
-    };
-    this.queueEntries.set(id, next);
-    return {
-      entry: this.getQueueEntry(id)!,
-      batchId: firstBatchId,
-      runIds,
-      batchIds,
-    };
-  }
-
-  removeQueueEntry(id: string): QueueEntry {
-    const existing = this.queueEntries.get(id);
-    if (!existing) throw notFound("queue entry", id);
-    if (existing.status === "removed") {
-      return this.getQueueEntry(id)!;
-    }
-    const next: QueueEntry = {
-      ...existing,
-      status: "removed",
-      removedAt: nowIso(),
-    };
-    this.queueEntries.set(id, next);
-    return this.getQueueEntry(id)!;
-  }
-
-  drainQueue(projectId: string): { removed: number } {
-    const queued = [...this.queueEntries.values()].filter(
-      (e) => e.projectId === projectId && e.status === "queued",
+  watcherEventExistsForSha(ruleId: string, sha: string): boolean {
+    return [...this.watcherEvents.values()].some(
+      (e) => e.ruleId === ruleId && e.processedSha === sha,
     );
-    const removedAt = nowIso();
-    for (const e of queued) {
-      this.queueEntries.set(e.id, {
-        ...e,
-        status: "removed",
-        removedAt,
-      });
-    }
-    return { removed: queued.length };
   }
 
   // ---- persistent eval queues + containers ----
@@ -6414,10 +4377,10 @@ export class MemoryQueries implements QueryStore {
       model: input.model, provider: input.provider,
       adapterOverrides: input.adapterOverrides ?? null, sandbox: input.sandbox ?? null,
       networkPolicy: input.networkPolicy ?? "allow", ports: [...(input.ports ?? [])],
-      judgeModel: input.judgeModel ?? null, judgeProvider: input.judgeProvider ?? null,
-      autoJudge: input.autoJudge !== false, status: "draft", activeBatchId: null,
+      status: "draft", activeBatchId: null,
       sharedAdapterId: input.sharedAdapterId ?? null,
       builtinAdapterId: input.builtinAdapterId ?? null,
+      agentCommit: input.agentCommit ?? null,
       revision: 1, createdAt: ts, updatedAt: ts,
     };
     this.evalQueues.set(queue.id, queue);
@@ -6448,13 +4411,11 @@ export class MemoryQueries implements QueryStore {
       sandbox: patch.sandbox !== undefined ? patch.sandbox : existing.sandbox,
       networkPolicy: patch.networkPolicy ?? existing.networkPolicy,
       ports: patch.ports !== undefined ? [...patch.ports] : existing.ports,
-      judgeModel: patch.judgeModel !== undefined ? patch.judgeModel : existing.judgeModel,
-      judgeProvider: patch.judgeProvider !== undefined ? patch.judgeProvider : existing.judgeProvider,
-      autoJudge: patch.autoJudge ?? existing.autoJudge,
       status: patch.status ?? existing.status,
       activeBatchId: patch.activeBatchId !== undefined ? patch.activeBatchId : existing.activeBatchId,
       sharedAdapterId: patch.sharedAdapterId !== undefined ? patch.sharedAdapterId : existing.sharedAdapterId,
       builtinAdapterId: patch.builtinAdapterId !== undefined ? patch.builtinAdapterId : existing.builtinAdapterId,
+      agentCommit: patch.agentCommit !== undefined ? patch.agentCommit : existing.agentCommit,
       revision: patch.incrementRevision ? existing.revision + 1 : existing.revision,
       updatedAt: nowIso(),
     };
@@ -6494,7 +4455,8 @@ export class MemoryQueries implements QueryStore {
     const item: EvalQueueItem = {
       id: input.id ?? newId(), queueId, projectId: queue.projectId, taskId: input.taskId,
       position, repeats: Math.max(1, input.repeats ?? 1), enabled: input.enabled !== false,
-      overrides: input.overrides ?? null, createdAt: ts, updatedAt: ts,
+      overrides: input.overrides ?? null, claimedRepeats: 0, deletedAt: null,
+      createdAt: ts, updatedAt: ts,
     };
     this.evalQueueItems.set(item.id, item);
     this.updateEvalQueue(queueId, { incrementRevision: true });
@@ -6508,9 +4470,22 @@ export class MemoryQueries implements QueryStore {
 
   listEvalQueueItems(queueId: string, opts: { includeDisabled?: boolean } = {}): EvalQueueItem[] {
     return [...this.evalQueueItems.values()].filter((i) => i.queueId === queueId &&
-      (opts.includeDisabled === true || i.enabled))
+      (opts.includeDisabled === true || i.enabled) && i.deletedAt === null)
       .sort((a, b) => a.position - b.position || a.createdAt.localeCompare(b.createdAt))
       .map((i) => structuredClone(i));
+  }
+
+  listEvalQueuesUsingTask(projectId: string, taskId: string): EvalQueue[] {
+    const ids = [...new Set(
+      [...this.evalQueueItems.values()]
+        .filter((i) => i.projectId === projectId && i.taskId === taskId && i.deletedAt === null)
+        .map((i) => i.queueId),
+    )];
+    return ids
+      .map((id) => this.evalQueues.get(id))
+      .filter((q): q is EvalQueue => q !== undefined)
+      .map((q) => structuredClone(q))
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
 
   updateEvalQueueItem(id: string, patch: UpdateEvalQueueItemInput): EvalQueueItem {
@@ -6542,7 +4517,13 @@ export class MemoryQueries implements QueryStore {
   deleteEvalQueueItem(id: string): void {
     const existing = this.evalQueueItems.get(id);
     if (!existing) throw notFound("eval queue item", id);
-    this.evalQueueItems.delete(id);
+    // Soft delete: prevents future claims without breaking run provenance/FKs.
+    this.evalQueueItems.set(id, {
+      ...existing,
+      enabled: false,
+      deletedAt: nowIso(),
+      updatedAt: nowIso(),
+    });
     this.updateEvalQueue(existing.queueId, { incrementRevision: true });
   }
 
@@ -6553,7 +4534,10 @@ export class MemoryQueries implements QueryStore {
     const row: QueueContainer = {
       id: input.id ?? newId(), queueId: input.queueId, projectId: input.projectId,
       batchId: input.batchId, runtimeContainerId: input.runtimeContainerId ?? null,
-      image: input.image, state: input.state, ports: [...(input.ports ?? [])],
+      image: input.image, imageId: input.imageId ?? null,
+      agentCommit: input.agentCommit ?? null, agentVersion: input.agentVersion ?? null,
+      buildId: input.buildId ?? null,
+      state: input.state, ports: [...(input.ports ?? [])],
       workspaceDir: input.workspaceDir, startedAt: input.startedAt ?? null,
       stoppedAt: null, error: input.error ?? null, createdAt: ts, updatedAt: ts,
     };
@@ -6567,9 +4551,7 @@ export class MemoryQueries implements QueryStore {
   }
 
   getActiveQueueContainer(queueId: string): QueueContainer | null {
-    return this.listQueueContainers(queueId).find(
-      (c) => c.state !== "stopped" && c.runtimeContainerId !== null && c.stoppedAt === null,
-    ) ?? null;
+    return this.listQueueContainers(queueId).find((c) => isActiveContainerState(c)) ?? null;
   }
 
   listQueueContainers(queueId: string): QueueContainer[] {
@@ -6594,115 +4576,119 @@ export class MemoryQueries implements QueryStore {
     return structuredClone(next);
   }
 
-  createQueueAnalysis(input: CreateQueueAnalysisInput): QueueAnalysis {
-    const row: QueueAnalysis = {
-      id: input.id ?? newId(), queueId: input.queueId, projectId: input.projectId,
-      batchId: input.batchId, selectedRunIds: [...input.selectedRunIds],
-      evidenceHashes: { ...input.evidenceHashes }, judgeModel: input.judgeModel,
-      judgeProvider: input.judgeProvider, judgeParams: input.judgeParams ?? null,
-      judgePrompt: input.judgePrompt ?? null, systemPromptVersion: input.systemPromptVersion,
-      parentAnalysisId: input.parentAnalysisId ?? null, status: input.status ?? "queued",
-      verdictPath: null, reportPath: null, eventsPath: null, rawResponsePath: null,
-      createdAt: nowIso(), startedAt: null, endedAt: null, error: null,
-    };
-    this.queueAnalyses.set(row.id, row);
-    return structuredClone(row);
+  listRunsByBatch(batchId: string): Run[] {
+    return [...this.runs.values()]
+      .filter((r) => r.batchId === batchId)
+      .map((r) => ({ ...r }));
   }
 
-  getQueueAnalysis(id: string): QueueAnalysis | null {
-    const row = this.queueAnalyses.get(id);
-    return row ? structuredClone(row) : null;
-  }
-
-  listQueueAnalyses(queueId: string, opts: { batchId?: string } = {}): QueueAnalysis[] {
-    return [...this.queueAnalyses.values()].filter((a) => a.queueId === queueId &&
-      (!opts.batchId || a.batchId === opts.batchId))
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((a) => structuredClone(a));
-  }
-
-  listOrphanedAnalyses(): Array<{ id: string; queueId: string; projectId: string; status: string }> {
-    return [...this.queueAnalyses.values()]
-      .filter((a) => a.status === "queued" || a.status === "running")
-      .map((a) => ({ id: a.id, queueId: a.queueId, projectId: a.projectId, status: a.status }));
-  }
-
-  updateQueueAnalysis(id: string, patch: UpdateQueueAnalysisInput): QueueAnalysis {
-    const existing = this.queueAnalyses.get(id);
-    if (!existing) throw notFound("queue analysis", id);
-    const next: QueueAnalysis = {
-      ...existing,
-      status: patch.status ?? existing.status,
-      verdictPath: patch.verdictPath !== undefined ? patch.verdictPath : existing.verdictPath,
-      reportPath: patch.reportPath !== undefined ? patch.reportPath : existing.reportPath,
-      eventsPath: patch.eventsPath !== undefined ? patch.eventsPath : existing.eventsPath,
-      rawResponsePath: patch.rawResponsePath !== undefined ? patch.rawResponsePath : existing.rawResponsePath,
-      startedAt: patch.startedAt !== undefined ? patch.startedAt : existing.startedAt,
-      endedAt: patch.endedAt !== undefined ? patch.endedAt : existing.endedAt,
-      error: patch.error !== undefined ? patch.error : existing.error,
-    };
-    this.queueAnalyses.set(id, next);
-    return structuredClone(next);
-  }
-
-  storeImprovementSteps(
-    queueAnalysisId: string,
-    projectId: string,
-    queueId: string,
-    steps: QueueImprovementStep[],
-  ): ImprovementStepRecord[] {
-    for (const [id, step] of this.improvementSteps) {
-      if (step.queueAnalysisId === queueAnalysisId) this.improvementSteps.delete(id);
+  claimQueueWork(input: ClaimQueueWorkInput): ClaimQueueWorkResult {
+    // Synchronous atomic equivalent of the SQLite BEGIN IMMEDIATE claim:
+    // no awaits, no interleaving, complete before returning.
+    // 1. Load the active generation and confirm it is still accepting.
+    const batch = this.batches.get(input.batchId);
+    if (!batch) throw notFound("run batch", input.batchId);
+    if (!batch.accepting) {
+      throw Object.assign(
+        new Error(`queue generation ${input.batchId} is closed; start a new generation`),
+        { code: "GENERATION_CLOSED" },
+      );
     }
-    const ts = nowIso();
-    for (const step of steps) {
-      this.improvementSteps.set(`${queueAnalysisId}:${step.id}`, {
-        ...structuredClone(step),
-        queueAnalysisId,
-        projectId,
-        queueId,
-        createdAt: ts,
-        updatedAt: ts,
+
+    // 2. Select enabled, non-deleted queue items in position, id order.
+    const items = [...this.evalQueueItems.values()]
+      .filter(
+        (i) =>
+          i.queueId === input.queueId &&
+          i.enabled &&
+          i.deletedAt === null,
+      )
+      .sort(
+        (a, b) => a.position - b.position || a.id.localeCompare(b.id),
+      );
+
+    // 3. Compare each item's repeats with runs already claimed for this generation.
+    const claimedPerItem = new Map<string, number>();
+    for (const run of this.runs.values()) {
+      if (run.batchId !== input.batchId || !run.queueItemId) continue;
+      claimedPerItem.set(run.queueItemId, (claimedPerItem.get(run.queueItemId) ?? 0) + 1);
+    }
+
+    let claim: { item: EvalQueueItem; repeatIndex: number } | null = null;
+    for (const item of items) {
+      const claimedCount = claimedPerItem.get(item.id) ?? 0;
+      if (claimedCount < item.repeats) {
+        claim = { item, repeatIndex: claimedCount };
+        break;
+      }
+    }
+
+    // 5. If no work exists, atomically mark the generation closing.
+    if (!claim) {
+      const closedRevision = input.snapshot.queueRevision;
+      this.batches.set(input.batchId, {
+        ...batch,
+        accepting: false,
+        closedRevision,
+        closedAt: nowIso(),
       });
+      return { claimed: false, closed: true, closedRevision };
     }
-    return this.listImprovementSteps({ queueAnalysisId });
-  }
 
-  listImprovementSteps(filter: ListImprovementStepsFilter): ImprovementStepRecord[] {
-    return [...this.improvementSteps.values()]
-      .filter((step) =>
-        step.queueAnalysisId === filter.queueAnalysisId &&
-        (!filter.class || step.class === filter.class) &&
-        (filter.priority === undefined || step.priority === filter.priority) &&
-        (!filter.status || step.status === filter.status) &&
-        (!filter.defectId || step.defectIds.includes(filter.defectId)))
-      .sort((a, b) => a.rank - b.rank)
-      .map((step) => structuredClone(step));
-  }
-
-  updateImprovementStepLifecycle(
-    queueAnalysisId: string,
-    id: string,
-    patch: UpdateImprovementStepLifecycleInput,
-  ): ImprovementStepRecord {
-    const storageId = `${queueAnalysisId}:${id}`;
-    const existing = this.improvementSteps.get(storageId);
-    if (!existing) throw notFound("improvement step", id);
-    if (!canTransitionImprovementStatus(existing.status, patch.status)) {
-      throw new Error(`invalid improvement step transition ${existing.status} -> ${patch.status}`);
-    }
-    if (patch.status === "blocked" && !patch.blockingReason?.trim()) {
-      throw new Error("blockingReason is required when status=blocked");
-    }
-    const next: ImprovementStepRecord = {
-      ...existing,
-      status: patch.status,
-      ...(patch.status === "blocked"
-        ? { blockingReason: patch.blockingReason!.trim() }
-        : { blockingReason: undefined }),
-      updatedAt: nowIso(),
+    // 4. Create exactly one queue-backed run with immutable eval/item snapshots.
+    // The claimed item may differ from the caller's expected task (the claim op
+    // selects the item atomically), so resolve snapshots for the actual item.
+    const { item, repeatIndex } = claim;
+    const taskForItem = this.tasks.get(item.taskId);
+    if (!taskForItem) throw notFound("task", item.taskId);
+    const evalSnapshot =
+      input.evalSnapshot &&
+      input.taskId === item.taskId
+        ? input.evalSnapshot
+        : JSON.parse(JSON.stringify(taskForItem));
+    const evalVersion = input.evalVersion ?? taskForItem.version ?? 1;
+    const itemSnapshot = input.itemSnapshot ?? {
+      id: item.id,
+      queueId: item.queueId,
+      taskId: item.taskId,
+      position: item.position,
+      repeats: item.repeats,
+      enabled: item.enabled ? 1 : 0,
+      overrides: item.overrides,
+      claimedRepeats: item.claimedRepeats,
     };
-    this.improvementSteps.set(storageId, next);
-    return structuredClone(next);
+    const run = this.createRun({
+      batchId: input.batchId,
+      taskId: item.taskId,
+      projectId: input.projectId,
+      queueId: input.queueId,
+      queueItemId: item.id,
+      queueContainerId: input.queueContainerId,
+      agentId: input.agentId ?? batch.agentId,
+      model: input.snapshot.model,
+      provider: input.snapshot.provider,
+      repeatIndex,
+      evalVersion,
+      evalSnapshot,
+      itemSnapshot,
+      status: "queued",
+      agentImage: input.snapshot.agentImage ?? undefined,
+      agentCommit: input.snapshot.agentCommit ?? undefined,
+      agentImageSource: "built",
+      adapterOverrides: input.snapshot.adapterOverrides,
+      trigger: "eval-queue",
+      triggerRef: input.queueId,
+      controlState: "running",
+    });
+
+    // Bump the item's immutable claimed-repeat floor.
+    this.evalQueueItems.set(item.id, {
+      ...item,
+      claimedRepeats: item.claimedRepeats + 1,
+      updatedAt: nowIso(),
+    });
+
+    return { claimed: true, run, queueItemId: item.id, repeatIndex };
   }
 
   upsertEvalMetrics(input: {
@@ -6886,141 +4872,9 @@ export class MemoryQueries implements QueryStore {
       tasks: this.listTasks(projectId, { includeArchived: true }),
       runs: this.listRuns({ projectId }),
       watchers: this.listWatcherRules(projectId, { includeDisabled: true }),
-      queue: this.listQueueEntries(projectId),
-      outboundWebhooks: this.listOutboundSubscriptions(projectId),
     };
   }
 
-  // ---- Outbound webhooks (P8c) ----
-
-  createOutboundSubscription(
-    projectId: string,
-    input: CreateOutboundSubscriptionInput,
-  ): OutboundSubscription {
-    if (!this.projects.has(projectId)) throw notFound("project", projectId);
-    const ts = nowIso();
-    const secret =
-      input.secret !== undefined && input.secret !== ""
-        ? input.secret
-        : `${newId()}-${newId()}`;
-    const eventTypes = Array.isArray(input.eventTypes)
-      ? [...input.eventTypes]
-      : [];
-    const sub: OutboundSubscription = {
-      id: newId(),
-      projectId,
-      url: input.url,
-      secret,
-      eventTypes,
-      enabled: input.enabled === false ? false : true,
-      createdAt: ts,
-      updatedAt: ts,
-    };
-    this.outboundSubscriptions.set(sub.id, sub);
-    // Return WITH secret present — only create surfaces it.
-    return { ...sub, eventTypes: [...sub.eventTypes] };
-  }
-
-  getOutboundSubscription(id: string): OutboundSubscription | null {
-    const s = this.outboundSubscriptions.get(id);
-    return s
-      ? stripOutboundSecret({ ...s, eventTypes: [...s.eventTypes] })
-      : null;
-  }
-
-  /**
-   * Raw signing secret for outbound HMAC. NEVER log the return value.
-   */
-  getOutboundSubscriptionWithSecret(id: string): string | null {
-    const s = this.outboundSubscriptions.get(id);
-    if (!s) return null;
-    if (s.secret == null || s.secret === "") return null;
-    return s.secret;
-  }
-
-  listOutboundSubscriptions(projectId: string): OutboundSubscription[] {
-    return [...this.outboundSubscriptions.values()]
-      .filter((s) => s.projectId === projectId)
-      .map((s) =>
-        stripOutboundSecret({ ...s, eventTypes: [...s.eventTypes] }),
-      );
-  }
-
-  updateOutboundSubscription(
-    id: string,
-    patch: UpdateOutboundSubscriptionPatch,
-  ): OutboundSubscription {
-    const existing = this.outboundSubscriptions.get(id);
-    if (!existing) throw notFound("outbound subscription", id);
-    const next: OutboundSubscription = {
-      ...existing,
-      url: patch.url !== undefined ? patch.url : existing.url,
-      eventTypes:
-        patch.eventTypes !== undefined
-          ? [...patch.eventTypes]
-          : [...existing.eventTypes],
-      enabled:
-        patch.enabled !== undefined ? patch.enabled : existing.enabled,
-      updatedAt: nowIso(),
-      // Secret is never touchable via update.
-      secret: existing.secret,
-    };
-    this.outboundSubscriptions.set(id, next);
-    return stripOutboundSecret({ ...next, eventTypes: [...next.eventTypes] });
-  }
-
-  deleteOutboundSubscription(id: string): void {
-    for (const [did, d] of this.webhookDeliveries) {
-      if (d.subscriptionId === id) this.webhookDeliveries.delete(did);
-    }
-    this.outboundSubscriptions.delete(id);
-  }
-
-  recordWebhookDelivery(input: RecordWebhookDeliveryInput): WebhookDelivery {
-    const delivery: WebhookDelivery = {
-      id: newId(),
-      subscriptionId: input.subscriptionId,
-      projectId: input.projectId,
-      eventType: input.eventType,
-      payload: input.payload ?? null,
-      status: input.status,
-      attempt: input.attempt,
-      responseStatus: input.responseStatus ?? null,
-      responseBody: truncateResponseBody(input.responseBody ?? null),
-      error: input.error ?? null,
-      deliveredAt: input.deliveredAt ?? null,
-      createdAt: nowIso(),
-    };
-    this.webhookDeliveries.set(delivery.id, delivery);
-    return { ...delivery };
-  }
-
-  listWebhookDeliveries(
-    projectId: string,
-    opts: ListWebhookDeliveriesOpts = {},
-  ): WebhookDelivery[] {
-    let rows = [...this.webhookDeliveries.values()].filter(
-      (d) => d.projectId === projectId,
-    );
-    if (opts.subscriptionId !== undefined) {
-      rows = rows.filter((d) => d.subscriptionId === opts.subscriptionId);
-    }
-    if (opts.eventType !== undefined) {
-      rows = rows.filter((d) => d.eventType === opts.eventType);
-    }
-    if (opts.status !== undefined) {
-      rows = rows.filter((d) => d.status === opts.status);
-    }
-    rows.sort((a, b) => {
-      if (a.createdAt !== b.createdAt) return b.createdAt.localeCompare(a.createdAt);
-      return b.id.localeCompare(a.id);
-    });
-    const limit =
-      opts.limit != null && Number.isFinite(opts.limit)
-        ? Math.max(1, Math.min(200, Math.floor(opts.limit)))
-        : 50;
-    return rows.slice(0, limit).map((d) => ({ ...d }));
-  }
 
   storeCheckResults(runId: string, results: CheckResult[]): void {
     this.checkResultsByRun.set(runId, results.map((r) => ({ ...r })));
@@ -7031,98 +4885,7 @@ export class MemoryQueries implements QueryStore {
     return stored ? stored.map((r) => ({ ...r })) : [];
   }
 
-  // ---- project rubrics ----
 
-  createProjectRubric(input: CreateProjectRubricInput): ProjectRubric {
-    if (!this.projects.has(input.projectId)) {
-      throw notFound("project", input.projectId);
-    }
-    const ts = nowIso();
-    if (input.isDefault) this.clearDefaultRubric(input.projectId);
-    const row: ProjectRubric = {
-      id: input.id ?? newId(),
-      projectId: input.projectId,
-      name: input.name,
-      description: input.description ?? null,
-      rubric: input.rubric,
-      rubricVersion: input.rubric.version ?? 1,
-      isDefault: input.isDefault === true,
-      archived: false,
-      createdAt: ts,
-      updatedAt: ts,
-    };
-    this.projectRubrics.set(row.id, row);
-    return { ...row };
-  }
-
-  /** Demote whichever rubric currently holds the default flag for a project. */
-  private clearDefaultRubric(projectId: string): void {
-    for (const [id, r] of this.projectRubrics) {
-      if (r.projectId === projectId && r.isDefault) {
-        this.projectRubrics.set(id, { ...r, isDefault: false });
-      }
-    }
-  }
-
-  getProjectRubric(id: string): ProjectRubric | null {
-    const row = this.projectRubrics.get(id);
-    return row ? { ...row } : null;
-  }
-
-  listProjectRubrics(
-    projectId: string,
-    opts: { includeArchived?: boolean } = {},
-  ): ProjectRubric[] {
-    const rows = [...this.projectRubrics.values()]
-      .filter((r) => r.projectId === projectId)
-      .filter((r) => (opts.includeArchived ? true : !r.archived))
-      .map((r) => ({ ...r }));
-    return sortProjectRubrics(rows);
-  }
-
-  getDefaultProjectRubric(projectId: string): ProjectRubric | null {
-    return this.listProjectRubrics(projectId).find((r) => r.isDefault) ?? null;
-  }
-
-  updateProjectRubric(
-    id: string,
-    patch: UpdateProjectRubricInput,
-  ): ProjectRubric {
-    const existing = this.projectRubrics.get(id);
-    if (!existing) throw notFound("project rubric", id);
-    const rubricChanged =
-      patch.rubric !== undefined && !rubricsEqual(existing.rubric, patch.rubric);
-    const nextVersion = rubricChanged
-      ? Math.max(existing.rubricVersion, patch.rubric?.version ?? 0) + 1
-      : existing.rubricVersion;
-    if (patch.isDefault) this.clearDefaultRubric(existing.projectId);
-    const base = this.projectRubrics.get(id)!;
-    const next: ProjectRubric = {
-      ...base,
-      name: patch.name ?? base.name,
-      description:
-        patch.description !== undefined ? patch.description : base.description,
-      rubric: { ...(patch.rubric ?? base.rubric), version: nextVersion },
-      rubricVersion: nextVersion,
-      isDefault: patch.isDefault !== undefined ? patch.isDefault : base.isDefault,
-      updatedAt: nowIso(),
-    };
-    this.projectRubrics.set(id, next);
-    return { ...next };
-  }
-
-  archiveProjectRubric(id: string): ProjectRubric {
-    const existing = this.projectRubrics.get(id);
-    if (!existing) throw notFound("project rubric", id);
-    const next: ProjectRubric = {
-      ...existing,
-      archived: true,
-      isDefault: false,
-      updatedAt: nowIso(),
-    };
-    this.projectRubrics.set(id, next);
-    return { ...next };
-  }
 }
 
 /** Alias kept for call-site ergonomics. */

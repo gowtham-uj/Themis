@@ -48,10 +48,10 @@ row fields.
 ## Reward and diagnostics
 
 Official reward is binary: `1` only when the isolated verifier exits successfully and every required
-non-skipped check passes; otherwise `0`. Partial verifier dimensions, judge scores and trace/diff metrics
+non-skipped check passes; otherwise `0`. Partial verifier dimensions and trace/diff metrics
 are diagnostic and never replace binary task success.
 
-Persist metrics with explicit provenance (`exact|derived|judge-derived|unknown`) and evidence refs.
+Persist metrics with explicit provenance (`exact|derived|unknown`) and evidence refs.
 Missing evidence is unknown, not zero. Dataset reporting groups by package version/digest, environment and
 verifier digests, category/language/repository/difficulty, agent/model/tool budgets, network policy and
 seed.

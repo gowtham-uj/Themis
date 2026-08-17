@@ -1,6 +1,6 @@
 /**
  * Deterministic check-runner — executes each rubric Check and records
- * pass/fail/error/skipped with detail. Results feed the judge as pass-rates
+ * pass/fail/error/skipped with detail. Results are retained as deterministic pass-rates
  * and criterion grounding (plan/rubric.md §5 + §7).
  *
  * Execution seam: ContainerRuntime.run (never inline podman/docker CLI).
@@ -12,7 +12,7 @@
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Check, Rubric } from "../domain.js";
-import type { CheckResult } from "../types.js";
+import type { CheckResult } from "../check-types.js";
 
 import type { ContainerHandle, ContainerRuntime } from "./runtime.js";
 
@@ -98,7 +98,7 @@ export async function runChecks(
     results.push(result);
   }
 
-  // Persist to disk (primary artifact for the judge worker).
+  // Persist to disk (primary deterministic-check artifact).
   if (opts.writeArtifact !== false) {
     try {
       await writeFile(

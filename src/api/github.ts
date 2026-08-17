@@ -3,7 +3,7 @@
  *
  * Exists so a commit can be *picked* rather than typed. Choosing what to
  * evaluate from a list of real commits ("the PR head", "the tag before the
- * regression") is a different action from pasting a 40-character sha, and the
+ * comparison") is a different action from pasting a 40-character sha, and the
  * platform should support the first one.
  *
  * Read-only by construction: this module can list and resolve, never write. A

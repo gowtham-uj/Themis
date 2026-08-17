@@ -157,12 +157,14 @@ Use this when you want full control over every field and don't want a generator 
 - `agent_id`: stable project-agent identifier used by queues and historical runs.
 - `name`: display name.
 - `image`: local/resulting OCI image tag used by queue containers.
-- `install_type`: `source-build` or `npm`.
+- `install_type`: `source-build`, `npm`, or `binary`.
 - `source_repo` / `source_ref`: required real agent CLI git repository and optional pinned ref for
-  `source-build`; optional/null for `npm`.
+  `source-build` and `binary`; optional/null for `npm`.
 - `containerfile`: OCI build recipe stored with the adapter. It must install the real CLI plus
-  `/bin/bash`; source-build sends the checkout as context, while npm uses an empty context and lets the
-  recipe install a pinned package. Build commit (when applicable), image id, log path, status, and
+  `/bin/bash`; source-build/binary send the checkout as context, while npm uses an empty context and
+  lets the recipe install a pinned package. `binary` differs from `source-build` only in the recipe:
+  it COPYs a committed prebuilt artifact (e.g. `bin/reaper.mjs`) instead of running `npm ci`/`tsc`,
+  so the image builds in seconds. Build commit (when applicable), image id, log path, status, and
   timestamp are persisted.
 - `command.argv`: exact CLI argv template for an eval. No shell interpolation is performed.
 - `connection_check.argv`: a cheap real CLI/model probe. It must emit a model message in the same
@@ -175,6 +177,13 @@ Use this when you want full control over every field and don't want a generator 
   - `reapercode-jsonl` — consume ReaperCode trajectory JSONL.
 - `evidence.paths`: native files/directories to copy from `/workspace` after the agent exits.
 - `evidence.required_paths`: missing paths taint the queue and prevent the next eval from running.
+- `evidence.manifest`: role-typed map of the native evidence a judge binds by role id. Each entry has
+  an `id`, a `role` (`trace` | `transcript` | `result` | `tool_calls` | `model_calls` | `session` |
+  `logs` | `tmp` | `other`), a workspace-relative `path` (`*`/`**` globs allowed), a `format`
+  (`jsonl` | `json` | `md` | `txt` | `log` | `dir`), and optional `required`, `primary`, `select`
+  (`latest_mtime` | `all`), `label`, and `record` ({`kindField`, `tsField`, `idField`, `kinds`,
+  `childPattern`}). The runner snapshots the manifest onto the run and hoists each role into a stable
+  archive folder (`session/`, `model-calls/`, `tool-logs/`, `tmp/`) at seal time.
 
 ### Template placeholders
 
@@ -214,7 +223,7 @@ The live parser is not the only evidence source. List every native trajectory, s
 screenshot directory, or agent report needed for later judging. Paths are relative to `/workspace` and
 cannot escape it. Files are copied under the eval archive's `retained/agent/` tree before cleanup.
 
-Use `required_paths` for evidence without which a judgement would be incomplete. Missing required
+Use `required_paths` for required execution evidence. Missing required
 evidence taints the queue container and stops execution before the next eval, preserving the live
 container for investigation through the introspection bridge.
 
@@ -280,8 +289,8 @@ exact bytes produced by the CLI. Channel 3 ends the stream and contains `exit_co
    cleanup verification pass, residual processes are killed, and the next eval starts from an empty
    reset workspace.
 9. Retrieve `/api/evals/:runId/archive` and require hash verification success.
-10. Run the real queue judge and rejudge the immutable archive. Never use a mock model gateway, fake
-    adapter, canned provider, fake runtime, or scripted verdict in tests.
+10. Retrieve and verify the immutable archive through the API. Never use a mock model gateway, fake
+    adapter, canned provider, fake runtime or scripted verifier in tests.
 
 ## Failure semantics
 

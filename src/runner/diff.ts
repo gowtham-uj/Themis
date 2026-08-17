@@ -62,7 +62,7 @@ export interface CaptureDiffOptions {
    * Agents write their own state into the workspace — ReaperCode keeps
    * `.reaper/` (trajectory, model-call transcripts, run manifests) right next
    * to the code. That is harness bookkeeping, not the agent's work product, and
-   * letting it into the diff means the judge scores an agent on its own log
+   * letting it into the diff would mix harness logs into the agent source diff
    * files. Defaults to {@link DEFAULT_DIFF_EXCLUDES}; pass `[]` to keep
    * everything.
    */

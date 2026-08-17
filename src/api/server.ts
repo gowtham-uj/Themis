@@ -1,14 +1,13 @@
-// @ts-nocheck
-import { createBatchClaimStore, judgeRun } from "../judge-stub.js";
 /**
- * REST API server — project/task/run CRUD + run control + SSE events.
+ * REST API server — project/task/run CRUD + persistent eval queues + SSE events.
  *
  * Bootstraps a tiny zero-dep router with a shared AppCtx. Routes follow
  * plan/api.md (project-scoped). Auth is optional via CreateServerOptions.authEnabled
  * (default false for local-dev + existing tests; see src/api/auth.ts).
  *
- * Runs execute in real Podman containers through run-controller-bridge.ts.
- * The configurable concurrency cap controls how many run containers are live.
+ * Evals execute through persistent queue-owned containers (queue-worker.ts).
+ * GET project runs, run detail/events/diff, and queue-backed pause/resume/abort
+ * are read-only or queue-scoped surfaces; there is no ad-hoc in-memory runner.
  */
 
 import { randomUUID } from "node:crypto";
@@ -18,7 +17,6 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { openDb as defaultOpenDb, resolveProjectDir, type OpenDbResult } from "../db/index.js";
 import {
-  judgementDir,
   type DbQueries,
   type Project,
   type Run,
@@ -36,6 +34,11 @@ import {
   type EvalPackageUpload,
 } from "../evals/package.js";
 import { readFromSeq } from "../schema/jsonl.js";
+import { isTerminalStatus } from "../runner/status.js";
+import {
+  resolveDiffPath,
+  resolveEventsPath,
+} from "../runner/run-layout.js";
 import { Router, readJsonBody, sendJson, type RequestContext } from "./router.js";
 import {
   badRequest,
@@ -44,55 +47,25 @@ import {
   HttpError,
   notFound,
 } from "./errors.js";
-import {
-  abortRun,
-  createLiveRunsMap,
-  isTerminalStatus,
-  pauseRun,
-  resolveDiffPath,
-  resolveEventsPath,
-  resumeRun,
-  runDirPath,
-  setNetwork,
-  startRun,
-  type LiveRunsMap,
-  type StartRunOptions,
-} from "./run-controller-bridge.js";
-import {
-  registerJudgementRoutes,
-  sanitizeFilenamePart,
-  serveHtmlFile,
-  type JudgeRunner,
-} from "./judgements-routes.js";
-import { registerFindingsRoutes } from "./findings-routes.js";
-import { registerRegressionRoutes } from "./regression-routes.js";
 import { registerWatcherRoutes } from "./watcher-routes.js";
 import { registerQueueRoutes } from "./queue-routes.js";
 import { registerAdapterRoutes } from "./adapter-routes.js";
-import { registerWebhooksRoutes } from "./webhooks-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
-import { registerRubricRoutes } from "./rubric-routes.js";
-import { registerArtifactRoutes } from "./artifact-routes.js";
+import { registerArchiveRoutes } from "./archive-routes.js";
 import { registerSandboxRoutes } from "./sandbox-routes.js";
-import { registerReleaseRoutes } from "./release-routes.js";
-import { registerCommitEvalRoutes } from "./commit-eval-routes.js";
 import { registerGitHubRoutes } from "./github-routes.js";
-import { registerImprovementRoutes } from "./improvement-routes.js";
 import {
   createLiveQueueContainersMap,
+  startQueueContainer,
   type LiveQueueContainersMap,
   type StartQueueContainerOptions,
 } from "../runner/queue-worker.js";
 import type { GitHubClient } from "./github.js";
-import { handleRunFinalized, type AutoJudgeDeps } from "./auto-judge.js";
-
 
 import {
-  OutboundWebhookDispatcher,
-  RealDeliverySink,
-  type DeliverySink,
-} from "./webhooks/outbound.js";
-import type { RefResolver } from "../watcher/engine.js";
+  type RefResolver,
+  type WatcherSeams,
+} from "../watcher/engine.js";
 import {
   gateRequest,
   getRequestAuth,
@@ -101,32 +74,19 @@ import {
 import {
   IdempotencyStore,
   type IdempotencyEntry,
-  withIdempotency,
 } from "./middleware.js";
 
 // ---------------------------------------------------------------------------
 // App context
 // ---------------------------------------------------------------------------
 
-/** Stub RefResolver used when createServer is not given a real/fake resolver. */
-function defaultRefResolver(): RefResolver {
-  return {
-    async resolveRef() {
-      throw new Error("ref resolution not configured");
-    },
-  };
-}
-
 export interface AppCtx {
   queries: DbQueries;
   dataDir: string;
-  liveRuns: LiveRunsMap;
   /** Queue-id keyed persistent queue containers. */
   liveQueueContainers: LiveQueueContainersMap;
   /** Queue worker options forwarded by the API lifecycle routes. */
   queueStartOpts?: StartQueueContainerOptions;
-  /** Max concurrent live runs (P3 = 1). */
-  concurrency: number;
   /**
    * In-memory Idempotency-Key → response body.
    * Backed by {@link IdempotencyStore} (LRU + TTL); Map-compatible surface.
@@ -136,46 +96,18 @@ export interface AppCtx {
     get(key: string): IdempotencyEntry | undefined;
     set(key: string, value: IdempotencyEntry): unknown;
   };
-  /** FIFO of run ids waiting for a slot (concurrency). */
-  startQueue: string[];
-  /** Currently starting/running count. */
-  activeStarts: number;
-  /** Extra startRun options forwarded from createServer. */
-  startOpts?: Omit<StartRunOptions, "adapter">;
-  /** Real PI SDK judge runner used by judgement APIs and auto-judge. */
-  judgeRunner: JudgeRunner;
-  /** Defaults for create-judgement when the request omits them. */
-  defaultSystemPromptVersion?: string;
-  defaultJudgeModel?: string;
-  defaultJudgeProvider?: string;
   /**
    * When true, every /api/* route (except GET /api/health) requires a valid
    * Bearer token. Default false so local-dev + the existing unauthenticated
-   * test suite keep working (loopback UI server-side fetch included).
+   * test suite keep working (loopback API clients included).
    */
   authEnabled: boolean;
   /**
-   * Resolve a git ref → sha (+ optional imageTag) for watcher manual fire /
-   * webhook ingress. Tests inject a fake; production wires git ls-remote.
-   * Defaults to a stub that throws "ref resolution not configured".
+   * Watcher seams (SHA resolution + queue-generation launch). Wired to resolve
+   * refs against the real source repo and to launch queue generations pinned to a
+   * commit override. Tests inject a fake.
    */
-  refResolver: RefResolver;
-  /**
-   * Enqueue a run into the concurrency-limited start pipeline.
-   * Used by queue promote so created runs actually begin.
-   */
-  enqueueStart: (runId: string) => void | Promise<void>;
-  /**
-   * Outbound webhook dispatcher (P8c). Undefined when outbound webhooks are
-   * explicitly disabled; otherwise a RealDeliverySink-backed dispatcher.
-   * Emit sites no-op cleanly when this is undefined.
-   */
-  outboundWebhooks?: OutboundWebhookDispatcher;
-  /**
-   * Single-winner claims over batch ids, so N runs finishing concurrently
-   * produce exactly one release rollup.
-   */
-  batchClaims: ReturnType<typeof createBatchClaimStore>;
+  watcherSeams?: WatcherSeams;
   /**
    * Read-only GitHub client for browsing live repo state (commits, refs, PRs)
    * and resolving a ref to a concrete sha. Tests inject a stubbed transport;
@@ -190,22 +122,8 @@ export interface CreateServerOptions {
   queries?: DbQueries;
   /** Override openDb (tests / custom backends). */
   openDb?: (dataDir: string) => OpenDbResult;
-  /** Concurrency cap for starting runs (default 1 for P3). */
-  concurrency?: number;
-  /** Extra startRun options (timeout, skipAgent, …). */
-  startOpts?: Omit<StartRunOptions, "adapter">;
   /** Options for persistent queue-container execution. */
   queueStartOpts?: StartQueueContainerOptions;
-  defaultSystemPromptVersion?: string;
-  defaultJudgeModel?: string;
-  defaultJudgeProvider?: string;
-  /**
-   * On startup, reconcile queued/running analyses orphaned by a prior process
-   * (crash/deploy that killed an in-flight judge) by marking them failed.
-   * Default true. Test harnesses that host a long-lived judge in-process and
-   * restart the server mid-run may disable this to avoid clobbering it.
-   */
-  reconcileOrphans?: boolean;
   /**
    * Gate /api/* behind Bearer tokens. Default **false** (local-dev path):
    * existing tests that hit routes unauthenticated MUST keep working.
@@ -215,23 +133,15 @@ export interface CreateServerOptions {
   authEnabled?: boolean;
   /**
    * Optional ref resolver for watcher routes. Tests inject a fake.
-   * Defaults to a stub that throws "ref resolution not configured".
+   * Backward-compatible; preferred to pass `watcherSeams` directly.
    */
   refResolver?: RefResolver;
   /**
-   * Optional outbound webhook dispatcher (P8c). When omitted, createServer
-   * builds a default RealDeliverySink-backed dispatcher. Tests pass a
-   * dispatcher pointed at a real local HTTP server. Pass `null` to disable
-   * outbound webhooks entirely (hooks no-op).
+   * Watcher seams (SHA resolution + queue-generation launch). When omitted but
+   * `refResolver` is set, resolution is derived from it and launching stays a
+   * throwing stub (absent a real queue runtime). Tests inject a fake.
    */
-  outboundDispatcher?: OutboundWebhookDispatcher | null;
-  /**
-   * Optional delivery sink used when building the default dispatcher.
-   * Prefer `outboundDispatcher` for full control; this is a lighter seam.
-   */
-  outboundSink?: DeliverySink;
-  /** Override default backoff (ms) for the built-in dispatcher. */
-  outboundBackoffMs?: number[];
+  watcherSeams?: WatcherSeams;
   /**
    * Read-only GitHub client. Inject a stubbed transport in tests so browsing
    * live repo state never depends on the network.
@@ -242,12 +152,11 @@ export interface CreateServerOptions {
 export interface ApiServer {
   server: Server;
   queries: DbQueries;
-  liveRuns: LiveRunsMap;
   liveQueueContainers: LiveQueueContainersMap;
   app: AppCtx;
   /** Listen on an ephemeral port (or given port). Resolves with the bound port. */
   listen(port?: number, host?: string): Promise<number>;
-  /** Close the HTTP server and best-effort abort live runs. */
+  /** Close the HTTP server and best-effort stop live queue containers. */
   close(): Promise<void>;
 }
 
@@ -265,13 +174,11 @@ function projectJson(p: Project) {
     default_agent_id: p.defaultAgentId,
     default_model: p.defaultModel,
     default_provider: p.defaultProvider,
-    default_judge_model: p.defaultJudgeModel,
     workspace_image: p.workspaceImage,
     check_runners: p.checkRunners,
     adapter_overrides: p.adapterOverrides,
     network_policy: p.networkPolicy,
     retention_runs: p.retentionRuns,
-    artifact_retention: p.artifactRetention,
     sandbox: p.sandbox,
     archived: p.archived,
     created_at: p.createdAt,
@@ -279,7 +186,7 @@ function projectJson(p: Project) {
   };
 }
 
-function taskJson(t: Task) {
+function taskJson(t: Task, usedByQueues?: { id: string; name: string }[]) {
   return {
     id: t.id,
     project_id: t.projectId,
@@ -302,6 +209,7 @@ function taskJson(t: Task) {
     package_manifest: t.packageManifest,
     package_validation: t.packageValidation,
     archived: t.archived,
+    used_by_queues: usedByQueues ?? [],
     created_at: t.createdAt,
     updated_at: t.updatedAt,
   };
@@ -426,8 +334,9 @@ function runJson(r: Run) {
       trigger: r.trigger,
       trigger_ref: r.triggerRef,
     },
-    events_path: r.eventsPath,
-    diff_path: r.diffPath,
+    // Deliberately NOT serialized: events_path / diff_path are absolute
+    // host filesystem locations — internal storage paths never leak to clients
+    // (the streamer/diff routes resolve them server-side from the DB row).
     error: r.error,
   };
 }
@@ -456,138 +365,19 @@ function requireRun(queries: DbQueries, id: string): Run {
   return r;
 }
 
-function assertNotTerminal(run: Run): void {
-  if (isTerminalStatus(run.status)) {
-    throw conflict(`run ${run.id} is terminal (${run.status})`);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Sequential start queue (concurrency cap)
-// ---------------------------------------------------------------------------
-
-/** Build the real PI SDK runner used by the single-run judgement API. */
-function createRealJudgeRunner(): JudgeRunner {
-  return async (ctx) => {
-    const run = ctx.queries.getRun(ctx.runId);
-    if (!run) throw new Error(`run not found: ${ctx.runId}`);
-    const task = ctx.queries.getTask(run.taskId);
-    if (!task) throw new Error(`eval not found: ${run.taskId}`);
-    const runDir = runDirPath(ctx.dataDir, ctx.projectId, ctx.runId);
-    const hasSourceArtifacts =
-      existsSync(join(runDir, "diff.patch")) ||
-      existsSync(join(runDir, "outputs-manifest.json"));
-    const result = await judgeRun({
-      runDir,
-      task: {
-        prompt: task.prompt,
-        rubric: ctx.body.rubric ?? task.rubric,
-        agentCategory: task.agentCategory,
-        ...(task.referenceSolution
-          ? { referenceSolution: task.referenceSolution }
-          : {}),
-      },
-      judgeModel: ctx.judgeModel,
-      judgeProvider: ctx.judgeProvider,
-      hasSourceArtifacts,
-      ...(ctx.judgePrompt ? { judgePrompt: ctx.judgePrompt } : {}),
-      judgementId: ctx.judgementId,
-      projectId: ctx.projectId,
-      dataDir: ctx.dataDir,
+/** Enforce project-token scope on an ID-addressed resource (run/events/diff/etc.). */
+function assertResourceScope(
+  req: IncomingMessage,
+  queries: DbQueries,
+  resource: { runId: string },
+): void {
+  const run = queries.getRun(resource.runId);
+  if (!run) return; // notFound handled by caller after requireRun
+  const auth = getRequestAuth(req);
+  if (auth?.projectId != null && auth.projectId !== run.projectId) {
+    throw new HttpError(401, "Unauthorized", "token is not scoped to this project", {
+      type: "https://agenteval.dev/errors/unauthorized",
     });
-    if (result.status !== "completed" || !result.verdict) {
-      throw new Error(result.error ?? "PI judge did not produce a completed verdict");
-    }
-    ctx.queries.storeVerdict(ctx.judgementId, result.verdict);
-  };
-}
-
-/** Collect the auto-judge coordinator's dependencies from the app context. */
-function autoJudgeDeps(app: AppCtx): AutoJudgeDeps {
-  return {
-    queries: app.queries,
-    dataDir: app.dataDir,
-    claims: app.batchClaims,
-    ...(app.judgeRunner ? { judgeRunner: app.judgeRunner } : {}),
-    ...(app.defaultJudgeModel ? { defaultJudgeModel: app.defaultJudgeModel } : {}),
-    ...(app.defaultJudgeProvider
-      ? { defaultJudgeProvider: app.defaultJudgeProvider }
-      : {}),
-    ...(app.defaultSystemPromptVersion
-      ? { defaultSystemPromptVersion: app.defaultSystemPromptVersion }
-      : {}),
-  };
-}
-
-async function enqueueStart(app: AppCtx, runId: string): Promise<void> {
-  app.startQueue.push(runId);
-  void drainStartQueue(app);
-}
-
-/**
- * Emit run.completed exactly once after a run reaches a terminal status.
- * No-ops when outbound webhooks are not configured.
- */
-function emitRunCompleted(app: AppCtx, runId: string): void {
-  if (!app.outboundWebhooks) return;
-  const run = app.queries.getRun(runId);
-  if (!run || !isTerminalStatus(run.status)) return;
-  void app.outboundWebhooks.dispatchEvent({
-    type: "run.completed",
-    projectId: run.projectId,
-    resourceId: runId,
-    data: {
-      status: run.status,
-      endedAt: run.endedAt,
-    },
-    timestamp: run.endedAt ?? new Date().toISOString(),
-  });
-}
-
-async function drainStartQueue(app: AppCtx): Promise<void> {
-  while (app.activeStarts < app.concurrency && app.startQueue.length > 0) {
-    const runId = app.startQueue.shift()!;
-    // Skip if already live or terminal.
-    const run = app.queries.getRun(runId);
-    if (!run || isTerminalStatus(run.status) || app.liveRuns.has(runId)) {
-      continue;
-    }
-    app.activeStarts += 1;
-    try {
-      const live = await startRun(app.dataDir, app.queries, runId, app.liveRuns, {
-        ...(app.startOpts ?? {}),
-        // Thread outbound dispatcher into the runner so run.completed fires
-        // exactly once at terminal finalization (not on status polls).
-        ...(app.outboundWebhooks
-          ? { outboundWebhooks: app.outboundWebhooks }
-          : {}),
-        // Auto-judge each run, then roll up the release when its batch is done.
-        onRunFinalized: (info) =>
-          handleRunFinalized(autoJudgeDeps(app), info),
-      });
-      // When the run finishes, free a slot and drain more.
-      void live.done.finally(() => {
-        // Safety-net emit: if the runner path already emitted, the dispatcher
-        // will fan-out again only if called — the runner is the primary site.
-        // We do NOT re-emit here to keep exactly-once; the runner hook owns it.
-        app.activeStarts = Math.max(0, app.activeStarts - 1);
-        void drainStartQueue(app);
-      });
-    } catch (err) {
-      app.activeStarts = Math.max(0, app.activeStarts - 1);
-      try {
-        app.queries.finalizeRun(runId, {
-          status: "failed",
-          error: err instanceof Error ? err.message : String(err),
-          controlState: "done",
-        });
-        // Terminal via start-failure path — emit once here (runner never started).
-        emitRunCompleted(app, runId);
-      } catch {
-        // best-effort
-      }
-      void drainStartQueue(app);
-    }
   }
 }
 
@@ -657,11 +447,7 @@ async function streamEvents(
 
   // If already terminal and nothing more is expected, end after replay.
   const fresh = app.queries.getRun(run.id);
-  const live = app.liveRuns.get(run.id);
-  if (
-    (fresh && isTerminalStatus(fresh.status) && !live) ||
-    (live?.finished)
-  ) {
+  if (fresh && isTerminalStatus(fresh.status)) {
     // One more pass in case the final events just landed.
     try {
       for await (const obj of readFromSeq(eventsPath, lastSeq)) {
@@ -713,13 +499,7 @@ async function streamEvents(
       }
 
       const r = app.queries.getRun(run.id);
-      const lr = app.liveRuns.get(run.id);
-      const terminal =
-        (r && isTerminalStatus(r.status) && (!lr || lr.finished)) ||
-        (lr?.finished ?? false);
-
-      // Also stop when we see a run.end in the stream.
-      // (lastSeq advanced above)
+      const terminal = r != null && isTerminalStatus(r.status);
 
       if (terminal || Date.now() - started > maxWaitMs) {
         // Final drain.
@@ -762,10 +542,7 @@ async function streamEvents(
 // Route registration
 // ---------------------------------------------------------------------------
 
-function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpts"]): void {
-  // Stash startOpts on a closure via app.startOpts (set at create time).
-  void startOpts;
-
+function registerRoutes(router: Router): void {
   // ---- health (public even when authEnabled) ----
   router.get("/api/health", (_req, res) => {
     sendJson(res, 200, { ok: true });
@@ -788,7 +565,6 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
       default_model?: string;
       default_provider?: string;
       network_policy?: string;
-      artifact_retention?: string;
     }>(req);
 
     if (!body.name || !String(body.name).trim()) {
@@ -811,7 +587,6 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
       defaultModel: body.default_model,
       defaultProvider: body.default_provider,
       networkPolicy: body.network_policy,
-      artifactRetention: body.artifact_retention,
     });
     resolveProjectDir(app.dataDir, project.id);
     sendJson(res, 201, projectJson(project));
@@ -863,12 +638,6 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     if ("network_policy" in body && typeof body.network_policy === "string") {
       patch.networkPolicy = body.network_policy;
     }
-    if (
-      "artifact_retention" in body &&
-      typeof body.artifact_retention === "string"
-    ) {
-      patch.artifactRetention = body.artifact_retention;
-    }
     const updated = app.queries.updateProject(ctx.params.id!, patch);
     sendJson(res, 200, projectJson(updated));
   });
@@ -880,63 +649,23 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     sendJson(res, 200, projectJson(archived));
   });
 
-  // ---- tasks ----
+  // ---- eval store (canonical eval packages) ----
 
-  router.get("/api/projects/:id/tasks", (_req, res, ctx) => {
+  router.get("/api/projects/:id/evals", (_req, res, ctx) => {
     const app = appOf(ctx);
-    requireProject(app.queries, ctx.params.id!);
+    const projectId = ctx.params.id!;
+    requireProject(app.queries, projectId);
     const includeArchived =
       ctx.query.include_archived === "1" || ctx.query.include_archived === "true";
     const categoryName = ctx.query.category_name;
     const list = app.queries
-      .listTasks(ctx.params.id!, { includeArchived })
-      .filter((task) => !categoryName || task.categoryName === categoryName)
-      .map(taskJson);
-    sendJson(res, 200, { tasks: list });
-  });
-
-  router.post("/api/projects/:id/tasks", (_req, _res, _ctx) => {
-    throw badRequest(
-      "flat task creation is not supported; create a canonical eval package through POST /api/projects/:id/evals",
-    );
-  });
-
-  router.get("/api/projects/:id/tasks/:taskId", (_req, res, ctx) => {
-    const app = appOf(ctx);
-    requireProject(app.queries, ctx.params.id!);
-    const task = requireTask(app.queries, ctx.params.id!, ctx.params.taskId!);
-    sendJson(res, 200, taskJson(task));
-  });
-
-  router.patch("/api/projects/:id/tasks/:taskId", (_req, _res, ctx) => {
-    const app = appOf(ctx);
-    requireProject(app.queries, ctx.params.id!);
-    requireTask(app.queries, ctx.params.id!, ctx.params.taskId!);
-    throw conflict(
-      "canonical eval packages are immutable; upload a complete new package version instead of patching fields",
-    );
-  });
-
-  router.delete("/api/projects/:id/tasks/:taskId", (_req, res, ctx) => {
-    const app = appOf(ctx);
-    requireProject(app.queries, ctx.params.id!);
-    requireTask(app.queries, ctx.params.id!, ctx.params.taskId!);
-    const archived = app.queries.archiveTask(ctx.params.taskId!);
-    sendJson(res, 200, taskJson(archived));
-  });
-
-  // ---- eval definitions (preferred aliases for task CRUD) ----
-
-  router.get("/api/projects/:id/evals", (_req, res, ctx) => {
-    const app = appOf(ctx);
-    requireProject(app.queries, ctx.params.id!);
-    const includeArchived =
-      ctx.query.include_archived === "1" || ctx.query.include_archived === "true";
+      .listTasks(projectId, { includeArchived })
+      .filter((task) => !categoryName || task.categoryName === categoryName);
     sendJson(res, 200, {
-      evals: app.queries
-        .listTasks(ctx.params.id!, { includeArchived })
-        .filter((task) => !ctx.query.category_name || task.categoryName === ctx.query.category_name)
-        .map(taskJson),
+      evals: list.map((task) =>
+        taskJson(task, app.queries.listEvalQueuesUsingTask(projectId, task.id)
+          .map((q) => ({ id: q.id, name: q.name }))),
+      ),
     });
   });
 
@@ -993,7 +722,7 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
         const tasks = await createSuiteEvals(app, project, decoded);
         sendJson(res, 201, {
           count: tasks.length,
-          tasks: tasks.map(taskJson),
+          tasks: tasks.map((t) => taskJson(t)),
         });
       } else {
         const created = await createSingleEvalFromFiles(app, project, decoded);
@@ -1008,11 +737,14 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
 
   router.get("/api/projects/:id/evals/:evalId", (_req, res, ctx) => {
     const app = appOf(ctx);
-    requireProject(app.queries, ctx.params.id!);
+    const projectId = ctx.params.id!;
+    requireProject(app.queries, projectId);
+    const task = requireTask(app.queries, projectId, ctx.params.evalId!);
     sendJson(
       res,
       200,
-      taskJson(requireTask(app.queries, ctx.params.id!, ctx.params.evalId!)),
+      taskJson(task, app.queries.listEvalQueuesUsingTask(projectId, task.id)
+        .map((q) => ({ id: q.id, name: q.name }))),
     );
   });
 
@@ -1027,149 +759,59 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
 
   router.delete("/api/projects/:id/evals/:evalId", (_req, res, ctx) => {
     const app = appOf(ctx);
-    requireProject(app.queries, ctx.params.id!);
-    const existing = requireTask(app.queries, ctx.params.id!, ctx.params.evalId!);
+    const projectId = ctx.params.id!;
+    requireProject(app.queries, projectId);
+    const existing = requireTask(app.queries, projectId, ctx.params.evalId!);
+    // Guard: refuse to archive an eval that a live queue still references. A
+    // dangling queue item would otherwise fail at claim time ("references
+    // unavailable eval") with no visibility here.
+    const users = app.queries.listEvalQueuesUsingTask(projectId, existing.id);
+    if (users.length > 0) {
+      throw conflict(
+        `eval ${existing.id} is referenced by queue(s): ${users.map((q) => q.name).join(", ")}`,
+      );
+    }
     sendJson(res, 200, taskJson(app.queries.archiveTask(existing.id)));
   });
 
-  router.post("/api/projects/:id/tasks/sync", (_req, _res, _ctx) => {
-    throw badRequest("legacy task-source sync is disabled; import canonical eval packages instead");
+  // ---- standalone eval-store namespace (lookup across projects) ----
+
+  /** GET /api/evals — list evals across all projects (filterable). */
+  router.get("/api/evals", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const projectId = ctx.query.project_id;
+    const categoryName = ctx.query.category_name;
+    const includeArchived =
+      ctx.query.include_archived === "1" || ctx.query.include_archived === "true";
+    const out: Record<string, unknown>[] = [];
+    for (const project of app.queries.listProjects({ includeArchived })) {
+      if (projectId && project.id !== projectId) continue;
+      for (const task of app.queries.listTasks(project.id, { includeArchived })) {
+        if (categoryName && task.categoryName !== categoryName) continue;
+        out.push(taskJson(
+          task,
+          app.queries.listEvalQueuesUsingTask(project.id, task.id)
+            .map((q) => ({ id: q.id, name: q.name })),
+        ));
+      }
+    }
+    sendJson(res, 200, { evals: out });
   });
 
-  router.post("/api/projects/:id/tasks:push", (_req, _res, _ctx) => {
-    throw badRequest("flat HTTP-push tasks are disabled; import a canonical eval package instead");
+  /** GET /api/evals/:evalId — one eval by global id (no project prefix). */
+  router.get("/api/evals/:evalId", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const task = app.queries.getTask(ctx.params.evalId!);
+    if (!task) throw notFound("eval", ctx.params.evalId!);
+    sendJson(
+      res,
+      200,
+      taskJson(task, app.queries.listEvalQueuesUsingTask(task.projectId, task.id)
+        .map((q) => ({ id: q.id, name: q.name }))),
+    );
   });
 
-  // ---- runs (create under project) ----
-
-  router.post(
-    "/api/projects/:id/runs",
-    withIdempotency(async (req, res, ctx) => {
-      const app = appOf(ctx);
-      const project = requireProject(app.queries, ctx.params.id!);
-
-      const body = await readJsonBody<{
-        taskId?: string;
-        task_id?: string;
-        taskTags?: string[];
-        task_tags?: string[];
-        agent?: string;
-        agentId?: string;
-        agent_id?: string;
-        model?: string;
-        provider?: string;
-        repeats?: number;
-        params?: Record<string, unknown>;
-        adapterOverrides?: Record<string, unknown>;
-        adapter_overrides?: Record<string, unknown>;
-        autoJudge?: boolean;
-        trigger?: string;
-        trigger_ref?: string;
-      }>(req);
-
-    const taskId = body.taskId ?? body.task_id;
-    const taskTags = body.taskTags ?? body.task_tags ?? [];
-    let task: Task | null = null;
-
-    if (taskId) {
-      task = requireTask(app.queries, project.id, taskId);
-    } else if (taskTags.length > 0) {
-      const all = app.queries.listTasks(project.id);
-      task =
-        all.find(
-          (t) => t.tags && taskTags.every((tag) => t.tags!.includes(tag)),
-        ) ?? null;
-      if (!task) throw notFound(`no task matching tags: ${taskTags.join(",")}`);
-    } else {
-      throw badRequest("taskId (or taskTags) is required");
-    }
-
-    const configuredAdapter = app.queries.listProjectAgentAdapters(project.id, {
-      includeDisabled: true,
-    })[0];
-    const agentId = configuredAdapter?.agentId ?? project.defaultAgentId;
-    const requestedAgent = body.agent ?? body.agentId ?? body.agent_id;
-    if (requestedAgent && requestedAgent !== agentId) {
-      throw badRequest("runs must use the project's configured agent");
-    }
-    const model = body.model ?? project.defaultModel;
-    const provider = body.provider ?? project.defaultProvider;
-    if (!agentId || !model || !provider) {
-      throw badRequest("configure the project agent adapter, model, and provider first");
-    }
-    const repeats = Math.max(1, Math.min(100, Number(body.repeats ?? 1) || 1));
-
-    // Per-run adapter overrides (image pin, env, tool allowlist). Previously
-    // accepted and dropped; the image pin is recorded on the batch so every run
-    // in it launches from the requested image.
-    const runOverrides = body.adapterOverrides ?? body.adapter_overrides;
-    const pinnedImage =
-      runOverrides && typeof runOverrides.image === "string"
-        ? runOverrides.image
-        : runOverrides && typeof runOverrides.imageTag === "string"
-          ? runOverrides.imageTag
-          : undefined;
-
-    const batch = app.queries.createBatch({
-      taskId: task.id,
-      projectId: project.id,
-      agentId,
-      model,
-      provider,
-      params: body.params ?? {},
-      repeats,
-      trigger: body.trigger,
-      triggerRef: body.trigger_ref,
-      ...(pinnedImage ? { agentImage: pinnedImage } : {}),
-    });
-
-    const runs: Run[] = [];
-    for (let i = 0; i < repeats; i++) {
-      const r = app.queries.createRun({
-        batchId: batch.id,
-        taskId: task.id,
-        projectId: project.id,
-        agentId,
-        model,
-        provider,
-        repeatIndex: i,
-        status: "queued",
-        controlState: "running",
-        startedAt: new Date().toISOString(),
-        trigger: body.trigger,
-        triggerRef: body.trigger_ref,
-        ...(pinnedImage
-          ? { agentImage: pinnedImage, agentImageSource: "run_override" }
-          : {}),
-        // Store the WHOLE override blob, not just the image: env (proxy /
-        // gateway endpoints), params, and allowedTools are equally per-run.
-        ...(runOverrides ? { adapterOverrides: runOverrides } : {}),
-      });
-      runs.push(r);
-    }
-
-    // Start the first run (concurrency 1 → sequential via queue).
-    for (const r of runs) {
-      void enqueueStart(app, r.id);
-    }
-
-    const bodyOut = {
-      batch_id: batch.id,
-      run_ids: runs.map((r) => r.id),
-      runs: runs.map(runJson),
-      status: "accepted",
-    };
-    const headers = {
-      Location: `/api/runs/${runs[0]!.id}`,
-    };
-
-    // Idempotency capture is handled by the withIdempotency wrapper around this
-    // handler (method+path scoped, TOCTOU-safe via store.reserve). The inline
-    // per-key cache was removed: it keyed on the raw header alone (cross-route
-    // collision risk) and used check-then-act (concurrent double-execute).
-    sendJson(res, 202, bodyOut, headers);
-    }),
-  );
+  // ---- runs (read-only; execution is queue-scoped) ----
 
   router.get("/api/projects/:id/runs", (_req, res, ctx) => {
     const app = appOf(ctx);
@@ -1180,15 +822,17 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
 
   // ---- run detail / events / diff / report ----
 
-  router.get("/api/runs/:id", (_req, res, ctx) => {
+  router.get("/api/runs/:id", (req, res, ctx) => {
     const app = appOf(ctx);
     const run = requireRun(app.queries, ctx.params.id!);
+    assertResourceScope(req, app.queries, { runId: run.id });
     sendJson(res, 200, runJson(run));
   });
 
   router.get("/api/runs/:id/events", async (req, res, ctx) => {
     const app = appOf(ctx);
     const run = requireRun(app.queries, ctx.params.id!);
+    assertResourceScope(req, app.queries, { runId: run.id });
     // `since` is exclusive (last received seq). Default -1 so a first connect
     // with since=0 (common client convention for "from the start") still
     // includes seq 0 (run.start). readFromSeq yields seq > sinceSeq.
@@ -1212,9 +856,10 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     await streamEvents(req, res, app, run, sinceSeq, finalMode);
   });
 
-  router.get("/api/runs/:id/diff", async (_req, res, ctx) => {
+  router.get("/api/runs/:id/diff", async (req, res, ctx) => {
     const app = appOf(ctx);
     const run = requireRun(app.queries, ctx.params.id!);
+    assertResourceScope(req, app.queries, { runId: run.id });
     const path = resolveDiffPath(
       app.dataDir,
       run.projectId,
@@ -1230,161 +875,6 @@ function registerRoutes(router: Router, startOpts: CreateServerOptions["startOpt
     res.setHeader("Content-Length", Buffer.byteLength(text));
     res.end(text);
   });
-
-  // GET /api/runs/:id/report — serve report.html from the latest completed judgement (P5b)
-  router.get("/api/runs/:id/report", async (_req, res, ctx) => {
-    const app = appOf(ctx);
-    const run = requireRun(app.queries, ctx.params.id!);
-    const list = app.queries.listJudgements({ runId: run.id });
-    // Prefer status=completed with a verdictPath; newest first by endedAt||createdAt.
-    const candidates = list.judgements
-      .filter((j) => j.status === "completed" && j.verdictPath)
-      .slice();
-    candidates.sort((a, b) => {
-      const ta = a.endedAt ?? a.createdAt ?? "";
-      const tb = b.endedAt ?? b.createdAt ?? "";
-      if (ta !== tb) return tb.localeCompare(ta);
-      return b.id.localeCompare(a.id);
-    });
-    const j = candidates[0];
-    if (!j) {
-      throw notFound(`report not available for run ${run.id}`);
-    }
-    const p = join(judgementDir(app.dataDir, j.projectId, j.id), "report.html");
-    if (!existsSync(p)) {
-      throw notFound(`report not available for run ${run.id}`);
-    }
-    const download =
-      ctx.query.download === "1" || ctx.query.download === "true";
-    await serveHtmlFile(res, p, {
-      download,
-      filename: `report-${sanitizeFilenamePart(run.id)}.html`,
-    });
-  });
-
-  // ---- run control ----
-
-  router.post("/api/runs/:id/pause", async (req, res, ctx) => {
-    const app = appOf(ctx);
-    const run = requireRun(app.queries, ctx.params.id!);
-    assertNotTerminal(run);
-    const mode =
-      (ctx.query.mode === "hard" ? "hard" : "soft") as "soft" | "hard";
-    try {
-      const updated = await pauseRun(run.id, mode, app.queries, app.liveRuns);
-      sendJson(res, 200, runJson(updated));
-    } catch (err) {
-      mapControlError(err);
-    }
-  });
-
-  router.post("/api/runs/:id/resume", async (_req, res, ctx) => {
-    const app = appOf(ctx);
-    const run = requireRun(app.queries, ctx.params.id!);
-    assertNotTerminal(run);
-    try {
-      const updated = await resumeRun(run.id, app.queries, app.liveRuns);
-      sendJson(res, 200, runJson(updated));
-    } catch (err) {
-      mapControlError(err);
-    }
-  });
-
-  router.post("/api/runs/:id/abort", async (_req, res, ctx) => {
-    const app = appOf(ctx);
-    const run = requireRun(app.queries, ctx.params.id!);
-    assertNotTerminal(run);
-    try {
-      const updated = await abortRun(
-        run.id,
-        app.queries,
-        app.liveRuns,
-        app.outboundWebhooks,
-      );
-      sendJson(res, 200, runJson(updated));
-    } catch (err) {
-      mapControlError(err);
-    }
-  });
-
-  router.post("/api/runs/:id/control", async (req, res, ctx) => {
-    const app = appOf(ctx);
-    const run = requireRun(app.queries, ctx.params.id!);
-    const body = await readJsonBody<{
-      action?: string;
-      enabled?: boolean;
-      mode?: string;
-      value?: unknown;
-    }>(req);
-
-    const action = body.action;
-    if (!action) throw badRequest("action is required");
-
-    if (action === "network") {
-      if (typeof body.enabled !== "boolean") {
-        throw badRequest("enabled (boolean) is required for action=network");
-      }
-      // Network toggle is allowed even if terminal? Spec says live control —
-      // only while live. But tests expect 200 after start. If not live yet,
-      // create a stub or return 409.
-      try {
-        const result = setNetwork(run.id, body.enabled, app.liveRuns);
-        sendJson(res, 200, result);
-      } catch (err) {
-        // If run is queued and not yet live, wait briefly for start.
-        if (
-          err &&
-          typeof err === "object" &&
-          (err as { code?: string }).code === "NOT_LIVE"
-        ) {
-          // Brief wait for the start queue.
-          const ok = await waitForLive(app, run.id, 5_000);
-          if (!ok) {
-            throw conflict(`run ${run.id} is not live yet`);
-          }
-          const result = setNetwork(run.id, body.enabled, app.liveRuns);
-          sendJson(res, 200, result);
-          return;
-        }
-        mapControlError(err);
-      }
-      return;
-    }
-
-    assertNotTerminal(run);
-
-    if (action === "pause") {
-      const mode = body.mode === "hard" ? "hard" : "soft";
-      const updated = await pauseRun(run.id, mode, app.queries, app.liveRuns);
-      sendJson(res, 200, runJson(updated));
-      return;
-    }
-    if (action === "resume") {
-      const updated = await resumeRun(run.id, app.queries, app.liveRuns);
-      sendJson(res, 200, runJson(updated));
-      return;
-    }
-    if (action === "abort") {
-      const updated = await abortRun(
-        run.id,
-        app.queries,
-        app.liveRuns,
-        app.outboundWebhooks,
-      );
-      sendJson(res, 200, runJson(updated));
-      return;
-    }
-
-    throw badRequest(`unknown action: ${action}`);
-  });
-}
-
-function mapControlError(err: unknown): never {
-  if (err && typeof err === "object" && (err as { code?: string }).code === "TERMINAL") {
-    throw conflict(err instanceof Error ? err.message : "run is terminal");
-  }
-  if (err instanceof HttpError) throw err;
-  throw err;
 }
 
 function header(req: IncomingMessage, name: string): string | undefined {
@@ -1424,7 +914,7 @@ function apiTokenJson(t: {
 /**
  * Token management routes. Always registered; when authEnabled the pre-dispatch
  * gate requires a valid (non-read-only for writes) Bearer. Bootstrap the first
- * token via `queries.createApiToken(...)` (CLI/seed) — there is no unauthenticated
+ * token via `queries.createApiToken(...)` (seed) — there is no unauthenticated
  * mint path when auth is on.
  */
 function registerTokenRoutes(router: Router): void {
@@ -1497,21 +987,6 @@ function registerTokenRoutes(router: Router): void {
   });
 }
 
-async function waitForLive(
-  app: AppCtx,
-  runId: string,
-  timeoutMs: number,
-): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (app.liveRuns.has(runId)) return true;
-    const r = app.queries.getRun(runId);
-    if (r && isTerminalStatus(r.status)) return false;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  return app.liveRuns.has(runId);
-}
-
 // ---------------------------------------------------------------------------
 // createServer
 // ---------------------------------------------------------------------------
@@ -1532,95 +1007,92 @@ export function createServer(opts: CreateServerOptions): ApiServer {
     ? { queries: opts.queries, dataDir: opts.dataDir }
     : open(opts.dataDir);
 
-  const liveRuns = createLiveRunsMap();
   const liveQueueContainers = createLiveQueueContainersMap();
   const authEnabled = opts.authEnabled === true;
 
-  // Reconcile analyses orphaned by a prior process (a crash, deploy, or OOM
-  // that killed an in-flight judge mid-run). Any queued/running analysis left
-  // over can no longer be completed — its worker is gone — so mark it failed
-  // rather than leaving a permanent "running" zombie. This is the prod-grade
-  // guard so a judge death never silently wedges a queue report forever.
-  const orphanSweep = (): void => {
-    for (const row of opened.queries.listOrphanedAnalyses()) {
-      opened.queries.updateQueueAnalysis(row.id, {
-        status: "failed",
-        error: `judge worker interrupted before completion (reconciled at server startup); prior status: ${row.status}`,
-      });
-    }
+  // Build the production watcher seams: resolve SHA via the injected resolver or
+  // GitHub client, detect an active generation, and launch a queue generation
+  // pinned to an immutable commit override. When that generation closes, the
+  // oldest pending watcher event for the queue is auto-launched next (FIFO),
+  // continuing across generations with no intermediate commit dropped.
+  const makeLauncher = (baseOpts?: StartQueueContainerOptions) => {
+    return async (queueId: string, commit: string) => {
+      const queue = opened.queries.getEvalQueue(queueId);
+      if (!queue) return { launched: false as const };
+      const project = opened.queries.getProject(queue.projectId);
+      if (!project) return { launched: false as const };
+      const startOpts: StartQueueContainerOptions = {
+        ...(baseOpts ?? {}),
+        agentCommitOverride: commit,
+        onQueueDrained: async () => {
+          // Generation closed: continue the FIFO with the oldest pending event
+          // for this queue. If the launch fails, revert it to pending so it is
+          // not dropped and can be retried on a later close.
+          const next = opened.queries.nextPendingWatcherEvent(queueId);
+          if (!next?.resolvedSha) return;
+          opened.queries.markWatcherEventLaunching(next.id);
+          const r = await makeLauncher(baseOpts)(queueId, next.resolvedSha).catch(async () => {
+            opened.queries.markWatcherEventPending(next.id);
+            return { launched: false as const };
+          });
+          if (r.launched && r.batchId) {
+            opened.queries.markWatcherEventLaunched(next.id, r.batchId, next.resolvedSha!);
+          } else {
+            opened.queries.markWatcherEventPending(next.id);
+          }
+        },
+      };
+      const live = await startQueueContainer(
+        app.dataDir,
+        opened.queries,
+        queueId,
+        liveQueueContainers,
+        startOpts,
+      );
+      return { launched: true as const, batchId: live.batchId };
+    };
   };
-  if (opts.reconcileOrphans !== false) orphanSweep();
 
-  // Outbound webhooks (P8c): default RealDeliverySink dispatcher unless
-  // explicitly disabled (null) or a pre-built dispatcher is injected.
-  let outboundWebhooks: OutboundWebhookDispatcher | undefined;
-  if (opts.outboundDispatcher === null) {
-    outboundWebhooks = undefined;
-  } else if (opts.outboundDispatcher) {
-    outboundWebhooks = opts.outboundDispatcher;
-  } else {
-    outboundWebhooks = new OutboundWebhookDispatcher({
-      queries: opened.queries,
-      sink: opts.outboundSink ?? new RealDeliverySink(),
-      ...(opts.outboundBackoffMs ? { backoffMs: opts.outboundBackoffMs } : {}),
-    });
-  }
+  const watcherSeams: WatcherSeams =
+    opts.watcherSeams ??
+    {
+      async resolveSha(repo, ref) {
+        if (opts.refResolver) {
+          const r = await opts.refResolver.resolveRef(repo, ref);
+          return { sha: r.sha };
+        }
+        throw new Error("watcher SHA resolution not configured");
+      },
+      hasActiveGeneration(queueId: string) {
+        return opened.queries.getActiveQueueContainer(queueId) != null;
+      },
+      launch: makeLauncher(opts.queueStartOpts
+        ? { runtime: opts.queueStartOpts.runtime, timeoutMs: opts.queueStartOpts.timeoutMs }
+        : undefined),
+    };
 
   const app: AppCtx = {
     queries: opened.queries,
     dataDir: opts.dataDir,
-    liveRuns,
     liveQueueContainers,
-    concurrency: opts.concurrency ?? 1,
-    // LRU + TTL store; still Map-compatible for the inline run/judgement caches.
     idempotency: new IdempotencyStore(),
-    startQueue: [],
-    activeStarts: 0,
     authEnabled,
-    refResolver: opts.refResolver ?? defaultRefResolver(),
-    // Bound below after app is constructed so the closure sees the final object.
-    enqueueStart: () => undefined,
-    batchClaims: createBatchClaimStore(),
-    judgeRunner: createRealJudgeRunner(),
+    watcherSeams,
     ...(opts.githubClient ? { githubClient: opts.githubClient } : {}),
   };
-  // Wire the real start-pipeline seam (concurrency-limited).
-  app.enqueueStart = (runId: string) => enqueueStart(app, runId);
-  app.startOpts = opts.startOpts;
   if (opts.queueStartOpts) app.queueStartOpts = opts.queueStartOpts;
-  if (outboundWebhooks) app.outboundWebhooks = outboundWebhooks;
-  if (opts.defaultSystemPromptVersion) {
-    app.defaultSystemPromptVersion = opts.defaultSystemPromptVersion;
-  }
-  if (opts.defaultJudgeModel) app.defaultJudgeModel = opts.defaultJudgeModel;
-  if (opts.defaultJudgeProvider) {
-    app.defaultJudgeProvider = opts.defaultJudgeProvider;
-  }
 
   const router = new Router();
-  registerRoutes(router, opts.startOpts);
-  // Judgement routes (P4c) — modular mount so this file stays focused on runs.
-  registerJudgementRoutes(router);
-  // Findings / issues-log routes (P6b) — list + lifecycle detail + k/N.
-  registerFindingsRoutes(router);
-  // Regression views (P7b) — trend + two-run compare + release compare.
-  registerRegressionRoutes(router);
+  registerRoutes(router);
   // Watcher rules + webhook ingress (P8b) — modular mount.
   registerWatcherRoutes(router);
   registerAdapterRoutes(router);
   registerQueueRoutes(router);
-  // Outbound webhook subscriptions (P8c) — CRUD + deliveries + test fire.
-  registerWebhooksRoutes(router);
   // Settings + password auth + project export (P9).
   registerSettingsRoutes(router);
-  // Project-scoped reusable rubrics — CRUD.
-  registerRubricRoutes(router);
-  registerArtifactRoutes(router);
+  registerArchiveRoutes(router);
   registerSandboxRoutes(router);
-  registerReleaseRoutes(router);
-  registerCommitEvalRoutes(router);
   registerGitHubRoutes(router);
-  registerImprovementRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {
@@ -1631,7 +1103,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
         const path = qIdx === -1 ? url : url.slice(0, qIdx);
 
         // Pre-dispatch auth gate. When authEnabled is false (default), this is a
-        // no-op — existing unauthenticated tests + local UI keep working.
+        // no-op — existing unauthenticated tests + local API clients keep working.
         // When true, every /api/* route (except GET /api/health) requires a
         // valid Bearer token; read-only tokens cannot write; project-scoped
         // tokens must match the path project.
@@ -1655,7 +1127,6 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   return {
     server,
     queries: app.queries,
-    liveRuns,
     liveQueueContainers,
     app,
     listen(port = 0, host = "127.0.0.1") {
@@ -1673,18 +1144,6 @@ export function createServer(opts: CreateServerOptions): ApiServer {
       });
     },
     async close() {
-      // Best-effort abort of live runs so tests don't hang.
-      for (const [id, live] of [...liveRuns.entries()]) {
-        try {
-          if (!live.finished) {
-            await live.controller.abort().catch(() => undefined);
-            await live.handle.remove().catch(() => undefined);
-          }
-        } catch {
-          // ignore
-        }
-        liveRuns.delete(id);
-      }
       for (const live of [...liveQueueContainers.values()]) {
         await live.stop().catch(() => undefined);
       }
@@ -1698,16 +1157,6 @@ export function createServer(opts: CreateServerOptions): ApiServer {
 
 // Re-exports for consumers / tests.
 export {
-  createLiveRunsMap,
-  isTerminalStatus,
-  startRun,
-  pauseRun,
-  resumeRun,
-  abortRun,
-  setNetwork,
-};
-export type { LiveRun, LiveRunsMap, StartRunOptions } from "./run-controller-bridge.js";
-export {
   createLiveQueueContainersMap,
   startQueueContainer,
 } from "../runner/queue-worker.js";
@@ -1716,15 +1165,3 @@ export type {
   LiveQueueContainersMap,
   StartQueueContainerOptions,
 } from "../runner/queue-worker.js";
-export {
-  OutboundWebhookDispatcher,
-  RealDeliverySink,
-  signPayload,
-  buildEventPayload,
-  dispatch,
-} from "./webhooks/outbound.js";
-export type {
-  DeliverySink,
-  OutboundEvent,
-  DispatchOpts,
-} from "./webhooks/outbound.js";

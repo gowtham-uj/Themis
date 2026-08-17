@@ -88,7 +88,7 @@ export interface PortMapping {
   /** Host port to publish on; 0 (or omitted) → runtime picks a free one. */
   hostPort?: number;
   protocol?: "tcp" | "udp";
-  /** Optional label surfaced in the UI/telemetry (e.g. "devserver", "cdp"). */
+  /** Optional label surfaced in telemetry (e.g. "devserver", "cdp"). */
   name?: string;
 }
 
@@ -160,6 +160,13 @@ export interface ContainerRuntime {
    * throws: an unavailable backend reports false, signaling the caller to build.
    */
   imageExists(image: string): Promise<boolean>;
+  /**
+   * Resolve a local image to its immutable content id (e.g. `podman image inspect
+   * --format {{.Id}}`). Returns null when the image is absent. Used to key
+   * derived images by the real bytes, so retagging an existing tag to new
+   * content invalidates downstream caches.
+   */
+  imageId?(image: string): Promise<string | null>;
   /**
    * Pull the image if missing (registry policy), then launch and return a handle. The caller owns the
    * lifecycle: stream stdout via the handle, then `wait()`, then `remove()`.

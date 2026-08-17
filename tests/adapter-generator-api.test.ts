@@ -77,7 +77,7 @@ describe("adapter from-generator API", () => {
   it("runs the generator, validates + stores the emitted adapter, persists the script", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "agenteval-gen-api-"));
     dirs.push(dataDir);
-    const api = createServer({ dataDir, outboundDispatcher: null });
+    const api = createServer({ dataDir });
     servers.push(api);
     const port = await api.listen(0);
     const base = `http://127.0.0.1:${port}`;
@@ -125,7 +125,7 @@ describe("adapter from-generator API", () => {
   it("runs a Node.js npm generator without a source repository", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "agenteval-gen-js-"));
     dirs.push(dataDir);
-    const api = createServer({ dataDir, outboundDispatcher: null });
+    const api = createServer({ dataDir });
     servers.push(api);
     const port = await api.listen(0);
     const base = `http://127.0.0.1:${port}`;
@@ -165,7 +165,7 @@ process.stdout.write(JSON.stringify(adapter));`;
   it("rejects a generator whose emitted agent_id differs from the request", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "agenteval-gen-id-"));
     dirs.push(dataDir);
-    const api = createServer({ dataDir, outboundDispatcher: null });
+    const api = createServer({ dataDir });
     servers.push(api);
     const port = await api.listen(0);
     const base = `http://127.0.0.1:${port}`;
@@ -195,7 +195,7 @@ process.stdout.write(JSON.stringify({
   it("generates the pinned Codex and Claude Code npm adapters", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "agenteval-gen-examples-"));
     dirs.push(dataDir);
-    const api = createServer({ dataDir, outboundDispatcher: null });
+    const api = createServer({ dataDir });
     servers.push(api);
     const port = await api.listen(0);
     const base = `http://127.0.0.1:${port}`;
@@ -234,7 +234,7 @@ process.stdout.write(JSON.stringify({
   it("rejects a generator that emits invalid JSON", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "agenteval-gen-bad-"));
     dirs.push(dataDir);
-    const api = createServer({ dataDir, outboundDispatcher: null });
+    const api = createServer({ dataDir });
     servers.push(api);
     const port = await api.listen(0);
     const base = `http://127.0.0.1:${port}`;

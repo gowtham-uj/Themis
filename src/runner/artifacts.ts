@@ -4,19 +4,17 @@
  *
  * The canonical location is `<runDir>/workspace/outputs`, the same directory the
  * `outputs` diff kind hashes into a manifest (see diff-category.ts). Reusing it
- * means a browser/data/research run has exactly one place to write, and findings
- * that carry a `kind:"artifact"` ref use a path relative to that directory —
- * which is what the judge prompt tells the model to emit.
+ * means a browser/data/research run has exactly one place to write. Captured
+ * output paths are recorded relative to that directory.
  *
- * This module is pure filesystem: no HTTP, no DB. The API layer serves what it
- * lists, and the UI renders images inline so a screenshot is one click from the
- * finding that cites it.
+ * This module is pure filesystem: no HTTP and no database access. Its inventory
+ * feeds retention and immutable eval archives.
  */
 
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 
 /** One artifact under a run's outputs dir. */
 export interface RunArtifact {
@@ -26,7 +24,7 @@ export interface RunArtifact {
   sha256: string;
   /** Best-effort content type from the extension. */
   contentType: string;
-  /** True for types the UI can render inline (screenshot review). */
+  /** True for image output types. */
   isImage: boolean;
   /** Last-modified time, ISO-8601. */
   modifiedAt: string;
@@ -83,44 +81,17 @@ export function artifactContentType(p: string): string {
   );
 }
 
-/** True when the UI can render this artifact inline as an image. */
+/** True when an artifact path has a recognized image extension. */
 export function isImageArtifact(p: string): boolean {
   return extOf(p) in IMAGE_TYPES;
 }
 
 /**
  * The outputs directory for a run — where the sandbox writes screenshots and
- * other artifacts, and the root that `kind:"artifact"` ref paths resolve against.
+ * other generated outputs before the eval archive is sealed.
  */
 export function artifactsDir(runDir: string): string {
   return join(runDir, "workspace", "outputs");
-}
-
-/**
- * Resolve an artifact-relative path to an absolute one, refusing anything that
- * escapes the outputs dir.
- *
- * Refs come from judge output — model-authored text — so `../../etc/passwd` and
- * absolute paths are both live inputs, not hypotheticals. Returns undefined
- * rather than throwing so callers map it to a 404 without leaking whether the
- * traversal target exists.
- */
-export function resolveArtifactPath(
-  runDir: string,
-  relPath: string,
-): string | undefined {
-  if (typeof relPath !== "string" || !relPath.trim()) return undefined;
-  // Reject absolute paths before any normalization — stripping the leading
-  // slash would silently turn `/etc/passwd` into a lookup we then serve.
-  const cleaned = relPath.trim();
-  if (isAbsolute(cleaned) || /^[\\/]/.test(cleaned)) return undefined;
-  if (cleaned.split(/[\\/]/).some((seg) => seg === "..")) return undefined;
-  const root = resolve(artifactsDir(runDir));
-  const abs = resolve(root, cleaned);
-  const rel = relative(root, abs);
-  // Empty rel means abs === root (a directory, not an artifact).
-  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return undefined;
-  return abs;
 }
 
 /** sha256 of a file, streamed (artifacts can be large screenshots/videos). */

@@ -3,7 +3,7 @@
  * Spec: plan/event-schema.md
  *
  * Flat, append-only, discriminated by `type`. Storage is JSONL; consumers
- * (SSE, judge, UI) read the same vocabulary.
+ * API consumers and archive readers use the same vocabulary.
  */
 
 /** Schema version currently emitted by adapters. */

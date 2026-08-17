@@ -54,8 +54,7 @@ export interface Anchors {
 }
 
 /**
- * A single scored criterion within a rubric. The unit that receives a 0.0–1.0
- * score with anchored descriptions so judging is absolute, not relative.
+ * A single criterion within an eval rubric, with stable anchored expectations.
  */
 export interface Criterion {
   /** Stable id within the rubric (e.g. "A1", "D2"). */
@@ -66,20 +65,19 @@ export interface Criterion {
   label: string;
   /** Weight within its axis (renormalized §7). */
   weight: number;
-  /** If true, failing it caps the overall verdict at "fail". */
+  /** If true, failing it marks the criterion as critical. */
   critical?: boolean;
   /** Which categories this criterion applies to. */
   appliesTo: AppliesTo;
   /** Anchored per-level meanings. */
   anchors: Anchors;
-  /** Optional deterministic check that grounds/overrides the judged score. */
+  /** Optional deterministic check associated with this criterion. */
   checkId?: string;
 }
 
 /**
- * A deterministic hook (plan/rubric.md §5): tests, build, typecheck, lint,
- * repro, secret_scan, perf_bench, http. Result is exact and cheap; the judge
- * reconciles with it. Tracked separately as pass-rates.
+ * A deterministic hook: tests, build, typecheck, lint, repro, secret_scan,
+ * perf_bench, or HTTP. Results are retained separately as pass-rates.
  */
 export interface Check {
   /** Stable id referenced by Criterion.checkId. */
@@ -135,7 +133,7 @@ export interface TaskSpec {
   rubric: Rubric;
   tags?: string[];
   profile?: TaskProfile;
-  /** Path/url to a reference solution (optional, gated access for judge). */
+  /** Optional path or URL to a reference solution retained outside the agent container. */
   referenceSolution?: string;
   /** Per-task checks (also in rubric.checks; convenience field). */
   checks?: Check[];

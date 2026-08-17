@@ -6,7 +6,7 @@
  *
  * Loopback / local-dev bypass:
  *   When `authEnabled` is false (the createServer default), no bearer is
- *   required. This keeps the existing test suite + UI server-side fetch working
+ *   required. This keeps the existing test suite + local API clients working
  *   unauthenticated on 127.0.0.1/::1. When `authEnabled: true`, every /api/*
  *   route (except GET /api/health) requires a valid non-revoked token — even
  *   from loopback. There is intentionally no silent loopback bypass in the
@@ -153,7 +153,7 @@ export function authMiddleware(
   const authEnabled = opts.authEnabled === true;
   return async (req, res, ctx) => {
     if (!authEnabled) {
-      // Local-dev / test default: no bearer required (loopback UI + suite).
+      // Local-dev / test default: no bearer required (loopback API clients + suite).
       return true;
     }
 
@@ -250,6 +250,13 @@ export function isPublicApiPath(method: string, path: string): boolean {
     m === "POST" &&
     (path === "/api/auth/login" || path === "/api/auth/login/")
   ) {
+    return true;
+  }
+  // The signed inbound git webhook is bearer-exempt: GitHub signs the payload
+  // with the watcher's shared secret, which IS the authentication. Only the
+  // exact signed hook route is exempt — all watcher CRUD, manual fire, and the
+  // event list remain bearer-protected and project-scoped.
+  if (m === "POST" && /^\/api\/projects\/[^/]+\/watcher\/hooks\/[^/]+$/.test(path)) {
     return true;
   }
   return false;

@@ -209,13 +209,6 @@ describe("buildExportBundle (secret-strip invariant)", () => {
       webhookSecret: "super-secret-webhook-value-do-not-leak",
     });
 
-    // Seed an outbound webhook subscription WITH a secret.
-    res.queries.createOutboundSubscription(project.id, {
-      url: "https://example.com/hook",
-      secret: "super-secret-outbound-value-do-not-leak",
-      eventTypes: ["run.completed"],
-    });
-
     // Seed an API token (hash stored; plaintext returned once at creation).
     const created = res.queries.createApiToken({
       userId: null,
@@ -232,19 +225,14 @@ describe("buildExportBundle (secret-strip invariant)", () => {
     // --- Serialized bundle must contain NO secret VALUES. ---
     const serialized = JSON.stringify(bundle);
     expect(serialized).not.toContain("super-secret-webhook-value-do-not-leak");
-    expect(serialized).not.toContain("super-secret-outbound-value-do-not-leak");
     expect(serialized).not.toContain("pw-export-secret");
     expect(serialized).not.toContain(created.token); // plaintext token
     expect(serialized).not.toContain(created.tokenHash); // token_hash
 
-    // --- Structural: watchers/outbound have secret fields forced to null. ---
+    // --- Structural: watchers have inbound webhook secret forced to null. ---
     for (const w of bundle.watchers) {
       const ww = w as { webhookSecret?: unknown };
       expect(ww.webhookSecret).toBeNull();
-    }
-    for (const s of bundle.outboundWebhooks) {
-      const ss = s as { secret?: unknown };
-      expect(ss.secret).toBeNull();
     }
 
     // --- User password hashes never travel in a project export bundle ---

@@ -327,6 +327,117 @@ function resolveStore(ctx: RequestContext): IdempotencyStore | IdempotencyMapLik
   return dedupStore;
 }
 
+/**
+ * Body-aware idempotency for idempotent *start/run* endpoints (e.g. queue
+ * generation start).
+ *
+ * The request body digest is folded into the store key, so a retry with the SAME
+ * Idempotency-Key but a DIFFERENT body is not silently replayed as the original:
+ * it resolves to a distinct key that is not yet present, and the handler runs
+ * again the way it would for any fresh key. Callers who want strict dedup of
+ * "the same logical start" must send the same body (and the same key). This keeps
+ * TOCTOU safety identical to {@link withIdempotency} (reserve runs synchronously
+ * before the handler) while making a digest mismatch not collide with a prior
+ * successful start.
+ *
+ * `digest` is the caller-owned body SHA-256 hex. Returns a wrapped handler that
+ * replays a cached completed response for (method,path,key,digest) or runs the
+ * handler and caches its JSON response.
+ */
+export function withBodyIdempotency(
+  digest: string,
+  handler: RouteHandler,
+): RouteHandler {
+  return async (req, res, ctx) => {
+    const rawKey = header(req, "idempotency-key");
+    if (!rawKey) {
+      await handler(req, res, ctx);
+      return;
+    }
+
+    const store = resolveStore(ctx);
+    // Fold the body digest into the store key so a same-key/different-body retry
+    // is treated as a fresh logical request, never a stale replay.
+    const storeKey = idempotencyStoreKey(ctx.method, ctx.path, `${rawKey}\0${digest}`);
+
+    // Replay a completed response.
+    const cached = store.get(storeKey);
+    if (cached) {
+      sendJson(res, cached.status, cached.body, cached.headers);
+      return;
+    }
+
+    const storeLike = store as IdempotencyStore;
+    const canReserve = typeof storeLike.reserve === "function";
+    if (canReserve && !storeLike.reserve(storeKey)) {
+      const ref = storeLike.getReference(storeKey);
+      if (ref && !("pending" in ref)) {
+        const entry: IdempotencyEntry = { status: ref.status, body: ref.body };
+        if (ref.headers) entry.headers = ref.headers;
+        sendJson(res, entry.status, entry.body, entry.headers);
+        return;
+      }
+      sendJson(
+        res,
+        409,
+        {
+          error: "idempotency_conflict",
+          detail: "a queue start with this Idempotency-Key + body is already in flight; retry the same key + body",
+        },
+        { "Content-Type": "application/problem+json" },
+      );
+      return;
+    }
+
+    const box: { buf: Buffer | null } = { buf: null };
+    const origEnd = res.end.bind(res);
+    (res as ServerResponse).end = ((
+      chunk?: unknown,
+      encodingOrCb?: unknown,
+      cb?: unknown,
+    ) => {
+      if (chunk !== undefined && chunk !== null && typeof chunk !== "function") {
+        if (Buffer.isBuffer(chunk)) {
+          box.buf = chunk;
+        } else if (typeof chunk === "string") {
+          const enc = typeof encodingOrCb === "string" ? encodingOrCb : "utf8";
+          box.buf = Buffer.from(chunk, enc as BufferEncoding);
+        }
+      }
+      res.end = origEnd;
+      if (typeof encodingOrCb === "function") return origEnd(chunk as never, encodingOrCb as never);
+      if (typeof cb === "function") return origEnd(chunk as never, encodingOrCb as never, cb as never);
+      return origEnd(chunk as never, encodingOrCb as never);
+    }) as typeof res.end;
+
+    try {
+      await handler(req, res, ctx);
+    } catch (err) {
+      if (canReserve) storeLike.release(storeKey);
+      throw err;
+    } finally {
+      res.end = origEnd;
+    }
+
+    if (box.buf && res.statusCode >= 200 && res.statusCode < 500) {
+      let body: unknown = box.buf.toString("utf8");
+      try {
+        body = JSON.parse(body as string);
+      } catch {
+        // keep raw string
+      }
+      const headers: Record<string, string> = {};
+      const loc = res.getHeader("Location");
+      if (typeof loc === "string") headers.Location = loc;
+      store.set(storeKey, {
+        status: res.statusCode,
+        body,
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      });
+    }
+  };
+}
+
 /** Minimal Map-like surface AppCtx.idempotency satisfies. */
 export type IdempotencyMapLike = {
   has(key: string): boolean;

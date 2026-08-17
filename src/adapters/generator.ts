@@ -215,9 +215,9 @@ export const GENERATOR_CONTRACT = {
     "image",
     "command {argv, env?, cwd?, timeout_ms?}",
     "connection_check {argv,...} OR derive_connection_check: true",
-    "evidence {paths, required_paths?}",
+    "evidence {paths, required_paths?, manifest?}",
     "parser_kind (canonical-jsonl | pi-jsonl | reapercode-jsonl)",
-    "install_type (source-build | npm)",
+    "install_type (source-build | npm | binary)",
     "source_repo (required for source-build; optional for npm)",
     "containerfile",
     "default_provider",
@@ -252,7 +252,19 @@ cat <<JSON
   "parser_kind": "canonical-jsonl",
   "evidence": {
     "paths": [".agent-runs", ".agent-logs"],
-    "required_paths": [".agent-runs"]
+    "required_paths": [".agent-runs"],
+    "manifest": [
+      {
+        "id": "trace",
+        "role": "trace",
+        "path": ".agent-runs/*.jsonl",
+        "format": "jsonl",
+        "primary": true,
+        "select": "latest_mtime",
+        "record": { "kindField": "type", "tsField": "timestamp", "idField": "id" }
+      },
+      { "id": "logs", "role": "logs", "path": ".agent-logs", "format": "dir", "select": "all" }
+    ]
   },
   "enabled": true
 }
@@ -270,7 +282,19 @@ const adapter = {
   command: { argv: ["agent", "{{prompt}}"], cwd: "/workspace", timeout_ms: 600000 },
   derive_connection_check: true,
   parser_kind: "canonical-jsonl",
-  evidence: { paths: [".agent-runs"] },
+  evidence: {
+    paths: [".agent-runs"],
+    manifest: [
+      {
+        id: "trace",
+        role: "trace",
+        path: ".agent-runs/*.jsonl",
+        format: "jsonl",
+        primary: true,
+        select: "latest_mtime"
+      }
+    ]
+  },
   shared: false,
 };
 process.stdout.write(JSON.stringify(adapter));`,

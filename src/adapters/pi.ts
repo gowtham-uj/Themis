@@ -309,7 +309,7 @@ export function mapPiEvent(
       const turn = state.turn >= 0 ? state.turn : 0;
       const fullText = extractTextFromMessage(message);
       const fullThinking = extractThinkingFromMessage(message);
-      // Emit full snapshots when we have content (UI concatenates deltas; storage keeps both).
+      // Emit full snapshots when we have content (clients can concatenate deltas; storage keeps both).
       if (fullThinking.text.length > 0) {
         const thinkingEv: CanonicalEvent = {
           ...envelope(next()),
@@ -504,7 +504,7 @@ export function mapPiEvent(
     case "thinking_level_changed":
     case "message_start":
     case "tool_execution_update": {
-      // Intermediate / UI-only — skip noise (or debug if needed).
+      // Intermediate / adapter-only — skip noise (or debug if needed).
       return out;
     }
     default: {
@@ -1012,7 +1012,7 @@ export async function* runPi(
     child.on("close", (code) => resolveExit(code ?? 1));
   });
 
-  // Stream stdout lines as they arrive (true streaming for live UI).
+  // Stream stdout lines as they arrive (true streaming for live API consumers).
   const rl = createInterface({ input: stdout, crlfDelay: Infinity });
   const state = createPiParseState(options.resolvedCommit, {
     deferRunEnd: true,
@@ -1157,7 +1157,34 @@ export const piAdapter: Adapter = {
     return buildPiCommand(ctx);
   },
   evidence() {
-    return { paths: [".pi"] };
+    // pi stores its append-only session tree as JSONL files under --session-dir
+    // (default /workspace/.pi): `<timestamp>_<sessionId>.jsonl`, line 1 = the
+    // SessionHeader (type "session"), the rest AgentSessionEvent lines. The whole
+    // tree is retained verbatim; this manifest only adds the role-typed map.
+    return {
+      paths: [".pi"],
+      manifest: [
+        {
+          id: "session",
+          role: "session",
+          path: ".pi",
+          format: "dir",
+          required: true,
+          primary: true,
+          label: "pi session directory",
+        },
+        {
+          id: "trace",
+          role: "trace",
+          path: ".pi/*.jsonl",
+          format: "jsonl",
+          primary: true,
+          select: "latest_mtime",
+          label: "pi session JSONL stream",
+          record: { kindField: "type", tsField: "timestamp", idField: "id" },
+        },
+      ],
+    };
   },
   parse(streams: AgentStreams, ctx: RunContext): AsyncIterable<CanonicalEvent> {
     // Defer run.end until exitCode is known so crash mid-stream → failed.

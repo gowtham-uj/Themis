@@ -153,14 +153,3 @@ export function resolveAdapterOverrides(
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/**
- * Resolve the container network mode for a run: an explicit per-run/adapter
- * `network` override wins over the project's stored `network_policy`.
- */
-export function resolveRunNetwork(
-  project: ProjectExecConfig | null | undefined,
-  overrides?: AdapterOverrides,
-): NetworkMode {
-  if (overrides?.network) return resolveNetworkMode(overrides.network);
-  return resolveNetworkMode(project?.networkPolicy);
-}

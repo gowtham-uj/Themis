@@ -29,7 +29,11 @@ interface Adapter {
     cwd?: string;
     timeoutMs?: number;
   };
-  evidence(ctx: RunContext): { paths: string[]; requiredPaths?: string[] };
+  evidence(ctx: RunContext): {
+    paths: string[];
+    requiredPaths?: string[];
+    manifest: EvidenceEntry[];   // role-typed map (trace/transcript/result/tool_calls/model_calls/tmp/…)
+  };
   parse(streams: AgentStreams, ctx: RunContext): AsyncIterable<CanonicalEvent>;
 }
 ```
@@ -43,6 +47,14 @@ The shared queue runner does: resolve exact adapter → start one persistent Pod
 connection check → optional configure → for each ordered eval, prepare workspace → exec `command()` →
 raw/canonical capture → diff/checks/native evidence → cleanup/reset → immutable archive seal. Event
 payloads are persisted verbatim; redaction is deferred.
+
+The adapter's `evidence.manifest` is a **role-typed map** of its native evidence: each `EvidenceEntry`
+has a stable `id`, a `role` (`trace`, `transcript`, `result`, `tool_calls`, `model_calls`, `session`,
+`logs`, `tmp`, `other`), a workspace-relative `path` (globs allowed), a `format`, and optional
+`required`/`primary`/`select`/`record` fields. The runner snapshots the manifest onto the run at claim
+time (`adapter-evidence.json` + a derived `evalContext.roles` on `run.json`) and, when sealing, hoists
+each role into a stable archive folder (`session/`, `model-calls/`, `tool-logs/`, `tmp/`) so a judge
+binds evidence by role id rather than by path folklore.
 
 ## Workspace prep (shared)
 
@@ -63,7 +75,7 @@ boundary. This is separate from adapters (adapters *run* an agent; task sources 
 The core speaks the `TaskSource` interface in [projects.md](projects.md); built-ins ship for
 `ui-builder`, `repo-md` (markdown specs in a repo, synced from the workspace commit), `manifest-yaml`,
 `ci-artifact`, and `http-push`. A project picks one primary source; adding a new ingest method =
-implementing one `TaskSource`, not touching the runner, judge, or storage. Family checks and adapter
+implementing one `TaskSource`, not touching the runner or storage. Family checks and adapter
 overrides for a project come from its settings, not from the task source.
 
 ## ReaperCode adapter
@@ -74,10 +86,15 @@ overrides for a project come from its settings, not from the task source.
   node bin/reaper exec run --prompt "<task.prompt>" \
     --workspace /workspace \
     --provider <provider> --model <model> \
-    [--reasoning-effort <e>] [--max-tokens <n>] \
+    [--reasoning-effort low|medium|high] [--thinking on|off] [--max-tokens <n>] \
     --stream-events            # new flag (change ②A): JSONL trajectory → stdout
   ```
   Keys via `.env`/env (`ANTHROPIC_API_KEY`, `MINIMAX_API_KEY`, …) injected by the runner.
+- **Model effort / thinking knobs**: forwarded from the adapter's `params` (set at the adapter or
+  queue level via `adapter_overrides.params`). `reasoningEffort` (or `reasoning_effort`) accepts
+  `low|medium|high` → `--reasoning-effort`; `thinking` (or `thinking_mode`) accepts
+  `on|off|enabled|disabled` → `--thinking`; `maxTokens` → `--max-tokens`. Invalid values are
+  dropped, not forwarded.
 - **Parse**: read stdout as JSONL trajectory entries; map by `kind` per the table in
   [event-schema.md](event-schema.md). If `--stream-events` isn't used, instead tail the file at
   `--trajectory-path` (change ②B).
@@ -110,7 +127,7 @@ overrides for a project come from its settings, not from the task source.
 3. Define real connection/configure/eval argv, provider credential mappings, and evidence paths.
 4. Emit canonical JSONL directly or install a wrapper that preserves native output and maps it.
 5. Generate, validate, build, start a queue, run at least two sequential evals, verify archives, and run
-   the real PI judge.
+   archive consumers.
 6. Set `shared: true` only when other projects should be able to select this exact adapter row.
 
 ## Robustness rules (all adapters)

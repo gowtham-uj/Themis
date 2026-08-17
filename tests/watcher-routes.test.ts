@@ -1,9 +1,11 @@
 /**
- * Watcher HTTP routes (P8b-routes).
+ * Per-project agent-commit queue watcher routes (P8b-routes).
  *
- * Boots the real API server on a temp dataDir with an offline ref resolver
- * (no network git). HMAC tests sign payloads with the once-surfaced secret.
- * No agent or judge execution is involved: routes enqueue, they do not run.
+ * Boots the real API server on a temp dataDir with an offline resolver + a fake
+ * generation launcher (no network git, no container backend). HMAC tests sign
+ * payloads with the once-surfaced secret. Watch a queue watcher bound to a
+ * source adapter; the queue must have a source-built adapter whose source_repo
+ * equals the watcher repo.
  */
 import { createHmac } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -12,7 +14,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer, type ApiServer } from "../src/api/server.ts";
 import type { Rubric, TaskSpec } from "../src/domain.ts";
-import type { RefResolver } from "../src/watcher/engine.ts";
+import type { RefResolver, WatcherSeams } from "../src/watcher/engine.ts";
 import type { WatcherRule } from "../src/db/queries.ts";
 
 const tempDirs: string[] = [];
@@ -52,11 +54,7 @@ function sampleRubric(): Rubric {
         label: "correctness",
         weight: 1,
         appliesTo: "coding",
-        anchors: {
-          full: "fully correct",
-          partial: "partially correct",
-          none: "incorrect",
-        },
+        anchors: { full: "full", partial: "partial", none: "none" },
       },
     ],
   };
@@ -76,7 +74,7 @@ function sampleTask(overrides: Partial<TaskSpec> = {}): TaskSpec {
   };
 }
 
-/** Offline ref resolver — deterministic, no network git (a seam, not a model double). */
+/** Offline ref resolver — deterministic, no network git. */
 class OfflineRefResolver implements RefResolver {
   constructor(
     private readonly map: Record<string, { sha: string; imageTag?: string }> = {},
@@ -91,6 +89,45 @@ class OfflineRefResolver implements RefResolver {
     if (hit) return hit;
     return { sha: `sha-of-${ref}`, imageTag: ref };
   }
+}
+
+/** Fake generation launcher + active-generation control. Mints a real run_batches row (FK). */
+function fakeSeams(
+  resolver: RefResolver,
+  api: Pick<ApiServer, "queries">,
+  opts: { activeQueueIds?: Set<string> } = {},
+): { seams: WatcherSeams; launches: Array<{ queueId: string; commit: string }> } {
+  const launches: Array<{ queueId: string; commit: string }> = [];
+  return {
+    launches,
+    seams: {
+      async resolveSha(repo, ref) {
+        const r = await resolver.resolveRef(repo, ref);
+        return { sha: r.sha };
+      },
+      hasActiveGeneration(queueId) {
+        return opts.activeQueueIds?.has(queueId) ?? false;
+      },
+      async launch(queueId, commit) {
+        launches.push({ queueId, commit });
+        const queue = api.queries.getEvalQueue(queueId)!;
+        const batch = api.queries.createBatch({
+          taskId: null,
+          projectId: queue.projectId,
+          agentId: queue.agentId,
+          model: queue.model,
+          provider: queue.provider,
+          params: {},
+          repeats: 0,
+          trigger: "watcher",
+          agentCommit: commit,
+          queueId,
+          queueRevision: queue.revision,
+        });
+        return { launched: true, batchId: batch.id };
+      },
+    },
+  };
 }
 
 interface HttpResult {
@@ -139,362 +176,394 @@ function signBody(secret: string, rawBody: string): string {
   );
 }
 
-/**
- * Clear a rule's webhook secret so getRawWatcherSecret returns null.
- * Works for MemoryQueries (private field is still runtime-accessible) and
- * SqliteQueries (via update if present). Used only for the 401-no-secret case.
- */
-function clearWebhookSecret(api: ApiServer, ruleId: string): void {
-  const q = api.queries as unknown as {
-    watcherRules?: Map<string, WatcherRule>;
-    db?: {
-      update?: (table: unknown) => {
-        set: (v: unknown) => {
-          where: (c: unknown) => { run: () => void };
-        };
-      };
-    };
-  };
-  // MemoryQueries path
-  if (q.watcherRules && q.watcherRules.has(ruleId)) {
-    const rule = q.watcherRules.get(ruleId)!;
-    q.watcherRules.set(ruleId, { ...rule, webhookSecret: null });
-    return;
-  }
-  // Sqlite path — try raw SQL via better-sqlite3 handle if available
-  const raw = (api.queries as unknown as { raw?: { prepare: (s: string) => { run: (...a: unknown[]) => void } } }).raw;
-  // SqliteQueries stores drizzle db; try a simple approach via any update
-  try {
-    // Access internal drizzle + schema is hard; use getRawWatcherSecret check after
-    // poking through mapWatcher if present. Fallback: monkey-patch method.
-    const original = api.queries.getRawWatcherSecret.bind(api.queries);
-    api.queries.getRawWatcherSecret = (id: string) => {
-      if (id === ruleId) return null;
-      return original(id);
-    };
-    void raw;
-  } catch {
-    api.queries.getRawWatcherSecret = () => null;
-  }
-}
-
 interface Seeded {
   api: ApiServer;
   base: string;
   projectId: string;
   taskId: string;
-  agentId: string;
+  queueId: string;
+  ruleId: string;
+  webhookSecret: string;
 }
 
+/**
+ * Seed a project with a source-built agent adapter whose sourceRepo is
+ * "owner/name" and one queue pinned to a commit, plus a watcher bound to that
+ * queue. Returns the ids needed for route calls.
+ */
 async function seedWorld(
   resolver: RefResolver = new OfflineRefResolver(),
-): Promise<Seeded> {
+  opts: { activeQueueIds?: Set<string> } = {},
+  apiOverride?: ApiServer,
+): Promise<Seeded & { launches: Array<{ queueId: string; commit: string }> }> {
   const dataDir = await tempDataDir();
-  const api = createServer({ dataDir, refResolver: resolver });
-  servers.push(api);
+  let api = apiOverride;
+  if (!api) {
+    api = createServer({ dataDir, refResolver: resolver });
+    servers.push(api);
+  }
+  // Build seams against the real query store so the launcher can mint a real
+  // run_batches row (FK on watcher_events.batch_id) and wire into the app.
+  const { seams, launches } = fakeSeams(resolver, api, opts);
+  api.app.watcherSeams = seams;
   const port = await api.listen(0);
   const base = `http://127.0.0.1:${port}`;
+  const q = api.queries;
 
-  // Register agent BEFORE createProject so default_agent_id FK succeeds (sqlite).
-  const agent = api.queries.registerAgent({
-    id: `pi-${Date.now()}`,
-    displayName: "Pi",
-    defaultModel: "claude",
-    defaultProvider: "anthropic",
-  });
-  const project = api.queries.createProject({
+  const project = q.createProject({
     name: "Watcher Routes",
     slug: `watcher-routes-${Date.now()}`,
-    defaultAgentId: agent.id,
-    defaultModel: "claude",
-    defaultProvider: "anthropic",
   });
-  const task = api.queries.createTask(project.id, sampleTask());
+  const adapter = q.createProjectAgentAdapter(project.id, {
+    agentId: "my-cli",
+    name: "My CLI",
+    image: "localhost/agent:latest",
+    sourceRepo: "owner/name",
+    sourceRef: "main",
+    installType: "source-build",
+    containerfile: "FROM node:22-bookworm\n",
+    command: { argv: ["my-cli", "run"] },
+    connectionCheck: { argv: ["my-cli", "check"] },
+    evidence: { paths: [] },
+    parserKind: "canonical-jsonl",
+  });
+  const task = q.createTask(project.id, sampleTask());
+  const queue = q.createEvalQueue(project.id, {
+    name: "Q",
+    agentId: adapter.agentId,
+    model: "deepseek-v4-flash",
+    provider: "nuralwatt",
+    agentCommit: "cccccccccccccccccccccccccccccccccccccccc",
+  });
+  q.createEvalQueueItem(queue.id, { taskId: task.id, repeats: 1 });
+
+  // Create a watcher bound to the queue via the API (validates repo identity).
+  const created = await http(base, "POST", `/api/projects/${project.id}/watchers`, {
+    body: {
+      queueId: queue.id,
+      repo: "owner/name",
+      trigger: "tag",
+      ref: "v*",
+      webhookSecret: "super-secret-test-key",
+    },
+  });
+  expect(created.status).toBe(201);
+  const rule = (created.json as { watcher: WatcherRule }).watcher;
 
   return {
     api,
     base,
     projectId: project.id,
     taskId: task.id,
-    agentId: agent.id,
+    queueId: queue.id,
+    ruleId: rule.id,
+    webhookSecret: rule.webhookSecret!,
+    launches,
   };
 }
 
-describe("watcher routes — CRUD", () => {
-  it("POST create surfaces secret once + X-Agenteval-Secret-Once; GET strips secrets", async () => {
-    const { base, projectId } = await seedWorld();
-
-    const created = await http(base, "POST", `/api/projects/${projectId}/watchers`, {
-      body: {
-        role: "agent",
-        repo: "owner/name",
-        trigger: "tag",
-        ref: "v*",
-        action: { enqueue: "all", repeats: 1 },
-      },
-    });
-    expect(created.status).toBe(201);
-    expect(created.headers.get("x-agenteval-secret-once")).toBe("true");
-    const body = created.json as {
-      watcher: WatcherRule;
-    };
-    expect(body.watcher.id).toBeTruthy();
-    expect(body.watcher.webhookSecret).toBeTruthy();
-    expect(typeof body.watcher.webhookSecret).toBe("string");
-    const secretOnce = body.watcher.webhookSecret!;
+describe("watcher routes — CRUD (queue-bound, repo-validated)", () => {
+  it("POST requires a project queue whose source repo matches; secret surfaced once", async () => {
+    const { base, projectId, ruleId, webhookSecret } = await seedWorld();
+    expect(ruleId).toBeTruthy();
+    expect(typeof webhookSecret).toBe("string");
 
     const listed = await http(base, "GET", `/api/projects/${projectId}/watchers`);
     expect(listed.status).toBe(200);
     const listBody = listed.json as { watchers: WatcherRule[] };
     expect(listBody.watchers).toHaveLength(1);
     expect(listBody.watchers[0]!.webhookSecret).toBeNull();
-    // Secret from create is not echoed back in list.
-    expect(listBody.watchers[0]!.id).toBe(body.watcher.id);
-    void secretOnce;
+    expect(listBody.watchers[0]!.queueId).toBeTruthy();
   });
 
-  it("PATCH updates without secret; DELETE 204; 404 missing project/rule", async () => {
-    const { base, projectId } = await seedWorld();
-
-    const created = await http(base, "POST", `/api/projects/${projectId}/watchers`, {
-      body: {
-        role: "agent",
-        repo: "owner/name",
-        trigger: "commit",
-        ref: "main",
-        action: { enqueue: "all" },
-      },
+  it("POST rejects a watcher whose repo does not equal the queue source repo (400)", async () => {
+    const dataDir = await tempDataDir();
+    const api = createServer({ dataDir });
+    servers.push(api);
+    const port = await api.listen(0);
+    const base = `http://127.0.0.1:${port}`;
+    const q = api.queries;
+    const project = q.createProject({ name: "P", slug: "p-repo" });
+    const adapter = q.createProjectAgentAdapter(project.id, {
+      agentId: "cli", name: "C", image: "localhost/c",
+      sourceRepo: "owner/name", sourceRef: "main", installType: "source-build",
+      containerfile: "FROM node\n", command: { argv: ["c"] },
+      connectionCheck: { argv: ["c"] }, evidence: { paths: [] },
+      parserKind: "canonical-jsonl",
     });
-    const rule = (created.json as { watcher: WatcherRule }).watcher;
+    const queue = q.createEvalQueue(project.id, {
+      name: "Q", agentId: adapter.agentId, model: "m", provider: "p",
+    });
 
-    const patched = await http(
-      base,
-      "PATCH",
-      `/api/projects/${projectId}/watchers/${rule.id}`,
-      { body: { enabled: false, ref: "develop" } },
-    );
-    expect(patched.status).toBe(200);
-    const pBody = patched.json as { watcher: WatcherRule };
-    expect(pBody.watcher.enabled).toBe(false);
-    expect(pBody.watcher.ref).toBe("develop");
-    expect(pBody.watcher.webhookSecret).toBeNull();
+    const wrong = await http(base, "POST", `/api/projects/${project.id}/watchers`, {
+      body: { queueId: queue.id, repo: "other/thing", trigger: "tag" },
+    });
+    expect(wrong.status).toBe(400);
+  });
 
-    const del = await http(
-      base,
-      "DELETE",
-      `/api/projects/${projectId}/watchers/${rule.id}`,
-    );
-    expect(del.status).toBe(204);
-
-    const delAgain = await http(
-      base,
-      "DELETE",
-      `/api/projects/${projectId}/watchers/${rule.id}`,
-    );
-    expect(delAgain.status).toBe(404);
-
-    const missingProject = await http(
-      base,
-      "GET",
-      `/api/projects/does-not-exist/watchers`,
-    );
-    expect(missingProject.status).toBe(404);
-
-    const missingRule = await http(
-      base,
-      "PATCH",
-      `/api/projects/${projectId}/watchers/no-such-rule`,
-      { body: { enabled: true } },
-    );
-    expect(missingRule.status).toBe(404);
+  it("POST rejects a queueId from a different project (400)", async () => {
+    const dataDir = await tempDataDir();
+    const api = createServer({ dataDir });
+    servers.push(api);
+    const port = await api.listen(0);
+    const base = `http://127.0.0.1:${port}`;
+    const q = api.queries;
+    const p1 = q.createProject({ name: "P1", slug: "p1" });
+    const p2 = q.createProject({ name: "P2", slug: "p2" });
+    const adapter = q.createProjectAgentAdapter(p1.id, {
+      agentId: "c1", name: "C", image: "localhost/c", sourceRepo: "a/b",
+      sourceRef: "main", installType: "source-build", containerfile: "FROM node\n",
+      command: { argv: ["c"] }, connectionCheck: { argv: ["c"] },
+      evidence: { paths: [] }, parserKind: "canonical-jsonl",
+    });
+    const queue = q.createEvalQueue(p1.id, {
+      name: "Q", agentId: adapter.agentId, model: "m", provider: "p",
+    });
+    const r = await http(base, "POST", `/api/projects/${p2.id}/watchers`, {
+      body: { queueId: queue.id, repo: "a/b", trigger: "tag" },
+    });
+    expect(r.status).toBe(400);
   });
 });
 
-describe("watcher routes — manual fire", () => {
-  it("POST .../run → 202 + batchIds when tasks exist", async () => {
+describe("watcher routes — manual fire (same engine path)", () => {
+  it("POST .../run → 202 + launches queue with the commit override", async () => {
     const resolver = new OfflineRefResolver({
-      "v1.0.0": { sha: "abc123", imageTag: "v1.0.0" },
+      "v1.0.0": { sha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd" },
     });
-    const { base, projectId } = await seedWorld(resolver);
+    const { base, projectId, ruleId, launches } = await seedWorld(resolver);
 
-    const created = await http(base, "POST", `/api/projects/${projectId}/watchers`, {
-      body: {
-        role: "agent",
-        repo: "owner/name",
-        trigger: "tag",
-        ref: "v*",
-        action: { enqueue: "all", repeats: 1 },
-      },
+    const fired = await http(base, "POST", `/api/projects/${projectId}/watchers/${ruleId}/run`, {
+      body: { ref: "v1.0.0" },
     });
-    const rule = (created.json as { watcher: WatcherRule }).watcher;
-
-    const fired = await http(
-      base,
-      "POST",
-      `/api/projects/${projectId}/watchers/${rule.id}/run`,
-      { body: { ref: "v1.0.0" } },
-    );
     expect(fired.status).toBe(202);
-    const fBody = fired.json as {
-      batchIds: string[];
-      watcherEventId: string | null;
-      status: string;
-    };
-    expect(fBody.batchIds.length).toBeGreaterThan(0);
-    expect(fBody.status).toBe("enqueued");
+    const fBody = fired.json as { status: string; watcherEventId: string };
+    expect(fBody.status).toBe("launched");
     expect(fBody.watcherEventId).toBeTruthy();
+    expect(launches).toEqual([
+      { queueId: expect.any(String), commit: "abcdefabcdefabcdefabcdefabcdefabcdefabcd" },
+    ]);
+  });
+
+  it("manual fire is idempotent: same ref+sha fires once, second deduped", async () => {
+    const resolver = new OfflineRefResolver({ "v1.0.0": { sha: "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef" } });
+    const { base, projectId, ruleId, launches } = await seedWorld(resolver);
+
+    const first = await http(base, "POST", `/api/projects/${projectId}/watchers/${ruleId}/run`, { body: { ref: "v1.0.0" } });
+    const second = await http(base, "POST", `/api/projects/${projectId}/watchers/${ruleId}/run`, { body: { ref: "v1.0.0" } });
+    expect(first.status).toBe(202);
+    expect((first.json as { status: string }).status).toBe("launched");
+    expect((second.json as { status: string }).status).toBe("deduped");
+    expect(launches).toHaveLength(1);
   });
 
   it("manual fire 404 for missing rule", async () => {
     const { base, projectId } = await seedWorld();
-    const r = await http(
-      base,
-      "POST",
-      `/api/projects/${projectId}/watchers/nope/run`,
-      { body: {} },
-    );
+    const r = await http(base, "POST", `/api/projects/${projectId}/watchers/nope/run`, { body: {} });
     expect(r.status).toBe(404);
   });
 });
 
-describe("watcher routes — webhook ingress HMAC", () => {
-  it("valid signature → 202 matched; last-byte-tampered → 401; no secret → 401", async () => {
+describe("watcher routes — webhook ingress HMAC + repo identity", () => {
+  it("valid signed hook → 202 launched; tampered signature → 401; missing sig → 401", async () => {
     const resolver = new OfflineRefResolver({
-      "v2.3.0": { sha: "deadbeef", imageTag: "v2.3.0" },
+      "v2.3.0": { sha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
     });
-    const { api, base, projectId } = await seedWorld(resolver);
-
-    const created = await http(base, "POST", `/api/projects/${projectId}/watchers`, {
-      body: {
-        role: "agent",
-        repo: "owner/name",
-        trigger: "tag",
-        ref: "v*",
-        action: { enqueue: "all" },
-        webhookSecret: "super-secret-test-key",
-      },
-    });
-    expect(created.status).toBe(201);
-    const rule = (created.json as { watcher: WatcherRule }).watcher;
-    const secret = rule.webhookSecret!;
-    expect(secret).toBe("super-secret-test-key");
+    const { base, projectId, ruleId, webhookSecret, launches } = await seedWorld(resolver);
 
     const payload = JSON.stringify({
       ref: "refs/tags/v2.3.0",
-      ref_type: "tag",
       repository: { full_name: "owner/name" },
     });
-    const goodSig = signBody(secret, payload);
+    const goodSig = signBody(webhookSecret, payload);
 
-    // Valid signature → 202
-    const ok = await http(
-      base,
-      "POST",
-      `/api/projects/${projectId}/watcher/hooks/${rule.id}`,
-      {
-        rawBody: payload,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Hub-Signature-256": goodSig,
-          "X-GitHub-Event": "create",
-          "X-GitHub-Ref": "refs/tags/v2.3.0",
-        },
+    const ok = await http(base, "POST", `/api/projects/${projectId}/watcher/hooks/${ruleId}`, {
+      rawBody: payload,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": goodSig,
+        "X-GitHub-Event": "create",
+        "X-GitHub-Ref": "refs/tags/v2.3.0",
       },
-    );
+    });
     expect(ok.status).toBe(202);
-    const okBody = ok.json as {
-      matched: boolean;
-      results: Array<{ ruleId: string; status: string }>;
-    };
-    expect(okBody.results.length).toBeGreaterThan(0);
-    // enqueued (or deduped if re-run); not ignored due to signature
-    expect(
-      ["enqueued", "deduped", "matched", "failed"].includes(
-        okBody.results[0]!.status,
-      ),
-    ).toBe(true);
+    const okBody = ok.json as { status: string; resolvedSha: string };
+    expect(okBody.status).toBe("launched");
+    expect(okBody.resolvedSha).toBe("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    expect(launches).toHaveLength(1);
 
-    // Tamper last byte of signature → still 401 (timingSafeEqual full compare)
-    const tampered =
-      goodSig.slice(0, -1) + (goodSig.endsWith("a") ? "b" : "a");
-    expect(tampered).not.toBe(goodSig);
-    expect(tampered.length).toBe(goodSig.length);
-    const bad = await http(
-      base,
-      "POST",
-      `/api/projects/${projectId}/watcher/hooks/${rule.id}`,
-      {
-        rawBody: payload,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Hub-Signature-256": tampered,
-          "X-GitHub-Event": "create",
-        },
-      },
-    );
+    const tampered = goodSig.slice(0, -1) + (goodSig.endsWith("a") ? "b" : "a");
+    const bad = await http(base, "POST", `/api/projects/${projectId}/watcher/hooks/${ruleId}`, {
+      rawBody: payload,
+      headers: { "Content-Type": "application/json", "X-Hub-Signature-256": tampered, "X-GitHub-Event": "create" },
+    });
     expect(bad.status).toBe(401);
 
-    // Missing signature → 401
-    const missing = await http(
-      base,
-      "POST",
-      `/api/projects/${projectId}/watcher/hooks/${rule.id}`,
-      {
-        rawBody: payload,
-        headers: {
-          "Content-Type": "application/json",
-          "X-GitHub-Event": "create",
-        },
-      },
-    );
+    const missing = await http(base, "POST", `/api/projects/${projectId}/watcher/hooks/${ruleId}`, {
+      rawBody: payload,
+      headers: { "Content-Type": "application/json", "X-GitHub-Event": "create" },
+    });
     expect(missing.status).toBe(401);
+  });
 
-    // Rule with no secret configured → 401
-    const created2 = await http(
-      base,
-      "POST",
-      `/api/projects/${projectId}/watchers`,
-      {
-        body: {
-          role: "agent",
-          repo: "owner/other",
-          trigger: "tag",
-          action: { enqueue: "all" },
-        },
-      },
-    );
-    const rule2 = (created2.json as { watcher: WatcherRule }).watcher;
-    clearWebhookSecret(api, rule2.id);
-    expect(api.queries.getRawWatcherSecret(rule2.id)).toBeNull();
+  it("signed hook with mismatched repository → ignored (not launched) + record event", async () => {
+    const resolver = new OfflineRefResolver({
+      "v2.3.0": { sha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+    });
+    const { base, projectId, ruleId, webhookSecret, launches } = await seedWorld(resolver);
 
-    const noSecret = await http(
-      base,
-      "POST",
-      `/api/projects/${projectId}/watcher/hooks/${rule2.id}`,
-      {
-        rawBody: payload,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Hub-Signature-256": goodSig,
-          "X-GitHub-Event": "create",
-        },
-      },
-    );
-    expect(noSecret.status).toBe(401);
+    const payload = JSON.stringify({
+      ref: "refs/tags/v2.3.0",
+      repository: { full_name: "other/repo" },
+    });
+    const sig = signBody(webhookSecret, payload);
+    const res = await http(base, "POST", `/api/projects/${projectId}/watcher/hooks/${ruleId}`, {
+      rawBody: payload,
+      headers: { "Content-Type": "application/json", "X-Hub-Signature-256": sig, "X-GitHub-Event": "create" },
+    });
+    expect(res.status).toBe(200);
+    const body = res.json as { status: string };
+    expect(body.status).toBe("ignored");
+    expect(launches).toHaveLength(0);
+  });
 
-    // 404 missing rule
-    const notFound = await http(
-      base,
-      "POST",
-      `/api/projects/${projectId}/watcher/hooks/no-such-rule`,
-      {
-        rawBody: payload,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Hub-Signature-256": goodSig,
-        },
-      },
+  it("active generation → webhook commit stays PENDING; event list shows it", async () => {
+    // Seed once, marking the queue active so no launch happens.
+    const { base, projectId, ruleId, webhookSecret, launches } = await seedWorld(
+      new OfflineRefResolver({ "v2.3.0": { sha: "dddddddddddddddddddddddddddddddddddddddd" } }),
+      { activeQueueIds: undefined },
     );
-    expect(notFound.status).toBe(404);
+    // The queue has NO active generation in the seam by default, so force it:
+    // re-point the app seams to treat every queue as active.
+    const api = servers[servers.length - 1]!;
+    const fs = await import("../src/watcher/engine.ts");
+    const sh: WatcherSeams = {
+      resolveSha: async (_r, _ref) => ({ sha: "dddddddddddddddddddddddddddddddddddddddd" }),
+      hasActiveGeneration: () => true,
+      launch: async () => ({ launched: true, batchId: "b" }),
+    };
+    void fs;
+    api.app.watcherSeams = sh;
+
+    const payload = JSON.stringify({ ref: "refs/tags/v2.3.0", repository: { full_name: "owner/name" } });
+    const sig = signBody(webhookSecret, payload);
+    const res = await http(base, "POST", `/api/projects/${projectId}/watcher/hooks/${ruleId}`, {
+      rawBody: payload,
+      headers: { "Content-Type": "application/json", "X-Hub-Signature-256": sig, "X-GitHub-Event": "create" },
+    });
+    expect(res.status).toBe(202);
+    expect((res.json as { status: string }).status).toBe("pending");
+    expect(launches).toHaveLength(0);
+
+    const events = await http(base, "GET", `/api/projects/${projectId}/watchers/${ruleId}/events`);
+    expect(events.status).toBe(200);
+    const evList = events.json as { events: Array<{ status: string; fifoSeq: number }> };
+    expect(evList.events[0]!.status).toBe("pending");
+    expect(evList.events[0]!.fifoSeq).toBe(1);
+  });
+
+  it("rule with no secret → 401", async () => {
+    const dataDir = await tempDataDir();
+    const api = createServer({ dataDir });
+    servers.push(api);
+    const port = await api.listen(0);
+    const base = `http://127.0.0.1:${port}`;
+    const q = api.queries;
+    const project = q.createProject({ name: "P", slug: "pp-nosec" });
+    const adapter = q.createProjectAgentAdapter(project.id, {
+      agentId: "cc", name: "C", image: "localhost/c", sourceRepo: "a/b",
+      sourceRef: "main", installType: "source-build", containerfile: "FROM node\n",
+      command: { argv: ["c"] }, connectionCheck: { argv: ["c"] },
+      evidence: { paths: [] }, parserKind: "canonical-jsonl",
+    });
+    const queue = q.createEvalQueue(project.id, { name: "Q", agentId: adapter.agentId, model: "m", provider: "p" });
+    const rule = q.createWatcherRule(project.id, { queueId: queue.id, repo: "a/b", trigger: "tag" });
+    // Clear the secret so HMAC verification cannot pass.
+    const raw = api.queries as unknown as { getRawWatcherSecret: () => string | null };
+    const original = raw.getRawWatcherSecret.bind(api.queries);
+    api.queries.getRawWatcherSecret = () => null;
+    void original;
+
+    const res = await http(base, "POST", `/api/projects/${project.id}/watcher/hooks/${rule.id}`, {
+      rawBody: "{}",
+      headers: { "Content-Type": "application/json", "X-Hub-Signature-256": "sha256=abcd" },
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("watcher routes — auth scoping (bearer-exempt hook, protected CRUD/manual)", () => {
+  async function bootAuthWorld(opts: { authEnabled: boolean }) {
+    const dataDir = await tempDataDir();
+    const api = createServer({ dataDir, authEnabled: opts.authEnabled });
+    servers.push(api);
+    const port = await api.listen(0);
+    const base = `http://127.0.0.1:${port}`;
+    const q = api.queries;
+    const project = q.createProject({ name: "P", slug: `auth-${Date.now()}` });
+    const adapter = q.createProjectAgentAdapter(project.id, {
+      agentId: "cli", name: "C", image: "localhost/c", sourceRepo: "owner/name",
+      sourceRef: "main", installType: "source-build", containerfile: "FROM node\n",
+      command: { argv: ["c"] }, connectionCheck: { argv: ["c"] },
+      evidence: { paths: [] }, parserKind: "canonical-jsonl",
+    });
+    const queue = q.createEvalQueue(project.id, { name: "Q", agentId: adapter.agentId, model: "m", provider: "p" });
+    const token = q.createApiToken({ label: "admin" });
+    const other = q.createProject({ name: "Other", slug: `other-${Date.now()}` });
+    return { api, base, projectId: project.id, queueId: queue.id, token: token.token, otherProjectId: other.id };
+  }
+
+  it("signed hook is bearer-exempt even when auth is enabled", async () => {
+    const { api, base, projectId, queueId } = await bootAuthWorld({ authEnabled: true });
+    const rule = api.queries.createWatcherRule(projectId, { queueId, repo: "owner/name", trigger: "tag" });
+    const secret = api.queries.getRawWatcherSecret(rule.id)!;
+
+    const payload = JSON.stringify({ ref: "refs/tags/v1.0.0", repository: { full_name: "owner/name" } });
+    const sig = signBody(secret, payload);
+    const res = await http(base, "POST", `/api/projects/${projectId}/watcher/hooks/${rule.id}`, {
+      rawBody: payload,
+      headers: { "Content-Type": "application/json", "X-Hub-Signature-256": sig, "X-GitHub-Event": "create" },
+    });
+    // Without a Bearer, the signed hook is still allowed (HMAC is the auth).
+    // A real resolver/launcher is not wired here, so the handler records a
+    // non-launched status — but crucially it is NOT a 401 auth rejection.
+    expect(res.status).not.toBe(401);
+    expect(res.status).toBe(202);
+  });
+
+  it("CRUD/manual/event-list are bearer-protected when auth is enabled", async () => {
+    const { api, base, projectId, queueId } = await bootAuthWorld({ authEnabled: true });
+    const rule = api.queries.createWatcherRule(projectId, { queueId, repo: "owner/name", trigger: "tag" });
+
+    // No bearer → 401 for CRUD + manual + event list.
+    const list = await http(base, "GET", `/api/projects/${projectId}/watchers`);
+    expect(list.status).toBe(401);
+    const manual = await http(base, "POST", `/api/projects/${projectId}/watchers/${rule.id}/run`, { body: {} });
+    expect(manual.status).toBe(401);
+    const events = await http(base, "GET", `/api/projects/${projectId}/watchers/${rule.id}/events`);
+    expect(events.status).toBe(401);
+    const create = await http(base, "POST", `/api/projects/${projectId}/watchers`, { body: { queueId, repo: "owner/name", trigger: "tag" } });
+    expect(create.status).toBe(401);
+  });
+
+  it("project-scoped token cannot access a different project's watchers", async () => {
+    const { api, base, projectId, queueId, token, otherProjectId } = await bootAuthWorld({ authEnabled: true });
+    // Issue a token scoped to projectId.
+    const scoped = api.queries.createApiToken({ label: "scoped", projectId });
+    const rule = api.queries.createWatcherRule(projectId, { queueId, repo: "owner/name", trigger: "tag" });
+
+    // Accessing the OTHER project's watchers with this token → 401 scope check.
+    const other = await http(base, "GET", `/api/projects/${otherProjectId}/watchers`, {
+      headers: { Authorization: `Bearer ${scoped.token}` },
+    });
+    expect(other.status).toBe(401);
+
+    // Accessing its OWN project → allowed.
+    const own = await http(base, "GET", `/api/projects/${projectId}/watchers`, {
+      headers: { Authorization: `Bearer ${scoped.token}` },
+    });
+    expect(own.status).toBe(200);
+    void rule;
+    void token;
   });
 });

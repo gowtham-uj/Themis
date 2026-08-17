@@ -1,7 +1,7 @@
 /**
  * Live network-cutoff control for a running sandbox.
  *
- * Spec: plan/execution.md §Live control (project dashboard → sandbox).
+ * Spec: plan/execution.md §Live control (API client → sandbox).
  *
  * Cutoff is a **live OVERRIDE** that supersedes the static per-task network policy
  * (`allow` | `allowlist` | `offline`) for the duration of the run. It does not

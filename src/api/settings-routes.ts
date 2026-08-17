@@ -1,7 +1,7 @@
 /**
  * Settings + auth-user + project-export routes (P9-settings).
  *
- * - GET/PUT /api/settings — global settings (keys, limits, judge-prompt, models).
+ * - GET/PUT /api/settings — global settings (keys, limits, models).
  *   Secret key VALUES are never returned — only a list of key NAMES.
  * - POST /api/auth/login — username/password → mint Bearer token.
  * - GET /api/auth/me — identity for the current bearer.
@@ -44,7 +44,6 @@ import {
 
 /** Well-known setting keys stored in the settings table. */
 export const SETTINGS_KEYS = {
-  judgePromptOverrides: "judge.prompt.overrides",
   defaultModels: "defaults.models",
   limits: "limits",
   /** List of secret key NAMES only (never values). */
@@ -53,7 +52,6 @@ export const SETTINGS_KEYS = {
 
 /** Public GET /api/settings response. Secrets are name-only. */
 export interface SettingsResponse {
-  judgePromptOverrides?: unknown;
   defaultModels?: unknown;
   limits?: unknown;
   /** Names of configured secret keys — NEVER secret values. */
@@ -62,7 +60,6 @@ export interface SettingsResponse {
 
 /** PUT /api/settings body. */
 export interface SettingsPutBody {
-  judgePromptOverrides?: unknown;
   defaultModels?: unknown;
   limits?: unknown;
   /**
@@ -74,10 +71,6 @@ export interface SettingsPutBody {
 
 function readSettings(queries: DbQueries): SettingsResponse {
   const out: SettingsResponse = {};
-  const overrides = queries.getSetting(SETTINGS_KEYS.judgePromptOverrides);
-  if (overrides !== null && overrides !== undefined) {
-    out.judgePromptOverrides = overrides;
-  }
   const models = queries.getSetting(SETTINGS_KEYS.defaultModels);
   if (models !== null && models !== undefined) {
     out.defaultModels = models;
@@ -96,12 +89,6 @@ function readSettings(queries: DbQueries): SettingsResponse {
 }
 
 function writeSettings(queries: DbQueries, body: SettingsPutBody): SettingsResponse {
-  if ("judgePromptOverrides" in body) {
-    queries.setSetting(
-      SETTINGS_KEYS.judgePromptOverrides,
-      body.judgePromptOverrides ?? null,
-    );
-  }
   if ("defaultModels" in body) {
     queries.setSetting(SETTINGS_KEYS.defaultModels, body.defaultModels ?? null);
   }
@@ -226,8 +213,6 @@ export function buildExportBundle(
   tasks: unknown[];
   runs: unknown[];
   watchers: unknown[];
-  queue: unknown[];
-  outboundWebhooks: unknown[];
   paths: string[];
   manifest: { algorithm: "sha256"; digest: string; pathCount: number };
 } {
@@ -247,12 +232,6 @@ export function buildExportBundle(
     void _ws;
     return { ...rest, webhookSecret: null };
   });
-  const outboundWebhooks = rows.outboundWebhooks.map((s) => {
-    const { secret: _s, ...rest } = s as typeof s & { secret?: unknown };
-    void _s;
-    return { ...rest, secret: null };
-  });
-
   const paths = listProjectSubtreePaths(dataDir, projectId);
   const manifestBody = JSON.stringify({ projectId, paths });
   const digest = createHash("sha256").update(manifestBody, "utf8").digest("hex");
@@ -264,8 +243,6 @@ export function buildExportBundle(
     tasks: rows.tasks,
     runs: rows.runs,
     watchers,
-    queue: rows.queue,
-    outboundWebhooks,
     paths,
     manifest: {
       algorithm: "sha256",

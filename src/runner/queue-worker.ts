@@ -9,6 +9,7 @@ import type {
   DbQueries,
   EvalQueue,
   EvalQueueItem,
+  GenerationSnapshot,
   QueueContainer,
   Run,
   Task,
@@ -33,11 +34,11 @@ import {
   ProvisionError,
   verifyCleanupInContainer,
 } from "./env-provision.js";
-import { restructureSuiteArchive, sealEvalArchive } from "./eval-archive.js";
+import { buildEvalContext, organizeArchiveLayout, restructureSuiteArchive, sealEvalArchive } from "./eval-archive.js";
 import { storeEvalArchive } from "./archive-store.js";
 import { classifyRunFailure } from "./run-failure.js";
 import { analyzeEvidenceIntegrity } from "./evidence-integrity.js";
-import { deriveRunMetrics } from "./metrics.js";
+import { deriveRunMetrics, RUN_METRICS_SCHEMA_VERSION } from "./metrics.js";
 import { buildEvalAgentImage } from "./package-image.js";
 import { runCanonicalPackageVerifier } from "./package-verifier.js";
 import { resolveAdapterOverrides, resolveNetworkMode } from "./project-config.js";
@@ -49,8 +50,12 @@ import type {
   ContainerHandle,
   ContainerRuntime,
 } from "./runtime.js";
-import { deriveRunStatus } from "./run.js";
+import { deriveRunStatus } from "./status.js";
 import { commitWorkspaceBaseline } from "./workspace.js";
+import {
+  ensureAdapterImageForCommit,
+  type AdapterBuildService,
+} from "./adapter-build.js";
 
 const DEFAULT_AGENT_TIMEOUT_MS = 120_000;
 const RAW_STDOUT = "raw-stdout.log";
@@ -66,7 +71,15 @@ export interface StartQueueContainerOptions {
     batchId: string;
     runIds: string[];
     tainted: boolean;
+    stopped: boolean;
   }) => void | Promise<void>;
+  /**
+   * Immutable commit override for THIS generation only. When set, the generation
+   * builds/runs this exact commit instead of the queue's default
+   * `queue.agentCommit`, WITHOUT mutating `queue.agentCommit`. Used by the queue
+   * watcher to launch a generation pinned to a specific webhook/commit.
+   */
+  agentCommitOverride?: string;
 }
 
 /** In-memory controller for one live queue-owned container. */
@@ -82,12 +95,19 @@ export interface LiveQueueContainer {
   acceptingExec: boolean;
   paused: boolean;
   stopRequested: boolean;
+  /** True once the worker finished its claim loop (generation closed or stopped). */
   finished: boolean;
+  /** Marks the current run for operator abort; worker seals partial evidence and continues. */
+  abortRequested: boolean;
+  /** Immutable container signature of this live generation (validates mid-run additions). */
+  signature: GenerationContainerSignature;
   done: Promise<void>;
   startExec(spec: ContainerExecSpec): Promise<ContainerExecHandle>;
   exec(spec: ContainerExecSpec): Promise<ContainerExecResult>;
   pause(): Promise<void>;
   resume(): Promise<void>;
+  /** Abort the current claimed eval (partial seal), then continue to the next claim when safe. */
+  abortCurrentRun(): Promise<void>;
   stop(graceMs?: number): Promise<void>;
 }
 
@@ -98,9 +118,9 @@ export function createLiveQueueContainersMap(): LiveQueueContainersMap {
   return new Map();
 }
 
-interface ExpandedRun {
+interface ClaimedRun {
   run: Run;
-  item: EvalQueueItem;
+  item: EvalQueueItem | null;
   task: Task;
   packageRuntime: EvalPackageRuntimeConfig;
   overrides: Record<string, unknown> | null;
@@ -111,7 +131,24 @@ interface EventRecorder {
   operator(spec: ContainerExecSpec, result: ContainerExecResult): Promise<void>;
 }
 
-/** Spawn one persistent container and begin draining its snapshotted eval queue. */
+/**
+ * The immutable execution signature of a live queue generation container. New
+ * queue items added while the generation runs are validated against this before
+ * being accepted; incompatible items are rejected so they never join a container
+ * that cannot run them.
+ */
+export interface GenerationContainerSignature {
+  image: string;
+  network: string;
+  networkAllowlist: string[] | null;
+  cpus: number | null;
+  memoryMiB: number | null;
+  ports: string;
+  /** Non-empty only for legacy (non-suite) canonical evals: their env digest must match. */
+  environmentDigest: string | null;
+}
+
+/** Spawn one persistent container and atomically claim + drain its eval queue. */
 export async function startQueueContainer(
   dataDir: string,
   queries: DbQueries,
@@ -135,8 +172,10 @@ export async function startQueueContainer(
   if (!queue) throw new Error(`eval queue not found: ${queueId}`);
   const project = queries.getProject(queue.projectId);
   if (!project) throw new Error(`project not found: ${queue.projectId}`);
-  const items = queries.listEvalQueueItems(queueId).filter((item) => item.enabled);
-  if (items.length === 0) throw new Error(`queue ${queueId} has no enabled evals`);
+  // The generation needs at least one enabled, non-deleted item to derive its
+  // container signature and image. Later additions may be accepted while running.
+  const seedItems = queries.listEvalQueueItems(queueId).filter((item) => item.enabled);
+  if (seedItems.length === 0) throw new Error(`queue ${queueId} has no enabled evals`);
 
   const sharedAdapter = queue.sharedAdapterId
     ? queries.getProjectAgentAdapter(queue.sharedAdapterId)
@@ -147,8 +186,6 @@ export async function startQueueContainer(
   if (sharedAdapter && sharedAdapter.agentId !== queue.agentId) {
     throw new Error(`queue ${queue.id} agent_id does not match shared adapter ${sharedAdapter.id}`);
   }
-  // Explicit adapter selection: a shared adapter, a project-owned adapter, or an
-  // explicitly chosen built-in (builtinAdapterId). No implicit fallback.
   const projectAdapter = sharedAdapter
     ? null
     : queries.getProjectAgentAdapterByAgentId(queue.projectId, queue.agentId);
@@ -170,34 +207,69 @@ export async function startQueueContainer(
     }
   }
   const adapterDef = sharedAdapter ?? projectAdapter;
-  if (adapterDef?.containerfile && adapterDef.buildStatus !== "ready") {
-    throw new Error(
-      `agent adapter ${adapterDef.id} image is not ready; build it through the adapter API first`,
-    );
-  }
   const queueAdapter = adapterDef
     ? createDeclarativeAdapter(adapterDef)
     : getAdapter(queue.builtinAdapterId!);
   const runtime = opts.runtime ?? resolveRuntime();
-  const tasks = new Map<string, Task>();
-  const packageRuntimes = new Map<string, EvalPackageRuntimeConfig>();
-  for (const item of items) {
-    const task = queries.getTask(item.taskId);
-    if (!task || task.projectId !== queue.projectId || task.archived) {
-      throw new Error(`queue item ${item.id} references unavailable eval ${item.taskId}`);
-    }
-    if (!task.packagePath || !task.packageDigest || !task.packageManifest) {
-      throw new Error(`queue item ${item.id} references a non-canonical eval package`);
-    }
-    tasks.set(task.id, task);
-    if (!packageRuntimes.has(task.id)) {
-      packageRuntimes.set(task.id, await loadEvalPackageRuntimeConfig({
-        packagePath: task.packagePath,
-        packageDigest: task.packageDigest,
-        manifest: task.packageManifest,
-      }));
+
+  // ---- Queue-pinned commit build (fail-closed before any immutable generation) ----
+  // A source adapter queue must resolve to a reproducible commit BEFORE the
+  // immutable batch/container/runs are created. We build the exact selected
+  // SHA (or reuse a ready adapter_build whose image still exists) and snapshot
+  // buildId/image/imageId/commit/version. Built-in adapters may omit it.
+  let build: { buildId: string; image: string; imageId: string; commit: string; version: string } | null = null;
+  if (adapterDef) {
+    if (adapterDef.installType === "source-build") {
+      // A generation-scoped override pins THIS generation to an exact commit
+      // without mutating the queue's default agent_commit.
+      const resolvedCommit = opts.agentCommitOverride ?? queue.agentCommit;
+      if (!resolvedCommit) {
+        throw new Error(
+          `queue ${queue.id} uses a source-built adapter ${adapterDef.id} but has no agent_commit; resolve a reproducible commit before start`,
+        );
+      }
+      const buildService: AdapterBuildService = {
+        queries,
+        dataDir,
+        runtime,
+      };
+      const buildRow = await ensureAdapterImageForCommit(buildService, adapterDef, resolvedCommit);
+      if (buildRow.status !== "ready" || !buildRow.imageId) {
+        throw new Error(
+          `adapter ${adapterDef.id} could not produce a ready image for commit ${resolvedCommit}`,
+        );
+      }
+      build = {
+        buildId: buildRow.id,
+        image: buildRow.image!,
+        imageId: buildRow.imageId,
+        commit: buildRow.commitSha,
+        version: buildRow.agentVersion ?? resolvedCommit.slice(0, 12),
+      };
+    } else {
+      // npm adapters have no source repo to pin; require the adapter be ready.
+      if (adapterDef.containerfile && adapterDef.buildStatus !== "ready") {
+        throw new Error(
+          `agent adapter ${adapterDef.id} image is not ready; build it through the adapter API first`,
+        );
+      }
     }
   }
+
+  // Load the seed task + package runtime to derive the container image + signature.
+  const seedItem = seedItems[0]!;
+  const seedTask = queries.getTask(seedItem.taskId);
+  if (!seedTask || seedTask.projectId !== queue.projectId || seedTask.archived) {
+    throw new Error(`queue item ${seedItem.id} references unavailable eval ${seedItem.taskId}`);
+  }
+  if (!seedTask.packagePath || !seedTask.packageDigest || !seedTask.packageManifest) {
+    throw new Error(`queue item ${seedItem.id} references a non-canonical eval package`);
+  }
+  const seedPackageRuntime = await loadEvalPackageRuntimeConfig({
+    packagePath: seedTask.packagePath,
+    packageDigest: seedTask.packageDigest,
+    manifest: seedTask.packageManifest,
+  });
 
   const workspaceDir = join(
     dataDir,
@@ -210,21 +282,21 @@ export async function startQueueContainer(
   await mkdir(workspaceDir, { recursive: true });
   await clearDirectory(workspaceDir);
 
-  const firstItem = items[0]!;
-  const firstTask = tasks.get(firstItem.taskId)!;
-  const firstOverrides = mergeOverrides(queue.adapterOverrides, firstItem.overrides);
-  const firstCtx = makeRunContext(
+  const seedOverrides = mergeOverrides(queue.adapterOverrides, seedItem.overrides);
+  const seedCtx = makeRunContext(
     `queue-image-${queue.id}`,
     queue,
-    firstTask,
+    seedTask,
     workspaceDir,
-    resolveAdapterOverrides(project, firstOverrides),
+    resolveAdapterOverrides(project, seedOverrides),
   );
-  const adapterImage = queueAdapter.image(firstCtx);
-  const firstEnvironmentDigest = evalEnvironmentDigest(firstTask.packageManifest!);
+  // For a source-built adapter the built image is the commit-addressed tag
+  // (build.image), which must be the `FROM`/`COPY --from` source for the eval
+  // image. npm/built-in adapters use the rendered template image.
+  const adapterImage = build ? build.image : queueAdapter.image(seedCtx);
   const builtEvalImage = await buildEvalAgentImage({
     runtime,
-    task: firstTask,
+    task: seedTask,
     adapterImage,
     buildRoot: join(
       dataDir,
@@ -236,45 +308,48 @@ export async function startQueueContainer(
     ),
   });
   const image = builtEvalImage.image;
-  const firstResolved = resolveAdapterOverrides(project, firstOverrides);
-  const firstPackageRuntime = packageRuntimes.get(firstTask.id)!;
-  const configuredNetwork = resolveNetworkMode(firstResolved?.network ?? queue.networkPolicy);
-  if (configuredNetwork !== firstPackageRuntime.network) {
+  const seedResolved = resolveAdapterOverrides(project, seedOverrides);
+  const configuredNetwork = resolveNetworkMode(seedResolved?.network ?? queue.networkPolicy);
+  if (configuredNetwork !== seedPackageRuntime.network) {
     throw new Error(
-      `queue ${queue.id} network policy ${configuredNetwork} does not match eval package policy ${firstPackageRuntime.network}`,
+      `queue ${queue.id} network policy ${configuredNetwork} does not match eval package policy ${seedPackageRuntime.network}`,
     );
   }
-  const containerNetwork = firstPackageRuntime.network;
-  const containerNetworkAllowlist = firstPackageRuntime.networkAllowlist;
-  const containerPorts = queue.ports.length > 0 ? queue.ports : (firstResolved?.ports ?? []);
+  const containerNetwork = seedPackageRuntime.network;
+  const containerNetworkAllowlist = seedPackageRuntime.networkAllowlist;
+  const containerPorts = queue.ports.length > 0 ? queue.ports : (seedResolved?.ports ?? []);
+  const generationSignature: GenerationContainerSignature = {
+    image,
+    network: containerNetwork,
+    networkAllowlist: containerNetworkAllowlist,
+    cpus: seedPackageRuntime.cpus ?? null,
+    memoryMiB: seedPackageRuntime.memoryMiB ?? null,
+    ports: JSON.stringify(containerPorts),
+    environmentDigest: seedPackageRuntime.suite ? null : evalEnvironmentDigest(seedTask.packageManifest),
+  };
 
-  // Container-level settings are immutable for the lifetime of a persistent
-  // queue. Reject item overrides that would only appear to change them.
-  for (const item of items) {
-    const task = tasks.get(item.taskId)!;
+  // Validate every existing enabled item resolves to this same container signature
+  // (a live generation cannot host heterogeneous eval environments).
+  for (const item of seedItems) {
+    const task = queries.getTask(item.taskId)!;
     const raw = mergeOverrides(queue.adapterOverrides, item.overrides);
     const resolved = resolveAdapterOverrides(project, raw);
     const itemAdapterImage = queueAdapter.image(
-      makeRunContext(
-        `queue-image-${queue.id}-${item.id}`,
-        queue,
-        task,
-        workspaceDir,
-        resolved,
-      ),
+      makeRunContext(`queue-image-${queue.id}-${item.id}`, queue, task, workspaceDir, resolved),
     );
     if (itemAdapterImage !== adapterImage) {
       throw new Error(
         `queue ${queue.id} resolves multiple adapter images (${adapterImage}, ${itemAdapterImage}); one persistent queue requires one image`,
       );
     }
-    const itemPackageRuntime = packageRuntimes.get(task.id)!;
-    // Suite evals share one fat-base container image regardless of their
-    // per-eval environment (each installs its own toolchain via setup.sh), so
-    // the env-digest homogeneity check only applies to legacy canonical evals.
+    const itemPackageRuntime = await loadEvalPackageRuntimeConfig({
+      packagePath: task.packagePath!,
+      packageDigest: task.packageDigest!,
+      manifest: task.packageManifest!,
+    });
     if (!itemPackageRuntime.suite) {
-      const itemEnvironmentDigest = evalEnvironmentDigest(task.packageManifest!);
-      if (itemEnvironmentDigest !== firstEnvironmentDigest) {
+      const itemDigest = evalEnvironmentDigest(task.packageManifest!);
+      if (itemDigest !== generationSignature.environmentDigest) {
         throw new Error(
           `queue ${queue.id} contains multiple agent environment digests; split them into separate queues`,
         );
@@ -292,8 +367,8 @@ export async function startQueueContainer(
       );
     }
     if (
-      itemPackageRuntime.cpus !== firstPackageRuntime.cpus ||
-      itemPackageRuntime.memoryMiB !== firstPackageRuntime.memoryMiB
+      itemPackageRuntime.cpus !== seedPackageRuntime.cpus ||
+      itemPackageRuntime.memoryMiB !== seedPackageRuntime.memoryMiB
     ) {
       throw new Error(
         `queue ${queue.id} contains multiple package CPU/RAM limits; split them into separate queues`,
@@ -307,18 +382,43 @@ export async function startQueueContainer(
     }
   }
 
-  const expandedCount = items.reduce((sum, item) => sum + item.repeats, 0);
+  // Build the generation snapshot once; every claimed run captures it immutably.
+  // For source adapters the commit/image/id/version/build snapshot comes from the
+  // resolved + built commit; built-in/npm adapters keep queue.agentCommit (null)
+  // and the rendered image.
+  const generationSnapshot: GenerationSnapshot = {
+    batchId: "",
+    queueId: queue.id,
+    queueRevision: queue.revision,
+    queueContainerId: "",
+    agentCommit: build ? build.commit : queue.agentCommit,
+    agentImage: image,
+    agentImageId: builtEvalImage.imageId,
+    agentVersion: build ? build.version : null,
+    buildId: build ? build.buildId : null,
+    model: queue.model,
+    provider: queue.provider,
+    adapterOverrides: queue.adapterOverrides,
+    networkPolicy: containerNetwork,
+  };
+
+  // Create the generation record (batch = container-holding generation; one batch
+  // owns many evals; task_id null). No runs are pre-created.
   const batch = queries.createBatch({
-    taskId: firstTask.id,
+    taskId: null,
     projectId: queue.projectId,
     agentId: queue.agentId,
     model: queue.model,
     provider: queue.provider,
-    params: resolveAdapterOverrides(project, firstOverrides)?.params ?? {},
-    repeats: expandedCount,
+    params: seedResolved?.params ?? {},
+    repeats: 0,
     trigger: "eval-queue",
     triggerRef: queue.id,
     agentImage: image,
+    agentImageId: builtEvalImage.imageId,
+    agentCommit: build ? build.commit : (queue.agentCommit ?? undefined),
+    agentVersion: build ? build.version : undefined,
+    buildId: build ? build.buildId : undefined,
     queueId: queue.id,
     queueRevision: queue.revision,
   });
@@ -327,49 +427,16 @@ export async function startQueueContainer(
     projectId: queue.projectId,
     batchId: batch.id,
     image,
+    imageId: builtEvalImage.imageId,
+    agentCommit: build ? build.commit : (queue.agentCommit ?? null),
+    agentVersion: build ? build.version : null,
+    buildId: build ? build.buildId : null,
     state: "starting",
     workspaceDir,
   });
-
-  const expanded: ExpandedRun[] = [];
-  for (const item of items) {
-    const task = tasks.get(item.taskId)!;
-    const rawOverrides = mergeOverrides(queue.adapterOverrides, item.overrides);
-    for (let repeatIndex = 0; repeatIndex < item.repeats; repeatIndex++) {
-      const run = queries.createRun({
-        batchId: batch.id,
-        taskId: task.id,
-        projectId: queue.projectId,
-        queueId: queue.id,
-        queueItemId: item.id,
-        queueContainerId: containerRow.id,
-        agentId: queue.agentId,
-        model: queue.model,
-        provider: queue.provider,
-        repeatIndex,
-        evalVersion: task.version,
-        evalSnapshot: taskSnapshot(task),
-        status: "queued",
-        agentImage: image,
-        adapterOverrides: rawOverrides,
-        trigger: "eval-queue",
-        triggerRef: queue.id,
-        controlState: "running",
-      });
-      expanded.push({
-        run,
-        item,
-        task,
-        packageRuntime: packageRuntimes.get(task.id)!,
-        overrides: rawOverrides,
-      });
-    }
-  }
-
-  queries.updateEvalQueue(queue.id, {
-    status: "starting",
-    activeBatchId: batch.id,
-  });
+  generationSnapshot.batchId = batch.id;
+  generationSnapshot.queueContainerId = containerRow.id;
+  queries.updateEvalQueue(queue.id, { status: "starting", activeBatchId: batch.id });
 
   let handle: ContainerHandle;
   try {
@@ -386,7 +453,7 @@ export async function startQueueContainer(
         "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
       ],
       env: {},
-      limits: { cpus: firstPackageRuntime.cpus, pids: 512 },
+      limits: { cpus: seedPackageRuntime.cpus, pids: 512 },
       timeoutMs: 0,
       network: containerNetwork,
       ...(containerNetwork === "allowlist"
@@ -403,12 +470,10 @@ export async function startQueueContainer(
       stoppedAt: new Date().toISOString(),
       error: message,
     });
-    queries.updateEvalQueue(queue.id, {
-      status: "failed",
-      activeBatchId: null,
-    });
-    for (const entry of expanded) {
-      queries.finalizeRun(entry.run.id, {
+    queries.updateEvalQueue(queue.id, { status: "failed", activeBatchId: null });
+    // Any runs already claimed (race with start failure) become failed.
+    for (const run of queries.listRunsByBatch(batch.id)) {
+      queries.finalizeRun(run.id, {
         status: "failed",
         error: `queue container failed to start: ${message}`,
         controlState: "done",
@@ -427,6 +492,8 @@ export async function startQueueContainer(
 
   let currentRecorder: EventRecorder | null = null;
   let currentExec: ContainerExecHandle | null = null;
+  let abortRequested = false;
+  let abortWaiters: Array<() => void> = [];
   const live: LiveQueueContainer = {
     queueId: queue.id,
     projectId: queue.projectId,
@@ -440,6 +507,8 @@ export async function startQueueContainer(
     paused: false,
     stopRequested: false,
     finished: false,
+    abortRequested: false,
+    signature: generationSignature,
     done: Promise.resolve(),
     async startExec(spec) {
       if (!live.acceptingExec || live.finished) {
@@ -493,16 +562,28 @@ export async function startQueueContainer(
       await handle.resume();
       live.paused = false;
       queries.updateQueueContainer(containerRow.id, {
-        state: live.currentRunId ? "running" : "idle",
+        state: live.currentRunId ? "running" : "running",
       });
       queries.updateEvalQueue(queue.id, {
-        status: live.currentRunId ? "running" : "completed",
+        status: live.currentRunId ? "running" : "running",
       });
+    },
+    async abortCurrentRun() {
+      if (live.finished) return;
+      // Signal the worker to stop the in-flight exec session and treat the
+      // current run as aborted (preserve partial events + seal partial archive).
+      abortRequested = true;
+      live.abortRequested = true;
+      if (currentExec) await currentExec.stop(2_000).catch(() => undefined);
+      // Resume waiting workers (the claim loop polls abortRequested anyway).
+      for (const w of abortWaiters.splice(0)) w();
     },
     async stop(graceMs = 10_000) {
       if (live.finished) return;
       live.stopRequested = true;
       live.acceptingExec = false;
+      abortRequested = true;
+      live.abortRequested = true;
       if (currentExec) await currentExec.stop(Math.min(graceMs, 2_000)).catch(() => undefined);
       queries.updateQueueContainer(containerRow.id, { state: "stopping" });
       await handle.stop(graceMs).catch(() => undefined);
@@ -512,18 +593,17 @@ export async function startQueueContainer(
         state: "stopped",
         stoppedAt: new Date().toISOString(),
       });
-      queries.updateEvalQueue(queue.id, {
-        status: "stopped",
-        activeBatchId: null,
-      });
+      queries.updateEvalQueue(queue.id, { status: "stopped", activeBatchId: null });
       liveQueues.delete(queue.id);
     },
   };
   liveQueues.set(queue.id, live);
 
+  const runIds: string[] = [];
+
   live.done = (async () => {
     let tainted = false;
-    const runIds: string[] = [];
+    let stopped = false;
     try {
       const connection = await verifyAdapterConnection({
         dataDir,
@@ -532,43 +612,40 @@ export async function startQueueContainer(
         adapter: queueAdapter,
         handle,
         workspaceDir,
-        task: firstTask,
-        overrides: resolveAdapterOverrides(project, firstOverrides),
+        task: seedTask,
+        overrides: resolveAdapterOverrides(project, seedOverrides),
       });
       const connectionReset = await clearWorkspaceInContainer(handle);
       if (!connectionReset.ok) {
         connection.error = connection.error ?? connectionReset.error;
         connection.ok = false;
       }
-      if (!connection.ok) {
-        const message = `agent/provider connection check failed: ${connection.error ?? "no real model response"}`;
-        queries.updateQueueContainer(containerRow.id, {
-          state: "running",
-          error: message,
-        });
-        queries.updateEvalQueue(queue.id, { status: "failed" });
-        for (const entry of expanded) {
-          queries.finalizeRun(entry.run.id, {
-            status: "failed",
-            error: message,
-            controlState: "done",
-          });
+      if (!connection.ok || (queueAdapter.configure !== undefined && live.stopRequested)) {
+        if (!connection.ok) {
+          const message = `agent/provider connection check failed: ${connection.error ?? "no real model response"}`;
+          queries.updateQueueContainer(containerRow.id, { state: "running", error: message });
+          queries.updateEvalQueue(queue.id, { status: "failed" });
+          for (const run of queries.listRunsByBatch(batch.id)) {
+            queries.finalizeRun(run.id, {
+              status: "failed",
+              error: message,
+              controlState: "done",
+            });
+          }
+          return;
         }
-        return;
       }
 
-      // Run the adapter's optional configure step (provider connection + model
-      // selection) once before any eval. A non-zero exit taints the queue.
       if (queueAdapter.configure) {
         const configureCtx: RunContext = makeRunContext(
           `configure-${batch.id}`,
           queue,
-          firstTask,
+          seedTask,
           workspaceDir,
-          resolveAdapterOverrides(project, firstOverrides),
+          resolveAdapterOverrides(project, seedOverrides),
         );
         const configureProbe = queueAdapter.configure(configureCtx);
-        if (configureProbe) {
+        if (configureProbe && !live.stopRequested) {
           const configureResult = await handle.exec({
             argv: configureProbe.command.argv,
             env: configureProbe.command.env,
@@ -604,53 +681,245 @@ export async function startQueueContainer(
             const message = `agent configure step failed (exit ${configureResult.exitCode}): ${configureResult.stderr.slice(0, 500)}`;
             queries.updateQueueContainer(containerRow.id, { state: "running", error: message });
             queries.updateEvalQueue(queue.id, { status: "failed" });
-            for (const entry of expanded) {
-              queries.finalizeRun(entry.run.id, { status: "failed", error: message, controlState: "done" });
+            for (const run of queries.listRunsByBatch(batch.id)) {
+              queries.finalizeRun(run.id, { status: "failed", error: message, controlState: "done" });
             }
             return;
           }
         }
       }
 
-      for (const entry of expanded) {
-        if (live.stopRequested || tainted) break;
-        live.currentRunId = entry.run.id;
-        live.currentQueueItemId = entry.item.id;
-        queries.updateQueueContainer(containerRow.id, { state: "running" });
-        const outcome = await executeEval({
-          dataDir,
-          queries,
-          runtime,
-          queue,
-          containerRow,
-          handle,
-          adapter: queueAdapter,
-          entry,
-          workspaceDir,
-          timeoutMs: opts.timeoutMs ?? entry.packageRuntime.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
-          isStopRequested: () => live.stopRequested,
-          setExec: (session) => {
-            currentExec = session;
-          },
-          setRecorder: (recorder) => {
-            currentRecorder = recorder;
-          },
-        });
-        runIds.push(entry.run.id);
-        tainted = outcome.tainted;
-        currentExec = null;
-        currentRecorder = null;
+      // ---- Dynamic claim loop ----
+      // Each iteration atomically claims one repeat of one enabled item, or
+      // atomically closes the generation (empty) and exits the loop. Pause and
+      // abort states are honored between claims and reflected into the live run.
+      for (;;) {
+        if (live.stopRequested) break;
+        while (live.paused && !live.stopRequested) {
+          await sleep(100);
+        }
+        if (live.stopRequested) break;
+
+        let claim;
+        try {
+          claim = queries.claimQueueWork({
+            batchId: batch.id,
+            queueId: queue.id,
+            projectId: queue.projectId,
+            queueContainerId: containerRow.id,
+            snapshot: generationSnapshot,
+            agentId: queue.agentId,
+          });
+        } catch (err) {
+          if (
+            err &&
+            typeof err === "object" &&
+            (err as { code?: string }).code === "GENERATION_CLOSED"
+          ) {
+            break;
+          }
+          throw err;
+        }
+        if (!claim.claimed) break; // atomically closed as empty
+
+        // A claimed run must always reach a terminal disposition (metrics +
+        // archive, or an explicit failure). Guard the whole per-claim body so a
+        // transient package-load/exec error fails exactly this run and the drain
+        // continues, rather than aborting the entire generation with an orphaned
+        // "queued"/"running" run.
+        const claimedRun = claim.run;
+        try {
+          const task = queries.getTask(claimedRun.taskId);
+          if (!task || task.archived) {
+            queries.finalizeRun(claimedRun.id, {
+              status: "failed",
+              error: `claimed eval ${claimedRun.taskId} is unavailable`,
+              controlState: "done",
+            });
+            continue;
+          }
+          const packageRuntime = await loadEvalPackageRuntimeConfig({
+            packagePath: task.packagePath!,
+            packageDigest: task.packageDigest!,
+            manifest: task.packageManifest!,
+          });
+          const itemSnapshot = claimedRun.itemSnapshot as Record<string, unknown> | null;
+          const rawOverrides = mergeOverrides(
+            queue.adapterOverrides,
+            (itemSnapshot as { overrides?: Record<string, unknown> | null } | null)?.overrides ?? null,
+          );
+          const entry: ClaimedRun = {
+            run: claimedRun,
+            item: claimedRun.itemSnapshot as unknown as EvalQueueItem | null,
+            task,
+            packageRuntime,
+            overrides: rawOverrides,
+          };
+
+          live.currentRunId = claimedRun.id;
+          live.currentQueueItemId = claimedRun.queueItemId;
+          abortRequested = false;
+          live.abortRequested = false;
+          queries.updateQueueContainer(containerRow.id, { state: "running" });
+
+          const outcome = await executeEval({
+            dataDir,
+            queries,
+            runtime,
+            queue,
+            containerRow,
+            handle,
+            adapter: queueAdapter,
+            entry,
+            workspaceDir,
+            timeoutMs: opts.timeoutMs ?? packageRuntime.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
+            isStopRequested: () => live.stopRequested,
+            isAbortRequested: () => abortRequested,
+            setExec: (session) => {
+              currentExec = session;
+            },
+            setRecorder: (recorder) => {
+              currentRecorder = recorder;
+            },
+          });
+          runIds.push(claimedRun.id);
+          tainted = outcome.tainted || tainted;
+          currentExec = null;
+          currentRecorder = null;
+          live.currentRunId = null;
+          live.currentQueueItemId = null;
+
+              // If a queue stop was requested mid-run, finalize the generation now.
+          if (live.stopRequested) {
+            stopped = true;
+            break;
+          }
+        } catch (err) {
+          const message = `queue worker failed claimed eval: ${
+            err instanceof Error ? err.message : String(err)
+          }`;
+          // Record the failure so the run is never left queued/running with no
+          // metrics/archive. Best-effort: finalizeRun itself could throw; the
+          // outer generation catch still marks the container failed then.
+          try {
+            queries.finalizeRun(claimedRun.id, {
+              status: "failed",
+              error: message,
+              controlState: "done",
+            });
+          } catch (finalizeErr) {
+            // Best-effort terminal write; the outer generation catch marks the
+            // container/queue failed so the orphan is at least surfaced there.
+          }
+          // The claimed run is terminal and must carry exactly one root
+          // run-metrics.json regardless of where executeEval failed (an
+          // un-archived, metrics-less failed run breaks the run-metrics
+          // guarantee). Write a minimal platform-owned terminal metrics file
+          // only if executeEval did not already write one.
+          const claimedRunDir = join(
+            dataDir,
+            "projects",
+            claimedRun.projectId,
+            "evals",
+            claimedRun.id,
+          );
+          try {
+            const metricsPath = join(claimedRunDir, "run-metrics.json");
+            let needsWrite = true;
+            try {
+              await readFile(metricsPath, "utf8");
+              needsWrite = false;
+            } catch {
+              // absent → write below
+            }
+            if (needsWrite) {
+              const terminalMetrics = deriveRunMetrics([], {
+                officialReward: null,
+              });
+              await writeJson(metricsPath, {
+                ...terminalMetrics,
+                terminalStatus: "failed",
+                measurements: {
+                  ...terminalMetrics.measurements,
+                  agent_crashes: {
+                    value: 1,
+                    unit: "count",
+                    provenance: "exact",
+                    refs: [],
+                  },
+                  timeouts: {
+                    value: 0,
+                    unit: "count",
+                    provenance: "exact",
+                    refs: [],
+                  },
+                },
+              });
+              try {
+                queries.upsertEvalMetrics({
+                  runId: claimedRun.id,
+                  projectId: claimedRun.projectId,
+                  schemaVersion: RUN_METRICS_SCHEMA_VERSION,
+                  execution: {
+                    ...terminalMetrics,
+                    terminalStatus: "failed",
+                  } as unknown as Record<string, unknown>,
+                });
+              } catch {
+                // best-effort metrics row
+              }
+            }
+          } catch {
+            // A metrics-write failure must not mask the run failure itself.
+          }
+          runIds.push(claimedRun.id);
+          currentExec = null;
+          currentRecorder = null;
+          live.currentRunId = null;
+          live.currentQueueItemId = null;
+          continue;
+        }
       }
 
       live.currentRunId = null;
       live.currentQueueItemId = null;
-      if (live.stopRequested) return;
+      // Release this generation's live slot BEFORE any onQueueDrained hook runs.
+      // The watcher FIFO auto-launch calls startQueueContainer for the next pending
+      // commit, which must see this queue as free (not ALREADY_ACTIVE) and must not
+      // be clobbered by this generation's own map-delete teardown. We finalize the
+      // container handle here too so generationhandover is not blocked.
+      const releaseSlot = () => {
+        if (live.finished) return;
+        live.finished = true;
+        handle.remove().catch(() => undefined);
+        if (liveQueues.get(queue.id) === live) liveQueues.delete(queue.id);
+      };
+      if (live.stopRequested) {
+        stopped = true;
+        releaseSlot();
+        queries.updateQueueContainer(containerRow.id, { state: "stopped" });
+        queries.updateEvalQueue(queue.id, { status: "stopped", activeBatchId: null });
+        if (opts.onQueueDrained) {
+          await opts.onQueueDrained({
+            queueId: queue.id,
+            projectId: queue.projectId,
+            batchId: batch.id,
+            runIds,
+            tainted,
+            stopped,
+          });
+        }
+        return;
+      }
+      releaseSlot();
       queries.updateQueueContainer(containerRow.id, {
-        state: tainted ? "failed" : "idle",
+        state: tainted ? "tainted" : "completed",
         ...(tainted ? { error: "queue workspace cleanup/reset failed" } : {}),
+        stoppedAt: new Date().toISOString(),
       });
       queries.updateEvalQueue(queue.id, {
         status: tainted ? "tainted" : "completed",
+        activeBatchId: null,
       });
       if (opts.onQueueDrained) {
         await opts.onQueueDrained({
@@ -659,14 +928,12 @@ export async function startQueueContainer(
           batchId: batch.id,
           runIds,
           tainted,
+          stopped,
         });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      queries.updateQueueContainer(containerRow.id, {
-        state: "failed",
-        error: message,
-      });
+      queries.updateQueueContainer(containerRow.id, { state: "failed", error: message });
       queries.updateEvalQueue(queue.id, { status: "failed" });
     } finally {
       currentExec = null;
@@ -674,7 +941,76 @@ export async function startQueueContainer(
     }
   })();
 
+  // Generation closure must stop + remove the persistent container and clear the
+  // queue's active generation. The worker loop releases the live slot before the
+  // onQueueDrained hook and before this finally; only delete from the live map if
+  // this generation is still the one registered (a watcher FIFO auto-launch may
+  // have already started a replacement generation for the same queue).
+  void live.done.finally(() => {
+    if (!live.finished) {
+      live.finished = true;
+      handle.remove().catch(() => undefined);
+      if (liveQueues.get(queue.id) === live) liveQueues.delete(queue.id);
+    }
+  });
+
   return live;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Validate an item (newly added while a generation runs) against the live
+ * generation's immutable container signature. Returns the reason when the item is
+ * incompatible, or null when it can run in the current container. Mirrors the
+ * startup homogeneity checks so a mid-run addition either joins the running
+ * container (matching signature) or is rejected with 409, never silently accepted
+ * and later un-runnable.
+ */
+export async function validateItemAgainstGenerationSignature(input: {
+  queries: DbQueries;
+  queue: EvalQueue;
+  task: Task;
+  overrides: Record<string, unknown> | null;
+  signature: GenerationContainerSignature;
+}): Promise<string | null> {
+  const { queries, queue, task, overrides, signature } = input;
+  if (!task.packagePath || !task.packageDigest || !task.packageManifest) {
+    return `eval ${task.id} is not a canonical eval package`;
+  }
+  const project = queries.getProject(queue.projectId);
+  if (!project) return "project not found";
+  const runtimeConfig = await loadEvalPackageRuntimeConfig({
+    packagePath: task.packagePath,
+    packageDigest: task.packageDigest,
+    manifest: task.packageManifest,
+  });
+  if (!runtimeConfig.suite && signature.environmentDigest !== null) {
+    if (evalEnvironmentDigest(task.packageManifest) !== signature.environmentDigest) {
+      return "eval environment digest does not match the active generation container";
+    }
+  }
+  const resolved = resolveAdapterOverrides(project, mergeOverrides(queue.adapterOverrides, overrides));
+  const itemNetwork = resolveNetworkMode(resolved?.network ?? queue.networkPolicy);
+  if (itemNetwork !== signature.network || runtimeConfig.network !== signature.network) {
+    return "network policy does not match the active generation container";
+  }
+  if (JSON.stringify(runtimeConfig.networkAllowlist) !== JSON.stringify(signature.networkAllowlist ?? [])) {
+    return "network allowlist does not match the active generation container";
+  }
+  if (
+    (runtimeConfig.cpus ?? null) !== signature.cpus ||
+    (runtimeConfig.memoryMiB ?? null) !== signature.memoryMiB
+  ) {
+    return "CPU/RAM limits do not match the active generation container";
+  }
+  const itemPorts = queue.ports.length > 0 ? queue.ports : (resolved?.ports ?? []);
+  if (JSON.stringify(itemPorts) !== signature.ports) {
+    return "port set does not match the active generation container";
+  }
+  return null;
 }
 
 async function executeEval(input: {
@@ -685,10 +1021,12 @@ async function executeEval(input: {
   containerRow: QueueContainer;
   handle: ContainerHandle;
   adapter: Adapter;
-  entry: ExpandedRun;
+  entry: ClaimedRun;
   workspaceDir: string;
   timeoutMs: number;
   isStopRequested: () => boolean;
+  /** True when the operator aborted the current eval; seals partial evidence. */
+  isAbortRequested: () => boolean;
   setExec: (session: ContainerExecHandle | null) => void;
   setRecorder: (recorder: EventRecorder | null) => void;
 }): Promise<{ tainted: boolean }> {
@@ -705,6 +1043,10 @@ async function executeEval(input: {
   const eventsPath = join(runDir, EVENTS);
   await mkdir(runDir, { recursive: true });
   await clearDirectory(workspaceDir);
+
+  // Persist eventsPath BEFORE the agent launches so SSE/NDJSON clients can tail
+  // the run's canonical events during execution (not only after finalize).
+  queries.setRunEventsPath(run.id, eventsPath);
 
   if (!task.packagePath || !task.packageDigest || !task.packageManifest) {
     throw new Error(`eval ${task.id} is not a validated canonical eval package`);
@@ -769,6 +1111,12 @@ async function executeEval(input: {
   input.setRecorder(record);
 
   await writeJson(join(runDir, "eval.json"), taskSnapshot(task));
+  // Snapshot the adapter's evidence manifest onto the run so a judge years
+  // later binds traces/logs to the adapter version that produced them. The
+  // role-typed evalContext is what the judge reads to find each evidence class
+  // (trace/transcript/result/tool_calls/model_calls/tmp) without path folklore.
+  const evidenceSpec = input.adapter.evidence(ctx);
+  await writeJson(join(runDir, "adapter-evidence.json"), evidenceSpec);
   await writeJson(join(runDir, "queue.json"), {
     queue,
     queueItem: entry.item,
@@ -781,6 +1129,7 @@ async function executeEval(input: {
     evalVersion: task.version,
     workspaceCommit,
     startedAt: new Date(startedAt).toISOString(),
+    evalContext: buildEvalContext(evidenceSpec.manifest),
   });
   await writeJson(join(runDir, "exec.json"), {
     image: handle.image,
@@ -933,11 +1282,12 @@ async function executeEval(input: {
       exitCode: execResult.exitCode,
       sawFatalError,
       timedOut: execResult.timedOut,
-      aborted: input.isStopRequested(),
+      aborted: input.isStopRequested() || input.isAbortRequested(),
     });
   } catch (err) {
     runError = err instanceof Error ? err.message : String(err);
-    status = input.isStopRequested() ? "aborted" : "failed";
+    status =
+      input.isStopRequested() || input.isAbortRequested() ? "aborted" : "failed";
     await record.append({
       v: 1,
       runId: run.id,
@@ -979,7 +1329,7 @@ async function executeEval(input: {
   const evidence = await copyRetainedEvidence(
     workspaceDir,
     runDir,
-    input.adapter.evidence(ctx),
+    evidenceSpec,
   );
   await writeJson(join(runDir, "evidence-extraction.json"), evidence);
   await record.append({
@@ -1132,20 +1482,22 @@ async function executeEval(input: {
   });
 
   const finalizationErrors: string[] = [];
+  // Verifier is ground truth for whether the eval actually passed. Read its
+  // official reward (persisted as verifier.json) so false_success is classified
+  // authoritatively (the agent claimed success the verifier did not confirm)
+  // instead of fragile shell-command heuristics. Hoisted to also feed the central
+  // archive manifest's reward.
+  let officialReward: number | null = null;
   try {
     await writeJson(join(runDir, "run.json"), {
       ...finalizedRun,
       evalVersion: task.version,
       workspaceCommit: workspaceCommit ?? finalizedRun.workspaceCommit,
+      evalContext: buildEvalContext(evidenceSpec.manifest),
     });
     const diffText = diffPath
       ? await readFile(diffPath, "utf8").catch(() => undefined)
       : undefined;
-    // Verifier is ground truth for whether the eval actually passed. Read its
-    // official reward (persisted as verifier.json) so false_success is judged
-    // authoritatively (the agent claimed success the verifier did not confirm)
-    // instead of fragile shell-command heuristics.
-    let officialReward: number | null = null;
     try {
       const verifierRecord = JSON.parse(
         await readFile(join(runDir, "verifier.json"), "utf8"),
@@ -1182,10 +1534,16 @@ async function executeEval(input: {
   let archiveError: string | null = null;
   try {
     if (packageRuntime.suite) {
-      // Reorganize the retained evidence into a judge-friendly layout (high-signal
-      // traces at the top, platform logs and dig-more material in subfolders) so
-      // the judge meets the important files first walking top-down.
+      // Reorganize retained evidence into a high-signal layout with traces at
+      // the top and platform logs plus deeper evidence in subfolders, so
+      // archive consumers meet important files first walking top-down. This also
+      // applies the shared target folder layout via organizeArchiveLayout.
       await restructureSuiteArchive(runDir);
+    } else {
+      // Legacy (non-suite) archives still get the shared target folder layout
+      // (verifier_res/session/diffs/raw_std/eval_lifecycle_logs + remove
+      // events.jsonl) before sealing.
+      await organizeArchiveLayout(runDir);
     }
     await sealEvalArchive(queries, runDir, {
       runId: run.id,
@@ -1193,13 +1551,15 @@ async function executeEval(input: {
       queueId: queue.id,
       batchId: run.batchId,
     });
-    // Central store: copy/record this eval's archive keyed by agent version, project,
-    // queue, and batch so all logs/traces live in one browsable place by which agent
-    // commit ran it. Best-effort; never fails the run.
+    // Central store: copy the sealed tree to archives/<runId> and upsert the
+    // catalog row in archives/index.json. Best-effort; never fails the run.
     try {
       const rowRun = queries.getRun(run.id);
       const rowTask = queries.getTask(task.id);
       const theProject = queries.getProject(queue.projectId);
+      const rowContainer = containerRow.runtimeContainerId
+        ? queries.getQueueContainer(containerRow.id)
+        : null;
       await storeEvalArchive({
         dataDir: input.dataDir,
         sealedArchiveDir: runDir,
@@ -1215,11 +1575,14 @@ async function executeEval(input: {
           agentId: rowRun?.agentId ?? null,
           agentCommit: rowRun?.agentCommit ?? null,
           agentImage: rowRun?.agentImage ?? null,
-          agentVersion: null,
+          agentImageId: rowContainer?.imageId ?? null,
+          agentVersion: rowContainer?.agentVersion ?? rowRun?.agentCommit?.slice(0, 12) ?? null,
+          buildId: rowContainer?.buildId ?? null,
+          queueRevision: queue.revision,
           model: queue.model,
           provider: queue.provider,
           status: status,
-          reward: null,
+          reward: officialReward ?? null,
           sealedAt: queries.getEvalArchive(run.id)?.sealedAt ?? null,
         },
       });
@@ -1379,11 +1742,18 @@ function collectApiKeys(): Record<string, string> {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_CODEX_ACCESS_TOKEN",
     "MINIMAX_API_KEY",
     "NEURALWATT_API_KEY",
     "NURALWATT_API_KEY",
     "NURALWATT_BASE_URL",
     "ANTHROPIC_BASE_URL",
+    "DEEPSEEK_API_KEY",
+    // Self-signed / short-lived proxy TLS: the OpenAI-compatible provider uses
+    // Node fetch, which honors this in-process. It is deliberately passed so a
+    // CLI-proxy connection object can work without trusting its cert chain.
+    "NODE_TLS_REJECT_UNAUTHORIZED",
   ]) {
     const value = process.env[name];
     if (value) keys[name] = value;

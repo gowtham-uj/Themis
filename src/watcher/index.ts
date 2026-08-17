@@ -1,20 +1,22 @@
 /**
- * Watcher package barrel (P8a foundation).
- * Engine is pure-ish: QueryStore + RefResolver seams; no HTTP/UI.
+ * Watcher barrel.
+ * The engine is the per-project agent-commit queue watcher: resolve commit,
+ * dedupe, durable pending FIFO event, and launch the queue generation.
  */
 
 export {
   applySemverFilter,
   computeDedupKey,
   globMatch,
-  handleWatcherEvent,
+  handleWatcherCommit,
+  isSameRepo,
   matchRules,
+  nextPendingForQueue,
   normalizeRepo,
   parseSemver,
   refMatches,
   repoMatches,
   shouldEnqueue,
-  type HandleWatcherEventResult,
   type RefResolver,
-  type WatcherInboundEvent,
+  type WatcherSeams,
 } from "./engine.js";

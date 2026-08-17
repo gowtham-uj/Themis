@@ -53,7 +53,7 @@ export interface EvalEnvSpec {
   /**
    * Whether setup output becomes the git baseline. Default true, which is
    * almost always right: only set false when the eval WANTS the agent to be
-   * credited with (or judged on) what setup produced.
+   * credited with what setup produced.
    */
   commitBaseline?: boolean;
   /**
@@ -182,7 +182,7 @@ function truncateLog(s: string): string {
  *
  * Wrapped rather than run raw so that:
  *  - `set -eu` makes a failing setup step fail provisioning, instead of
- *    handing the agent a half-built environment it will be judged against;
+ *    handing the agent a half-built environment it will run against;
  *  - cwd is the workspace, so relative paths in an eval mean what they look
  *    like they mean;
  *  - the git baseline is committed by the same shell, immediately after setup,
@@ -465,7 +465,7 @@ const DEFAULT_CLEANUP_TIMEOUT_SEC = 300;
  * Tear down an eval's environment so the next eval starts clean.
  *
  * Runs after the agent AND after the diff/traces are captured — cleanup that
- * ran earlier would delete the very evidence the judge needs.
+ * ran earlier would delete the evidence archive needs.
  *
  * Never throws. Cleanup is housekeeping: a passing eval must not be reported as
  * failed because teardown was flaky, and a failing eval must still get its

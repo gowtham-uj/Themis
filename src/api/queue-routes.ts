@@ -1,10 +1,6 @@
-// @ts-nocheck
-import { prepareQueueAnalysis, executeQueueAnalysis } from "../judge-stub.js";
-import type { ImprovementOwnerClass, ImprovementStepStatus } from "../types.js";
 /** Persistent eval-queue, queue-container, introspection, and archive routes. */
 
 import { once } from "node:events";
-import { readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type {
   CreateEvalQueueInput,
@@ -12,9 +8,8 @@ import type {
   DbQueries,
   EvalQueue,
   EvalQueueItem,
-  ImprovementStepRecord,
   Project,
-  QueueAnalysis,
+  ProjectAgentAdapter,
   UpdateEvalQueueInput,
   UpdateEvalQueueItemInput,
 } from "../db/queries.js";
@@ -23,10 +18,18 @@ import { verifyEvalArchive } from "../runner/eval-archive.js";
 import { parsePorts } from "../runner/project-config.js";
 import {
   startQueueContainer,
+  validateItemAgainstGenerationSignature,
+  type GenerationContainerSignature,
   type LiveQueueContainer,
   type LiveQueueContainersMap,
   type StartQueueContainerOptions,
 } from "../runner/queue-worker.js";
+import {
+  resolveAgentCommit,
+  type AdapterBuildService,
+  type ResolvedAgentCommit,
+} from "../runner/adapter-build.js";
+import { isTerminalStatus } from "../runner/status.js";
 import { getRequestAuth, isLoopbackAddress } from "./auth.js";
 import { badRequest, conflict, HttpError, notFound } from "./errors.js";
 import {
@@ -35,6 +38,7 @@ import {
   type RequestContext,
   type Router,
 } from "./router.js";
+import { withBodyIdempotency } from "./middleware.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
@@ -90,18 +94,6 @@ function requireQueue(
   return queue;
 }
 
-function requireQueueAnalysis(
-  queries: DbQueries,
-  queue: EvalQueue,
-  analysisId: string,
-): QueueAnalysis {
-  const analysis = queries.getQueueAnalysis(analysisId);
-  if (!analysis || analysis.queueId !== queue.id) {
-    throw notFound(`queue analysis not found: ${analysisId}`);
-  }
-  return analysis;
-}
-
 function requireItem(
   queries: DbQueries,
   queue: EvalQueue,
@@ -114,34 +106,65 @@ function requireItem(
   return item;
 }
 
-function improvementStepView(step: ImprovementStepRecord) {
-  return {
-    id: step.id,
-    queue_analysis_id: step.queueAnalysisId,
-    project_id: step.projectId,
-    queue_id: step.queueId,
-    rank: step.rank,
-    class: step.class,
-    priority: step.priority,
-    confidence: step.confidence,
-    defect_ids: step.defectIds,
-    subsystem: step.subsystem,
-    problem: step.problem,
-    evidence: step.evidence,
-    target: step.target,
-    change: step.change,
-    acceptance_criteria: step.acceptanceCriteria,
-    tests: step.tests,
-    verify_task_ids: step.verifyTaskIds,
-    regression_task_ids: step.regressionTaskIds,
-    dependencies: step.dependencies,
-    non_goals: step.nonGoals,
-    preventive: step.preventive,
-    status: step.status,
-    blocking_reason: step.blockingReason ?? null,
-    created_at: step.createdAt,
-    updated_at: step.updatedAt,
-  };
+/** The build service used for commit resolution (queries + a dataDir for builds). */
+function buildServiceFor(app: QueueAppCtx): AdapterBuildService {
+  return { queries: app.queries, dataDir: app.dataDir };
+}
+
+/** The selected adapter (project-owned or shared) backing a queue's agent. */
+function adapterForQueue(
+  queries: DbQueries,
+  queue: EvalQueue,
+): ProjectAgentAdapter | null {
+  if (queue.sharedAdapterId) {
+    return queries.getProjectAgentAdapter(queue.sharedAdapterId);
+  }
+  return queries.getProjectAgentAdapterByAgentId(queue.projectId, queue.agentId);
+}
+
+/**
+ * Resolve a queue's agent_commit / agent_ref into a stored full SHA.
+ *
+ * A full 40-char SHA is accepted verbatim (reproducible pin). Any ref is resolved
+ * immediately to its exact commit via the adapter's source repo so the queue
+ * stores only full shas. Returns null when the queue uses a built-in adapter
+ * (may omit agent_commit) or when no commit/ref is given.
+ */
+async function resolveQueueCommit(
+  app: QueueAppCtx,
+  queue: EvalQueue,
+  body: { agent_commit?: string | null; agentCommit?: string | null; agent_ref?: string | null; agentRef?: string | null },
+): Promise<ResolvedAgentCommit | null> {
+  const commit = body.agent_commit ?? body.agentCommit;
+  const ref = body.agent_ref ?? body.agentRef;
+  if (commit === undefined && ref === undefined) {
+    // No commit requested: keep the existing queue pin (null allowed for built-ins).
+    return queue.agentCommit ? { sha: queue.agentCommit, shortSha: queue.agentCommit.slice(0, 12), repo: "" } : null;
+  }
+  if (commit !== undefined && commit !== null && ref !== undefined && ref !== null) {
+    throw badRequest("provide agent_commit or agent_ref, not both");
+  }
+  const adapter = adapterForQueue(app.queries, queue);
+  if (!adapter || adapter.installType !== "source-build" || !adapter.sourceRepo) {
+    throw badRequest(
+      "agent_commit/agent_ref requires a source-built agent adapter with source_repo",
+    );
+  }
+  if (ref !== undefined && ref !== null) {
+    const resolved = await resolveAgentCommit(
+      buildServiceFor(app),
+      adapter.sourceRepo,
+      String(ref),
+    );
+    if (!resolved) {
+      throw badRequest("agent_ref could not be resolved to a commit; pass a full SHA or a resolvable ref");
+    }
+    return resolved;
+  }
+  if (commit !== undefined && commit !== null) {
+    return resolveAgentCommit(buildServiceFor(app), adapter.sourceRepo, String(commit));
+  }
+  return null;
 }
 
 function requireLiveQueue(
@@ -250,6 +273,16 @@ function parseExecBody(body: ExecBody): {
   return { command: body.command, cwd, env, timeoutMs, maxOutputBytes };
 }
 
+/** Strip host-internal storage paths from a queue container row for API clients. */
+function publicContainer(
+  container: import("../db/queries.js").QueueContainer | null,
+): Record<string, unknown> | null {
+  if (!container) return null;
+  const { workspaceDir: _workspaceDir, ...rest } = container;
+  void _workspaceDir;
+  return { ...rest } as unknown as Record<string, unknown>;
+}
+
 function queueView(app: QueueAppCtx, queue: EvalQueue): Record<string, unknown> {
   const live = app.liveQueueContainers.get(queue.id);
   const container = app.queries.getActiveQueueContainer(queue.id);
@@ -259,11 +292,10 @@ function queueView(app: QueueAppCtx, queue: EvalQueue): Record<string, unknown> 
   return {
     queue,
     items: app.queries.listEvalQueueItems(queue.id, { includeDisabled: true }),
-    container,
+    container: publicContainer(container),
     current_run_id: live?.currentRunId ?? null,
     current_queue_item_id: live?.currentQueueItemId ?? null,
     runs,
-    analyses: app.queries.listQueueAnalyses(queue.id),
   };
 }
 
@@ -297,16 +329,14 @@ export function registerQueueRoutes(router: Router): void {
       network_policy?: string;
       networkPolicy?: string;
       ports?: unknown;
-      judge_model?: string | null;
-      judgeModel?: string | null;
-      judge_provider?: string | null;
-      judgeProvider?: string | null;
-      auto_judge?: boolean;
-      autoJudge?: boolean;
       shared_adapter_id?: string | null;
       sharedAdapterId?: string | null;
       builtin_adapter_id?: string | null;
       builtinAdapterId?: string | null;
+      agent_commit?: string | null;
+      agentCommit?: string | null;
+      agent_ref?: string | null;
+      agentRef?: string | null;
     }>(req);
     if (typeof body.name !== "string" || !body.name.trim()) {
       throw badRequest("name is required");
@@ -381,14 +411,22 @@ export function registerQueueRoutes(router: Router): void {
     const networkPolicy = body.network_policy ?? body.networkPolicy;
     if (networkPolicy !== undefined) input.networkPolicy = networkPolicy;
     if (body.ports !== undefined) input.ports = parsePorts(body.ports) ?? [];
-    const judgeModel = body.judge_model ?? body.judgeModel;
-    if (judgeModel !== undefined) input.judgeModel = judgeModel;
-    const judgeProvider = body.judge_provider ?? body.judgeProvider;
-    if (judgeProvider !== undefined) input.judgeProvider = judgeProvider;
-    const autoJudge = body.auto_judge ?? body.autoJudge;
-    if (autoJudge !== undefined) input.autoJudge = autoJudge;
     const queue = app.queries.createEvalQueue(projectId, input);
-    sendJson(res, 201, queueView(app, queue));
+    // Pin the queue to an agent commit (resolved to a full SHA) if requested.
+    // Done after create so the queue row exists to inspect its adapter.
+    if (body.agent_commit !== undefined || body.agentCommit !== undefined ||
+        body.agent_ref !== undefined || body.agentRef !== undefined) {
+      if (input.builtinAdapterId) {
+        throw badRequest("builtin_adapter_id queues cannot pin an agent_commit");
+      }
+      const resolved = await resolveQueueCommit(app, queue, body);
+      if (resolved) {
+        app.queries.updateEvalQueue(queue.id, { agentCommit: resolved.sha });
+      } else if (body.agent_commit !== undefined && body.agent_commit !== null) {
+        throw badRequest("agent_commit must resolve to a full SHA for a source-built adapter");
+      }
+    }
+    sendJson(res, 201, queueView(app, app.queries.getEvalQueue(queue.id)!));
   });
 
   router.get("/api/projects/:id/queues", (_req, res, ctx) => {
@@ -479,14 +517,15 @@ export function registerQueueRoutes(router: Router): void {
     const network = body.network_policy ?? body.networkPolicy;
     if (typeof network === "string") patch.networkPolicy = network;
     if (body.ports !== undefined) patch.ports = parsePorts(body.ports) ?? [];
-    const judgeModel = body.judge_model ?? body.judgeModel;
-    if (judgeModel === null || typeof judgeModel === "string") patch.judgeModel = judgeModel;
-    const judgeProvider = body.judge_provider ?? body.judgeProvider;
-    if (judgeProvider === null || typeof judgeProvider === "string") {
-      patch.judgeProvider = judgeProvider;
+    if (body.agent_commit !== undefined || body.agentCommit !== undefined ||
+        body.agent_ref !== undefined || body.agentRef !== undefined) {
+      const base = app.queries.getEvalQueue(queue.id)!;
+      const resolved = await resolveQueueCommit(app, base, body);
+      if (resolved) patch.agentCommit = resolved.sha;
+      else if ((body.agent_commit ?? body.agentCommit) != null) {
+        throw badRequest("agent_commit must be a full SHA for a source-built adapter");
+      }
     }
-    const autoJudge = body.auto_judge ?? body.autoJudge;
-    if (typeof autoJudge === "boolean") patch.autoJudge = autoJudge;
     patch.incrementRevision = true;
     const updated = app.queries.updateEvalQueue(queue.id, patch);
     sendJson(res, 200, queueView(app, updated));
@@ -506,9 +545,6 @@ export function registerQueueRoutes(router: Router): void {
   router.post("/api/projects/:id/queues/:queueId/items", async (req, res, ctx) => {
     const app = appOf(ctx);
     const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-    if (app.queries.getActiveQueueContainer(queue.id)) {
-      throw conflict("stop the queue container before changing queue items");
-    }
     const body = await readJsonBody<{
       eval_id?: string;
       task_id?: string;
@@ -526,6 +562,21 @@ export function registerQueueRoutes(router: Router): void {
     if (!task || task.projectId !== queue.projectId || task.archived) {
       throw badRequest(`eval is unavailable: ${taskId}`);
     }
+    // Mid-run additions are allowed but must be runnable in the active
+    // generation's immutable container. Reject incompatible items with 409.
+    const live = app.liveQueueContainers.get(queue.id);
+    if (live && !live.finished) {
+      const incompat = await validateItemAgainstGenerationSignature({
+        queries: app.queries,
+        queue,
+        task,
+        overrides: body.overrides !== undefined ? objectOrNull(body.overrides, "overrides") : null,
+        signature: live.signature,
+      });
+      if (incompat) {
+        throw conflict(`item cannot run in the active queue generation: ${incompat}`);
+      }
+    }
     const input: CreateEvalQueueItemInput = { taskId };
     if (body.repeats !== undefined) input.repeats = positiveInt(body.repeats, "repeats");
     if (body.enabled !== undefined) input.enabled = body.enabled;
@@ -542,9 +593,6 @@ export function registerQueueRoutes(router: Router): void {
     async (req, res, ctx) => {
       const app = appOf(ctx);
       const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-      if (app.queries.getActiveQueueContainer(queue.id)) {
-        throw conflict("stop the queue container before changing queue items");
-      }
       const body = await readJsonBody<{
         category_name?: string;
         categoryName?: string;
@@ -562,12 +610,28 @@ export function registerQueueRoutes(router: Router): void {
       if (matches.length === 0) {
         throw badRequest(`no enabled evals found in category: ${categoryName.trim()}`);
       }
+      const live = app.liveQueueContainers.get(queue.id);
+      const signature = live && !live.finished ? live.signature : null;
       const added = [];
       const skipped: string[] = [];
+      const incompatible: string[] = [];
       for (const task of matches) {
         if (existingTaskIds.has(task.id)) {
           skipped.push(task.id);
           continue;
+        }
+        if (signature) {
+          const incompat = await validateItemAgainstGenerationSignature({
+            queries: app.queries,
+            queue,
+            task,
+            overrides: null,
+            signature,
+          });
+          if (incompat) {
+            incompatible.push(task.id);
+            continue;
+          }
         }
         added.push(app.queries.createEvalQueueItem(queue.id, {
           taskId: task.id,
@@ -580,6 +644,7 @@ export function registerQueueRoutes(router: Router): void {
         matched_eval_count: matches.length,
         added,
         skipped_eval_ids: skipped,
+        incompatible_eval_ids: incompatible,
       });
     },
   );
@@ -598,18 +663,56 @@ export function registerQueueRoutes(router: Router): void {
       const app = appOf(ctx);
       const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
       const item = requireItem(app.queries, queue, ctx.params.itemId!);
-      if (app.queries.getActiveQueueContainer(queue.id)) {
-        throw conflict("stop the queue container before changing queue items");
-      }
       const body = await readJsonBody<Record<string, unknown>>(req);
       const patch: UpdateEvalQueueItemInput = {};
       if (typeof body.position === "number") patch.position = body.position;
       if (typeof body.before === "string") patch.before = body.before;
       if (typeof body.after === "string") patch.after = body.after;
-      if (body.repeats !== undefined) patch.repeats = positiveInt(body.repeats, "repeats");
+      if (body.repeats !== undefined) {
+        const requested = positiveInt(body.repeats, "repeats");
+        // Repeat floor: cannot reduce repeats below the number of runs for this
+        // item already claimed in the ACTIVE generation (their immutable run
+        // snapshots can never change). The item's lifetime `claimedRepeats`
+        // counter is cumulative across generations and is never reset, so it is
+        // NOT the floor: it would falsely lock repeats at the historical total
+        // after a generation closes and a fresh one starts with nothing claimed.
+        const activeContainer = app.queries.getActiveQueueContainer(queue.id);
+        let floor = 0;
+        if (activeContainer) {
+          floor = app.queries
+            .listRuns({ batchId: activeContainer.batchId })
+            .filter((r) => r.queueItemId === item.id).length;
+        }
+        if (requested < floor) {
+          throw conflict(
+            `cannot reduce repeats below ${floor} already claimed in the active generation`,
+          );
+        }
+        patch.repeats = requested;
+      }
       if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
       if (body.overrides !== undefined) {
-        patch.overrides = objectOrNull(body.overrides, "overrides");
+        const overrides = objectOrNull(body.overrides, "overrides");
+        // Changing overrides can alter network/image/ports/limits that the live
+        // generation container is pinned to. Validate against that immutable
+        // signature when a generation is active so an incompatible item is never
+        // claimed into (and re-validated against) a built container.
+        const live = app.liveQueueContainers.get(queue.id);
+        if (live && !live.finished) {
+          const task = app.queries.getTask(item.taskId);
+          if (!task) throw badRequest(`eval is unavailable: ${item.taskId}`);
+          const incompat = await validateItemAgainstGenerationSignature({
+            queries: app.queries,
+            queue,
+            task,
+            overrides,
+            signature: live.signature,
+          });
+          if (incompat) {
+            throw conflict(`item cannot run in the active queue generation: ${incompat}`);
+          }
+        }
+        patch.overrides = overrides;
       }
       sendJson(res, 200, { item: app.queries.updateEvalQueueItem(item.id, patch) });
     },
@@ -621,96 +724,52 @@ export function registerQueueRoutes(router: Router): void {
       const app = appOf(ctx);
       const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
       const item = requireItem(app.queries, queue, ctx.params.itemId!);
-      if (app.queries.getActiveQueueContainer(queue.id)) {
-        throw conflict("stop the queue container before changing queue items");
-      }
+      // DELETING a queue item while a generation is active is allowed and becomes
+      // a soft delete: prevents future claims without breaking run provenance.
       app.queries.deleteEvalQueueItem(item.id);
       res.statusCode = 204;
       res.end();
     },
   );
 
-  router.put("/api/projects/:id/queues/:queueId/container", async (_req, res, ctx) => {
-    const app = appOf(ctx);
-    const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-    const startOpts = {
-      ...app.queueStartOpts,
-      onQueueDrained: async (info: {
-        queueId: string;
-        projectId: string;
-        batchId: string;
-        runIds: string[];
-        tainted: boolean;
-      }) => {
-        // The eval pipeline ends by judging its own queue archives when the
-        // queue is configured with auto_judge and drained cleanly. The judge
-        // runs detached (202-style) so the drain callback returns promptly and
-        // the report is produced in the background once the judge finishes.
-        const current = app.queries.getEvalQueue(queue.id);
-        const autoJudge = current?.autoJudge ?? queue.autoJudge;
-        if (!autoJudge || info.tainted || info.runIds.length === 0) {
-          if (app.queueStartOpts?.onQueueDrained) {
-            await app.queueStartOpts.onQueueDrained(info);
-          }
-          return;
-        }
-        const input = {
-          queueId: queue.id,
-          batchId: info.batchId,
-          judgeModel: current?.judgeModel ?? "deepseek-v4-flash",
-          judgeProvider: current?.judgeProvider ?? current?.provider ?? "neuralwatt",
-          judgePrompt: null,
-          judgeParams: null,
-          parentAnalysisId: null,
-        };
+  router.put(
+    "/api/projects/:id/queues/:queueId/container",
+    withBodyIdempotency(
+      // Body digest defaults to empty-body hash (this endpoint sends no body);
+      // a retry with the same key and the same empty body replays the 202.
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      async (_req, res, ctx) => {
+        const app = appOf(ctx);
+        const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
+        const startOpts = { ...app.queueStartOpts };
         try {
-          const { analysis } = await prepareQueueAnalysis(app.dataDir, app.queries, input);
-          void executeQueueAnalysis(app.dataDir, app.queries, input, analysis)
-            .catch((err) => {
-              const message = err instanceof Error ? err.message : String(err);
-              app.queries.updateQueueAnalysis(analysis.id, {
-                status: "failed",
-                error: message,
-                endedAt: new Date().toISOString(),
-              });
-            });
-        } catch (err) {
-          app.queries.updateEvalQueue(queue.id, {
-            status: "failed",
-            activeBatchId: null,
+          const live = await startQueueContainer(
+            app.dataDir,
+            app.queries,
+            queue.id,
+            app.liveQueueContainers,
+            startOpts,
+          );
+          sendJson(res, 202, {
+            queue_id: queue.id,
+            batch_id: live.batchId,
+            queue_container_id: live.queueContainerId,
+            runtime_container_id: live.handle.id,
+            image: live.handle.image,
+            ports: live.handle.ports ?? [],
           });
-        }
-        if (app.queueStartOpts?.onQueueDrained) {
-          await app.queueStartOpts.onQueueDrained(info);
+        } catch (err) {
+          const code = err && typeof err === "object" ? (err as { code?: unknown }).code : undefined;
+          const message = err instanceof Error ? err.message : String(err);
+          if (code === "ALREADY_ACTIVE") throw conflict(message);
+          if (/no enabled evals|unavailable eval|multiple images|adapter .*not ready|configured agent|no agent_commit|reproducible commit/i.test(message)) {
+            throw badRequest(message);
+          }
+          throw err;
         }
       },
-    };
-    try {
-      const live = await startQueueContainer(
-        app.dataDir,
-        app.queries,
-        queue.id,
-        app.liveQueueContainers,
-        startOpts,
-      );
-      sendJson(res, 202, {
-        queue_id: queue.id,
-        batch_id: live.batchId,
-        queue_container_id: live.queueContainerId,
-        runtime_container_id: live.handle.id,
-        image: live.handle.image,
-        ports: live.handle.ports ?? [],
-      });
-    } catch (err) {
-      const code = err && typeof err === "object" ? (err as { code?: unknown }).code : undefined;
-      const message = err instanceof Error ? err.message : String(err);
-      if (code === "ALREADY_ACTIVE") throw conflict(message);
-      if (/no enabled evals|unavailable eval|multiple images|adapter .*not ready|configured agent/i.test(message)) {
-        throw badRequest(message);
-      }
-      throw err;
-    }
-  });
+    ),
+  );
 
   router.get("/api/projects/:id/queues/:queueId/container", (_req, res, ctx) => {
     const app = appOf(ctx);
@@ -729,7 +788,8 @@ export function registerQueueRoutes(router: Router): void {
       const body = await readJsonBody<{ action?: string }>(req);
       if (body.action === "pause") await live.pause();
       else if (body.action === "resume") await live.resume();
-      else throw badRequest("action must be pause or resume");
+      else if (body.action === "abort") await live.abortCurrentRun();
+      else throw badRequest("action must be pause, resume, or abort");
       sendJson(res, 200, queueView(app, app.queries.getEvalQueue(queue.id)!));
     },
   );
@@ -858,231 +918,6 @@ export function registerQueueRoutes(router: Router): void {
     sendJson(res, 200, { project_id: projectId, containers });
   });
 
-  router.post(
-    "/api/projects/:id/queues/:queueId/analyses",
-    async (req, res, ctx) => {
-      const app = appOf(ctx);
-      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-      const body = await readJsonBody<{
-        batch_id?: string;
-        batchId?: string;
-        run_ids?: string[];
-        runIds?: string[];
-        all?: boolean;
-        judge_model?: string;
-        judgeModel?: string;
-        judge_provider?: string;
-        judgeProvider?: string;
-        judge_prompt?: string | null;
-        judgePrompt?: string | null;
-        judge_params?: Record<string, unknown> | null;
-        judgeParams?: Record<string, unknown> | null;
-        parent_analysis_id?: string | null;
-        parentAnalysisId?: string | null;
-      }>(req);
-      const batchId =
-        body.batch_id ??
-        body.batchId ??
-        queue.activeBatchId ??
-        app.queries.listQueueContainers(queue.id)[0]?.batchId;
-      if (!batchId) throw badRequest("batch_id is required when the queue has no execution history");
-      const runIds = body.run_ids ?? body.runIds;
-      if (!body.all && (!runIds || runIds.length === 0)) {
-        throw badRequest("set all:true or provide run_ids");
-      }
-      const judgeModel = body.judge_model ?? body.judgeModel ?? queue.judgeModel;
-      const judgeProvider =
-        body.judge_provider ?? body.judgeProvider ?? queue.judgeProvider ?? queue.provider;
-      if (!judgeModel || !judgeProvider) {
-        throw badRequest("judge_model and judge_provider are required");
-      }
-      const input = {
-        queueId: queue.id,
-        batchId,
-        ...(body.all ? {} : { runIds }),
-        judgeModel,
-        judgeProvider,
-        judgePrompt: body.judge_prompt ?? body.judgePrompt ?? null,
-        judgeParams: body.judge_params ?? body.judgeParams ?? null,
-        parentAnalysisId:
-          body.parent_analysis_id ?? body.parentAnalysisId ?? null,
-      };
-      const { analysis } = await prepareQueueAnalysis(app.dataDir, app.queries, input);
-      // Run the judge detached so the 202 returns and the request never blocks
-      // for the full judge session. A caller whose client times out therefore
-      // cannot kill the in-flight judge; they poll the analysis detail endpoint.
-      void executeQueueAnalysis(app.dataDir, app.queries, input, analysis)
-        .catch(() => undefined);
-      const location = `/api/projects/${queue.projectId}/queues/${queue.id}/analyses/${analysis.id}`;
-      res.writeHead(202, { "content-type": "application/json", Location: location });
-      res.end(JSON.stringify({ analysis }));
-    },
-  );
-
-  router.get("/api/projects/:id/queues/:queueId/analyses", (_req, res, ctx) => {
-    const app = appOf(ctx);
-    const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-    sendJson(res, 200, { analyses: app.queries.listQueueAnalyses(queue.id) });
-  });
-
-  router.get(
-    "/api/projects/:id/queues/:queueId/analyses/:analysisId",
-    (_req, res, ctx) => {
-      const app = appOf(ctx);
-      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-      const analysis = requireQueueAnalysis(
-        app.queries,
-        queue,
-        ctx.params.analysisId!,
-      );
-      sendJson(res, 200, { analysis });
-    },
-  );
-
-  router.get(
-    "/api/projects/:id/queues/:queueId/analyses/:analysisId/events",
-    async (_req, res, ctx) => {
-      const app = appOf(ctx);
-      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-      const analysis = requireQueueAnalysis(
-        app.queries,
-        queue,
-        ctx.params.analysisId!,
-      );
-      if (!analysis.eventsPath) throw conflict("queue analysis events are not ready");
-      const events = await readFile(analysis.eventsPath).catch(() => null);
-      if (events === null) throw notFound("queue analysis events file is missing");
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
-      res.setHeader("X-Content-Type-Options", "nosniff");
-      res.end(events);
-    },
-  );
-
-  router.get(
-    "/api/projects/:id/queues/:queueId/analyses/:analysisId/transcript",
-    async (_req, res, ctx) => {
-      const app = appOf(ctx);
-      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-      const analysis = requireQueueAnalysis(
-        app.queries,
-        queue,
-        ctx.params.analysisId!,
-      );
-      if (!analysis.rawResponsePath) {
-        throw conflict("queue analysis PI transcript is not ready");
-      }
-      const transcript = await readFile(analysis.rawResponsePath).catch(() => null);
-      if (transcript === null) throw notFound("queue analysis PI transcript is missing");
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json; charset=utf-8");
-      res.setHeader("X-Content-Type-Options", "nosniff");
-      res.end(transcript);
-    },
-  );
-
-  router.get(
-    "/api/projects/:id/queues/:queueId/analyses/:analysisId/verdict",
-    async (_req, res, ctx) => {
-      const app = appOf(ctx);
-      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-      const analysis = requireQueueAnalysis(
-        app.queries,
-        queue,
-        ctx.params.analysisId!,
-      );
-      if (!analysis.verdictPath) throw conflict("queue analysis verdict is not ready");
-      const verdict = await readFile(analysis.verdictPath).catch(() => null);
-      if (verdict === null) throw notFound("queue analysis verdict file is missing");
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json; charset=utf-8");
-      res.setHeader("X-Content-Type-Options", "nosniff");
-      res.end(verdict);
-    },
-  );
-
-  router.get(
-    "/api/projects/:id/queues/:queueId/analyses/:analysisId/improvement-steps",
-    (_req, res, ctx) => {
-      const app = appOf(ctx);
-      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-      const analysis = requireQueueAnalysis(app.queries, queue, ctx.params.analysisId!);
-      const owner = ctx.query.class;
-      const status = ctx.query.status;
-      if (owner && !["agent", "platform", "judge", "eval"].includes(owner)) {
-        throw badRequest("class must be agent|platform|judge|eval");
-      }
-      if (status && !["proposed", "ready", "blocked", "in_progress", "verified", "rejected"].includes(status)) {
-        throw badRequest("invalid improvement step status");
-      }
-      const priority = ctx.query.priority === undefined ? undefined : Number(ctx.query.priority);
-      if (priority !== undefined && (!Number.isInteger(priority) || priority < 0 || priority > 3)) {
-        throw badRequest("priority must be an integer 0..3");
-      }
-      const steps = app.queries.listImprovementSteps({
-        queueAnalysisId: analysis.id,
-        ...(owner ? { class: owner as ImprovementOwnerClass } : {}),
-        ...(status ? { status: status as ImprovementStepStatus } : {}),
-        ...(priority !== undefined ? { priority } : {}),
-        ...(ctx.query.defect_id ? { defectId: ctx.query.defect_id } : {}),
-      });
-      sendJson(res, 200, { improvement_steps: steps.map(improvementStepView) });
-    },
-  );
-
-  router.patch(
-    "/api/projects/:id/queues/:queueId/analyses/:analysisId/improvement-steps/:stepId",
-    async (req, res, ctx) => {
-      const app = appOf(ctx);
-      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-      const analysis = requireQueueAnalysis(app.queries, queue, ctx.params.analysisId!);
-      const body = await readJsonBody<{
-        status?: ImprovementStepStatus;
-        blocking_reason?: string | null;
-        blockingReason?: string | null;
-      }>(req);
-      if (!body.status || !["proposed", "ready", "blocked", "in_progress", "verified", "rejected"].includes(body.status)) {
-        throw badRequest("status is required and must be a valid lifecycle status");
-      }
-      let updated;
-      try {
-        updated = app.queries.updateImprovementStepLifecycle(
-          analysis.id,
-          ctx.params.stepId!,
-          {
-            status: body.status,
-            blockingReason: body.blocking_reason ?? body.blockingReason ?? null,
-          },
-        );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (/not found/i.test(message)) throw notFound(message);
-        throw badRequest(message);
-      }
-      sendJson(res, 200, { improvement_step: improvementStepView(updated) });
-    },
-  );
-
-  router.get(
-    "/api/projects/:id/queues/:queueId/analyses/:analysisId/report",
-    async (_req, res, ctx) => {
-      const app = appOf(ctx);
-      const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
-      const analysis = requireQueueAnalysis(
-        app.queries,
-        queue,
-        ctx.params.analysisId!,
-      );
-      if (!analysis.reportPath) throw conflict("queue analysis report is not ready");
-      const html = await readFile(analysis.reportPath, "utf8").catch(() => null);
-      if (html === null) throw notFound("queue analysis report file is missing");
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.setHeader("X-Content-Type-Options", "nosniff");
-      res.end(html);
-    },
-  );
-
   router.get("/api/evals/:runId/metrics", (req, res, ctx) => {
     const app = appOf(ctx);
     const run = app.queries.getRun(ctx.params.runId!);
@@ -1123,6 +958,17 @@ export function registerQueueRoutes(router: Router): void {
     const archive = app.queries.getEvalArchive(run.id);
     if (!archive) throw notFound(`eval archive not found: ${run.id}`);
     const verification = await verifyEvalArchive(archive);
-    sendJson(res, verification.ok ? 200 : 409, { archive, verification });
+    // Strip absolute host manifest paths: internal storage locations are never
+    // serialized to API clients (the central archive API strips storagePath too).
+    const publicArchive = {
+      runId: archive.runId,
+      projectId: archive.projectId,
+      queueId: archive.queueId,
+      batchId: archive.batchId,
+      manifestSha256: archive.manifestSha256,
+      sizeBytes: archive.sizeBytes,
+      sealedAt: archive.sealedAt,
+    };
+    sendJson(res, verification.ok ? 200 : 409, { archive: publicArchive, verification });
   });
 }

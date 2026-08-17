@@ -148,5 +148,5 @@ A suite archive containing `tasks/` creates one eval row per task (`splitSuiteTa
 shows creating each eval one-by-one via `POST /evals` to exercise the real per-eval creation flow.
 
 ### Categories and queues
-Evals are project-scoped. Load them into a queue, run the real agent, then let the queue auto-judge
-its archives into a report. Adaptive setup is per-project; there are no global default evals.
+Evals are project-scoped. Load them into a queue, run the real agent, then inspect the sealed archive
+through the project or central archive API. Adaptive setup is per-project; there are no global default evals.

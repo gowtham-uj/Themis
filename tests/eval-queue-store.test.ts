@@ -180,35 +180,6 @@ async function exerciseStore(q: QueryStore): Promise<void> {
   });
   expect(q.listEvalArchives({ queueId: queue.id })).toHaveLength(1);
 
-  const firstAnalysis = q.createQueueAnalysis({
-    queueId: queue.id,
-    projectId: project.id,
-    batchId: batch.id,
-    selectedRunIds: [run.id],
-    evidenceHashes: { [run.id]: "a".repeat(64) },
-    judgeModel: "claude-opus-4-6",
-    judgeProvider: "anthropic",
-    systemPromptVersion: "queue-v1",
-  });
-  q.updateQueueAnalysis(firstAnalysis.id, {
-    status: "completed",
-    verdictPath: "/analysis/1/verdict.json",
-    endedAt: new Date().toISOString(),
-  });
-  const secondAnalysis = q.createQueueAnalysis({
-    queueId: queue.id,
-    projectId: project.id,
-    batchId: batch.id,
-    selectedRunIds: [run.id],
-    evidenceHashes: { [run.id]: "a".repeat(64) },
-    judgeModel: "future-model",
-    judgeProvider: "anthropic",
-    systemPromptVersion: "queue-v2",
-    parentAnalysisId: firstAnalysis.id,
-  });
-  expect(q.listQueueAnalyses(queue.id)).toHaveLength(2);
-  expect(secondAnalysis.parentAnalysisId).toBe(firstAnalysis.id);
-
   q.updateQueueContainer(container.id, {
     state: "stopped",
     stoppedAt: new Date().toISOString(),
@@ -232,28 +203,58 @@ describe("persistent eval queue store", () => {
     const dir = await dataDir("agenteval-queue-migrate-");
     const first = openDb(dir);
     expect(first.raw).not.toBeNull();
+    // Build a realistic v8 store: project/task/agent rows plus a legacy
+    // queue_entries table with one still-queued entry written via raw SQL
+    // (the legacy public API was removed in v9).
     first.queries.registerAgent({ id: "pi", displayName: "Pi" });
     const project = first.queries.createProject({ name: "M", slug: "migrate" });
     const task = first.queries.createTask(project.id, evalSpec("legacy-eval", "Legacy"));
-    const entry = first.queries.createQueueEntry(project.id, {
-      targetKind: "task",
-      taskId: task.id,
-      agentId: "pi",
-      model: "claude-opus-4-6",
-      provider: "anthropic",
-      repeats: 2,
-      source: "api",
-    });
-    first.raw!.pragma("user_version = 1");
-    first.raw!.prepare("DELETE FROM schema_migrations WHERE version = 2").run();
-    first.raw!.close();
+    const raw = first.raw!;
+    raw.exec(`CREATE TABLE queue_entries (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      trigger_ref TEXT,
+      target_kind TEXT NOT NULL,
+      task_id TEXT,
+      task_tags_json TEXT,
+      agent_id TEXT NOT NULL,
+      model TEXT,
+      provider TEXT,
+      repeats INTEGER,
+      params_json TEXT,
+      adapter_overrides_json TEXT,
+      priority INTEGER NOT NULL DEFAULT 0,
+      position REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      dedup_key TEXT,
+      source TEXT,
+      created_at TEXT NOT NULL,
+      promoted_at TEXT,
+      promoted_batch_id TEXT,
+      removed_at TEXT
+    )`);
+    const entryId = "legacy-entry-1";
+    raw.prepare(
+      `INSERT INTO queue_entries (
+        id, project_id, target_kind, task_id, agent_id, model, provider,
+        repeats, position, status, source, created_at
+      ) VALUES (?, ?, 'task', ?, 'pi', 'claude-opus-4-6', 'anthropic', 2, 1, 'queued', 'api', ?)`,
+    ).run(entryId, project.id, task.id, new Date().toISOString());
+    // Force a re-migration from an earlier version.
+    raw.pragma("user_version = 8");
+    raw.prepare("DELETE FROM schema_migrations WHERE version = 9").run();
+    raw.close();
 
     const reopened = openDb(dir);
     if (reopened.raw) sqliteHandles.push(reopened.raw);
-    const migrated = reopened.queries.getEvalQueue(`legacy-${entry.id}`);
+    const migrated = reopened.queries.getEvalQueue(`legacy-${entryId}`);
     expect(migrated).toMatchObject({ projectId: project.id, agentId: "pi" });
     expect(reopened.queries.listEvalQueueItems(migrated!.id)).toEqual([
       expect.objectContaining({ taskId: task.id, repeats: 2 }),
     ]);
+    // Legacy queue_entries table is dropped after migration.
+    expect(
+      reopened.raw!.prepare("SELECT count(*) c FROM sqlite_master WHERE name='queue_entries'").get().c,
+    ).toBe(0);
   });
 });

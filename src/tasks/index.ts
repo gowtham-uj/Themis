@@ -2,7 +2,7 @@
  * Task sources — pluggable ingest turning a project's representation into TaskSpecs.
  *
  * Built-ins shipped here:
- * - `ui-builder` (UI form + task.json readback)
+ * - `ui-builder` (legacy name for API-authored task.json readback)
  * - `repo-md` (markdown + YAML frontmatter under the workspace)
  * - `manifest-yaml` (single YAML manifest enumerating tasks)
  * - `ci-artifact` (CI directory-of-JSON / single manifest.json)

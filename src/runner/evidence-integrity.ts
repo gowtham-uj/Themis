@@ -2,19 +2,23 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, relative, sep } from "node:path";
-import type { Ref } from "../types.js";
 import type { RunMetrics } from "./metrics.js";
+
+interface EvidenceRef {
+  kind: "artifact";
+  path: string;
+}
 
 export const EVIDENCE_INTEGRITY_SCHEMA_VERSION = 1 as const;
 
 export type EvidenceIntegrityStatus = "valid" | "invalid" | "contradictory" | "unknown";
-export type EvidenceOwnerClass = "agent" | "platform" | "judge" | "eval";
+export type EvidenceOwnerClass = "agent" | "platform" | "eval";
 
 export interface EvidenceIntegrityCheck {
   id: string;
   status: EvidenceIntegrityStatus;
   artifactPath: string;
-  refs: Ref[];
+  refs: EvidenceRef[];
   observed: string;
   interpretation: string;
   ownerClass: EvidenceOwnerClass;
@@ -39,7 +43,7 @@ export async function analyzeEvidenceIntegrity(input: {
     const name = basename(path);
     if (name !== "reaper-result.json" && name !== "trajectory-metrics.json") continue;
     const artifactPath = relative(join(input.retainedDir, ".."), path).split(sep).join("/");
-    const refs: Ref[] = [{ kind: "artifact", path: artifactPath }];
+    const refs: EvidenceRef[] = [{ kind: "artifact", path: artifactPath }];
     const raw = await readFile(path, "utf8");
     let parsed: unknown;
     // Reaper's native result artifact can carry log/text lines before the JSON
@@ -198,7 +202,7 @@ function findEmptyToolIdentifiers(value: unknown, path = "$", out: string[] = []
 function metricContradictions(
   value: unknown,
   artifactPath: string,
-  refs: Ref[],
+  refs: EvidenceRef[],
   metrics: RunMetrics,
 ): EvidenceIntegrityCheck[] {
   if (!value || typeof value !== "object" || Array.isArray(value)) return [];
@@ -250,7 +254,7 @@ function metricContradictions(
 function contradiction(
   id: string,
   artifactPath: string,
-  refs: Ref[],
+  refs: EvidenceRef[],
   observed: string,
 ): EvidenceIntegrityCheck {
   return {

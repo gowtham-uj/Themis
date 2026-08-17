@@ -67,8 +67,8 @@ async function* stringAsStream(text: string): AsyncIterable<string> {
 }
 
 describe("ADAPTER_STATUS", () => {
-  it("marks the adapter as ahead of live ReaperCode", () => {
-    expect(ADAPTER_STATUS).toBe("spec-ahead-of-reaper");
+  it("marks the adapter as live against current ReaperCode", () => {
+    expect(ADAPTER_STATUS).toBe("live");
   });
 });
 
@@ -103,6 +103,52 @@ describe("reaperCodeAdapter surface", () => {
 
     const viaAdapter = reaperCodeAdapter.command(ctx);
     expect(viaAdapter.argv).toEqual(argv);
+  });
+
+  it("declares a role-typed evidence manifest over the .reaper tree", () => {
+    const spec = reaperCodeAdapter.evidence(ctx);
+    expect(spec.manifest).toBeDefined();
+    const byId = new Map(spec.manifest.map((entry) => [entry.id, entry]));
+    // ids are unique and every entry has a role + format + path
+    expect(spec.manifest.length).toBe(new Set(spec.manifest.map((e) => e.id)).size);
+    for (const entry of spec.manifest) {
+      expect(entry.role).toBeDefined();
+      expect(entry.format).toBeDefined();
+      expect(entry.path.startsWith("task/")).toBe(true);
+    }
+    // primary trace + transcript + result + tmp are all declared
+    expect(byId.get("trace")?.role).toBe("trace");
+    expect(byId.get("trace")?.primary).toBe(true);
+    expect(byId.get("trace")?.select).toBe("latest_mtime");
+    expect(byId.get("transcript")?.role).toBe("transcript");
+    expect(byId.get("result")?.path).toBe("task/.reaper/latest-run.json");
+    expect(byId.get("tmp")?.role).toBe("tmp");
+    expect(byId.get("tmp")?.path).toBe("task/.reaper/tmp");
+    expect(byId.get("tmp")?.select).toBe("all");
+  });
+
+  it("forwards thinking + reasoning-effort + maxTokens from adapter params", () => {
+    const on = buildReaperCommand(makeCtx({
+      params: { reasoningEffort: "high", thinking: "on", maxTokens: 1234 },
+    }));
+    expect(on.argv).toContain("--reasoning-effort");
+    expect(on.argv).toContain("high");
+    expect(on.argv).toContain("--thinking");
+    expect(on.argv).toContain("on");
+    expect(on.argv).toContain("--max-tokens");
+    expect(on.argv).toContain("1234");
+
+    // snake_case + off spellings are normalized too
+    const off = buildReaperCommand(makeCtx({
+      params: { reasoning_effort: "low", thinking: "disabled" },
+    }));
+    expect(off.argv).toContain("low");
+    expect(off.argv).toContain("--thinking");
+    expect(off.argv).toContain("off");
+
+    // invalid effort is dropped, not forwarded
+    const invalid = buildReaperCommand(makeCtx({ params: { reasoningEffort: "bananas" } }));
+    expect(invalid.argv).not.toContain("bananas");
   });
 });
 

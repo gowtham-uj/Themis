@@ -1,18 +1,13 @@
-# Agenteval API operator guide
+# agenteval API operator guide
 
-This guide covers the backend/API-only workflow from an empty installation to evaluated, judged and
-queryable results. The normative adapter details are in
-[`plan/adapter-generation-guide.md`](../plan/adapter-generation-guide.md); canonical eval package details
-are in [`docs/eval-authoring.md`](./eval-authoring.md).
+This guide covers the API-only workflow from an empty installation to queued eval execution and centrally
+queryable immutable results.
 
 Assume `BASE=http://127.0.0.1:8080`. When authentication is enabled, send:
 
 ```http
 Authorization: Bearer <token>
 ```
-
-Write endpoints reject read-only tokens. Project-scoped tokens cannot read or mutate another project.
-JSON uses snake_case on the HTTP boundary.
 
 ## 1. Create a project
 
@@ -21,167 +16,81 @@ POST /api/projects
 Content-Type: application/json
 
 {
-  "name": "ReaperCode regression suite",
-  "slug": "reapercode-regression",
-  "description": "Canonical coding eval packages",
+  "name": "ReaperCode eval suite",
+  "slug": "reapercode-evals",
   "default_model": "deepseek-v4-flash",
-  "default_provider": "nuralwatt",
-  "network_policy": "allow",
-  "artifact_retention": "keep"
+  "default_provider": "nuralwatt"
 }
 ```
 
-Useful operations:
+## 2. Create or select an adapter
 
-```text
-GET    /api/projects
-GET    /api/projects/<projectId>
-PATCH  /api/projects/<projectId>
-DELETE /api/projects/<projectId>       # archives; does not erase evidence
-```
+Create a declarative project adapter with `POST /api/projects/<projectId>/adapters`, or generate one with
+`POST /api/projects/<projectId>/adapters/from-generator`. Validate and build it through the corresponding
+adapter endpoints. The adapter record retains its resolved source commit and built image provenance.
 
-## 2. Configure the real agent adapter
+An adapter can be shared by setting its sharing field through the adapter API. Consumer queues must select
+that exact shared adapter-store row; sharing is never implicit.
 
-A project owns at most one adapter. Other projects may explicitly select a shared adapter-store row.
-There is no implicit fallback.
-
-Generator path:
+## 3. Import canonical eval packages
 
 ```http
-POST /api/projects/<projectId>/adapters/from-generator
+POST /api/projects/<projectId>/evals
 Content-Type: application/json
 
-{
-  "agent_id": "my-agent",
-  "name": "My Agent",
-  "generator": "#!/bin/bash\nset -euo pipefail\n...",
-  "install_type": "npm",
-  "default_provider": "nuralwatt",
-  "default_model": "deepseek-v4-flash",
-  "build": true
-}
+{"files":{"task.toml":"...","seed_repo/README.md":"...",...}}
 ```
 
-The generator emits one validated adapter JSON object. Its image must contain the actual CLI and expose a
-stable command. Provider credentials are mapped by name; values are injected only at command time and
-are never baked into the image. Use:
+Or upload ZIP/TAR bytes:
 
-```text
-GET  /api/projects/<projectId>/adapters
-GET  /api/adapters/generator-contract
-GET  /api/adapters/store
-POST /api/projects/<projectId>/adapters/<adapterId>/validate
-POST /api/projects/<projectId>/adapters/<adapterId>/build
+```http
+POST /api/projects/<projectId>/evals:import-archive?format=zip
+Content-Type: application/octet-stream
 ```
 
-See the complete command/parser/evidence/configure contract in the adapter-generation guide.
+The package validator rejects incomplete or unsafe packages atomically. Solution/tests/validation content
+is retained outside the agent container.
 
-## 3. Create canonical eval packages
+The eval store is decoupled from queues: a queue item is a pointer to an eval id, and a run snapshots
+the eval at claim time. Evals list the queues that reference them (`used_by_queues`), and deletion is
+guarded — `DELETE /api/projects/<projectId>/evals/<evalId>` returns `409` while a live queue still
+references the eval. A cross-project listing is available at `GET /api/evals?project_id=...&category_name=...`
+and `GET /api/evals/<evalId>`.
 
-Flat task/prompt creation and field patching are rejected. Submit a complete package through either:
-
-```text
-POST /api/projects/<projectId>/evals
-     JSON {files:{path: content|{encoding,content}}}
-
-POST /api/projects/<projectId>/evals:import-archive?format=zip|tar|tar.gz
-     raw archive bytes
-```
-
-Read/list/archive:
-
-```text
-GET    /api/projects/<projectId>/evals?category_name=<name>&include_archived=false
-GET    /api/projects/<projectId>/evals/<evalId>
-DELETE /api/projects/<projectId>/evals/<evalId>
-GET    /api/projects/<projectId>/eval-categories
-```
-
-Each response includes package digest, validation record, arbitrary `category_name`, functional
-`agent_category`, rubric version and immutable package manifest. See the authoring guide before creating
-one.
-
-## 4. Create a persistent queue
-
-Owned adapter:
+## 4. Create a queue and add evals
 
 ```http
 POST /api/projects/<projectId>/queues
 Content-Type: application/json
 
 {
-  "name": "JavaScript bugfix suite",
+  "name": "DeepSeek queue",
   "model": "deepseek-v4-flash",
-  "provider": "nuralwatt",
-  "judge_model": "deepseek-v4-flash",
-  "judge_provider": "nuralwatt",
-  "auto_judge": false,
-  "network_policy": "allow",
-  "ports": []
+  "provider": "nuralwatt"
 }
 ```
 
-Shared adapter: add `"shared_adapter_id":"<exact-store-row-id>"`. The selected row must be enabled,
-shared, owned by a different project, and compatible with the queue’s model/provider.
-
-Add one eval:
+Then add eval IDs:
 
 ```http
 POST /api/projects/<projectId>/queues/<queueId>/items
+Content-Type: application/json
 
-{"eval_id":"<evalId>","repeats":1,"enabled":true}
+{"eval_id":"<evalId>","repeats":1}
 ```
 
-Load a whole arbitrary category:
+## 5. Start and inspect the persistent queue container
 
 ```http
-POST /api/projects/<projectId>/queues/<queueId>/items:load-category
-
-{"category_name":"javascript-bugfix","repeats":3,"enabled":true}
+PUT /api/projects/<projectId>/queues/<queueId>/container
+GET /api/projects/<projectId>/queues/<queueId>/container
+GET /api/projects/<projectId>/containers
 ```
 
-The category operation is idempotent for existing task ids: matches already in the queue are reported as
-skipped. Queue item/environment changes require the queue container to be stopped.
+One real Podman container is created for the active queue. Evals execute sequentially. Each eval runs its
+setup, the real agent, evidence extraction, separate verifier, cleanup, workspace reset, and archive seal.
 
-Queue inspection/mutation:
-
-```text
-GET    /api/projects/<projectId>/queues
-GET    /api/projects/<projectId>/queues/<queueId>
-PATCH  /api/projects/<projectId>/queues/<queueId>
-DELETE /api/projects/<projectId>/queues/<queueId>
-GET    /api/projects/<projectId>/queues/<queueId>/items
-PATCH  /api/projects/<projectId>/queues/<queueId>/items/<itemId>
-DELETE /api/projects/<projectId>/queues/<queueId>/items/<itemId>
-```
-
-One active queue owns one real persistent Podman container. All items must resolve the same adapter image,
-canonical environment digest, network policy and port set. Different canonical environments belong in
-different queues.
-
-## 5. Start, control and inspect execution
-
-```text
-PUT    /api/projects/<projectId>/queues/<queueId>/container
-GET    /api/projects/<projectId>/queues/<queueId>/container
-PATCH  /api/projects/<projectId>/queues/<queueId>/container  {"action":"pause|resume"}
-DELETE /api/projects/<projectId>/queues/<queueId>/container
-GET    /api/projects/<projectId>/containers
-```
-
-At queue start the platform:
-
-1. builds the canonical `environment/` on top of the selected adapter image;
-2. runs the real adapter connection check and optional configure step once;
-3. prepares each `environment/repo/` in a clean workspace;
-4. runs optional trusted setup, then the real agent;
-5. captures canonical events, raw output, source diff and native evidence;
-6. stops the agent process and captures evidence before verifier access;
-7. builds/runs the hidden `tests/` verifier in a separate offline container;
-8. records binary verifier reward and diagnostics;
-9. restores/runs optional trusted cleanup, resets the workspace, finalizes metadata and seals the archive.
-
-Privileged operator introspection of the live queue container:
+For privileged live inspection of an existing queue container:
 
 ```http
 POST /api/projects/<projectId>/queues/<queueId>/container/exec
@@ -190,139 +99,74 @@ Content-Type: application/json
 {"command":"ps aux","cwd":"/workspace","timeout_ms":30000}
 ```
 
-The response is channel-framed binary stdout/stderr/control data. Operator commands are recorded in the
-canonical trace as operator introspection and are never attributed to the agent.
+## 6. Read run state and events
 
-## 6. Evidence, metrics and run control
-
-```text
-GET /api/evals/<runId>/archive
-GET /api/evals/<runId>/metrics
+```http
 GET /api/runs/<runId>
 GET /api/runs/<runId>/events
+GET /api/runs/<runId>/events?stream=ndjson
 GET /api/runs/<runId>/diff
-GET /api/runs/<runId>/artifacts
+GET /api/evals/<runId>/metrics
+GET /api/evals/<runId>/archive
 ```
 
-`archive` verifies the immutable manifest and every file hash. `metrics` returns:
+The verifier reward is authoritative. Provider quota, rate-limit, context-length, authentication, and model
+availability failures are classified explicitly in the run archive.
 
-```json
-{
-  "schema_version": 1,
-  "execution": {
-    "measurements": {
-      "tokens_used": {"value":1234,"unit":"tokens","provenance":"exact","refs":[]},
-      "verification_rate": {"value":1,"unit":"ratio","provenance":"derived","refs":[]}
-    }
-  },
-  "outcome": {
-    "officialReward": 1,
-    "measurements": {
-      "hidden_test_score": {"value":1,"unit":"ratio","provenance":"exact","refs":[]},
-      "cost_per_solved": {"value":0.04,"unit":"usd/solved","provenance":"derived","refs":[]}
-    }
-  }
-}
-```
+## 7. Browse the central archive store
 
-Every measurement is `exact`, `derived`, `judge-derived`, or `unknown`; unknown evidence is never encoded
-as zero. Official reward is the isolated verifier’s binary result. Trace/diff metrics remain diagnostic.
-
-Legacy ad-hoc run control remains available for persisted runs:
-
-```text
-POST /api/runs/<runId>/pause?mode=soft|hard
-POST /api/runs/<runId>/resume
-POST /api/runs/<runId>/abort
-POST /api/runs/<runId>/control
-```
-
-## 7. Run a queue judgement revision
+Across all projects:
 
 ```http
-POST /api/projects/<projectId>/queues/<queueId>/analyses
-Content-Type: application/json
-
-{
-  "batch_id": "<batchId>",
-  "all": true,
-  "judge_model": "deepseek-v4-flash",
-  "judge_provider": "nuralwatt",
-  "judge_params": {"thinkingLevel":"high","maxTokens":16384}
-}
+GET /api/archives?agent_commit=<sha>&model=deepseek-v4-flash&reward=1
 ```
 
-The real PI judge must list and completely read every selected immutable archive file. It drafts one
-standard Verdict and one evidence-linked narrative per eval, then preflights the complete queue-analysis
-v2 payload. The final token-only submit persists exactly the preflighted payload.
-
-Artifacts:
-
-```text
-GET /api/projects/<projectId>/queues/<queueId>/analyses
-GET /api/projects/<projectId>/queues/<queueId>/analyses/<analysisId>
-GET /api/projects/<projectId>/queues/<queueId>/analyses/<analysisId>/events
-GET /api/projects/<projectId>/queues/<queueId>/analyses/<analysisId>/transcript
-GET /api/projects/<projectId>/queues/<queueId>/analyses/<analysisId>/verdict
-GET /api/projects/<projectId>/queues/<queueId>/analyses/<analysisId>/report
-```
-
-The HTML report is self-contained and narrative-first: verdict, execution timeline, strengths, concerns,
-criteria, findings, handoff and four owner backlogs.
-
-## 8. Manage improvement-step lifecycle
-
-```text
-GET /api/projects/<projectId>/queues/<queueId>/analyses/<analysisId>/improvement-steps
-    ?class=agent|platform|judge|eval
-    &priority=0|1|2|3
-    &status=proposed|ready|blocked|in_progress|verified|rejected
-    &defect_id=<id>
-```
+For one project:
 
 ```http
-PATCH /api/projects/<projectId>/queues/<queueId>/analyses/<analysisId>/improvement-steps/<stepId>
-
-{"status":"in_progress"}
+GET /api/projects/<projectId>/archives?queue_id=<queueId>&status=completed
 ```
 
-Only lifecycle status/blocking metadata is mutable. Evidence, problem, target, change, tests and acceptance
-criteria remain immutable analysis content. Invalid transitions are rejected.
+One archive, by run id:
 
-## 9. Single-run judgements, findings and comparisons
-
-```text
-POST /api/runs/<runId>/judgements
-GET  /api/judgements/<judgementId>
-GET  /api/judgements/<judgementId>/events
-GET  /api/judgements/<judgementId>/report
-GET  /api/projects/<projectId>/findings
-GET  /api/projects/<projectId>/findings/<fingerprint>
-GET  /api/projects/<projectId>/tasks/<taskId>/trend
-GET  /api/projects/<projectId>/compare/runs?a=<runA>&b=<runB>
-GET  /api/projects/<projectId>/compare/releases?from=<version>&to=<version>
+```http
+GET /api/archives/<runId>
+GET /api/archives/<runId>/files/retained/trace.jsonl
 ```
 
-Judgement detail includes the Verdict plus optional narrative/schema version. Findings are fingerprinted
-and tracked as introduced, persisted, resolved or regressed.
+The older project/commit paths still work as aliases:
 
-## 10. Webhooks and operational integrations
+```http
+GET /api/archives/<projectId>/<agentCommit>
+GET /api/archives/<projectId>/<agentCommit>/<runId>
+GET /api/archives/<projectId>/<agentCommit>/<runId>/files/retained/trace.jsonl
+```
 
-Outbound subscriptions may notify external applications about run, judgement and finding lifecycle
-events. Secrets are returned only once at creation and are never emitted by list routes. See
-[`plan/api.md`](../plan/api.md) for watcher, webhook, token and release endpoint details.
+Available list filters are `project_id`, `agent_id`, `agent_commit`, `queue_id`, `batch_id`, `run_id`,
+`task_id`, `task_name`, `model`, `provider`, `status`, `reward`, `limit`, and `offset`.
 
-## End-to-end checklist
+## 8. Control and stop queue execution
 
-1. Create project.
-2. Create/build/validate one real project adapter, or explicitly select a shared adapter.
-3. Author and locally inspect a canonical eval package.
-4. Import through JSON file map or quarantined archive.
-5. Confirm package digest, validation and category API output.
-6. Create queue; add one eval or load a category.
-7. Start queue container; inspect connection/configure state.
-8. Observe real agent execution and separate verifier result.
-9. Verify archive hashes and per-eval metrics.
-10. Run real queue analysis; inspect PI trace/transcript/verdict/report.
-11. Query owner backlogs and update lifecycle status.
-12. Re-run target and regression eval sets after fixes.
+Run pausing, resuming, and aborting are queue-container operations (there are no standalone run-level
+control routes). Pause/resume/abort act on the current run in the active queue container; abort seals
+partial evidence then lets the worker continue to the next claim.
+
+```http
+PATCH  /api/projects/<projectId>/queues/<queueId>/container
+       {"action":"pause"|"resume"|"abort"}
+DELETE /api/projects/<projectId>/queues/<queueId>/container
+```
+
+## 9. Export a project
+
+```http
+POST /api/projects/<projectId>/export
+```
+
+Returns a portable JSON bundle of the project's rows and path manifest for backup or migration.
+
+## Removed interfaces
+
+The backend has no judge/judgement, queue-analysis, report, findings/regression/improvement, reusable-rubric,
+standalone run-artifact, or frontend interface. Historical evidence and generated outputs are accessed
+through immutable eval archives.

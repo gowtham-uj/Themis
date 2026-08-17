@@ -1,31 +1,39 @@
 /**
- * Watcher rule CRUD + manual fire + git-host webhook ingress (P8b-routes).
+ * Per-project agent-commit queue watcher routes.
  *
- * GET    /api/projects/:id/watchers
- * POST   /api/projects/:id/watchers
- * PATCH  /api/projects/:id/watchers/:ruleId
- * DELETE /api/projects/:id/watchers/:ruleId
- * POST   /api/projects/:id/watchers/:ruleId/run
- * POST   /api/projects/:id/watcher/hooks/:ruleId
+ * A watcher belongs to a project and exactly one eval queue. Its repo must equal
+ * that queue's source adapter's source repo. A signed inbound webhook verifies
+ * HMAC + repository identity, resolves the full SHA, deduplicates watcher+SHA,
+ * and records a durable pending FIFO event. If the queue has no active generation
+ * it launches with that commit as an immutable generation override; otherwise the
+ * commit stays pending and is auto-launched FIFO when the generation closes.
  *
- * Auth is a wrapping concern (p8b-auth); these handlers do not check tokens.
+ * Routes:
+ *   GET    /api/projects/:id/watchers
+ *   POST   /api/projects/:id/watchers
+ *   GET    /api/projects/:id/watchers/:ruleId/events   (event list)
+ *   PATCH  /api/projects/:id/watchers/:ruleId
+ *   DELETE /api/projects/:id/watchers/:ruleId
+ *   POST   /api/projects/:id/watchers/:ruleId/run               (manual fire)
+ *   POST   /api/projects/:id/watcher/hooks/:ruleId               (signed hook, bearer-exempt)
+ *
+ * Auth is a wrapping concern (p8b-auth / server gate). Only the exact signed-hook
+ * route is bearer-exempt when auth is enabled; CRUD/manual/event-list remain
+ * bearer-protected and project-scoped.
+ *
  * Spec: plan/api.md §/watchers, plan/watcher.md §Ingress.
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type {
-  CreateWatcherRuleInput,
   DbQueries,
-  UpdateWatcherRulePatch,
-  WatcherAction,
-  WatcherRole,
   WatcherRule,
 } from "../db/queries.js";
 import {
-  handleWatcherEvent,
-  type RefResolver,
-  type WatcherInboundEvent,
+  handleWatcherCommit,
+  repoMatches,
+  type WatcherSeams,
 } from "../watcher/engine.js";
 import { badRequest, HttpError, notFound } from "./errors.js";
 import {
@@ -44,8 +52,13 @@ import {
 export interface WatcherAppCtx {
   queries: DbQueries;
   dataDir: string;
-  /** Injected ref resolver (tests + production git host). */
-  refResolver?: RefResolver;
+  /** Seams: SHA resolution + queue-generation launch. Wired in createServer. */
+  watcherSeams?: WatcherSeams;
+  /**
+   * Production resolver seam. Injected from AppCtx.watcherSeams when present;
+   * tests may inject directly. Kept for backward API.
+   */
+  refResolver?: WatcherSeams["resolveSha"];
 }
 
 // ---------------------------------------------------------------------------
@@ -78,14 +91,28 @@ function requireWatcherRule(
   return rule;
 }
 
-/** Resolve the AppCtx refResolver, falling back to a throwing stub. */
-function resolveRefResolver(app: WatcherAppCtx): RefResolver {
-  if (app.refResolver) return app.refResolver;
-  return {
-    async resolveRef() {
+/** Resolve the AppCtx seams, falling back to a throwing stub. */
+function resolveSeams(app: WatcherAppCtx): WatcherSeams {
+  const s = app.watcherSeams;
+  if (s) return s;
+  const resolver =
+    app.refResolver ??
+    (async () => {
       throw new Error("ref resolution not configured");
+    });
+  const seams: WatcherSeams = {
+    async resolveSha(repo, ref) {
+      const r = await resolver(repo, ref);
+      return { sha: r.sha };
+    },
+    hasActiveGeneration(queueId) {
+      return app.queries.getActiveQueueContainer(queueId) != null;
+    },
+    async launch(queueId, commit) {
+      throw new Error("watcher generation launch not configured");
     },
   };
+  return seams;
 }
 
 function header(req: IncomingMessage, name: string): string | undefined {
@@ -124,7 +151,6 @@ export function normalizeGitRef(ref: string | null | undefined): string | undefi
   if (s.startsWith("refs/tags/")) s = s.slice("refs/tags/".length);
   else if (s.startsWith("refs/heads/")) s = s.slice("refs/heads/".length);
   else if (s.startsWith("refs/remotes/")) {
-    // refs/remotes/origin/main → origin/main then take last segment if remote-prefixed
     s = s.slice("refs/remotes/".length);
     const slash = s.indexOf("/");
     if (slash >= 0) s = s.slice(slash + 1);
@@ -133,32 +159,8 @@ export function normalizeGitRef(ref: string | null | undefined): string | undefi
 }
 
 /**
- * Map a GitHub X-GitHub-Event (and payload) to a watcher trigger.
- * push → commit; create (tag) → tag; pull_request → pr; else webhook.
- */
-export function mapGitHubEventToTrigger(
-  eventName: string | undefined,
-  payload: Record<string, unknown>,
-): string {
-  const name = (eventName ?? "").toLowerCase();
-  if (name === "push") return "commit";
-  if (name === "create") {
-    const refType = String(payload.ref_type ?? payload.refType ?? "");
-    if (refType === "tag") return "tag";
-    // branch create still treated as commit-ish for rules watching branches
-    return "commit";
-  }
-  if (name === "pull_request" || name === "pull_request_target") return "pr";
-  if (name === "delete") {
-    // Deleting refs should not enqueue; callers treat as no-op.
-    return "webhook";
-  }
-  return "webhook";
-}
-
-/**
- * Extract the short ref from a GitHub-style payload / headers.
- * Prefers X-GitHub-Ref header, then payload.ref, then PR head ref.
+ * Extract the short ref from a GitHub payload / headers.
+ * Prefers the X-GitHub-Ref header, then payload.ref, then PR head ref.
  */
 export function extractGitHubRef(
   headers: { githubRef?: string },
@@ -166,15 +168,28 @@ export function extractGitHubRef(
 ): string | undefined {
   if (headers.githubRef) return normalizeGitRef(headers.githubRef);
   if (typeof payload.ref === "string") return normalizeGitRef(payload.ref);
-  // pull_request payloads
   const pr = payload.pull_request as Record<string, unknown> | undefined;
   if (pr) {
     const head = pr.head as Record<string, unknown> | undefined;
     if (head && typeof head.ref === "string") return normalizeGitRef(head.ref);
     if (head && typeof head.sha === "string") return head.sha;
   }
-  // create event: ref is bare tag/branch name
   if (typeof payload.ref === "string") return normalizeGitRef(payload.ref);
+  return undefined;
+}
+
+/** Extract owner/name repo id from a GitHub push payload. */
+export function extractGitHubRepo(
+  payload: Record<string, unknown>,
+): string | undefined {
+  const repo = payload.repository as Record<string, unknown> | undefined;
+  if (repo && typeof repo.full_name === "string") return repo.full_name;
+  if (repo && typeof repo.name === "string" && typeof repo.owner === "object") {
+    const owner = repo.owner as Record<string, unknown> | undefined;
+    if (owner && typeof owner.name === "string") {
+      return `${owner.name}/${repo.name}`;
+    }
+  }
   return undefined;
 }
 
@@ -185,7 +200,6 @@ export function extractGitHubRef(
 export function parseWebhookPayload(raw: string): Record<string, unknown> {
   const trimmed = raw.trim();
   if (!trimmed) return {};
-  // form-urlencoded with payload=
   if (
     trimmed.includes("payload=") &&
     !trimmed.startsWith("{") &&
@@ -221,23 +235,12 @@ function unauthorized(detail: string): HttpError {
   });
 }
 
-function isWatcherRole(v: unknown): v is WatcherRole {
-  return v === "agent" || v === "workspace";
-}
-
-function isWatcherAction(v: unknown): v is WatcherAction {
-  if (!v || typeof v !== "object") return false;
-  const a = v as WatcherAction;
-  return a.enqueue === "all" || a.enqueue === "subset";
-}
-
 // ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
 /**
  * Register watcher rule + webhook ingress routes on an existing Router.
- * Called from createServer next to registerFindingsRoutes.
  */
 export function registerWatcherRoutes(router: Router): void {
   // GET /api/projects/:id/watchers — list (secrets stripped)
@@ -248,9 +251,21 @@ export function registerWatcherRoutes(router: Router): void {
     const watchers = app.queries.listWatcherRules(projectId, {
       includeDisabled: true,
     });
-    // Defensive: ensure secrets are null even if a backend regresses.
     const stripped = watchers.map((w) => ({ ...w, webhookSecret: null }));
     sendJson(res, 200, { watchers: stripped });
+  });
+
+  // GET /api/projects/:id/watchers/:ruleId/events — durable event list
+  router.get("/api/projects/:id/watchers/:ruleId/events", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const projectId = ctx.params.id!;
+    requireProject(app.queries, projectId);
+    requireWatcherRule(app.queries, projectId, ctx.params.ruleId!);
+    const events = app.queries.listWatcherEvents(projectId, {
+      ruleId: ctx.params.ruleId,
+      limit: undefined,
+    });
+    sendJson(res, 200, { events });
   });
 
   // POST /api/projects/:id/watchers — create (secret surfaced once)
@@ -260,34 +275,57 @@ export function registerWatcherRoutes(router: Router): void {
     requireProject(app.queries, projectId);
 
     const body = await readJsonBody<{
-      role?: string;
       repo?: string;
       trigger?: string;
       ref?: string | null;
       semverFilter?: string | null;
-      action?: WatcherAction;
+      queueId?: string;
+      queue_id?: string;
       webhookSecret?: string;
       enabled?: boolean;
     }>(req);
 
-    if (!isWatcherRole(body.role)) {
-      throw badRequest("role must be 'agent' or 'workspace'");
-    }
     if (!body.repo || !String(body.repo).trim()) {
       throw badRequest("repo is required");
     }
     if (!body.trigger || !String(body.trigger).trim()) {
       throw badRequest("trigger is required");
     }
-    if (!isWatcherAction(body.action)) {
-      throw badRequest("action.enqueue must be 'all' or 'subset'");
+    const queueId = String(body.queueId ?? body.queue_id ?? "");
+    if (!queueId) {
+      throw badRequest("queueId is required (a watcher fires one queue)");
+    }
+    const queue = app.queries.getEvalQueue(queueId);
+    if (!queue || queue.projectId !== projectId) {
+      throw badRequest("queueId must reference a queue in this project");
+    }
+    // Repo must equal the queue's source adapter source repo.
+    const adapter = queue.sharedAdapterId
+      ? app.queries.getProjectAgentAdapter(queue.sharedAdapterId)
+      : app.queries.getProjectAgentAdapterByAgentId(projectId, queue.agentId);
+    if (!adapter?.sourceRepo) {
+      throw badRequest(
+        "the selected queue has no source-built adapter with a source_repo; a queue watcher requires one",
+      );
+    }
+    if (!repoMatches(String(body.repo).trim(), adapter.sourceRepo)) {
+      throw badRequest(
+        `watcher repo '${body.repo}' must equal the queue adapter source repo '${adapter.sourceRepo}'`,
+      );
     }
 
-    const input: CreateWatcherRuleInput = {
-      role: body.role,
+    const input: {
+      repo: string;
+      trigger: string;
+      queueId: string;
+      ref?: string | null;
+      semverFilter?: string | null;
+      webhookSecret?: string;
+      enabled?: boolean;
+    } = {
       repo: String(body.repo).trim(),
       trigger: String(body.trigger).trim(),
-      action: body.action,
+      queueId,
     };
     if (body.ref !== undefined) input.ref = body.ref;
     if (body.semverFilter !== undefined) input.semverFilter = body.semverFilter;
@@ -295,7 +333,6 @@ export function registerWatcherRoutes(router: Router): void {
     if (body.enabled !== undefined) input.enabled = body.enabled;
 
     const rule = app.queries.createWatcherRule(projectId, input);
-    // Surface secret exactly once; document via response header.
     sendJson(
       res,
       201,
@@ -315,31 +352,60 @@ export function registerWatcherRoutes(router: Router): void {
     const body = await readJsonBody<{
       ref?: string | null;
       semverFilter?: string | null;
-      action?: WatcherAction;
       enabled?: boolean;
       repo?: string;
+      queueId?: string;
+      queue_id?: string;
       webhookSecret?: unknown;
     }>(req);
 
-    // Explicitly reject secret rotation via PATCH (separate flow if ever needed).
     if ("webhookSecret" in body && body.webhookSecret !== undefined) {
       throw badRequest("webhookSecret cannot be updated via PATCH");
     }
 
-    const patch: UpdateWatcherRulePatch = {};
+    const patch: {
+      ref?: string | null;
+      semverFilter?: string | null;
+      enabled?: boolean;
+      repo?: string;
+      queueId?: string | null;
+    } = {};
     if (body.ref !== undefined) patch.ref = body.ref;
     if (body.semverFilter !== undefined) patch.semverFilter = body.semverFilter;
-    if (body.action !== undefined) {
-      if (!isWatcherAction(body.action)) {
-        throw badRequest("action.enqueue must be 'all' or 'subset'");
-      }
-      patch.action = body.action;
-    }
     if (body.enabled !== undefined) patch.enabled = body.enabled;
+
+    const queueId = body.queueId ?? body.queue_id;
+    if (queueId !== undefined) {
+      if (queueId === null) {
+        throw badRequest("a watcher must own exactly one queue");
+      }
+      const queue = app.queries.getEvalQueue(String(queueId));
+      if (!queue || queue.projectId !== projectId) {
+        throw badRequest("queueId must reference a queue in this project");
+      }
+      const adapter = queue.sharedAdapterId
+        ? app.queries.getProjectAgentAdapter(queue.sharedAdapterId)
+        : app.queries.getProjectAgentAdapterByAgentId(projectId, queue.agentId);
+      const repo = body.repo ?? requireWatcherRule(app.queries, projectId, ruleId).repo;
+      if (!adapter?.sourceRepo) {
+        throw badRequest("the selected queue has no source-built adapter with a source_repo");
+      }
+      if (!repoMatches(repo, adapter.sourceRepo)) {
+        throw badRequest(
+          `watcher repo '${repo}' must equal the queue adapter source repo '${adapter.sourceRepo}'`,
+        );
+      }
+      patch.queueId = String(queueId);
+    }
     if (body.repo !== undefined) patch.repo = body.repo;
 
-    const updated = app.queries.updateWatcherRule(ruleId, patch);
-    // Defensive strip.
+    const updated = app.queries.updateWatcherRule(ruleId, {
+      ref: patch.ref,
+      semverFilter: patch.semverFilter,
+      enabled: patch.enabled,
+      repo: patch.repo,
+      queueId: patch.queueId,
+    });
     sendJson(res, 200, { watcher: { ...updated, webhookSecret: null } });
   });
 
@@ -355,7 +421,7 @@ export function registerWatcherRoutes(router: Router): void {
     res.end();
   });
 
-  // POST /api/projects/:id/watchers/:ruleId/run — manual fire
+  // POST /api/projects/:id/watchers/:ruleId/run — manual fire (same engine path)
   router.post(
     "/api/projects/:id/watchers/:ruleId/run",
     async (req, res, ctx) => {
@@ -367,91 +433,41 @@ export function registerWatcherRoutes(router: Router): void {
 
       const body = await readJsonBody<{
         ref?: string;
-        agentId?: string;
-        model?: string;
-        provider?: string;
+        queueId?: string;
       }>(req);
 
-      const event: WatcherInboundEvent = {
-        projectId,
-        trigger: "manual",
-        // Prefer body.ref, then rule.ref, then HEAD (engine also falls back).
-        ref: body.ref ?? rule.ref ?? "HEAD",
-        // For matchRules the rule.trigger must equal event.trigger. Manual fire
-        // uses trigger="manual", so the rule itself must be a manual-trigger rule
-        // OR we temporarily match by forcing trigger to the rule's trigger when
-        // the rule is not "manual". Spec: manual fire always works for any rule —
-        // build event with the rule's own trigger so matchRules finds it, while
-        // provenance still records trigger as the rule's trigger (engine records
-        // event.trigger). Prefer rule.trigger so non-manual rules still fire.
-        // Actually plan says trigger="manual" for manual fire. For matchRules to
-        // hit, the rule must have trigger=manual OR we override. Use the rule's
-        // trigger for matching so any rule can be manually fired.
-        role: rule.role,
-        repo: rule.repo,
-      };
-      // Match against the rule's configured trigger (manual fire of a tag rule
-      // should still enqueue). Overwrite trigger for match.
-      event.trigger = rule.trigger === "manual" ? "manual" : String(rule.trigger);
-      // Keep body overrides for agent/model when provided.
-      if (body.agentId) event.agentId = body.agentId;
-      if (body.model) event.model = body.model;
-      if (body.provider) event.provider = body.provider;
-      // Prefer body.ref when given; otherwise rule.ref or HEAD.
-      if (body.ref !== undefined) event.ref = body.ref;
-      else if (rule.ref) event.ref = rule.ref;
-      else event.ref = "HEAD";
-
-      // Force-match: if the rule is not enabled, still allow manual fire by
-      // matching only this rule via handleWatcherEvent after ensuring it matches.
-      // handleWatcherEvent only lists enabled rules. For disabled rules return 400.
       if (!rule.enabled) {
         throw badRequest("watcher rule is disabled");
       }
-
-      // When rule.trigger is not "manual", event.trigger is set to rule.trigger
-      // above so matchRules finds it. Record provenance uses that trigger.
-
-      const resolver = resolveRefResolver(app);
-      let result;
-      try {
-        result = await handleWatcherEvent(app.queries, resolver, event);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (/no tasks to enqueue/i.test(message)) {
-          throw badRequest("no tasks to enqueue");
-        }
-        throw err;
+      if (!rule.queueId) {
+        throw badRequest("watcher rule has no queue");
       }
 
-      const mine = result.results.find((r) => r.ruleId === ruleId);
-      if (!mine) {
-        throw badRequest("watcher rule did not match manual fire event");
-      }
-      if (mine.status === "failed") {
-        const errMsg = mine.error ?? "watcher fire failed";
-        if (/no tasks to enqueue/i.test(errMsg)) {
-          throw badRequest("no tasks to enqueue");
-        }
-        throw badRequest(errMsg);
-      }
+      const seams = resolveSeams(app);
+      const result = await handleWatcherCommit({
+        queries: app.queries,
+        seams,
+        rule,
+        queueId: body.queueId ?? rule.queueId,
+        ref: body.ref ?? undefined,
+        eventRepo: rule.repo,
+      });
 
-      // Newest event for this rule is the one we just recorded.
       const events = app.queries.listWatcherEvents(projectId, {
         ruleId,
         limit: 1,
       });
-      const watcherEventId = events[0]?.id ?? null;
-
+      const watcherEventId = events[0]?.id ?? result.event.id;
       sendJson(res, 202, {
-        batchIds: mine.batchIds ?? [],
+        status: result.status,
         watcherEventId,
-        status: mine.status,
+        queueId: rule.queueId,
       });
     },
   );
 
-  // POST /api/projects/:id/watcher/hooks/:ruleId — git-host webhook ingress
+  // POST /api/projects/:id/watcher/hooks/:ruleId — signed git-host webhook ingress.
+  // BEARER-EXEMPT: GitHub signs the payload; a shared GitHub secret is the auth.
   router.post(
     "/api/projects/:id/watcher/hooks/:ruleId",
     async (req, res, ctx) => {
@@ -459,13 +475,11 @@ export function registerWatcherRoutes(router: Router): void {
       const projectId = ctx.params.id!;
       const ruleId = ctx.params.ruleId!;
       requireProject(app.queries, projectId);
-      // Rule must exist (404) before HMAC (401) so callers can distinguish.
       const rule = requireWatcherRule(app.queries, projectId, ruleId);
 
       // Raw body for HMAC — do not parse first.
       const rawBody = await readBody(req);
 
-      // Secret must be configured.
       const secret = app.queries.getRawWatcherSecret(ruleId);
       if (!secret) {
         throw unauthorized("watcher rule has no webhook_secret configured");
@@ -479,81 +493,110 @@ export function registerWatcherRoutes(router: Router): void {
       const payload = parseWebhookPayload(rawBody);
       const ghEvent = header(req, "x-github-event");
       const ghRefHeader = header(req, "x-github-ref");
-      const trigger = mapGitHubEventToTrigger(ghEvent, payload);
       const ref = extractGitHubRef({ githubRef: ghRefHeader }, payload);
+      const eventRepo = extractGitHubRepo(payload);
 
       // Skip pure delete events (no enqueue).
       if (ghEvent?.toLowerCase() === "delete") {
         const ev = app.queries.recordWatcherEvent({
           ruleId,
           projectId,
-          trigger,
+          queueId: rule.queueId ?? null,
+          trigger: rule.trigger,
           ref: ref ?? null,
           status: "ignored",
         });
         sendJson(res, 202, {
           matched: false,
-          results: [{ ruleId, status: "ignored", watcherEventId: ev.id }],
+          status: "ignored",
+          watcherEventId: ev.id,
         });
         return;
       }
 
-      // Align event trigger with the rule when GitHub mapping differs from the
-      // rule's configured trigger (e.g. tag-push often arrives as create/push).
-      // Prefer the mapped trigger; if the rule won't match, fall back to rule.trigger
-      // only when the mapped type is a superset (webhook) — otherwise let matchRules decide.
-      let eventTrigger = trigger;
-      if (rule.trigger === "tag" && (trigger === "commit" || trigger === "webhook")) {
-        // create(tag) already maps to tag; push of a tag ref may map to commit.
-        if (ref && /^v?\d+\.\d+/.test(ref)) eventTrigger = "tag";
+      if (!rule.queueId) {
+        throw badRequest("watcher rule has no queue");
       }
-      // For exact-rule webhook URL, force trigger to the rule's trigger so this
-      // specific hook always targets its rule when ref/repo/role match.
-      eventTrigger = String(rule.trigger);
-
-      const event: WatcherInboundEvent = {
-        projectId,
-        trigger: eventTrigger,
-        ref,
-        role: rule.role,
-        repo: rule.repo,
-      };
-
-      const resolver = resolveRefResolver(app);
-      const result = await handleWatcherEvent(app.queries, resolver, event);
-      const filtered = result.results.filter((r) => r.ruleId === ruleId);
-
-      if (filtered.length === 0) {
-        // Rule did not match (disabled mid-flight, ref glob miss, etc.).
+      if (!rule.enabled) {
         const ev = app.queries.recordWatcherEvent({
           ruleId,
           projectId,
-          trigger: eventTrigger,
+          queueId: rule.queueId,
+          trigger: rule.trigger,
           ref: ref ?? null,
           status: "ignored",
         });
         sendJson(res, 202, {
           matched: false,
-          results: [{ ruleId, status: "ignored", watcherEventId: ev.id }],
+          status: "ignored",
+          watcherEventId: ev.id,
         });
         return;
       }
 
-      const matched = filtered.some(
-        (r) =>
-          r.status === "enqueued" ||
-          r.status === "deduped" ||
-          r.status === "failed" ||
-          r.status === "matched",
-      );
+      // Repository identity: the hook repo must equal the watcher's repo.
+      if (!eventRepo) {
+        throw badRequest("webhook payload did not include repository identity");
+      }
+      if (!repoMatches(rule.repo, eventRepo)) {
+        const ev = app.queries.recordWatcherEvent({
+          ruleId,
+          projectId,
+          queueId: rule.queueId,
+          trigger: rule.trigger,
+          ref: ref ?? null,
+          status: "ignored",
+          error: `webhook repo ${eventRepo} does not match watcher repo ${rule.repo}`,
+        });
+        sendJson(res, 200, {
+          matched: false,
+          status: "ignored",
+          watcherEventId: ev.id,
+        });
+        return;
+      }
+
+      const seams = resolveSeams(app);
+      let result;
+      try {
+        result = await handleWatcherCommit({
+          queries: app.queries,
+          seams,
+          rule,
+          queueId: rule.queueId,
+          ref: ref ?? undefined,
+          eventRepo,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const ev = app.queries.recordWatcherEvent({
+          ruleId,
+          projectId,
+          queueId: rule.queueId,
+          trigger: rule.trigger,
+          ref: ref ?? null,
+          status: "failed",
+          error: message,
+        });
+        sendJson(res, 202, {
+          matched: false,
+          status: "failed",
+          watcherEventId: ev.id,
+          error: message,
+        });
+        return;
+      }
+
       sendJson(res, 202, {
-        matched,
-        results: filtered.map((r) => ({
-          ruleId: r.ruleId,
-          status: r.status,
-          ...(r.batchIds ? { batchIds: r.batchIds } : {}),
-          ...(r.error ? { error: r.error } : {}),
-        })),
+        matched: result.status === "launched" || result.status === "pending",
+        status: result.status,
+        watcherEventId: result.event.id,
+        resolvedSha: result.event.resolvedSha,
+        processedSha: result.event.processedSha,
+        fifoSeq: result.event.fifoSeq,
+        ...(result.status === "launched" && result.event.batchId
+          ? { batchId: result.event.batchId }
+          : {}),
       });
     },
   );

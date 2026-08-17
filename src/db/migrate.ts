@@ -13,6 +13,39 @@ import type Database from "better-sqlite3";
 import { SCHEMA_VERSION } from "./schema.js";
 
 /**
+ * Built-in agents that the adapter registry always ships. They must exist in the
+ * `agents` table because `eval_queues.agent_id` FKs into it; the in-memory
+ * adapter registry is not persistence. Seeded idempotently on every migrate.
+ */
+const BUILTIN_AGENTS: ReadonlyArray<{
+  id: string;
+  displayName: string;
+  defaultModel: string;
+  defaultProvider: string;
+}> = [
+  { id: "reapercode", displayName: "ReaperCode", defaultModel: "deepseek-v4-flash", defaultProvider: "nuralwatt" },
+  { id: "pi", displayName: "pi coding agent", defaultModel: "deepseek-v4-flash", defaultProvider: "nuralwatt" },
+];
+
+/** Ensure built-in agents have rows so builtin_adapter_id queues satisfy FKs. */
+function seedBuiltinAgents(db: Database.Database): void {
+  const insert = db.prepare(
+    "INSERT INTO agents (id, display_name, default_model, default_provider) VALUES (?, ?, ?, ?)",
+  );
+  const upsert = db.prepare(
+    "INSERT INTO agents (id, display_name, default_model, default_provider) VALUES (?, ?, ?, ?) " +
+      "ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name, " +
+      "default_model = COALESCE(excluded.default_model, agents.default_model), " +
+      "default_provider = COALESCE(excluded.default_provider, agents.default_provider)",
+  );
+  for (const agent of BUILTIN_AGENTS) {
+    const exists = db.prepare("SELECT 1 FROM agents WHERE id = ?").get(agent.id);
+    if (exists) upsert.run(agent.id, agent.displayName, agent.defaultModel, agent.defaultProvider);
+    else insert.run(agent.id, agent.displayName, agent.defaultModel, agent.defaultProvider);
+  }
+}
+
+/**
  * Raw SQL DDL matching plan/data-model.md. Order respects FK dependencies
  * (agents before projects; projects/tasks before runs; etc.).
  */
@@ -34,7 +67,6 @@ const DDL: string[] = [
     default_agent_id TEXT REFERENCES agents(id),
     default_model TEXT,
     default_provider TEXT,
-    default_judge_model TEXT,
     workspace_image TEXT,
     check_runners_json TEXT,
     adapter_overrides_json TEXT,
@@ -79,6 +111,23 @@ const DDL: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_project_agent_adapters_project ON project_agent_adapters(project_id, enabled)`,
 
+  `CREATE TABLE IF NOT EXISTS adapter_builds (
+    id TEXT PRIMARY KEY,
+    adapter_id TEXT NOT NULL REFERENCES project_agent_adapters(id),
+    commit_sha TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'building',
+    image TEXT,
+    image_id TEXT,
+    agent_version TEXT,
+    log_path TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(adapter_id, commit_sha)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_adapter_builds_commit ON adapter_builds(commit_sha)`,
+
   `CREATE TABLE IF NOT EXISTS eval_queues (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -91,13 +140,11 @@ const DDL: string[] = [
     sandbox_json TEXT,
     network_policy TEXT NOT NULL DEFAULT 'allow',
     ports_json TEXT,
-    judge_model TEXT,
-    judge_provider TEXT,
-    auto_judge INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'draft',
     active_batch_id TEXT,
     shared_adapter_id TEXT REFERENCES project_agent_adapters(id),
     builtin_adapter_id TEXT,
+    agent_commit TEXT,
     revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -142,6 +189,8 @@ const DDL: string[] = [
     repeats INTEGER NOT NULL DEFAULT 1,
     enabled INTEGER NOT NULL DEFAULT 1,
     overrides_json TEXT,
+    claimed_repeats INTEGER NOT NULL DEFAULT 0,
+    deleted_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
@@ -149,7 +198,7 @@ const DDL: string[] = [
 
   `CREATE TABLE IF NOT EXISTS run_batches (
     id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(id),
+    task_id TEXT REFERENCES tasks(id),
     project_id TEXT NOT NULL REFERENCES projects(id),
     agent_id TEXT NOT NULL REFERENCES agents(id),
     model TEXT NOT NULL,
@@ -160,9 +209,15 @@ const DDL: string[] = [
     trigger_ref TEXT,
     agent_image TEXT,
     agent_commit TEXT,
+    agent_image_id TEXT,
+    agent_version TEXT,
+    build_id TEXT,
     queue_id TEXT REFERENCES eval_queues(id),
     queue_revision INTEGER,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    accepting INTEGER NOT NULL DEFAULT 1,
+    closed_revision INTEGER,
+    closed_at TEXT
   )`,
 
   `CREATE TABLE IF NOT EXISTS queue_containers (
@@ -172,6 +227,10 @@ const DDL: string[] = [
     batch_id TEXT NOT NULL REFERENCES run_batches(id),
     runtime_container_id TEXT,
     image TEXT NOT NULL,
+    image_id TEXT,
+    agent_commit TEXT,
+    agent_version TEXT,
+    build_id TEXT,
     state TEXT NOT NULL,
     ports_json TEXT,
     workspace_dir TEXT NOT NULL,
@@ -186,6 +245,7 @@ const DDL: string[] = [
   `CREATE TABLE IF NOT EXISTS watcher_rules (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
+    queue_id TEXT REFERENCES eval_queues(id),
     role TEXT NOT NULL,
     repo TEXT NOT NULL,
     trigger TEXT NOT NULL,
@@ -246,6 +306,9 @@ const DDL: string[] = [
     resolved_sha TEXT,
     status TEXT NOT NULL,
     batch_id TEXT REFERENCES run_batches(id),
+    queue_id TEXT REFERENCES eval_queues(id),
+    fifo_seq INTEGER,
+    processed_sha TEXT,
     error TEXT
   )`,
 
@@ -262,8 +325,6 @@ const DDL: string[] = [
     repeats INTEGER,
     params_json TEXT,
     adapter_overrides_json TEXT,
-    auto_judge INTEGER,
-    judge_model TEXT,
     priority INTEGER NOT NULL DEFAULT 0,
     position REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
@@ -287,93 +348,6 @@ const DDL: string[] = [
     sealed_at TEXT NOT NULL
   )`,
 
-  `CREATE TABLE IF NOT EXISTS queue_analyses (
-    id TEXT PRIMARY KEY,
-    queue_id TEXT NOT NULL REFERENCES eval_queues(id),
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    batch_id TEXT NOT NULL REFERENCES run_batches(id),
-    selected_run_ids_json TEXT NOT NULL,
-    evidence_hashes_json TEXT NOT NULL,
-    judge_model TEXT NOT NULL,
-    judge_provider TEXT NOT NULL,
-    judge_params_json TEXT,
-    judge_prompt TEXT,
-    system_prompt_version TEXT NOT NULL,
-    parent_analysis_id TEXT,
-    status TEXT NOT NULL,
-    verdict_path TEXT,
-    report_path TEXT,
-    events_path TEXT,
-    raw_response_path TEXT,
-    created_at TEXT NOT NULL,
-    started_at TEXT,
-    ended_at TEXT,
-    error TEXT
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_queue_analyses_queue_batch ON queue_analyses(queue_id, batch_id)`,
-
-  `CREATE TABLE IF NOT EXISTS judgements (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES runs(id),
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    queue_analysis_id TEXT REFERENCES queue_analyses(id),
-    judge_model TEXT NOT NULL,
-    judge_provider TEXT NOT NULL,
-    judge_prompt TEXT,
-    system_prompt_version TEXT NOT NULL,
-    status TEXT NOT NULL,
-    overall_score REAL,
-    verdict TEXT,
-    report_path TEXT,
-    events_path TEXT,
-    verdict_path TEXT,
-    narrative_json TEXT,
-    narrative_schema_version INTEGER,
-    created_at TEXT,
-    ended_at TEXT
-  )`,
-
-  `CREATE TABLE IF NOT EXISTS scores (
-    id TEXT PRIMARY KEY,
-    judgement_id TEXT NOT NULL REFERENCES judgements(id),
-    criterion TEXT NOT NULL,
-    weight REAL NOT NULL,
-    score REAL NOT NULL,
-    rationale TEXT
-  )`,
-
-  `CREATE TABLE IF NOT EXISTS improvement_steps (
-    id TEXT PRIMARY KEY,
-    step_key TEXT NOT NULL,
-    queue_analysis_id TEXT NOT NULL REFERENCES queue_analyses(id),
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    queue_id TEXT NOT NULL REFERENCES eval_queues(id),
-    rank INTEGER NOT NULL,
-    class TEXT NOT NULL,
-    priority INTEGER NOT NULL,
-    confidence REAL NOT NULL,
-    defect_ids_json TEXT NOT NULL,
-    subsystem TEXT NOT NULL,
-    problem TEXT NOT NULL,
-    evidence_json TEXT NOT NULL,
-    target_json TEXT NOT NULL,
-    change TEXT NOT NULL,
-    acceptance_criteria_json TEXT NOT NULL,
-    tests_json TEXT NOT NULL,
-    verify_task_ids_json TEXT NOT NULL,
-    regression_task_ids_json TEXT NOT NULL,
-    dependencies_json TEXT NOT NULL,
-    non_goals_json TEXT NOT NULL,
-    preventive INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL,
-    blocking_reason TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(queue_analysis_id, rank),
-    UNIQUE(queue_analysis_id, step_key)
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_improvement_steps_analysis_status ON improvement_steps(queue_analysis_id, status)`,
-
   `CREATE TABLE IF NOT EXISTS eval_metrics (
     run_id TEXT PRIMARY KEY REFERENCES runs(id),
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -383,42 +357,6 @@ const DDL: string[] = [
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
-
-  `CREATE TABLE IF NOT EXISTS findings (
-    fingerprint TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(id),
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    category TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    claim TEXT NOT NULL,
-    latest_severity TEXT,
-    latest_confidence REAL,
-    first_seen_judgement TEXT REFERENCES judgements(id),
-    last_seen_judgement TEXT REFERENCES judgements(id),
-    first_seen_at TEXT,
-    last_seen_at TEXT,
-    occurrence_count INTEGER NOT NULL DEFAULT 1,
-    resolved_at TEXT,
-    status TEXT NOT NULL DEFAULT 'open'
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id)`,
-
-  `CREATE TABLE IF NOT EXISTS finding_occurrences (
-    id TEXT PRIMARY KEY,
-    finding_fingerprint TEXT NOT NULL REFERENCES findings(fingerprint),
-    judgement_id TEXT NOT NULL REFERENCES judgements(id),
-    run_id TEXT NOT NULL REFERENCES runs(id),
-    severity TEXT NOT NULL,
-    confidence REAL NOT NULL,
-    claim TEXT NOT NULL,
-    criterion TEXT,
-    refs_json TEXT NOT NULL,
-    fix_json TEXT,
-    status TEXT NOT NULL DEFAULT 'introduced',
-    created_at TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_occurrences_run ON finding_occurrences(run_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_occurrences_judgement ON finding_occurrences(judgement_id)`,
 
   `CREATE TABLE IF NOT EXISTS checks (
     id TEXT PRIMARY KEY,
@@ -461,63 +399,13 @@ const DDL: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash)`,
 
-  // Outbound webhook subscriptions (P8c) — secret returned once at create.
-  `CREATE TABLE IF NOT EXISTS outbound_subscriptions (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    url TEXT NOT NULL,
-    secret TEXT NOT NULL,
-    event_types_json TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_outbound_subs_project ON outbound_subscriptions(project_id)`,
-
-  // Delivery attempt log for outbound webhooks.
-  `CREATE TABLE IF NOT EXISTS webhook_deliveries (
-    id TEXT PRIMARY KEY,
-    subscription_id TEXT NOT NULL REFERENCES outbound_subscriptions(id),
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    event_type TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    status TEXT NOT NULL,
-    attempt INTEGER NOT NULL DEFAULT 0,
-    response_status INTEGER,
-    response_body TEXT,
-    error TEXT,
-    delivered_at TEXT,
-    created_at TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_project_created ON webhook_deliveries(project_id, created_at)`,
-  `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_sub ON webhook_deliveries(subscription_id)`,
-
-  // Deterministic check results (P9, rubric.md §5). The verdict JSON also
-  // carries checkResults; this table is a run-keyed DB mirror so API consumers
-  // can query pass-rates without parsing the verdict body.
+  // Deterministic check results (P9, rubric.md §5). This run-keyed table lets API consumers query deterministic check results.
   `CREATE TABLE IF NOT EXISTS check_results (
     run_id TEXT NOT NULL,
     results_json TEXT NOT NULL,
     recorded_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_check_results_run ON check_results(run_id)`,
-
-  // Project-scoped reusable rubrics (plan/rubric.md §6 profiles). A task may
-  // embed its own rubric_json OR reference one of these by id; the project
-  // rubric is the shared, versioned baseline that many tasks can point at.
-  `CREATE TABLE IF NOT EXISTS project_rubrics (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    name TEXT NOT NULL,
-    description TEXT,
-    rubric_json TEXT NOT NULL,
-    rubric_version INTEGER NOT NULL DEFAULT 1,
-    is_default INTEGER NOT NULL DEFAULT 0,
-    archived INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS idx_project_rubrics_project ON project_rubrics(project_id)`,
 
   // Version bookkeeping (in addition to PRAGMA user_version).
   `CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -537,8 +425,6 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE users ADD COLUMN role TEXT",
     "ALTER TABLE users ADD COLUMN created_at TEXT",
     "ALTER TABLE users ADD COLUMN email TEXT",
-    // Artifact retention: what survives judgement (keep|referenced|all).
-    "ALTER TABLE projects ADD COLUMN artifact_retention TEXT DEFAULT 'keep'",
     // Sandbox policy: per-project container controls (caps, mounts, devices…).
     "ALTER TABLE projects ADD COLUMN sandbox_json TEXT",
     // Per-run adapter overrides (image, env, params, tools) as submitted.
@@ -562,9 +448,8 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE runs ADD COLUMN queue_container_id TEXT REFERENCES queue_containers(id)",
     "ALTER TABLE runs ADD COLUMN eval_version INTEGER",
     "ALTER TABLE runs ADD COLUMN eval_snapshot_json TEXT",
-    "ALTER TABLE judgements ADD COLUMN queue_analysis_id TEXT REFERENCES queue_analyses(id)",
-    "ALTER TABLE judgements ADD COLUMN narrative_json TEXT",
-    "ALTER TABLE judgements ADD COLUMN narrative_schema_version INTEGER",
+    // v9: immutable queue-item snapshot copied at claim time.
+    "ALTER TABLE runs ADD COLUMN item_snapshot_json TEXT",
     // Adapter generator + connection-check derivation.
     "ALTER TABLE project_agent_adapters ADD COLUMN connection_check_derived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE project_agent_adapters ADD COLUMN generator_script TEXT",
@@ -574,6 +459,27 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE eval_queues ADD COLUMN shared_adapter_id TEXT",
     // v7: explicit built-in adapter opt-in; no implicit fallback.
     "ALTER TABLE eval_queues ADD COLUMN builtin_adapter_id TEXT",
+    // v9: queue commit + dynamic item soft-delete / claim state.
+    "ALTER TABLE eval_queues ADD COLUMN agent_commit TEXT",
+    "ALTER TABLE eval_queue_items ADD COLUMN claimed_repeats INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE eval_queue_items ADD COLUMN deleted_at TEXT",
+    // v9: generation snapshot on queue_containers.
+    "ALTER TABLE queue_containers ADD COLUMN image_id TEXT",
+    "ALTER TABLE queue_containers ADD COLUMN agent_commit TEXT",
+    "ALTER TABLE queue_containers ADD COLUMN agent_version TEXT",
+    "ALTER TABLE queue_containers ADD COLUMN build_id TEXT",
+    // v9: generation + acceptance state on run_batches.
+    "ALTER TABLE run_batches ADD COLUMN agent_image_id TEXT",
+    "ALTER TABLE run_batches ADD COLUMN agent_version TEXT",
+    "ALTER TABLE run_batches ADD COLUMN build_id TEXT",
+    "ALTER TABLE run_batches ADD COLUMN accepting INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE run_batches ADD COLUMN closed_revision INTEGER",
+    "ALTER TABLE run_batches ADD COLUMN closed_at TEXT",
+    // v9: watcher queue ownership + durable pending-event state.
+    "ALTER TABLE watcher_rules ADD COLUMN queue_id TEXT",
+    "ALTER TABLE watcher_events ADD COLUMN queue_id TEXT",
+    "ALTER TABLE watcher_events ADD COLUMN fifo_seq INTEGER",
+    "ALTER TABLE watcher_events ADD COLUMN processed_sha TEXT",
   ];
   for (const sql of alters) {
     try {
@@ -582,6 +488,82 @@ function ensureColumns(db: Database.Database): void {
       // column already present — ok
     }
   }
+}
+
+/** Remove capabilities deleted from the API-only backend. */
+function dropRemovedCapabilityTables(db: Database.Database): void {
+  db.pragma("foreign_keys = OFF");
+  for (const table of [
+    "finding_occurrences",
+    "findings",
+    "improvement_steps",
+    "scores",
+    "judgements",
+    "queue_analyses",
+    "project_rubrics",
+    // v9: legacy queue_entries are migrated into named eval_queues first;
+    // the raw entry table is removed once its rows exist as named queues.
+    "queue_entries",
+    // Outbound webhooks (P8c) were removed: subscriptions + delivery log are
+    // no longer part of the API-only backend.
+    "outbound_subscriptions",
+    "webhook_deliveries",
+  ]) {
+    db.exec(`DROP TABLE IF EXISTS ${table}`);
+  }
+  db.pragma("foreign_keys = ON");
+}
+
+/**
+ * v9: rebuild run_batches making task_id nullable (SQLite cannot ALTER away
+ * NOT NULL). One batch may own many evals in a queue generation, so task_id
+ * becomes a single-eval convenience pointer rather than a required FK.
+ * Idempotent — checks the live column constraint before rebuilding.
+ */
+function rebuildRunBatchesNullableTaskId(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(run_batches)").all() as Array<{
+    name: string;
+    notnull: number;
+  }>;
+  const taskCol = cols.find((c) => c.name === "task_id");
+  if (!taskCol || taskCol.notnull === 0) return; // already nullable / absent
+
+  db.pragma("foreign_keys = OFF");
+  db.exec(`CREATE TABLE run_batches_v9 (
+    id TEXT PRIMARY KEY,
+    task_id TEXT REFERENCES tasks(id),
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    model TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    repeats INTEGER NOT NULL,
+    trigger TEXT,
+    trigger_ref TEXT,
+    agent_image TEXT,
+    agent_commit TEXT,
+    agent_image_id TEXT,
+    agent_version TEXT,
+    build_id TEXT,
+    queue_id TEXT REFERENCES eval_queues(id),
+    queue_revision INTEGER,
+    created_at TEXT NOT NULL,
+    accepting INTEGER NOT NULL DEFAULT 1,
+    closed_revision INTEGER,
+    closed_at TEXT
+  )`);
+  db.exec(`INSERT INTO run_batches_v9 (
+    id, task_id, project_id, agent_id, model, provider, params_json, repeats,
+    trigger, trigger_ref, agent_image, agent_commit, agent_image_id, agent_version,
+    build_id, queue_id, queue_revision, created_at, accepting, closed_revision, closed_at
+  ) SELECT
+    id, task_id, project_id, agent_id, model, provider, params_json, repeats,
+    trigger, trigger_ref, agent_image, agent_commit, NULL, NULL, NULL,
+    queue_id, queue_revision, created_at, 1, NULL, NULL
+  FROM run_batches`);
+  db.exec("DROP TABLE run_batches");
+  db.exec("ALTER TABLE run_batches_v9 RENAME TO run_batches");
+  db.pragma("foreign_keys = ON");
 }
 
 /**
@@ -600,8 +582,6 @@ function migrateLegacyQueueEntries(db: Database.Database): void {
     repeats: number | null;
     params_json: string | null;
     adapter_overrides_json: string | null;
-    auto_judge: number | null;
-    judge_model: string | null;
     created_at: string;
     project_model: string | null;
     project_provider: string | null;
@@ -623,9 +603,8 @@ function migrateLegacyQueueEntries(db: Database.Database): void {
     INSERT OR IGNORE INTO eval_queues (
       id, project_id, name, description, agent_id, model, provider,
       adapter_overrides_json, sandbox_json, network_policy, ports_json,
-      judge_model, judge_provider, auto_judge, status, active_batch_id,
-      revision, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'allow', '[]', ?, 'anthropic', ?,
+      status, active_batch_id, revision, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'allow', '[]',
       'draft', NULL, 1, ?, ?)
   `);
   const insertItem = db.prepare(`
@@ -673,8 +652,6 @@ function migrateLegacyQueueEntries(db: Database.Database): void {
       model,
       provider,
       overrides ? JSON.stringify(overrides) : null,
-      row.judge_model,
-      row.auto_judge === 0 ? 0 : 1,
       ts,
       ts,
     );
@@ -754,9 +731,14 @@ export function migrate(db: Database.Database): void {
       }
     });
     apply();
+    // Table rebuilds (PRAGMA foreign_keys) and drops run outside the tx.
+    rebuildRunBatchesNullableTaskId(db);
+    dropRemovedCapabilityTables(db);
+    seedBuiltinAgents(db);
     return;
   }
 
+  // DDL + column additions are safe in a transaction.
   const apply = db.transaction(() => {
     for (const stmt of DDL) {
       db.exec(stmt);
@@ -769,6 +751,10 @@ export function migrate(db: Database.Database): void {
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   });
   apply();
+  // Table rebuilds (PRAGMA foreign_keys) and drops run outside the tx.
+  rebuildRunBatchesNullableTaskId(db);
+  dropRemovedCapabilityTables(db);
+  seedBuiltinAgents(db);
 }
 
 /** Read the stamped schema version (0 if never migrated). */

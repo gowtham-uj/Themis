@@ -76,6 +76,7 @@ export function createDeclarativeAdapter(definition: ProjectAgentAdapter): Adapt
         ...(definition.evidence.requiredPaths
           ? { requiredPaths: [...definition.evidence.requiredPaths] }
           : {}),
+        manifest: (definition.evidence.manifest ?? []).map((entry) => ({ ...entry })),
       };
     },
     parse(streams, ctx) {

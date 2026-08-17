@@ -17,7 +17,7 @@ afterEach(async () => {
 async function boot(): Promise<{ api: ApiServer; base: string }> {
   const dataDir = await mkdtemp(join(tmpdir(), "agenteval-validate-"));
   dirs.push(dataDir);
-  const api = createServer({ dataDir, outboundDispatcher: null });
+  const api = createServer({ dataDir });
   servers.push(api);
   const port = await api.listen(0);
   return { api, base: `http://127.0.0.1:${port}` };
@@ -62,7 +62,20 @@ describe("adapter validate (dry-run)", () => {
         cwd: "/workspace",
         timeout_ms: 120000,
       },
-      evidence: { paths: [".runs"] },
+      evidence: {
+        paths: [".runs"],
+        manifest: [
+          {
+            id: "trace",
+            role: "trace",
+            path: ".runs/*.jsonl",
+            format: "jsonl",
+            primary: true,
+            select: "latest_mtime",
+            record: { kindField: "type", tsField: "timestamp", idField: "id" },
+          },
+        ],
+      },
       parser_kind: "canonical-jsonl",
       default_provider: "nuralwatt",
       default_model: "deepseek-v4-flash",
@@ -76,6 +89,7 @@ describe("adapter validate (dry-run)", () => {
       command: { argv: string[]; env: Record<string, string>; cwd: string; timeout_ms: number };
       connection_check: { argv: string[] };
       configure: { argv: string[]; env: Record<string, string>; cwd: string; timeout_ms: number };
+      evidence: { paths: string[]; manifest: Array<{ id: string; role: string }> };
     };
     expect(body.command.argv).toContain("sample-model");
     expect(body.command.argv).toContain("sample-provider");
@@ -90,6 +104,12 @@ describe("adapter validate (dry-run)", () => {
 
     // Derived connection check uses the command template with the probe prompt.
     expect(body.connection_check.argv).toContain("Reply with exactly AGENTEVAL_CONNECTION_OK. Do not use tools.");
+
+    // The evidence manifest is round-tripped into the declarative adapter and
+    // surfaced on the validate response so a judge can bind roles by id.
+    expect(body.evidence.manifest).toHaveLength(1);
+    expect(body.evidence.manifest[0].id).toBe("trace");
+    expect(body.evidence.manifest[0].role).toBe("trace");
   });
 
   it("renders the generator contract discovery endpoint", async () => {

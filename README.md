@@ -1,29 +1,32 @@
 # agenteval
 
-A self-hosted **general agent evaluation platform**: run autonomous agents against eval tasks, capture
-rich canonical traces (thinking, messages, tool calls, results, tokens), judge each run with a
-**three-layer verdict** — scores + localized diagnostics + located **findings** — plus a two-lens
-**improvements synthesis** (`withoutSource` always; `withSource` gated by agent category), and track
-regressions across agent versions. Coding agents are one pre-defined category.
-
-**This directory is the implementation.** The spec lives in [`plan/`](./plan/) (the source of truth —
-read `plan/README.md` and `plan/roadmap.md` first). When code and plan diverge, fix one and record why.
+A self-hosted, API-only agent evaluation backend. It creates and versions agent adapters and eval
+packages, runs eval queues in persistent Podman containers, captures canonical events and native traces,
+executes deterministic verifiers, seals one immutable evidence archive per eval run, and stores those
+archives in a flat central catalog keyed by run id.
 
 ## Current scope
 
-The supported acceptance surface is backend/API-only. Projects own evals and at most one adapter;
-queues may explicitly select a shared adapter-store row. Each active queue owns one persistent real
-Podman container and runs its evals sequentially. The judge is one real PI SDK agent using the
-versioned custom prompt and restricted archive tools. Frontend work is deferred.
+The HTTP API is the only application interface. There is no bundled frontend, judge subsystem,
+judgement API, reusable-rubric API, or standalone run-artifact API.
+
+Projects own canonical eval packages and adapter configurations. Queues may use a project adapter, an
+explicitly shared adapter-store entry, or an explicitly selected built-in adapter. Each active queue owns
+one persistent real Podman container and executes its evals sequentially with per-eval setup and cleanup.
+Protected solution, test, and validation content never enters the agent container.
+
+Every sealed eval archive contains the run metadata, canonical events, agent logs and native traces,
+verifier output, deterministic metrics, cleanup/reset evidence, and captured generated outputs. The
+central archive API supports cross-project and project-scoped filtering by agent commit, queue, batch,
+run, task, model, provider, status, and reward.
 
 See:
 
-- [`docs/README.md`](./docs/README.md) — complete user/operator documentation.
-- [`docs/eval-authoring.md`](./docs/eval-authoring.md) — canonical eval package authoring and strict creation.
-- [`docs/platform-api-guide.md`](./docs/platform-api-guide.md) — end-to-end API operations.
-- [`plan/adapter-generation-guide.md`](./plan/adapter-generation-guide.md) — integrate a real CLI agent.
+- [`docs/README.md`](./docs/README.md) — user and operator documentation.
+- [`docs/eval-authoring.md`](./docs/eval-authoring.md) — canonical eval package authoring.
+- [`docs/platform-api-guide.md`](./docs/platform-api-guide.md) — API operations.
+- [`plan/adapter-generation-guide.md`](./plan/adapter-generation-guide.md) — real CLI adapter integration.
 - [`plan/execution.md`](./plan/execution.md) — queue container and evidence lifecycle.
-- [`plan/judge.md`](./plan/judge.md) — PI judge, verdict, and report lifecycle.
 
 ## Quick start
 
@@ -35,6 +38,6 @@ npm run build
 node dist/src/cli/serve.js --port 8080 --data-dir ./data
 ```
 
-Every runtime/model acceptance path is real, including tests. `PodmanRuntime` is the supported backend;
-there is no fake/local-process runtime or mocked model gateway. This host requires
+Runtime and model acceptance paths use real systems. `PodmanRuntime` is the supported container backend;
+there is no fake local-process runtime or mocked model gateway. This host requires
 `AGENTEVAL_PODMAN_SUDO=1`. See `CLAUDE.md` for the cgroup and Podman constraints.

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RunController } from "../src/runner/control.ts";
 import { PodmanRuntime } from "../src/runner/podman-runtime.ts";
-import { deriveRunStatus } from "../src/runner/run.ts";
+import { deriveRunStatus } from "../src/runner/status.ts";
 import type { RunContainerSpec } from "../src/runner/runtime.ts";
 import { parseJsonl } from "../src/schema/jsonl.ts";
 

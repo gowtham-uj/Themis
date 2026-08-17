@@ -67,7 +67,7 @@ describe("project agent adapter API", () => {
   it("enforces one CRUD-able CLI agent per project and binds queues to it", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "agenteval-adapter-api-"));
     dirs.push(dataDir);
-    const api = createServer({ dataDir, outboundDispatcher: null });
+    const api = createServer({ dataDir });
     servers.push(api);
     const port = await api.listen(0);
     const base = `http://127.0.0.1:${port}`;
@@ -122,7 +122,7 @@ describe("project agent adapter API", () => {
   it("requires explicit valid shared adapter references and protects consumers", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "agenteval-shared-adapter-api-"));
     dirs.push(dataDir);
-    const api = createServer({ dataDir, outboundDispatcher: null });
+    const api = createServer({ dataDir });
     servers.push(api);
     const port = await api.listen(0);
     const base = `http://127.0.0.1:${port}`;

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Rubric, TaskSpec } from "../src/domain.ts";
-import type { CheckResult } from "../src/judge/verdict.ts";
+import type { CheckResult } from "../src/check-types.ts";
 import {
   openDb,
   resolveProjectDir,
@@ -343,18 +343,8 @@ describe("agents + batches + runs", () => {
   });
 });
 
-describe("findings query surface (P6a)", () => {
-  it("listFindings / getFinding start empty and are callable", async () => {
-    const { queries } = open(await tempDataDir());
-    expect(queries.listFindings()).toEqual([]);
-    expect(queries.getFinding("nope")).toBeNull();
-    expect(queries.listOccurrences("nope")).toEqual([]);
-  });
-});
-
-// P9: deterministic check-results persistence (the table is mirrored in
-// check_results so API consumers can query pass-rates without parsing the
-// verdict body). Verifies the Drizzle-backed SqliteQueries impl AND the
+// Deterministic check-results persistence. Verifies the Drizzle-backed
+// SqliteQueries implementation and the
 // MemoryQueries fallback both store/round-trip + upsert (replace, not append).
 describe("check results (P9)", () => {
   it("storeCheckResults / getCheckResults round-trip on both backends", async () => {

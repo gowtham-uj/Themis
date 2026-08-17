@@ -1,22 +1,20 @@
 /**
- * Live GitHub browsing — pick the commit to evaluate.
+ * Project agent-repository browsing + commit resolution.
  *
- * GET /api/github/commits?repo=…&ref=…   → recent commits, newest first
- * GET /api/github/refs?repo=…            → branches + tags
- * GET /api/github/pulls?repo=…           → open PRs with head shas
- * GET /api/github/resolve?repo=…&ref=…   → any ref → concrete commit
- * GET /api/projects/:id/github/commits   → same, using the project's own repo
+ * Replaces the old generic global / project-workspace GitHub browsing. A queue is
+ * pinned to a commit from its SELECTED adapter's source repo; these endpoints
+ * browse / resolve that same repo so the picked commit is always reproducible:
  *
- * These exist so a commit can be chosen from real repository state rather than
- * pasted as a sha. The payloads are shaped for a picker: subject line, author,
- * date, short sha.
+ *   GET /api/projects/:id/agent/commits?ref=…       → recent commits (branch/ref scoped)
+ *   GET /api/projects/:id/agent/refs                 → branches + tags
+ *   POST /api/projects/:id/agent/resolve  {ref}      → any ref → concrete commit
  *
  * Read-only. The GitHub token comes from server settings or the environment,
- * never from the request — a caller must not be able to make the server use a
+ * NEVER from the request — a caller must not be able to make the server use a
  * token it supplied.
  */
 
-import type { DbQueries, Task } from "../db/queries.js";
+import type { DbQueries, ProjectAgentAdapter } from "../db/queries.js";
 import {
   GitHubClient,
   GitHubError,
@@ -24,7 +22,7 @@ import {
   type RepoRef,
 } from "./github.js";
 import { badRequest, HttpError, notFound } from "./errors.js";
-import { sendJson, type RequestContext, type Router } from "./router.js";
+import { readJsonBody, sendJson, type RequestContext, type Router } from "./router.js";
 
 /** Minimal AppCtx surface these routes need. */
 export interface GitHubAppCtx {
@@ -42,7 +40,6 @@ function clientFor(app: GitHubAppCtx): GitHubClient {
   if (app.githubClient) return app.githubClient;
   let token: string | undefined;
   try {
-    // Settings are the operator-configured source; env is the deploy default.
     const settings = app.queries as unknown as {
       getSetting?: (key: string) => { value?: string } | null;
     };
@@ -53,46 +50,63 @@ function clientFor(app: GitHubAppCtx): GitHubClient {
   return new GitHubClient({ token });
 }
 
+/** The project's selected enabled agent adapter, or its explicitly shared adapter. */
+function selectedAdapterForQueue(
+  queries: DbQueries,
+  projectId: string,
+  agentId: string,
+): ProjectAgentAdapter | null {
+  const queueAdapter = queries
+    .listEvalQueues(projectId)
+    .find((q) => q.agentId === agentId);
+  if (queueAdapter?.sharedAdapterId) {
+    const shared = queries.getProjectAgentAdapter(queueAdapter.sharedAdapterId);
+    if (shared) return shared;
+  }
+  return queries.getProjectAgentAdapterByAgentId(projectId, agentId);
+}
+
+/**
+ * The repo a project's queue agent is pinned to — its selected adapter's source
+ * repo. That is the only repository a commit/branch/tag picker can meaningfully
+ * offer, and it is exactly the repo the queue will build from.
+ */
+function repoForProjectAgent(
+  queries: DbQueries,
+  projectId: string,
+  agentId: string,
+): RepoRef {
+  const project = queries.getProject(projectId);
+  if (!project || project.archived) {
+    throw notFound(`project not found: ${projectId}`);
+  }
+  const adapter = selectedAdapterForQueue(queries, projectId, agentId);
+  const repoSource = adapter?.sourceRepo;
+  if (!adapter || !repoSource || adapter.installType !== "source-build") {
+    throw badRequest(
+      `project ${projectId} has no source-built agent adapter; pin a commit from its source_repo (or pass ?repo=owner/name)`,
+    );
+  }
+  const parsed = parseRepoRef(repoSource);
+  if (!parsed) {
+    throw badRequest(`adapter source_repo is not a valid repo reference: ${repoSource}`);
+  }
+  return parsed;
+}
+
 /** Repo from the query string, or 400. */
 function repoFromQuery(ctx: RequestContext): RepoRef {
   const raw = ctx.query.repo ?? ctx.query.repository ?? "";
   const repo = parseRepoRef(raw);
   if (!repo) {
-    throw badRequest(
-      "repo is required, as owner/name or a GitHub URL",
-    );
+    throw badRequest("repo is required, as owner/name or a GitHub URL");
   }
   return repo;
-}
-
-/**
- * The repo a project's evals point at.
- *
- * Taken from the project's tasks rather than stored separately: the repo an
- * eval suite targets IS whatever its tasks target, and a second copy of that
- * fact would be one that could disagree.
- */
-function repoForProject(queries: DbQueries, projectId: string): RepoRef {
-  const project = queries.getProject(projectId);
-  if (!project || project.archived) {
-    throw notFound(`project not found: ${projectId}`);
-  }
-  const tasks: Task[] = queries.listTasks(projectId).filter((t) => !t.archived);
-  for (const t of tasks) {
-    if (t.workspace.source === "git" && t.workspace.repo) {
-      const parsed = parseRepoRef(t.workspace.repo);
-      if (parsed) return parsed;
-    }
-  }
-  throw badRequest(
-    `project ${projectId} has no git-backed eval tasks; pass ?repo=owner/name`,
-  );
 }
 
 /** Turn a GitHubError into the matching HTTP error. */
 function rethrow(err: unknown): never {
   if (err instanceof GitHubError) {
-    // 404 and 403 mean the same thing to a caller as they do to GitHub.
     throw new HttpError(
       err.status === 404 ? 404 : err.status === 403 ? 403 : 502,
       err.status === 404 ? "Not Found" : "GitHub Error",
@@ -110,18 +124,25 @@ function intParam(ctx: RequestContext, key: string): number | undefined {
 }
 
 export function registerGitHubRoutes(router: Router): void {
-  router.get("/api/github/commits", async (_req, res, ctx) => {
+  // Project agent-repo commits — the adapter's own source repo, newest first.
+  router.get("/api/projects/:id/agent/commits", async (_req, res, ctx) => {
     const app = appOf(ctx);
-    const repo = repoFromQuery(ctx);
+    const projectId = ctx.params.id!;
+    const agentId = ctx.query.agent_id ?? ctx.query.agentId;
+    if (!agentId) throw badRequest("agent_id is required");
+    const repo = ctx.query.repo
+      ? repoFromQuery(ctx)
+      : repoForProjectAgent(app.queries, projectId, agentId);
     try {
       const commits = await clientFor(app).listCommits(repo, {
         ...(ctx.query.ref ? { ref: ctx.query.ref } : {}),
-        ...(ctx.query.path ? { path: ctx.query.path } : {}),
         ...(intParam(ctx, "limit") !== undefined
           ? { limit: intParam(ctx, "limit")! }
           : {}),
       });
       sendJson(res, 200, {
+        project_id: projectId,
+        agent_id: agentId,
         repo: `${repo.owner}/${repo.name}`,
         commits: commits.map((c) => ({
           sha: c.sha,
@@ -137,16 +158,23 @@ export function registerGitHubRoutes(router: Router): void {
     }
   });
 
-  router.get("/api/github/refs", async (_req, res, ctx) => {
+  // Project agent-repo refs — branches + tags of the adapter source repo.
+  router.get("/api/projects/:id/agent/refs", async (_req, res, ctx) => {
     const app = appOf(ctx);
-    const repo = repoFromQuery(ctx);
-    const client = clientFor(app);
+    const projectId = ctx.params.id!;
+    const agentId = ctx.query.agent_id ?? ctx.query.agentId;
+    if (!agentId) throw badRequest("agent_id is required");
+    const repo = ctx.query.repo
+      ? repoFromQuery(ctx)
+      : repoForProjectAgent(app.queries, projectId, agentId);
     try {
       const [branches, tags] = await Promise.all([
-        client.listBranches(repo),
-        client.listTags(repo),
+        clientFor(app).listBranches(repo),
+        clientFor(app).listTags(repo),
       ]);
       sendJson(res, 200, {
+        project_id: projectId,
+        agent_id: agentId,
         repo: `${repo.owner}/${repo.name}`,
         branches: branches.map((b) => ({ name: b.name, sha: b.sha })),
         tags: tags.map((t) => ({ name: t.name, sha: t.sha })),
@@ -156,88 +184,37 @@ export function registerGitHubRoutes(router: Router): void {
     }
   });
 
-  router.get("/api/github/pulls", async (_req, res, ctx) => {
+  // Project agent-repo commit resolution — any ref → concrete commit.
+  router.post("/api/projects/:id/agent/resolve", async (req, res, ctx) => {
     const app = appOf(ctx);
-    const repo = repoFromQuery(ctx);
+    const projectId = ctx.params.id!;
+    const body = await readJsonBody<{
+      agent_id?: string;
+      agentId?: string;
+      ref?: string;
+      commit?: string;
+      sha?: string;
+    }>(req);
+    const agentId = body.agent_id ?? body.agentId;
+    if (!agentId) throw badRequest("agent_id is required");
+    const ref = body.ref ?? body.commit ?? body.sha;
+    if (!ref || !String(ref).trim()) throw badRequest("ref is required");
+    const repo = ctx.query.repo
+      ? repoFromQuery(ctx)
+      : repoForProjectAgent(app.queries, projectId, agentId);
     try {
-      const pulls = await clientFor(app).listPullRequests(repo, {
-        ...(ctx.query.state === "closed" || ctx.query.state === "all"
-          ? { state: ctx.query.state }
-          : {}),
-        ...(intParam(ctx, "limit") !== undefined
-          ? { limit: intParam(ctx, "limit")! }
-          : {}),
-      });
+      const c = await clientFor(app).resolveCommit(repo, String(ref).trim());
       sendJson(res, 200, {
-        repo: `${repo.owner}/${repo.name}`,
-        pulls: pulls.map((p) => ({
-          number: p.number,
-          title: p.title,
-          author: p.author,
-          // The head sha is what an eval would actually run against.
-          head_sha: p.headSha,
-          head_ref: p.headRef,
-          base_ref: p.baseRef,
-          draft: p.draft,
-          url: p.url,
-        })),
-      });
-    } catch (err) {
-      rethrow(err);
-    }
-  });
-
-  router.get("/api/github/resolve", async (_req, res, ctx) => {
-    const app = appOf(ctx);
-    const repo = repoFromQuery(ctx);
-    const ref = ctx.query.ref ?? ctx.query.commit ?? ctx.query.sha ?? "";
-    if (!ref) throw badRequest("ref is required");
-    try {
-      const c = await clientFor(app).resolveCommit(repo, ref);
-      sendJson(res, 200, {
+        project_id: projectId,
+        agent_id: agentId,
         repo: `${repo.owner}/${repo.name}`,
         requested_ref: ref,
-        // The resolved sha is what an evaluation records: a branch name means
-        // something different next week, so a result pinned to a ref is not
-        // reproducible.
         sha: c.sha,
         short_sha: c.shortSha,
         message: c.message,
         author: c.author,
         authored_at: c.authoredAt,
         url: c.url,
-      });
-    } catch (err) {
-      rethrow(err);
-    }
-  });
-
-  // Project-scoped: browse the repo this project's evals already target.
-  router.get("/api/projects/:id/github/commits", async (_req, res, ctx) => {
-    const app = appOf(ctx);
-    const repo = ctx.query.repo
-      ? repoFromQuery(ctx)
-      : repoForProject(app.queries, ctx.params.id!);
-    try {
-      const commits = await clientFor(app).listCommits(repo, {
-        ...(ctx.query.ref ? { ref: ctx.query.ref } : {}),
-        ...(intParam(ctx, "limit") !== undefined
-          ? { limit: intParam(ctx, "limit")! }
-          : {}),
-      });
-      sendJson(res, 200, {
-        project_id: ctx.params.id,
-        repo: `${repo.owner}/${repo.name}`,
-        commits: commits.map((c) => ({
-          sha: c.sha,
-          short_sha: c.shortSha,
-          message: c.message,
-          author: c.author,
-          authored_at: c.authoredAt,
-          url: c.url,
-          // One click from "this commit" to "evaluate it".
-          evaluate_url: `/api/projects/${encodeURIComponent(ctx.params.id!)}/evaluate`,
-        })),
       });
     } catch (err) {
       rethrow(err);

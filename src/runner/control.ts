@@ -12,7 +12,7 @@
 import { appendEvent } from "../schema/append.js";
 import type { RunStatus } from "../schema/events.js";
 import type { ContainerHandle } from "./runtime.js";
-import { deriveRunStatus } from "./run.js";
+import { deriveRunStatus } from "./status.js";
 
 /** control_state values recorded on a run (plan/execution.md, plan/data-model.md). */
 export type ControlState =
