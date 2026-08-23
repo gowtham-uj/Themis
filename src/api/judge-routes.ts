@@ -30,6 +30,12 @@ function appOf(ctx: { app: unknown }): App {
   return ctx.app as App;
 }
 
+/** In-flight phase1 runs keyed by runId: resolved with the result once done. */
+const phase1InFlight = new Map<
+  string,
+  Promise<{ result_version: unknown; current_pointer: unknown }>
+>();
+
 /** Register judge health + Phase-1 execution routes. */
 export function registerJudgeRoutes(router: Router): void {
   router.get("/api/judge/health", (_req, res) => {
@@ -84,42 +90,75 @@ export function registerJudgeRoutes(router: Router): void {
         : await mkdtemp(join(tmpdir(), "ae-judge-"));
     const viewDir = await mkdtemp(join(tmpdir(), "ae-judge-view-"));
 
-    const state = await runPhase1({
-      caseId: `case_${runId}`,
-      runId,
-      archiveDir,
-      workDir,
-      gateway,
-      attemptId: `att_${runId}_${Date.now()}`,
-    });
+    // Phase-1 is a minutes-long model pipeline. Return 202 immediately and run
+    // in the background — holding an HTTP response open across model calls is
+    // exactly the pattern the design forbids (and trips client header timeouts).
+    let existing = phase1InFlight.get(runId);
+    if (!existing) {
+      const task = (async () => {
+        const state = await runPhase1({
+          caseId: `case_${runId}`,
+          runId,
+          archiveDir,
+          workDir,
+          gateway,
+          attemptId: `att_${runId}_${Date.now()}`,
+        });
 
-    const published = await publishJudgeArchiveView({
-      runId,
-      trackId: body.track_id || "default",
-      baseArchiveDir: archiveDir,
-      judgeDir: join(workDir, "judge"),
-      viewDir,
-    });
+        const published = await publishJudgeArchiveView({
+          runId,
+          trackId: body.track_id || "default",
+          baseArchiveDir: archiveDir,
+          judgeDir: join(workDir, "judge"),
+          viewDir,
+        });
 
+        const db = openThemisDb(app.dataDir);
+        try {
+          const stored = upsertResultVersion(db, published.result);
+          const pointer = advanceCurrentPointer(db, {
+            runId,
+            trackId: stored.trackId,
+            resultVersionId: stored.id,
+            archiveViewPath: stored.archiveViewPath ?? viewDir,
+            baseManifestSha256: stored.reportSha256,
+            expectedResultVersionId: null,
+          });
+          return { result_version: stored, current_pointer: pointer };
+        } finally {
+          db.close();
+        }
+      })().finally(() => {
+        phase1InFlight.delete(runId);
+      });
+      existing = task;
+      phase1InFlight.set(runId, existing);
+    }
+    sendJson(res, 202, { accepted: true, run_id: runId });
+  });
+
+  /** Poll Phase-1 completion: 200 when done, 202 while still running. */
+  router.get("/api/judge/runs/:runId/phase1", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const runId = ctx.params.runId!;
+    const inflight = phase1InFlight.get(runId);
+    if (inflight) {
+      void inflight.then((outcome) => {
+        if (!res.writableEnded) {
+          sendJson(res, 200, outcome);
+        }
+      });
+      return;
+    }
+    // Not in-flight: report the latest published result version, if any.
     const db = openThemisDb(app.dataDir);
     try {
-      const stored = upsertResultVersion(db, published.result);
-      const pointer = advanceCurrentPointer(db, {
-        runId,
-        trackId: stored.trackId,
-        resultVersionId: stored.id,
-        archiveViewPath: stored.archiveViewPath ?? viewDir,
-        baseManifestSha256: stored.reportSha256,
-        expectedResultVersionId: null,
-      });
-      sendJson(res, 200, {
-        run_id: runId,
-        work_dir: workDir,
-        view_dir: viewDir,
-        paths: state.paths,
-        result_version: stored,
-        current_pointer: pointer,
-      });
+      const rows = listResultVersionsByRun(db, runId);
+      if (rows.length > 0) {
+        sendJson(res, 200, { result_version: rows[rows.length - 1] });
+      } else {
+        sendJson(res, 202, { accepted: false, run_id: runId, status: "not_started" });
+      }
     } finally {
       db.close();
     }

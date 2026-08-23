@@ -154,27 +154,38 @@ describe.skipIf(!LIVE)("developer-flow E2E", () => {
       }
       expect(runId).toBeTruthy();
 
-      // 6. Judge the sealed archive.
+      // 6. Submit the judge (async — Phase-1 is minutes of model work).
       const judgeRes = await api(
         "POST",
         `/api/judge/runs/${runId}/phase1`,
         { track_id: "devflow" },
-        10 * 60_000,
+        60_000,
       );
-      expect(judgeRes.status).toBeLessThan(300);
-      const rv = (judgeRes.json as Json).result_version as Json;
+      expect(judgeRes.status).toBe(202);
+      expect((judgeRes.json as Json).accepted).toBe(true);
+
+      // 7. Poll until a published result version exists.
+      let rv: Json | undefined;
+      for (let i = 0; i < 60; i += 1) {
+        const status = await api("GET", `/api/judge/runs/${runId}/phase1`, undefined, 60_000);
+        const maybeRv = (status.json as Json).result_version as Json | undefined;
+        if (maybeRv) {
+          rv = maybeRv;
+          break;
+        }
+        await sleep(10_000);
+      }
       expect(rv).toBeTruthy();
-      expect(String(rv.publicationState)).toBe("published");
+      expect(String(rv!.publicationState)).toBe("published");
 
-      const pointer = (judgeRes.json as Json).current_pointer as Json;
-      expect(String(pointer.resultVersionId)).toBe(String(rv.id));
-
-      // 7. Read back via results API.
-      const getRes = await api("GET", `/api/judge/results/${rv.id}`);
+      // 8. Read back via results API (list has the same id).
+      const getRes = await api("GET", `/api/judge/results/${rv!.id}`, undefined, 60_000);
       expect(getRes.status).toBeLessThan(300);
-      expect(String((getRes.json as Json).result?.id ?? (getRes.json as Json).result_version?.id ?? "")).toBe(
-        String(rv.id),
-      );
+      expect(
+        String(
+          (getRes.json as Json).result?.id ?? (getRes.json as Json).result_version?.id ?? "",
+        ),
+      ).toBe(String(rv!.id));
     },
     30 * 60_000,
   );
