@@ -137,20 +137,15 @@ export function registerJudgeRoutes(router: Router): void {
     sendJson(res, 202, { accepted: true, run_id: runId });
   });
 
-  /** Poll Phase-1 completion: 200 when done, 202 while still running. */
+  /** Poll Phase-1 completion: 200 when a result exists, 202 while still running. */
   router.get("/api/judge/runs/:runId/phase1", (_req, res, ctx) => {
     const app = appOf(ctx);
     const runId = ctx.params.runId!;
-    const inflight = phase1InFlight.get(runId);
-    if (inflight) {
-      void inflight.then((outcome) => {
-        if (!res.writableEnded) {
-          sendJson(res, 200, outcome);
-        }
-      });
+    // Always answer immediately. Long-running work must never hold the socket.
+    if (phase1InFlight.has(runId)) {
+      sendJson(res, 202, { accepted: true, run_id: runId, status: "running" });
       return;
     }
-    // Not in-flight: report the latest published result version, if any.
     const db = openThemisDb(app.dataDir);
     try {
       const rows = listResultVersionsByRun(db, runId);
