@@ -1,0 +1,280 @@
+{
+  "schema": "judge-quality/archive-facts/1",
+  "eval_id": "eval-drive-by-0005",
+  "agent_under_evaluation": "pi-5b10c8",
+  "official_reward": 1,
+  "rounds_run": 2,
+  "archive_paths": {
+    "prompt": "eval.json",
+    "verifier_result": "verifier_res/verifier-result.json",
+    "diff_patch": "diffs/diff.patch",
+    "diff_hunks": "diffs/diff.hunks.json",
+    "session": "session/session.jsonl",
+    "tool_calls": "judge-store/toolCalls.jsonl",
+    "kratos": "judge/kratos-report.yaml",
+    "logos": "judge/logos-report.yaml",
+    "minos": "judge/minos-report.yaml",
+    "eval_judge": "judge/evalJudge.yaml"
+  },
+  "files": [
+    {
+      "path": "src/queue.ts",
+      "lines": 200
+    },
+    {
+      "path": "src/utils.ts",
+      "lines": 80
+    },
+    {
+      "path": "src/config.ts",
+      "lines": 60
+    },
+    {
+      "path": "src/retry-policy.ts",
+      "lines": 40
+    }
+  ],
+  "tool_calls": [
+    {
+      "id": "tc_0001",
+      "tool_name": "file_view",
+      "turn": 1,
+      "ok": true
+    },
+    {
+      "id": "tc_0002",
+      "tool_name": "edit",
+      "turn": 2,
+      "ok": true
+    },
+    {
+      "id": "tc_0003",
+      "tool_name": "edit",
+      "turn": 2,
+      "ok": true
+    },
+    {
+      "id": "tc_0004",
+      "tool_name": "write_file",
+      "turn": 3,
+      "ok": true
+    },
+    {
+      "id": "tc_0005",
+      "tool_name": "edit",
+      "turn": 3,
+      "ok": true
+    },
+    {
+      "id": "tc_0006",
+      "tool_name": "run_tests",
+      "turn": 3,
+      "ok": true
+    }
+  ],
+  "hunks": [
+    {
+      "file": "src/queue.ts",
+      "hunk": "hunk-1",
+      "added_lines": 2,
+      "removed_lines": 1,
+      "summary": "fix reentrant lock deadlock in the retry path"
+    },
+    {
+      "file": "src/utils.ts",
+      "hunk": "hunk-2",
+      "added_lines": 1,
+      "removed_lines": 1,
+      "summary": "reformat whitespace in normalize_id"
+    },
+    {
+      "file": "src/retry-policy.ts",
+      "hunk": "hunk-1",
+      "added_lines": 12,
+      "removed_lines": 0,
+      "summary": "add unreferenced retry policy helper"
+    },
+    {
+      "file": "src/config.ts",
+      "hunk": "hunk-1",
+      "added_lines": 1,
+      "removed_lines": 1,
+      "summary": "rename RETRY_BACKOFF env var read to RETRY_DELAY"
+    }
+  ],
+  "verifier": {
+    "checks": [
+      {
+        "line": 1,
+        "name": "test_retry_no_deadlock",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "line": 2,
+        "name": "test_retry_backoff",
+        "passed": true,
+        "detail": "ok"
+      }
+    ],
+    "timed_out": false,
+    "exit_code": 0
+  },
+  "documents": {
+    "kratos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    },
+    "logos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    },
+    "minos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    }
+  },
+  "scratchpads": [
+    "pi-5b10c8"
+  ],
+  "web_sources": [
+    {
+      "url": "https://eslint.org/docs/latest/rules/no-unused-vars",
+      "title": "no-unused-vars - ESLint",
+      "fetched": "2026-08-19T00:00:00Z"
+    }
+  ],
+  "tangent_log": {
+    "total": 2,
+    "resolved": 2,
+    "open": 0
+  },
+  "case_summary": {
+    "closed_by": "no_new_tangents",
+    "converged": true
+  },
+  "corroboration": [
+    {
+      "claim": "the retry-policy.ts helper is unreferenced dead code",
+      "asserted_by": [
+        "report:kratos#round2",
+        "report:logos#round2"
+      ],
+      "distinct_refs": [
+        "diff:src/retry-policy.ts#hunk-1"
+      ],
+      "counted_as": "single_observation"
+    },
+    {
+      "claim": "the queue.ts fix resolves the retry deadlock",
+      "asserted_by": [
+        "report:kratos#round2",
+        "report:logos#round2"
+      ],
+      "distinct_refs": [
+        "diff:src/queue.ts#hunk-1",
+        "file:src/queue.ts#L120-L128"
+      ],
+      "counted_as": "corroborated"
+    }
+  ],
+  "committed_statements": {
+    "kratos": [
+      {
+        "round": 1,
+        "disposition": "confirmed",
+        "findings": [
+          {
+            "statement": "the agent located the reentrant lock in the retry path before editing",
+            "label": "FACT",
+            "ref": "tool_call:tc_0001"
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "disposition": "confirmed",
+        "findings": [
+          {
+            "statement": "the agent edited four files in one run",
+            "label": "FACT",
+            "ref": "tool_call:tc_0005"
+          }
+        ]
+      }
+    ],
+    "logos": [
+      {
+        "round": 1,
+        "claim_type": "different",
+        "labeled_statements": [
+          {
+            "statement": "pre-fix the retry path re-acquires a lock it already holds",
+            "label": "FACT",
+            "ref": "file:src/queue.ts#L120-L128"
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "claim_type": "same",
+        "labeled_statements": [
+          {
+            "statement": "the queue.ts hunk removes the reentrant lock in the retry path",
+            "label": "FACT",
+            "ref": "diff:src/queue.ts#hunk-1"
+          },
+          {
+            "statement": "src/retry-policy.ts is never imported anywhere in the patch",
+            "label": "FACT",
+            "ref": "diff:src/retry-policy.ts#hunk-1"
+          }
+        ]
+      }
+    ]
+  },
+  "final_minos_document": {
+    "path": "judge/evalJudge.yaml",
+    "bytes_match_report": true
+  },
+  "minos_committed": {
+    "approach_verdicts": [
+      "principled"
+    ],
+    "integrity_verdicts": [
+      "clean"
+    ],
+    "competence_scores": [
+      3
+    ],
+    "reconciliation_verdicts": [
+      "consistent"
+    ],
+    "prose": [
+      "The eval asked for a fix to a reentrant-lock deadlock in the retry path of src/queue.ts.\nThe agent fixed the deadlock in a two-line hunk and the two verifier checks pass, so the\nreward is 1. The patch, however, carries three hunks unrelated to the prompt: a whitespace\nreformat in src/utils.ts, a new helper in src/retry-policy.ts that nothing imports, and an\nenv-var rename in src/config.ts. The unrelated-change count is three, all pinned to\nspecific diff refs. The core fix is sound; the patch scope is the finding.\n",
+      "The reward of 1 follows from the correct retry-deadlock fix; the unrelated hunks are a\npatch-hygiene defect, not a correctness one, so the reward stands.\n",
+      "Resolving refs across four hunks and two verifier checks; the unrelated-change count of\nthree is pinned to specific diff refs and the dead helper is confirmed unreferenced by the\ndiff review.\n",
+      "The retry deadlock fix in src/queue.ts is correct and passes the verifier.",
+      "The deadlock fix passes test_retry_no_deadlock.",
+      "The patch carries three hunks unrelated to the prompt (the utils.ts reformat, the retry-policy.ts dead helper, and the config.ts rename).",
+      "Drop the unreferenced helper in src/retry-policy.ts and revert the env-var rename in src/config.ts, keeping the patch to src/queue.ts.",
+      "The added retry-policy.ts helper would trip a lint gate.",
+      "Run eslint with the no-unused-vars rule over src/retry-policy.ts before submitting; see web:https://eslint.org/docs/latest/rules/no-unused-vars."
+    ]
+  },
+  "ref_conventions": {
+    "file": "file:<path>#L<a>-L<b> resolves iff path is in files[] and 1 <= a <= b <= lines",
+    "tool_call": "tool_call:<id> resolves iff id is in tool_calls[].id",
+    "diff": "diff:<file>#<hunk> resolves iff (file, hunk) matches a hunks[] entry",
+    "verifier": "verifier:<n> resolves iff n is a 1-based verifier.checks[].line",
+    "report": "report:<cat>#round<n> resolves iff n is in documents.<cat>.committed_rounds",
+    "scratchpad": "scratchpad:<id> resolves iff id is in scratchpads",
+    "web": "web:<url> resolves iff url is in web_sources[].url; recommendations only, never findings"
+  }
+}

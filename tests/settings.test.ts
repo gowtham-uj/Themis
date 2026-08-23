@@ -145,17 +145,20 @@ describe("loginUser (token mint path)", () => {
   it("returns user + token on correct credentials; null on wrong/unknown", async () => {
     const { res } = open();
     registerUser(res.queries, { username: "loginuser", password: "good" });
-    const ok = loginUser(res.queries, "loginuser", "good");
+    const ok = await loginUser(res.queries, "loginuser", "good", {
+      allowGlobalForAnyUser: true,
+    });
     expect(ok).not.toBeNull();
     expect(ok!.user.username).toBe("loginuser");
-    expect(typeof ok!.token).toBe("string");
-    expect(ok!.token.length).toBeGreaterThan(0);
-    expect(ok!.tokenHash).toBeTruthy();
+    expect(ok!.tokens).toHaveLength(1);
+    expect(typeof ok!.tokens[0]!.token).toBe("string");
+    expect(ok!.tokens[0]!.token.length).toBeGreaterThan(0);
+    expect(ok!.tokens[0]!.tokenHash).toBeTruthy();
     // The plaintext token is NOT the hash.
-    expect(ok!.token).not.toBe(ok!.tokenHash);
+    expect(ok!.tokens[0]!.token).not.toBe(ok!.tokens[0]!.tokenHash);
 
-    expect(loginUser(res.queries, "loginuser", "bad")).toBeNull();
-    expect(loginUser(res.queries, "nobody", "good")).toBeNull();
+    expect(await loginUser(res.queries, "loginuser", "bad")).toBeNull();
+    expect(await loginUser(res.queries, "nobody", "good")).toBeNull();
   });
 });
 

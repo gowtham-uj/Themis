@@ -35,6 +35,7 @@ import {
   repoMatches,
   type WatcherSeams,
 } from "../watcher/engine.js";
+import { requireAdminRequest } from "./auth.js";
 import { badRequest, HttpError, notFound } from "./errors.js";
 import {
   readBody,
@@ -52,6 +53,7 @@ import {
 export interface WatcherAppCtx {
   queries: DbQueries;
   dataDir: string;
+  authEnabled: boolean;
   /** Seams: SHA resolution + queue-generation launch. Wired in createServer. */
   watcherSeams?: WatcherSeams;
   /**
@@ -273,6 +275,9 @@ export function registerWatcherRoutes(router: Router): void {
     const app = appOf(ctx);
     const projectId = ctx.params.id!;
     requireProject(app.queries, projectId);
+    // A watcher clones + builds a caller-named repository and launches
+    // generations from it; creation is an admin operation.
+    requireAdminRequest(req, app.queries, app.authEnabled);
 
     const body = await readJsonBody<{
       repo?: string;

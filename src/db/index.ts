@@ -120,8 +120,22 @@ export function openDb(dataDir: string): OpenDbResult {
     );
   }
 
-  // Fallback so npm test stays green without a working native sqlite build.
-  return openMemory(dataDir);
+  // The in-memory store is test-only. In production a failure to open the real
+  // database must fail closed — silently serving from a volatile empty store
+  // would make every "persisted" project/queue/run vanish at restart.
+  // Vitest sets VITEST=true; NODE_ENV is not always "test".
+  if (
+    process.env.NODE_ENV === "test" ||
+    process.env.VITEST ||
+    process.env.AGENTEVAL_DB_ALLOW_MEMORY === "1"
+  ) {
+    return openMemory(dataDir);
+  }
+
+  throw new Error(
+    "failed to open the agenteval SQLite database; refusing to start with in-memory storage " +
+      "(set AGENTEVAL_DB_ALLOW_MEMORY=1 to explicitly allow a volatile in-memory store)",
+  );
 }
 
 /**

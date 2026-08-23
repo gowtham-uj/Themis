@@ -121,6 +121,20 @@ async function readTarEntries(path: string, gzip: boolean): Promise<Map<string, 
   const pending: Promise<void>[] = [];
   let totalBytes = 0;
   let terminalError: Error | null = null;
+  // Resume a rejected entry while still counting its decompressed bytes, so a
+  // tar bomb whose entries are all "unsafe" or "unsupported" cannot decompress
+  // gigabytes of discarded data under the uncompressed-bytes cap.
+  const discardWithCounting = (entry: ReadEntry): void => {
+    entry.on("data", (chunk: Buffer) => {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_UNCOMPRESSED_BYTES) {
+        const err = new Error(`eval archive exceeds ${MAX_UNCOMPRESSED_BYTES} uncompressed bytes`);
+        terminalError = terminalError ?? err;
+        entry.destroy(err);
+      }
+    });
+    entry.resume();
+  };
   await listTar({
     file: path,
     gzip,
@@ -132,7 +146,7 @@ async function readTarEntries(path: string, gzip: boolean): Promise<Map<string, 
         assertSafeArchivePath(name);
       } catch (error) {
         terminalError = error instanceof Error ? error : new Error(String(error));
-        entry.resume();
+        discardWithCounting(entry);
         return;
       }
       if (entry.type === "Directory") {
@@ -141,12 +155,12 @@ async function readTarEntries(path: string, gzip: boolean): Promise<Map<string, 
       }
       if (!["File", "OldFile", "ContiguousFile"].includes(entry.type)) {
         terminalError = new Error(`eval TAR contains unsupported ${entry.type}: ${name}`);
-        entry.resume();
+        discardWithCounting(entry);
         return;
       }
       if (files.size + pending.length >= MAX_FILES) {
         terminalError = new Error(`eval archive exceeds ${MAX_FILES} files`);
-        entry.resume();
+        discardWithCounting(entry);
         return;
       }
       pending.push(new Promise<void>((resolve, reject) => {
@@ -183,9 +197,15 @@ function assertSafeArchivePath(path: string): void {
   if (!path || path.includes("\0") || path.startsWith("/") || /^[A-Za-z]:\//.test(path)) {
     throw new Error(`eval archive contains unsafe path: ${path}`);
   }
+  if (path.length > 512) {
+    throw new Error(`eval archive path is too long: ${path.slice(0, 64)}…`);
+  }
   const segments = path.split("/");
   if (segments.some((segment) => segment === "..")) {
     throw new Error(`eval archive contains traversal path: ${path}`);
+  }
+  if (segments.length > 64) {
+    throw new Error(`eval archive path is too deep: ${path.slice(0, 64)}…`);
   }
 }
 

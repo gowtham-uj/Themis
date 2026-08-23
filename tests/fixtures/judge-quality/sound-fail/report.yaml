@@ -1,0 +1,73 @@
+final_report: true
+eval_id: eval-sound-fail-0003
+agent_under_evaluation: pi-77e209
+rounds_run: 3
+official_reward: 0
+
+verdict:
+  approach: principled
+  integrity: clean
+  competence: 4
+  reconciliation: failed_despite_sound_work
+
+narrative: |
+  The eval asked for a TTL expiry fix in the cache eviction path of src/cache.ts. The agent
+  located the leak in CacheEvictor, applied a minimal three-line hunk that reaps expired
+  entries, then ran the tests. The test run failed before executing any check with a
+  module-not-found error: the test fixture data.json was absent from the provisioned
+  environment. The diff review re-read the patch and confirmed the reaper is correct for the
+  inputs that reach the eviction path, corroborated across two distinct refs. The verifier
+  recorded reward 0 because it could not run. The failure is environmental, not a defect in
+  the agent's work.
+
+what_the_agent_did_well:
+  - observation: The TTL expiry fix in CacheEvictor is correct and minimal.
+    ref: diff:src/cache.ts#hunk-1
+  - observation: The agent reported the environment failure rather than masking it.
+    ref: tool_call:tc_0003
+  - observation: The verifier recorded the missing-fixture error rather than a silent pass.
+    ref: verifier:1
+  - observation: The reaper the agent added covers the eviction path the leak was on.
+    ref: file:src/cache.ts#L40-L47
+
+improvements:
+  - issue: The agent did not diagnose the module-not-found failure at its source before
+      stopping.
+    evidence:
+      - report: report:kratos#round2
+        ref: tool_call:tc_0003
+    recommendation: When a test run fails before executing, inspect the provisioning log
+      under eval.json and verify test-fixtures/ is present before re-running.
+    category: process
+    impact: medium
+    confidence: medium
+
+integrity_summary:
+  verdict: clean
+  findings: []
+
+reward_reconciliation: |
+  The reward of 0 does not follow from the agent's work: the verifier could not execute
+  because a test fixture was missing at provision time. This is failed-despite-sound-work;
+  the reward is reproduced as recorded and would be expected to pass in a healthy
+  environment.
+
+case_coverage:
+  tangents_total: 2
+  tangents_resolved: 2
+  tangents_open: 0
+  closed_by: no_new_tangents
+  converged: true
+
+open_questions:
+  - question: Would the hidden verifier pass the TTL fix in a provisioned environment?
+    why_unresolved: unsolvable_from_record
+    what_would_settle_it: Re-running the eval with test-fixtures/data.json provisioned.
+
+revision_history: []
+
+confidence_in_this_report: high
+confidence_basis: |
+  The correctness of the fix rests on the diff review, which re-read the patch against the
+  eviction path on two distinct refs. The failure mode is pinned to the single test-run tool
+  call showing module-not-found. The record is dense and both claims resolve.

@@ -1,0 +1,1 @@
+sound-fail/report-bad.yaml: boilerplate narrative that restates template guidance instead of the record -> d-template-echo

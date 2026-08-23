@@ -230,9 +230,20 @@ export class Router {
       if (route.method === method) {
         matched = route;
         params = {};
-        for (let i = 0; i < route.paramNames.length; i++) {
-          const name = route.paramNames[i]!;
-          params[name] = decodeURIComponent(m[i + 1] ?? "");
+        try {
+          for (let i = 0; i < route.paramNames.length; i++) {
+            const name = route.paramNames[i]!;
+            params[name] = decodeURIComponent(m[i + 1] ?? "");
+          }
+        } catch {
+          // Malformed percent-encoding in a path segment is a client error, not
+          // an internal one.
+          apiError(res, 400, {
+            title: "Bad Request",
+            detail: "malformed URL encoding in path",
+            type: "https://agenteval.dev/errors/bad-request",
+          });
+          return;
         }
         break;
       }

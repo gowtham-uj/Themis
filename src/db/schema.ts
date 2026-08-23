@@ -543,6 +543,28 @@ export const apiTokens = sqliteTable(
   (t) => [index("idx_api_tokens_hash").on(t.tokenHash)],
 );
 
+/**
+ * Project membership (v10). Non-admin users only see/write projects they belong
+ * to. Admins and system tokens remain unrestricted.
+ */
+export const projectMembers = sqliteTable(
+  "project_members",
+  {
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    createdAt: text("created_at").notNull(),
+  },
+  (t) => [
+    unique("uq_project_members").on(t.projectId, t.userId),
+    index("idx_project_members_user").on(t.userId),
+    index("idx_project_members_project").on(t.projectId),
+  ],
+);
+
 // Deterministic check results (P9, rubric.md §5). Run-keyed JSON mirror of the
 // Run-keyed deterministic check results for API consumers. One row per run.
 export const checkResults = sqliteTable(
@@ -578,10 +600,11 @@ export const schema = {
   users,
   settings,
   apiTokens,
+  projectMembers,
   checkResults,
 };
 
 export type Schema = typeof schema;
 
 /** Migration version stamped into pragma user_version / migrations table. */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;

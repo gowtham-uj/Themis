@@ -13,13 +13,27 @@ function arg(name: string, fallback?: string): string | undefined {
 
 const port = Number(arg("port", process.env.PORT ?? "8080"));
 const dataDir = resolve(arg("data-dir", process.env.DATA_DIR ?? "./data") ?? "./data");
+const authEnabled = process.env.AGENTEVAL_AUTH === "1";
+// Loopback by default. Exposing the API on a non-loopback interface with auth
+// disabled would let any remote caller mint tokens, import evals, and start
+// containers — require an explicit opt-in before allowing that combination.
+const host = process.env.AGENTEVAL_HOST ?? (arg("host", "127.0.0.1") ?? "127.0.0.1");
+const isLoopbackBind = host === "127.0.0.1" || host === "::1" || host === "localhost";
+if (!authEnabled && !isLoopbackBind && process.env.AGENTEVAL_ALLOW_UNAUTH_NETWORK !== "1") {
+  // eslint-disable-next-line no-console
+  console.error(
+    `refusing to bind ${host} with authentication disabled; ` +
+      "set AGENTEVAL_AUTH=1 to require tokens, or AGENTEVAL_ALLOW_UNAUTH_NETWORK=1 to acknowledge the risk",
+  );
+  process.exit(1);
+}
 const api = createServer({
   dataDir,
-  authEnabled: process.env.AGENTEVAL_AUTH === "1",
+  authEnabled,
 });
-const bound = await api.listen(port, "0.0.0.0");
+const bound = await api.listen(port, host);
 // eslint-disable-next-line no-console
-console.log(`agenteval API serving on :${bound} (data=${dataDir})`);
+console.log(`agenteval API serving on :${bound} (data=${dataDir}, auth=${authEnabled ? "on" : "off"})`);
 
 const shutdown = async (sig: string): Promise<void> => {
   // eslint-disable-next-line no-console

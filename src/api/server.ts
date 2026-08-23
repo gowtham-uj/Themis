@@ -52,6 +52,7 @@ import { registerQueueRoutes } from "./queue-routes.js";
 import { registerAdapterRoutes } from "./adapter-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerArchiveRoutes } from "./archive-routes.js";
+import { registerJudgeRoutes } from "./judge-routes.js";
 import { registerSandboxRoutes } from "./sandbox-routes.js";
 import { registerGitHubRoutes } from "./github-routes.js";
 import {
@@ -70,6 +71,7 @@ import {
   gateRequest,
   getRequestAuth,
   hashToken,
+  requireAdminRequest,
 } from "./auth.js";
 import {
   IdempotencyStore,
@@ -381,6 +383,41 @@ function assertResourceScope(
   }
 }
 
+/**
+ * Projects the caller may see. null means unrestricted (auth off, admin user,
+ * or a system/global operator token with no user binding).
+ */
+function callerProjectScope(
+  req: IncomingMessage,
+  queries: DbQueries,
+  authEnabled: boolean,
+): Set<string> | null {
+  if (!authEnabled) return null;
+  const auth = getRequestAuth(req);
+  if (!auth) return new Set();
+  if (auth.projectId != null) return new Set([auth.projectId]);
+  if (!auth.userId) return null; // system/operator global token
+  const user = queries.getUser(auth.userId);
+  if (user?.role === "admin") return null;
+  return new Set(queries.listUserProjectIds(auth.userId));
+}
+
+/** Reject access to a project the caller's token is not scoped to. */
+function assertProjectScope(
+  req: IncomingMessage,
+  queries: DbQueries,
+  authEnabled: boolean,
+  projectId: string,
+): void {
+  const scope = callerProjectScope(req, queries, authEnabled);
+  if (scope == null) return;
+  if (!scope.has(projectId)) {
+    throw new HttpError(401, "Unauthorized", "token is not scoped to this project", {
+      type: "https://agenteval.dev/errors/unauthorized",
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // SSE / ndjson event streaming
 // ---------------------------------------------------------------------------
@@ -592,10 +629,16 @@ function registerRoutes(router: Router): void {
     sendJson(res, 201, projectJson(project));
   });
 
-  router.get("/api/projects", (_req, res, ctx) => {
+  router.get("/api/projects", (req, res, ctx) => {
     const app = appOf(ctx);
     const includeArchived = ctx.query.include_archived === "1" || ctx.query.include_archived === "true";
-    const list = app.queries.listProjects({ includeArchived }).map(projectJson);
+    // Project-scoped tokens see only their own project; global tokens (admin /
+    // auth-off local dev) see everything.
+    const scope = callerProjectScope(req, app.queries, app.authEnabled);
+    const list = app.queries
+      .listProjects({ includeArchived })
+      .filter((p) => scope == null || scope.has(p.id))
+      .map(projectJson);
     sendJson(res, 200, { projects: list });
   });
 
@@ -687,6 +730,9 @@ function registerRoutes(router: Router): void {
   router.post("/api/projects/:id/evals", async (req, res, ctx) => {
     const app = appOf(ctx);
     const project = requireProject(app.queries, ctx.params.id!);
+    // Canonical eval packages contain Dockerfiles that are built by the rootful
+    // Podman backend. Creating one is therefore a privileged operation.
+    requireAdminRequest(req, app.queries, app.authEnabled);
     const upload = await readJsonBody<EvalPackageUpload>(req, {
       limitBytes: 70 * 1024 * 1024,
     });
@@ -701,6 +747,7 @@ function registerRoutes(router: Router): void {
   router.post("/api/projects/:id/evals:import-archive", async (req, res, ctx) => {
     const app = appOf(ctx);
     const project = requireProject(app.queries, ctx.params.id!);
+    requireAdminRequest(req, app.queries, app.authEnabled);
     const format = ctx.query.format as EvalArchiveFormat | undefined;
     if (!format || !["zip", "tar", "tar.gz"].includes(format)) {
       throw badRequest("format query parameter must be zip|tar|tar.gz");
@@ -777,14 +824,16 @@ function registerRoutes(router: Router): void {
   // ---- standalone eval-store namespace (lookup across projects) ----
 
   /** GET /api/evals — list evals across all projects (filterable). */
-  router.get("/api/evals", (_req, res, ctx) => {
+  router.get("/api/evals", (req, res, ctx) => {
     const app = appOf(ctx);
     const projectId = ctx.query.project_id;
     const categoryName = ctx.query.category_name;
     const includeArchived =
       ctx.query.include_archived === "1" || ctx.query.include_archived === "true";
+    const scope = callerProjectScope(req, app.queries, app.authEnabled);
     const out: Record<string, unknown>[] = [];
     for (const project of app.queries.listProjects({ includeArchived })) {
+      if (scope != null && !scope.has(project.id)) continue;
       if (projectId && project.id !== projectId) continue;
       for (const task of app.queries.listTasks(project.id, { includeArchived })) {
         if (categoryName && task.categoryName !== categoryName) continue;
@@ -799,10 +848,11 @@ function registerRoutes(router: Router): void {
   });
 
   /** GET /api/evals/:evalId — one eval by global id (no project prefix). */
-  router.get("/api/evals/:evalId", (_req, res, ctx) => {
+  router.get("/api/evals/:evalId", (req, res, ctx) => {
     const app = appOf(ctx);
     const task = app.queries.getTask(ctx.params.evalId!);
     if (!task) throw notFound("eval", ctx.params.evalId!);
+    assertProjectScope(req, app.queries, app.authEnabled, task.projectId);
     sendJson(
       res,
       200,
@@ -918,10 +968,33 @@ function apiTokenJson(t: {
  * mint path when auth is on.
  */
 function registerTokenRoutes(router: Router): void {
-  router.get("/api/tokens", (_req, res, ctx) => {
+  router.get("/api/tokens", (req, res, ctx) => {
     const app = appOf(ctx);
     const projectId = ctx.query.project_id || ctx.query.projectId;
     const userId = ctx.query.user_id || ctx.query.userId;
+    const auth = getRequestAuth(req);
+    const privileged =
+      !app.authEnabled ||
+      !auth ||
+      !auth.userId ||
+      app.queries.getUser(auth.userId)?.role === "admin";
+    if (!privileged) {
+      // Non-admins only see their own tokens, optionally filtered to one project.
+      if (auth.projectId != null && projectId && projectId !== auth.projectId) {
+        throw new HttpError(
+          403,
+          "Forbidden",
+          "a project-scoped token cannot list another project's tokens",
+          { type: "https://agenteval.dev/errors/forbidden" },
+        );
+      }
+      const list = app.queries.listApiTokens({
+        userId: auth.userId!,
+        ...(auth.projectId ? { projectId: auth.projectId } : projectId ? { projectId } : {}),
+      });
+      sendJson(res, 200, { tokens: list.map((t) => apiTokenJson(t)) });
+      return;
+    }
     const list = app.queries.listApiTokens({
       ...(projectId ? { projectId } : {}),
       ...(userId ? { userId } : {}),
@@ -952,9 +1025,62 @@ function registerTokenRoutes(router: Router): void {
       read_only?: boolean;
       readOnly?: boolean;
     }>(req);
+    // Project-scoped tokens may only mint a token for their OWN project. They
+    // cannot mint a global token (requestedProjectId null) or bind a different
+    // user — that would escalate privileges.
+    let requestedProjectId = body.project_id ?? body.projectId ?? null;
+    const requestedUserId = body.user_id ?? body.userId ?? null;
+    if (auth?.projectId != null) {
+      if (requestedProjectId == null) requestedProjectId = auth.projectId;
+      if (requestedProjectId !== auth.projectId) {
+        throw new HttpError(
+          403,
+          "Forbidden",
+          "a project-scoped token cannot mint a token for another project",
+          { type: "https://agenteval.dev/errors/forbidden" },
+        );
+      }
+      if (requestedUserId != null && auth.userId != null && requestedUserId !== auth.userId) {
+        throw new HttpError(
+          403,
+          "Forbidden",
+          "a project-scoped token cannot mint a token for another user",
+          { type: "https://agenteval.dev/errors/forbidden" },
+        );
+      }
+    } else if (auth?.userId != null) {
+      // Global user-bound tokens: non-admins may only mint within their memberships.
+      const user = app.queries.getUser(auth.userId);
+      if (!user || user.role !== "admin") {
+        if (requestedProjectId == null) {
+          throw new HttpError(
+            403,
+            "Forbidden",
+            "non-admin tokens cannot mint a global token",
+            { type: "https://agenteval.dev/errors/forbidden" },
+          );
+        }
+        if (!app.queries.isProjectMember(requestedProjectId, auth.userId)) {
+          throw new HttpError(
+            403,
+            "Forbidden",
+            "token is not a member of the requested project",
+            { type: "https://agenteval.dev/errors/forbidden" },
+          );
+        }
+        if (requestedUserId != null && requestedUserId !== auth.userId) {
+          throw new HttpError(
+            403,
+            "Forbidden",
+            "non-admin tokens cannot mint a token for another user",
+            { type: "https://agenteval.dev/errors/forbidden" },
+          );
+        }
+      }
+    }
     const created = app.queries.createApiToken({
-      userId: body.user_id ?? body.userId ?? null,
-      projectId: body.project_id ?? body.projectId ?? null,
+      userId: requestedUserId,
+      projectId: requestedProjectId,
       label: body.label ?? null,
       readOnly: body.read_only ?? body.readOnly ?? false,
     });
@@ -982,6 +1108,33 @@ function registerTokenRoutes(router: Router): void {
         : tokenHash;
     const existing = app.queries.getApiToken(hash);
     if (!existing) throw notFound(`token not found`);
+    const privileged =
+      !app.authEnabled ||
+      !auth ||
+      !auth.userId ||
+      app.queries.getUser(auth.userId)?.role === "admin";
+    if (!privileged) {
+      if (existing.userId !== auth!.userId) {
+        throw new HttpError(
+          403,
+          "Forbidden",
+          "non-admin tokens can only revoke their own tokens",
+          { type: "https://agenteval.dev/errors/forbidden" },
+        );
+      }
+      if (
+        auth!.projectId != null &&
+        existing.projectId != null &&
+        existing.projectId !== auth!.projectId
+      ) {
+        throw new HttpError(
+          403,
+          "Forbidden",
+          "a project-scoped token cannot revoke another project's token",
+          { type: "https://agenteval.dev/errors/forbidden" },
+        );
+      }
+    }
     app.queries.revokeApiToken(hash);
     sendJson(res, 200, { revoked: true, token_hash: hash });
   });
@@ -1009,6 +1162,13 @@ export function createServer(opts: CreateServerOptions): ApiServer {
 
   const liveQueueContainers = createLiveQueueContainersMap();
   const authEnabled = opts.authEnabled === true;
+  // Recover abandoned active generations left by a previous crashed process so
+  // queues are not permanently blocked with ALREADY_ACTIVE.
+  try {
+    opened.queries.recoverStaleQueueContainers({ olderThanMs: 0 });
+  } catch {
+    // Recovery must not prevent the API from booting; operators can reconcile.
+  }
 
   // Build the production watcher seams: resolve SHA via the injected resolver or
   // GitHub client, detect an active generation, and launch a queue generation
@@ -1091,6 +1251,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   // Settings + password auth + project export (P9).
   registerSettingsRoutes(router);
   registerArchiveRoutes(router);
+  registerJudgeRoutes(router);
   registerSandboxRoutes(router);
   registerGitHubRoutes(router);
 

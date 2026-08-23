@@ -44,6 +44,8 @@ export interface IdempotencyEntry {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** Canonical request-body digest for strict same-key/same-request replay. */
+  requestDigest?: string;
 }
 
 /**
@@ -57,6 +59,7 @@ export interface IdempotencyEntry {
 export interface IdempotencyPending {
   pending: true;
   storedAt: number;
+  requestDigest?: string;
 }
 
 interface StoredEntry extends IdempotencyEntry {
@@ -129,6 +132,7 @@ export class IdempotencyStore {
       body: e.body,
     };
     if (e.headers) out.headers = e.headers;
+    if (e.requestDigest !== undefined) out.requestDigest = e.requestDigest;
     return out;
   }
 
@@ -140,11 +144,26 @@ export class IdempotencyStore {
    * caller won the claim (must later `set` the response), false when the key is
    * already claimed/completed (caller should replay or 409).
    */
-  reserve(key: string): boolean {
+  reserve(key: string, requestDigest?: string): boolean {
+    const now = this.now();
+    // Expire old completed AND pending reservations before admission, then
+    // enforce the cap here too (not only in set) so unique in-flight keys cannot
+    // grow the map without bound.
+    for (const [storedKey, value] of this.map) {
+      if (now - value.storedAt > this.ttlMs) this.map.delete(storedKey);
+    }
     const e = this.map.get(key);
-    if (e && this.now() - e.storedAt <= this.ttlMs) return false;
-    this.map.delete(key);
-    const pending: IdempotencyPending = { pending: true, storedAt: this.now() };
+    if (e) return false;
+    while (this.map.size >= this.maxSize) {
+      const oldest = this.map.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.map.delete(oldest);
+    }
+    const pending: IdempotencyPending = {
+      pending: true,
+      storedAt: now,
+      ...(requestDigest !== undefined ? { requestDigest } : {}),
+    };
     this.map.set(key, pending);
     return true;
   }
@@ -169,6 +188,7 @@ export class IdempotencyStore {
       storedAt: this.now(),
     };
     if (value.headers) stored.headers = value.headers;
+    if (value.requestDigest !== undefined) stored.requestDigest = value.requestDigest;
     this.map.set(key, stored);
     while (this.map.size > this.maxSize) {
       const oldest = this.map.keys().next().value as string | undefined;
@@ -189,8 +209,21 @@ export function idempotencyStoreKey(
   method: string,
   routeOrPath: string,
   key: string,
+  caller = "anonymous",
 ): string {
-  return `${method.toUpperCase()} ${routeOrPath}\0${key}`;
+  return `${caller}\0${method.toUpperCase()} ${routeOrPath}\0${key}`;
+}
+
+/** Stable caller scope from the request auth stash (without importing auth.ts). */
+function idempotencyCaller(req: IncomingMessage): string {
+  const authKey = Symbol.for("agenteval.api.auth");
+  const auth = (req as unknown as Record<PropertyKey, unknown>)[authKey] as
+    | { tokenHash?: string; userId?: string | null; projectId?: string | null }
+    | undefined;
+  if (auth?.tokenHash) return `token:${auth.tokenHash}`;
+  if (auth?.userId) return `user:${auth.userId}`;
+  if (auth?.projectId) return `project:${auth.projectId}`;
+  return `remote:${req.socket.remoteAddress ?? "unknown"}`;
 }
 
 /**
@@ -225,7 +258,7 @@ export function withIdempotency(handler: RouteHandler): RouteHandler {
     }
 
     const store = resolveStore(ctx);
-    const storeKey = idempotencyStoreKey(ctx.method, ctx.path, rawKey);
+    const storeKey = idempotencyStoreKey(ctx.method, ctx.path, rawKey, idempotencyCaller(req));
 
     // (2) Replay a completed cached response.
     const cached = store.get(storeKey);
@@ -317,6 +350,10 @@ export function withIdempotency(handler: RouteHandler): RouteHandler {
         body,
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
       });
+    } else if (canReserve) {
+      // A handler that produced no cacheable response (204, stream, or 5xx) must
+      // not leave the key pending until TTL expiry.
+      storeLike.release(storeKey);
     }
   };
 }
@@ -331,18 +368,13 @@ function resolveStore(ctx: RequestContext): IdempotencyStore | IdempotencyMapLik
  * Body-aware idempotency for idempotent *start/run* endpoints (e.g. queue
  * generation start).
  *
- * The request body digest is folded into the store key, so a retry with the SAME
- * Idempotency-Key but a DIFFERENT body is not silently replayed as the original:
- * it resolves to a distinct key that is not yet present, and the handler runs
- * again the way it would for any fresh key. Callers who want strict dedup of
- * "the same logical start" must send the same body (and the same key). This keeps
- * TOCTOU safety identical to {@link withIdempotency} (reserve runs synchronously
- * before the handler) while making a digest mismatch not collide with a prior
- * successful start.
+ * One Idempotency-Key identifies one logical request for one caller. A retry
+ * with the same key and body replays the response; the same key with a different
+ * body returns 409 and never executes a second operation. This keeps TOCTOU
+ * safety identical to {@link withIdempotency} while preventing accidental key
+ * reuse from creating a duplicate resource.
  *
- * `digest` is the caller-owned body SHA-256 hex. Returns a wrapped handler that
- * replays a cached completed response for (method,path,key,digest) or runs the
- * handler and caches its JSON response.
+ * `digest` is the canonical request-body SHA-256 hex.
  */
 export function withBodyIdempotency(
   digest: string,
@@ -356,9 +388,30 @@ export function withBodyIdempotency(
     }
 
     const store = resolveStore(ctx);
-    // Fold the body digest into the store key so a same-key/different-body retry
-    // is treated as a fresh logical request, never a stale replay.
-    const storeKey = idempotencyStoreKey(ctx.method, ctx.path, `${rawKey}\0${digest}`);
+    // One idempotency key identifies one logical request. Reusing it with a
+    // different body is a conflict, never a fresh operation.
+    const storeKey = idempotencyStoreKey(
+      ctx.method,
+      ctx.path,
+      rawKey,
+      idempotencyCaller(req),
+    );
+
+    const storeLike = store as IdempotencyStore;
+    const canReserve = typeof storeLike.reserve === "function";
+    const existingRef = canReserve ? storeLike.getReference(storeKey) : undefined;
+    if (existingRef?.requestDigest !== undefined && existingRef.requestDigest !== digest) {
+      sendJson(
+        res,
+        409,
+        {
+          error: "idempotency_mismatch",
+          detail: "this Idempotency-Key was already used with a different request body",
+        },
+        { "Content-Type": "application/problem+json" },
+      );
+      return;
+    }
 
     // Replay a completed response.
     const cached = store.get(storeKey);
@@ -367,9 +420,7 @@ export function withBodyIdempotency(
       return;
     }
 
-    const storeLike = store as IdempotencyStore;
-    const canReserve = typeof storeLike.reserve === "function";
-    if (canReserve && !storeLike.reserve(storeKey)) {
+    if (canReserve && !storeLike.reserve(storeKey, digest)) {
       const ref = storeLike.getReference(storeKey);
       if (ref && !("pending" in ref)) {
         const entry: IdempotencyEntry = { status: ref.status, body: ref.body };
@@ -432,8 +483,11 @@ export function withBodyIdempotency(
       store.set(storeKey, {
         status: res.statusCode,
         body,
+        requestDigest: digest,
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
       });
+    } else if (canReserve) {
+      storeLike.release(storeKey);
     }
   };
 }

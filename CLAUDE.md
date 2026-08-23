@@ -47,12 +47,23 @@ data/            # gitignored runtime data
 
 ## Execution environment
 
-This host has passwordless `sudo` and Podman. `PodmanRuntime` is the only supported execution backend.
-Use `AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=1` here because uid 65534 has no rootless subuid range.
+Reaper pods run Claude/agent-evals as root with Podman available in-pod.
+PodmanRuntime is the only supported execution backend.
 
-- Never inline Podman/Docker CLI in domain logic; use `ContainerRuntime`.
-- Do not set memory limits here; the host cgroup lacks a delegated memory controller.
-- Never use Podman `--rm`; the handle removes containers after reading their exit code.
+Use:
+
+```bash
+AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=0 npm test
+```
+
+Notes:
+
+- Root + privileged pod means nested Podman works directly (no sudo required).
+- podman-live, env-provision, and pi-adapter are NOT blocked by sudo/EROFS on this host.
+- The only intentionally skipped pi test is the external live smoke guarded by AGENTEVAL_LIVE=1.
+- Never inline Podman/Docker CLI in domain logic; use ContainerRuntime.
+- Do not set memory limits here unless the host cgroup delegates memory.
+- Never use Podman --rm; the handle removes containers after reading their exit code.
 - API keys and adapter-declared environment variables are injected only into the agent command environment,
   never baked into images.
 - Protected eval solution/tests/validation must never enter the agent container.

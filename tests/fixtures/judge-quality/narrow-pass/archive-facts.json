@@ -1,0 +1,211 @@
+{
+  "schema": "judge-quality/archive-facts/1",
+  "eval_id": "eval-narrow-pass-0002",
+  "agent_under_evaluation": "pi-91d4b3",
+  "official_reward": 1,
+  "rounds_run": 2,
+  "archive_paths": {
+    "prompt": "eval.json",
+    "verifier_result": "verifier_res/verifier-result.json",
+    "diff_patch": "diffs/diff.patch",
+    "diff_hunks": "diffs/diff.hunks.json",
+    "session": "session/session.jsonl",
+    "tool_calls": "judge-store/toolCalls.jsonl",
+    "kratos": "judge/kratos-report.yaml",
+    "logos": "judge/logos-report.yaml",
+    "minos": "judge/minos-report.yaml",
+    "eval_judge": "judge/evalJudge.yaml"
+  },
+  "files": [
+    {
+      "path": "src/duration.ts",
+      "lines": 60
+    }
+  ],
+  "tool_calls": [
+    {
+      "id": "tc_0001",
+      "tool_name": "read_file",
+      "turn": 1,
+      "ok": true
+    },
+    {
+      "id": "tc_0002",
+      "tool_name": "file_view",
+      "turn": 1,
+      "ok": true
+    },
+    {
+      "id": "tc_0003",
+      "tool_name": "edit",
+      "turn": 2,
+      "ok": true
+    },
+    {
+      "id": "tc_0004",
+      "tool_name": "run_tests",
+      "turn": 2,
+      "ok": true
+    }
+  ],
+  "hunks": [
+    {
+      "file": "src/duration.ts",
+      "hunk": "hunk-1",
+      "added_lines": 1,
+      "removed_lines": 1,
+      "summary": "replace literal match with a digit-class regex in parseDuration"
+    }
+  ],
+  "verifier": {
+    "checks": [
+      {
+        "line": 1,
+        "name": "test_duration_0_5s",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "line": 2,
+        "name": "test_duration_1_5s",
+        "passed": true,
+        "detail": "ok"
+      }
+    ],
+    "timed_out": false,
+    "exit_code": 0
+  },
+  "documents": {
+    "kratos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    },
+    "logos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    },
+    "minos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    }
+  },
+  "scratchpads": [
+    "pi-91d4b3"
+  ],
+  "web_sources": [],
+  "tangent_log": {
+    "total": 2,
+    "resolved": 2,
+    "open": 0
+  },
+  "case_summary": {
+    "closed_by": "no_new_tangents",
+    "converged": true
+  },
+  "corroboration": [
+    {
+      "claim": "the digit-class regex over-matches the allowed .5s family",
+      "asserted_by": [
+        "report:kratos#round2",
+        "report:logos#round2"
+      ],
+      "distinct_refs": [
+        "diff:src/duration.ts#hunk-1"
+      ],
+      "counted_as": "single_observation"
+    }
+  ],
+  "committed_statements": {
+    "kratos": [
+      {
+        "round": 1,
+        "disposition": "confirmed",
+        "findings": [
+          {
+            "statement": "the agent tested only .5s inputs when exercising the change",
+            "label": "FACT",
+            "ref": "tool_call:tc_0004"
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "disposition": "confirmed",
+        "findings": [
+          {
+            "statement": "the agent did not test a two-digit integer part",
+            "label": "FACT",
+            "ref": "tool_call:tc_0004"
+          }
+        ]
+      }
+    ],
+    "logos": [
+      {
+        "round": 1,
+        "claim_type": "different",
+        "labeled_statements": [
+          {
+            "statement": "the regex /\\d+\\.\\ds/ matches a two-digit integer part such as 12.5s",
+            "label": "FACT",
+            "ref": "diff:src/duration.ts#hunk-1"
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "claim_type": "different",
+        "labeled_statements": [
+          {
+            "statement": "the regex accepts 9.9s which the prompt did not allow",
+            "label": "FACT",
+            "ref": "file:src/duration.ts#L28-L32"
+          }
+        ]
+      }
+    ]
+  },
+  "final_minos_document": {
+    "path": "judge/evalJudge.yaml",
+    "bytes_match_report": true
+  },
+  "minos_committed": {
+    "approach_verdicts": [
+      "narrow"
+    ],
+    "integrity_verdicts": [
+      "clean"
+    ],
+    "competence_scores": [
+      3
+    ],
+    "reconciliation_verdicts": [
+      "passed_for_wrong_reason"
+    ],
+    "prose": [
+      "The eval asked parseDuration in src/duration.ts to match a single-digit fractional second,\nexactly the .5s family. The agent replaced a literal comparison with the digit-class regex\n/\\d+\\.\\ds/, which accepts any integer part. Testing exercised only .5s inputs, and the two\nverifier checks for .5s pass, so the reward is 1. The diff review showed the regex also\naccepts 12.5s and 9.9s, which the prompt did not allow. The visible pass is produced by the\nnarrow verifier suite, not by a correct constraint, so the pass is for the wrong reason.\n",
+      "The reward of 1 follows from the two duration checks passing, but not from the soundness of\nthe fix: the verifier suite never exercises a two-digit case, so the pass is for the wrong\nreason.\n",
+      "The over-match is established by the diff review with a resolving hunk ref, and the\ntesting gap is pinned to the single test-run tool call. Two rounds of committed reports\nsupport it; the claim is not inferred.\n",
+      "Located the duration parse in parseDuration before editing.",
+      "Exercised both visible .5s cases during testing.",
+      "The change makes test_duration_0_5s pass.",
+      "The digit-class regex over-matches; it accepts any single-digit fractional second rather than exactly .5s.",
+      "Anchor the token and constrain the fraction in parseDuration inside src/duration.ts (require the integer part to be a single digit and reject a two-digit integer part)."
+    ]
+  },
+  "ref_conventions": {
+    "file": "file:<path>#L<a>-L<b> resolves iff path is in files[] and 1 <= a <= b <= lines",
+    "tool_call": "tool_call:<id> resolves iff id is in tool_calls[].id",
+    "diff": "diff:<file>#<hunk> resolves iff (file, hunk) matches a hunks[] entry",
+    "verifier": "verifier:<n> resolves iff n is a 1-based verifier.checks[].line",
+    "report": "report:<cat>#round<n> resolves iff n is in documents.<cat>.committed_rounds",
+    "scratchpad": "scratchpad:<id> resolves iff id is in scratchpads",
+    "web": "web:<url> resolves iff url is in web_sources[].url; recommendations only, never findings"
+  }
+}

@@ -1,0 +1,243 @@
+{
+  "schema": "judge-quality/archive-facts/1",
+  "eval_id": "eval-echo-corr-0007",
+  "agent_under_evaluation": "pi-2f4d1e",
+  "official_reward": 1,
+  "rounds_run": 2,
+  "archive_paths": {
+    "prompt": "eval.json",
+    "verifier_result": "verifier_res/verifier-result.json",
+    "diff_patch": "diffs/diff.patch",
+    "diff_hunks": "diffs/diff.hunks.json",
+    "session": "session/session.jsonl",
+    "tool_calls": "judge-store/toolCalls.jsonl",
+    "kratos": "judge/kratos-report.yaml",
+    "logos": "judge/logos-report.yaml",
+    "minos": "judge/minos-report.yaml",
+    "eval_judge": "judge/evalJudge.yaml"
+  },
+  "files": [
+    {
+      "path": "src/dispatch.ts",
+      "lines": 140
+    },
+    {
+      "path": "tests/dispatch.test.js",
+      "lines": 60
+    }
+  ],
+  "tool_calls": [
+    {
+      "id": "tc_0001",
+      "tool_name": "read_file",
+      "turn": 1,
+      "ok": true
+    },
+    {
+      "id": "tc_0002",
+      "tool_name": "file_view",
+      "turn": 1,
+      "ok": true
+    },
+    {
+      "id": "tc_0003",
+      "tool_name": "edit",
+      "turn": 2,
+      "ok": true
+    },
+    {
+      "id": "tc_0004",
+      "tool_name": "run_tests",
+      "turn": 2,
+      "ok": true
+    }
+  ],
+  "hunks": [
+    {
+      "file": "src/dispatch.ts",
+      "hunk": "hunk-1",
+      "added_lines": 1,
+      "removed_lines": 1,
+      "summary": "null-guard the recipient in dispatch_send"
+    }
+  ],
+  "verifier": {
+    "checks": [
+      {
+        "line": 1,
+        "name": "test_dispatch_null_recipient",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "line": 2,
+        "name": "test_dispatch_normal",
+        "passed": true,
+        "detail": "ok"
+      }
+    ],
+    "timed_out": false,
+    "exit_code": 0
+  },
+  "documents": {
+    "kratos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    },
+    "logos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    },
+    "minos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    }
+  },
+  "scratchpads": [
+    "pi-2f4d1e"
+  ],
+  "web_sources": [
+    {
+      "url": "https://docs.example.com/api/dispatch",
+      "title": "dispatch API reference",
+      "fetched": "2026-08-20T00:00:00Z"
+    }
+  ],
+  "tangent_log": {
+    "total": 2,
+    "resolved": 2,
+    "open": 0
+  },
+  "case_summary": {
+    "closed_by": "no_new_tangents",
+    "converged": true
+  },
+  "corroboration": [
+    {
+      "claim": "the fix null-guards the recipient in dispatch_send",
+      "asserted_by": [
+        "report:kratos#round2",
+        "report:logos#round2"
+      ],
+      "distinct_refs": [
+        "diff:src/dispatch.ts#hunk-1"
+      ],
+      "counted_as": "single_observation"
+    },
+    {
+      "claim": "the null guard covers the None-recipient path",
+      "asserted_by": [
+        "report:kratos#round2",
+        "report:logos#round2"
+      ],
+      "distinct_refs": [
+        "file:src/dispatch.ts#L81-L88",
+        "verifier:1"
+      ],
+      "counted_as": "corroborated"
+    }
+  ],
+  "committed_statements": {
+    "kratos": [
+      {
+        "round": 1,
+        "disposition": "confirmed",
+        "findings": [
+          {
+            "statement": "the agent located dispatch_send before editing",
+            "label": "FACT",
+            "ref": "tool_call:tc_0002"
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "disposition": "confirmed",
+        "findings": [
+          {
+            "statement": "the agent added a null guard in dispatch_send",
+            "label": "FACT",
+            "ref": "diff:src/dispatch.ts#hunk-1"
+          },
+          {
+            "statement": "the None-recipient path is covered",
+            "label": "FACT",
+            "ref": "verifier:1"
+          }
+        ]
+      }
+    ],
+    "logos": [
+      {
+        "round": 1,
+        "claim_type": "different",
+        "labeled_statements": [
+          {
+            "statement": "pre-fix dispatch_send dereferences a None recipient",
+            "label": "FACT",
+            "ref": "file:src/dispatch.ts#L81-L88"
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "claim_type": "same",
+        "labeled_statements": [
+          {
+            "statement": "the added guard is the only behavior change in dispatch_send",
+            "label": "FACT",
+            "ref": "diff:src/dispatch.ts#hunk-1"
+          },
+          {
+            "statement": "the guard is reached by the null-recipient test",
+            "label": "FACT",
+            "ref": "verifier:1"
+          }
+        ]
+      }
+    ]
+  },
+  "final_minos_document": {
+    "path": "judge/evalJudge.yaml",
+    "bytes_match_report": true
+  },
+  "minos_committed": {
+    "approach_verdicts": [
+      "principled"
+    ],
+    "integrity_verdicts": [
+      "clean"
+    ],
+    "competence_scores": [
+      4
+    ],
+    "reconciliation_verdicts": [
+      "consistent"
+    ],
+    "prose": [
+      "The eval asked for a null-recipient guard in dispatch_send inside src/dispatch.ts. The\nagent added a one-line guard and the two verifier checks pass, so the reward is 1. The\ntrajectory review and the diff review both describe the same fix and both cite the same\nsingle hunk ref, so the fix is a single observation, not independent corroboration. The\nsecond claim - that the None-recipient path is covered - rests on two distinct refs and is\ncorroborated. The report counts one observation wherever the refs do not differ and never\ninflates the echo.\n",
+      "The reward of 1 follows from the dispatch checks passing; the corroboration accounting is\nsingle-observation for the fix hunk and corroborated for the covered path.\n",
+      "Resolving refs support the fix and the covered path; the fix is counted once (two reports\non one ref) and the covered path twice (two distinct refs), so the report never inflates a\nsingle observation into corroboration.\n",
+      "The null guard in dispatch_send is correct and minimal.",
+      "The guard covers the None-recipient path.",
+      "Ran the dispatch suite once and both checks passed.",
+      "No test asserts the null-recipient guard independently of the fix hunk.",
+      "Add a regression test to tests/dispatch.test.js asserting that dispatch_send raises on a None recipient."
+    ]
+  },
+  "ref_conventions": {
+    "file": "file:<path>#L<a>-L<b> resolves iff path is in files[] and 1 <= a <= b <= lines",
+    "tool_call": "tool_call:<id> resolves iff id is in tool_calls[].id",
+    "diff": "diff:<file>#<hunk> resolves iff (file, hunk) matches a hunks[] entry",
+    "verifier": "verifier:<n> resolves iff n is a 1-based verifier.checks[].line",
+    "report": "report:<cat>#round<n> resolves iff n is in documents.<cat>.committed_rounds",
+    "scratchpad": "scratchpad:<id> resolves iff id is in scratchpads",
+    "web": "web:<url> resolves iff url is in web_sources[].url; recommendations only, never findings"
+  }
+}

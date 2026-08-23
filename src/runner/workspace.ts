@@ -8,6 +8,8 @@
  */
 
 import { access, mkdir } from "node:fs/promises";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -65,7 +67,12 @@ export async function prepareWorkspace(
   await assertEmptyOrMissing(targetDir);
 
   const ref = spec.ref;
-  await gitClone(normalizeRepoUrl(repo), targetDir, ref, options.env);
+  if (ref?.trim().startsWith("-")) {
+    throw new Error(`invalid git ref: ${ref}`);
+  }
+  const normalizedRepo = normalizeRepoUrl(repo);
+  await validateRepositoryTarget(normalizedRepo);
+  await gitClone(normalizedRepo, targetDir, ref, options.env);
   const commit = await gitRevParse(targetDir, "HEAD", options.env);
 
   const prepared: PreparedWorkspace = {
@@ -170,6 +177,11 @@ async function gitInit(
 export function normalizeRepoUrl(repo: string): string {
   const raw = repo.trim();
   if (!raw) return raw;
+  // Reject anything that could be parsed by git as an option (`-…`) — a
+  // caller-controlled repo string must never become `git clone <option>`.
+  if (raw.startsWith("-")) {
+    throw new Error(`invalid repository reference: ${raw}`);
+  }
   // Already a URL, an SSH remote, or a filesystem path.
   if (
     /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ||
@@ -191,6 +203,81 @@ export function normalizeRepoUrl(repo: string): string {
   return raw;
 }
 
+function allowedGitHosts(): Set<string> {
+  const hosts = new Set<string>(["github.com"]);
+  try {
+    hosts.add(new URL(process.env.GITHUB_SERVER_URL ?? "https://github.com").hostname.toLowerCase());
+  } catch {
+    // invalid operator URL is ignored here; startup/use will fail elsewhere
+  }
+  for (const value of (process.env.AGENTEVAL_GIT_HOST_ALLOWLIST ?? "").split(",")) {
+    const host = value.trim().toLowerCase();
+    if (host) hosts.add(host);
+  }
+  return hosts;
+}
+
+function isPrivateAddress(address: string): boolean {
+  if (isIP(address) === 4) {
+    const [a, b] = address.split(".").map(Number);
+    return (
+      a === 0 || a === 10 || a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b! >= 16 && b! <= 31) ||
+      (a === 192 && b === 168) ||
+      a! >= 224
+    );
+  }
+  if (isIP(address) === 6) {
+    const value = address.toLowerCase();
+    return (
+      value === "::" || value === "::1" ||
+      value.startsWith("fe8") || value.startsWith("fe9") ||
+      value.startsWith("fea") || value.startsWith("feb") ||
+      value.startsWith("fc") || value.startsWith("fd") ||
+      value.startsWith("ff") || value.startsWith("::ffff:127.") ||
+      value.startsWith("::ffff:10.") || value.startsWith("::ffff:192.168.")
+    );
+  }
+  return true;
+}
+
+/** Validate repository schemes/hosts before git performs any network access. */
+async function validateRepositoryTarget(repo: string): Promise<void> {
+  const isLocal = repo.startsWith("/") || repo.startsWith(".") || repo.startsWith("~");
+  if (isLocal) {
+    if (process.env.NODE_ENV === "test" || process.env.AGENTEVAL_ALLOW_LOCAL_REPOS === "1") return;
+    throw new Error("local repository paths are disabled; set AGENTEVAL_ALLOW_LOCAL_REPOS=1 to opt in");
+  }
+  if (repo.startsWith("git@")) {
+    if (process.env.AGENTEVAL_ALLOW_SSH_REPOS === "1") return;
+    throw new Error("SSH repository URLs are disabled; use HTTPS or set AGENTEVAL_ALLOW_SSH_REPOS=1");
+  }
+
+  let url: URL;
+  try {
+    url = new URL(repo);
+  } catch {
+    throw new Error(`invalid repository URL: ${repo}`);
+  }
+  if (url.protocol !== "https:") {
+    throw new Error(`repository URL must use HTTPS: ${repo}`);
+  }
+  if (url.username || url.password) {
+    throw new Error("repository URLs must not embed credentials");
+  }
+  const host = url.hostname.toLowerCase();
+  if (!allowedGitHosts().has(host)) {
+    throw new Error(
+      `repository host ${host} is not allowed; add it to AGENTEVAL_GIT_HOST_ALLOWLIST`,
+    );
+  }
+  const addresses = await lookup(host, { all: true, verbatim: true });
+  if (addresses.length === 0 || addresses.some((entry) => isPrivateAddress(entry.address))) {
+    throw new Error(`repository host ${host} resolves to a private or disallowed address`);
+  }
+}
+
 async function gitClone(
   repo: string,
   targetDir: string,
@@ -198,12 +285,14 @@ async function gitClone(
   env?: NodeJS.ProcessEnv,
 ): Promise<void> {
   const baseEnv = { ...process.env, ...env };
+  // `--` terminates option parsing so a repo string can never be read as a git
+  // option (defense in depth on top of normalizeRepoUrl's `-` rejection).
   // Prefer a shallow clone when possible.
   if (ref) {
     try {
       await execFileAsync(
         "git",
-        ["clone", "--depth", "1", "--branch", ref, repo, targetDir],
+        ["clone", "--depth", "1", "--branch", ref, "--", repo, targetDir],
         { env: baseEnv },
       );
       return;
@@ -214,7 +303,7 @@ async function gitClone(
     try {
       await execFileAsync(
         "git",
-        ["clone", "--depth", "1", repo, targetDir],
+        ["clone", "--depth", "1", "--", repo, targetDir],
         { env: baseEnv },
       );
       return;
@@ -228,8 +317,11 @@ async function gitClone(
   const { rm } = await import("node:fs/promises");
   await rm(targetDir, { recursive: true, force: true });
   await mkdir(targetDir, { recursive: true });
-  await execFileAsync("git", ["clone", repo, targetDir], { env: baseEnv });
+  await execFileAsync("git", ["clone", "--", repo, targetDir], { env: baseEnv });
   if (ref) {
+    // ref was rejected above if it begins with `-`, so this positional argument
+    // cannot be parsed as an option. (`git checkout --detach -- <ref>` is invalid:
+    // after `--`, git treats the ref as a pathspec.)
     await execFileAsync("git", ["-C", targetDir, "checkout", "--detach", ref], {
       env: baseEnv,
     });

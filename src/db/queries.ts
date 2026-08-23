@@ -32,6 +32,7 @@ import {
   evalQueueItems,
   evalQueues,
   projectAgentAdapters,
+  projectMembers,
   projects,
   queueContainers,
   runBatches,
@@ -1050,6 +1051,19 @@ export interface QueryStore {
   deleteWatcherRule(id: string): void;
   /** Insert a watcher_events row and return it. */
   recordWatcherEvent(input: RecordWatcherEventInput): WatcherEvent;
+  /**
+   * Atomically allocate a FIFO seq and insert a pending watcher event, or return
+   * a deduped event when the same rule already has an active SHA. Prevents
+   * concurrent identical webhooks from launching the same commit twice.
+   */
+  enqueueWatcherPendingEvent(input: {
+    ruleId: string;
+    projectId: string;
+    queueId: string;
+    trigger: string;
+    ref?: string | null;
+    resolvedSha: string;
+  }): { status: "pending" | "deduped"; event: WatcherEvent };
   /** Newest-receivedAt-first. */
   listWatcherEvents(
     projectId: string,
@@ -1095,6 +1109,23 @@ export interface QueryStore {
   getActiveQueueContainer(queueId: string): QueueContainer | null;
   listQueueContainers(queueId: string): QueueContainer[];
   updateQueueContainer(id: string, patch: UpdateQueueContainerInput): QueueContainer;
+  /**
+   * Mark abandoned active generation containers as failed. Used at API boot and
+   * before starting a generation so a crashed process cannot permanently block a
+   * queue with an orphaned `starting`/`running` row.
+   */
+  recoverStaleQueueContainers(opts?: {
+    olderThanMs?: number;
+    now?: string;
+  }): QueueContainer[];
+  /**
+   * Atomically create the batch + active container for one generation, or throw
+   * with code ALREADY_ACTIVE when another generation already owns the queue.
+   */
+  beginQueueGeneration(input: {
+    batch: CreateBatchInput;
+    container: Omit<CreateQueueContainerInput, "batchId">;
+  }): { batch: RunBatch; container: QueueContainer };
 
   /**
    * Atomic claim-or-empty-close for a queue generation.
@@ -1150,6 +1181,12 @@ export interface QueryStore {
   deleteUser(id: string): void;
   /** Number of users (for first-user bootstrap). */
   countUsers(): number;
+
+  addProjectMember(projectId: string, userId: string): void;
+  removeProjectMember(projectId: string, userId: string): void;
+  listProjectMembers(projectId: string): string[];
+  listUserProjectIds(userId: string): string[];
+  isProjectMember(projectId: string, userId: string): boolean;
 
   // ---- Settings (P9) ----
   /** Read a single setting (JSON-parsed). null when missing. */
@@ -1685,7 +1722,9 @@ export class SqliteQueries implements QueryStore {
   ) {}
 
   transaction<T>(operation: () => T): T {
-    return operation();
+    // better-sqlite3/drizzle support BEGIN IMMEDIATE via behavior: "immediate".
+    // Queue starts and watcher FIFO dedupe need this to serialize writers.
+    return this.db.transaction(operation, { behavior: "immediate" });
   }
 
   createProject(input: CreateProjectInput): Project {
@@ -2697,6 +2736,72 @@ export class SqliteQueries implements QueryStore {
     return mapWatcherEventRow(row);
   }
 
+  enqueueWatcherPendingEvent(input: {
+    ruleId: string;
+    projectId: string;
+    queueId: string;
+    trigger: string;
+    ref?: string | null;
+    resolvedSha: string;
+  }): { status: "pending" | "deduped"; event: WatcherEvent } {
+    return this.transaction(() => {
+      const active = this.db
+        .select()
+        .from(watcherEvents)
+        .where(
+          and(
+            eq(watcherEvents.ruleId, input.ruleId),
+            eq(watcherEvents.resolvedSha, input.resolvedSha),
+          ),
+        )
+        .all()
+        .map(mapWatcherEventRow)
+        .find((e) => ["pending", "launching", "launched"].includes(e.status));
+      if (active) {
+        const deduped = this.recordWatcherEvent({
+          ruleId: input.ruleId,
+          projectId: input.projectId,
+          queueId: input.queueId,
+          trigger: input.trigger,
+          ref: input.ref ?? null,
+          resolvedSha: input.resolvedSha,
+          status: "deduped",
+        });
+        return { status: "deduped", event: deduped };
+      }
+      const fifoSeq = this.nextWatcherFifoSeq(input.queueId);
+      try {
+        const pending = this.recordWatcherEvent({
+          ruleId: input.ruleId,
+          projectId: input.projectId,
+          queueId: input.queueId,
+          trigger: input.trigger,
+          ref: input.ref ?? null,
+          resolvedSha: input.resolvedSha,
+          status: "pending",
+          fifoSeq,
+        });
+        return { status: "pending", event: pending };
+      } catch (err) {
+        // Unique active-sha index: a concurrent writer won the race.
+        const message = err instanceof Error ? err.message : String(err);
+        if (/UNIQUE|unique/i.test(message)) {
+          const deduped = this.recordWatcherEvent({
+            ruleId: input.ruleId,
+            projectId: input.projectId,
+            queueId: input.queueId,
+            trigger: input.trigger,
+            ref: input.ref ?? null,
+            resolvedSha: input.resolvedSha,
+            status: "deduped",
+          });
+          return { status: "deduped", event: deduped };
+        }
+        throw err;
+      }
+    });
+  }
+
   listWatcherEvents(
     projectId: string,
     opts: { ruleId?: string; limit?: number } = {},
@@ -2981,15 +3086,26 @@ export class SqliteQueries implements QueryStore {
     if (active) throw new Error(`eval queue ${input.queueId} already has active container ${active.id}`);
     const id = input.id ?? newId();
     const ts = nowIso();
-    this.db.insert(queueContainers).values({
-      id, queueId: input.queueId, projectId: input.projectId, batchId: input.batchId,
-      runtimeContainerId: input.runtimeContainerId ?? null, image: input.image,
-      imageId: input.imageId ?? null, agentCommit: input.agentCommit ?? null,
-      agentVersion: input.agentVersion ?? null, buildId: input.buildId ?? null,
-      state: input.state, portsJson: stringifyJson(input.ports ?? []), workspaceDir: input.workspaceDir,
-      startedAt: input.startedAt ?? null, stoppedAt: null, error: input.error ?? null,
-      createdAt: ts, updatedAt: ts,
-    }).run();
+    try {
+      this.db.insert(queueContainers).values({
+        id, queueId: input.queueId, projectId: input.projectId, batchId: input.batchId,
+        runtimeContainerId: input.runtimeContainerId ?? null, image: input.image,
+        imageId: input.imageId ?? null, agentCommit: input.agentCommit ?? null,
+        agentVersion: input.agentVersion ?? null, buildId: input.buildId ?? null,
+        state: input.state, portsJson: stringifyJson(input.ports ?? []), workspaceDir: input.workspaceDir,
+        startedAt: input.startedAt ?? null, stoppedAt: null, error: input.error ?? null,
+        createdAt: ts, updatedAt: ts,
+      }).run();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/UNIQUE|unique/i.test(message)) {
+        throw Object.assign(
+          new Error(`eval queue ${input.queueId} already has an active container`),
+          { code: "ALREADY_ACTIVE" },
+        );
+      }
+      throw err;
+    }
     return this.getQueueContainer(id)!;
   }
 
@@ -3018,6 +3134,72 @@ export class SqliteQueries implements QueryStore {
     if (patch.error !== undefined) values.error = patch.error;
     this.db.update(queueContainers).set(values).where(eq(queueContainers.id, id)).run();
     return this.getQueueContainer(id)!;
+  }
+
+  recoverStaleQueueContainers(opts: {
+    olderThanMs?: number;
+    now?: string;
+  } = {}): QueueContainer[] {
+    const olderThanMs = opts.olderThanMs ?? 0;
+    const nowMs = Date.parse(opts.now ?? nowIso());
+    const recovered: QueueContainer[] = [];
+    for (const row of this.db.select().from(queueContainers).all().map(mapQueueContainerRow)) {
+      if (!isActiveContainerState(row)) continue;
+      const startedMs = Date.parse(row.startedAt ?? row.createdAt);
+      if (!Number.isFinite(startedMs) || nowMs - startedMs < olderThanMs) continue;
+      const updated = this.updateQueueContainer(row.id, {
+        state: "failed",
+        stoppedAt: opts.now ?? nowIso(),
+        error: row.error ?? "recovered stale queue container after process restart",
+      });
+      // Close the generation batch so it cannot keep accepting claims.
+      this.db
+        .update(runBatches)
+        .set({ accepting: 0, closedAt: opts.now ?? nowIso() })
+        .where(eq(runBatches.id, row.batchId))
+        .run();
+      const queue = this.getEvalQueue(row.queueId);
+      if (queue?.activeBatchId === row.batchId) {
+        this.updateEvalQueue(row.queueId, { status: "failed", activeBatchId: null });
+      }
+      // Any still-queued runs under the orphaned generation become failed.
+      for (const run of this.listRunsByBatch(row.batchId)) {
+        if (run.status === "queued" || run.status === "running") {
+          this.finalizeRun(run.id, {
+            status: "failed",
+            error: "queue generation recovered after process restart",
+            controlState: "done",
+          });
+        }
+      }
+      recovered.push(updated);
+    }
+    return recovered;
+  }
+
+  beginQueueGeneration(input: {
+    batch: CreateBatchInput;
+    container: Omit<CreateQueueContainerInput, "batchId">;
+  }): { batch: RunBatch; container: QueueContainer } {
+    return this.transaction(() => {
+      const active = this.getActiveQueueContainer(input.container.queueId);
+      if (active) {
+        throw Object.assign(
+          new Error(`eval queue ${input.container.queueId} already has active container ${active.id}`),
+          { code: "ALREADY_ACTIVE" },
+        );
+      }
+      const batch = this.createBatch(input.batch);
+      const container = this.createQueueContainer({
+        ...input.container,
+        batchId: batch.id,
+      });
+      this.updateEvalQueue(input.container.queueId, {
+        status: "starting",
+        activeBatchId: batch.id,
+      });
+      return { batch, container };
+    });
   }
 
   listRunsByBatch(batchId: string): Run[] {
@@ -3078,13 +3260,30 @@ export class SqliteQueries implements QueryStore {
       claimedPerItem.set(run.queueItemId, (claimedPerItem.get(run.queueItemId) ?? 0) + 1);
     }
 
-    let claim: { item: EvalQueueItem; repeatIndex: number } | null = null;
+    let claim: { item: EvalQueueItem; repeatIndex: number; task: typeof tasks.$inferSelect } | null = null;
     for (const item of items) {
-      const claimedCount = claimedPerItem.get(item.id) ?? 0;
-      if (claimedCount < item.repeats) {
-        claim = { item, repeatIndex: claimedCount };
-        break;
+      // claimedRepeats is an immutable floor across generations. A new queue
+      // container (new batchId) must NOT re-claim work already claimed in a
+      // prior generation — that was re-running finished evals after API crashes
+      // and pushing claimedRepeats above repeats (E2E observation).
+      const claimedCount = Math.max(claimedPerItem.get(item.id) ?? 0, item.claimedRepeats);
+      if (claimedCount >= item.repeats) continue;
+      const taskForItem = tx
+        .select()
+        .from(tasks)
+        .where(eq(tasks.id, item.taskId))
+        .get();
+      // Soft-skip unavailable/archived evals instead of aborting the whole
+      // generation. Soft-delete the queue item so it is not reselected forever.
+      if (!taskForItem || taskForItem.archived === 1) {
+        tx.update(evalQueueItems)
+          .set({ deletedAt: nowIso(), enabled: 0, updatedAt: nowIso() })
+          .where(eq(evalQueueItems.id, item.id))
+          .run();
+        continue;
       }
+      claim = { item, repeatIndex: claimedCount, task: taskForItem };
+      break;
     }
 
     // 5. If no work exists, atomically mark the generation closing.
@@ -3105,14 +3304,8 @@ export class SqliteQueries implements QueryStore {
     // The claim op does not know which item will be claimed until the atomic
     // selection above, so it resolves the eval + item snapshots for THAT item.
     const runId = newId();
-    const { item, repeatIndex } = claim;
+    const { item, repeatIndex, task: taskForItem } = claim;
     const agentId = input.agentId ?? batchRow.agentId;
-    const taskForItem = tx
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, item.taskId))
-      .get();
-    if (!taskForItem) throw notFound("task", item.taskId);
     const evalSnapshot =
       input.evalSnapshot !== undefined && input.taskId === item.taskId
         ? stringifyJson(input.evalSnapshot)
@@ -3357,6 +3550,54 @@ export class SqliteQueries implements QueryStore {
     return this.db.select().from(users).all().length;
   }
 
+  addProjectMember(projectId: string, userId: string): void {
+    if (!this.getProject(projectId)) throw notFound("project", projectId);
+    if (!this.getUser(userId)) throw notFound("user", userId);
+    if (this.isProjectMember(projectId, userId)) return;
+    this.db.insert(projectMembers).values({
+      projectId,
+      userId,
+      createdAt: nowIso(),
+    }).run();
+  }
+
+  removeProjectMember(projectId: string, userId: string): void {
+    this.db
+      .delete(projectMembers)
+      .where(and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, userId)))
+      .run();
+  }
+
+  listProjectMembers(projectId: string): string[] {
+    return this.db
+      .select()
+      .from(projectMembers)
+      .where(eq(projectMembers.projectId, projectId))
+      .all()
+      .map((row) => row.userId)
+      .sort();
+  }
+
+  listUserProjectIds(userId: string): string[] {
+    return this.db
+      .select()
+      .from(projectMembers)
+      .where(eq(projectMembers.userId, userId))
+      .all()
+      .map((row) => row.projectId)
+      .sort();
+  }
+
+  isProjectMember(projectId: string, userId: string): boolean {
+    return (
+      this.db
+        .select()
+        .from(projectMembers)
+        .where(and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, userId)))
+        .get() !== undefined
+    );
+  }
+
   // ---- Settings (P9) ----
 
   getSetting(key: string): unknown | null {
@@ -3489,6 +3730,8 @@ export class MemoryQueries implements QueryStore {
   private evalArchives = new Map<string, EvalArchive>();
   private apiTokens = new Map<string, ApiToken>();
   private users = new Map<string, User>();
+  /** Keyed by `${projectId}\0${userId}`. */
+  private projectMembers = new Map<string, { projectId: string; userId: string; createdAt: string }>();
   private settings = new Map<string, SettingRow>();
   private checkResultsByRun = new Map<string, CheckResult[]>();
 
@@ -4289,6 +4532,52 @@ export class MemoryQueries implements QueryStore {
     return { ...event };
   }
 
+  enqueueWatcherPendingEvent(input: {
+    ruleId: string;
+    projectId: string;
+    queueId: string;
+    trigger: string;
+    ref?: string | null;
+    resolvedSha: string;
+  }): { status: "pending" | "deduped"; event: WatcherEvent } {
+    return this.transaction(() => {
+      const active = [...this.watcherEvents.values()].find(
+        (e) =>
+          e.ruleId === input.ruleId &&
+          e.resolvedSha === input.resolvedSha &&
+          ["pending", "launching", "launched"].includes(e.status),
+      );
+      if (active) {
+        return {
+          status: "deduped",
+          event: this.recordWatcherEvent({
+            ruleId: input.ruleId,
+            projectId: input.projectId,
+            queueId: input.queueId,
+            trigger: input.trigger,
+            ref: input.ref ?? null,
+            resolvedSha: input.resolvedSha,
+            status: "deduped",
+          }),
+        };
+      }
+      const fifoSeq = this.nextWatcherFifoSeq(input.queueId);
+      return {
+        status: "pending",
+        event: this.recordWatcherEvent({
+          ruleId: input.ruleId,
+          projectId: input.projectId,
+          queueId: input.queueId,
+          trigger: input.trigger,
+          ref: input.ref ?? null,
+          resolvedSha: input.resolvedSha,
+          status: "pending",
+          fifoSeq,
+        }),
+      };
+    });
+  }
+
   listWatcherEvents(
     projectId: string,
     opts: { ruleId?: string; limit?: number } = {},
@@ -4576,6 +4865,73 @@ export class MemoryQueries implements QueryStore {
     return structuredClone(next);
   }
 
+  recoverStaleQueueContainers(opts: {
+    olderThanMs?: number;
+    now?: string;
+  } = {}): QueueContainer[] {
+    const olderThanMs = opts.olderThanMs ?? 0;
+    const nowMs = Date.parse(opts.now ?? nowIso());
+    const recovered: QueueContainer[] = [];
+    for (const row of [...this.queueContainers.values()]) {
+      if (!isActiveContainerState(row)) continue;
+      const startedMs = Date.parse(row.startedAt ?? row.createdAt);
+      if (!Number.isFinite(startedMs) || nowMs - startedMs < olderThanMs) continue;
+      const updated = this.updateQueueContainer(row.id, {
+        state: "failed",
+        stoppedAt: opts.now ?? nowIso(),
+        error: row.error ?? "recovered stale queue container after process restart",
+      });
+      const batch = this.batches.get(row.batchId);
+      if (batch) {
+        this.batches.set(row.batchId, {
+          ...batch,
+          accepting: false,
+          closedAt: opts.now ?? nowIso(),
+        });
+      }
+      const queue = this.getEvalQueue(row.queueId);
+      if (queue?.activeBatchId === row.batchId) {
+        this.updateEvalQueue(row.queueId, { status: "failed", activeBatchId: null });
+      }
+      for (const run of this.listRunsByBatch(row.batchId)) {
+        if (run.status === "queued" || run.status === "running") {
+          this.finalizeRun(run.id, {
+            status: "failed",
+            error: "queue generation recovered after process restart",
+            controlState: "done",
+          });
+        }
+      }
+      recovered.push(updated);
+    }
+    return recovered;
+  }
+
+  beginQueueGeneration(input: {
+    batch: CreateBatchInput;
+    container: Omit<CreateQueueContainerInput, "batchId">;
+  }): { batch: RunBatch; container: QueueContainer } {
+    return this.transaction(() => {
+      const active = this.getActiveQueueContainer(input.container.queueId);
+      if (active) {
+        throw Object.assign(
+          new Error(`eval queue ${input.container.queueId} already has active container ${active.id}`),
+          { code: "ALREADY_ACTIVE" },
+        );
+      }
+      const batch = this.createBatch(input.batch);
+      const container = this.createQueueContainer({
+        ...input.container,
+        batchId: batch.id,
+      });
+      this.updateEvalQueue(input.container.queueId, {
+        status: "starting",
+        activeBatchId: batch.id,
+      });
+      return { batch, container };
+    });
+  }
+
   listRunsByBatch(batchId: string): Run[] {
     return [...this.runs.values()]
       .filter((r) => r.batchId === batchId)
@@ -4614,13 +4970,23 @@ export class MemoryQueries implements QueryStore {
       claimedPerItem.set(run.queueItemId, (claimedPerItem.get(run.queueItemId) ?? 0) + 1);
     }
 
-    let claim: { item: EvalQueueItem; repeatIndex: number } | null = null;
+    let claim: { item: EvalQueueItem; repeatIndex: number; task: Task } | null = null;
     for (const item of items) {
-      const claimedCount = claimedPerItem.get(item.id) ?? 0;
-      if (claimedCount < item.repeats) {
-        claim = { item, repeatIndex: claimedCount };
-        break;
+      // Same floor as the SQLite path: claimedRepeats survives across batches.
+      const claimedCount = Math.max(claimedPerItem.get(item.id) ?? 0, item.claimedRepeats);
+      if (claimedCount >= item.repeats) continue;
+      const taskForItem = this.tasks.get(item.taskId);
+      if (!taskForItem || taskForItem.archived) {
+        this.evalQueueItems.set(item.id, {
+          ...item,
+          enabled: false,
+          deletedAt: nowIso(),
+          updatedAt: nowIso(),
+        });
+        continue;
       }
+      claim = { item, repeatIndex: claimedCount, task: taskForItem };
+      break;
     }
 
     // 5. If no work exists, atomically mark the generation closing.
@@ -4638,9 +5004,7 @@ export class MemoryQueries implements QueryStore {
     // 4. Create exactly one queue-backed run with immutable eval/item snapshots.
     // The claimed item may differ from the caller's expected task (the claim op
     // selects the item atomically), so resolve snapshots for the actual item.
-    const { item, repeatIndex } = claim;
-    const taskForItem = this.tasks.get(item.taskId);
-    if (!taskForItem) throw notFound("task", item.taskId);
+    const { item, repeatIndex, task: taskForItem } = claim;
     const evalSnapshot =
       input.evalSnapshot &&
       input.taskId === item.taskId
@@ -4837,6 +5201,36 @@ export class MemoryQueries implements QueryStore {
 
   countUsers(): number {
     return this.users.size;
+  }
+
+  addProjectMember(projectId: string, userId: string): void {
+    if (!this.getProject(projectId)) throw notFound("project", projectId);
+    if (!this.getUser(userId)) throw notFound("user", userId);
+    const key = `${projectId}\0${userId}`;
+    if (this.projectMembers.has(key)) return;
+    this.projectMembers.set(key, { projectId, userId, createdAt: nowIso() });
+  }
+
+  removeProjectMember(projectId: string, userId: string): void {
+    this.projectMembers.delete(`${projectId}\0${userId}`);
+  }
+
+  listProjectMembers(projectId: string): string[] {
+    return [...this.projectMembers.values()]
+      .filter((row) => row.projectId === projectId)
+      .map((row) => row.userId)
+      .sort();
+  }
+
+  listUserProjectIds(userId: string): string[] {
+    return [...this.projectMembers.values()]
+      .filter((row) => row.userId === userId)
+      .map((row) => row.projectId)
+      .sort();
+  }
+
+  isProjectMember(projectId: string, userId: string): boolean {
+    return this.projectMembers.has(`${projectId}\0${userId}`);
   }
 
   // ---- Settings (P9) ----

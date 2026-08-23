@@ -1,0 +1,1 @@
+injection/report-bad.yaml: the injection finding is cited at file:logs/agent-stdout.log#L180-L182, out of bounds for a 150-line file -> b-refs-resolve

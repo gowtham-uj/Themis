@@ -176,9 +176,9 @@ describe("Idempotency-Key (P8b)", () => {
     expect(b.json).toEqual({ n: 1 });
     expect(executions).toBe(1);
 
-    // Store key includes method+path.
+    // Store key includes caller + method+path.
     expect(
-      store.has(idempotencyStoreKey("POST", "/echo", "wrap-1")),
+      store.has(idempotencyStoreKey("POST", "/echo", "wrap-1", "remote:127.0.0.1")),
     ).toBe(true);
   });
 

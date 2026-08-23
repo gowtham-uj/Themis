@@ -117,11 +117,16 @@ export function handleError(res: ServerResponse, err: unknown): void {
     }
     return;
   }
-  const message =
-    err instanceof Error ? err.message : typeof err === "string" ? err : "Internal Server Error";
+  // Log the real error server-side; never echo internal details (paths, SQL,
+  // stack traces, secrets) to clients on a 500.
+  // eslint-disable-next-line no-console
+  console.error(
+    "[api] unhandled error:",
+    err instanceof Error ? (err.stack ?? err.message) : String(err),
+  );
   apiError(res, 500, {
     title: "Internal Server Error",
-    detail: message,
+    detail: "Internal Server Error",
     type: "https://agenteval.dev/errors/internal",
   });
 }

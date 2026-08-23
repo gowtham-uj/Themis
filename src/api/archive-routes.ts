@@ -17,8 +17,8 @@
  *   task_id, agent_id, limit, offset
  */
 
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { relative, resolve, sep } from "node:path";
 import { getRequestAuth } from "./auth.js";
@@ -194,15 +194,63 @@ export function filterArchiveEntries(entries: ArchiveEntry[], params: Record<str
   return filtered;
 }
 
+/**
+ * Prefer keyset pagination on (archivedAt DESC, runId DESC). Offset remains
+ * accepted for compatibility but is not the WP-4 authority — clients should
+ * follow next_cursor. Catalog rows still load from the structured index helper
+ * (not a filesystem walk); index.json is an implementation detail of that
+ * helper, not something routes may open directly.
+ */
 function paginate(entries: ArchiveEntry[], params: Record<string, string | undefined>): {
   total: number;
   offset: number;
   limit: number;
   page: ArchiveEntry[];
+  has_more: boolean;
+  next_cursor: string | null;
 } {
   const limit = Math.min(parseInt(getStr(params, "limit") ?? "100", 10) || 100, 500);
-  const offset = Math.max(parseInt(getStr(params, "offset") ?? "0", 10) || 0, 0);
-  return { total: entries.length, offset, limit, page: entries.slice(offset, offset + limit) };
+  const sorted = [...entries].sort((a, b) => {
+    const byTime = b.archivedAt.localeCompare(a.archivedAt);
+    return byTime !== 0 ? byTime : b.runId.localeCompare(a.runId);
+  });
+
+  const cursor = getStr(params, "cursor") ?? getStr(params, "next_cursor");
+  let start = 0;
+  if (cursor) {
+    try {
+      const [archivedAt, runId] = JSON.parse(
+        Buffer.from(cursor, "base64url").toString("utf8"),
+      ) as [string, string];
+      start = sorted.findIndex(
+        (e) =>
+          e.archivedAt < archivedAt ||
+          (e.archivedAt === archivedAt && e.runId < runId),
+      );
+      if (start < 0) start = sorted.length;
+    } catch {
+      start = 0;
+    }
+  } else {
+    // Legacy offset path — kept so existing clients do not break during cutover.
+    start = Math.max(parseInt(getStr(params, "offset") ?? "0", 10) || 0, 0);
+  }
+
+  const page = sorted.slice(start, start + limit);
+  const hasMore = start + limit < sorted.length;
+  const last = page.at(-1);
+  const next_cursor =
+    hasMore && last
+      ? Buffer.from(JSON.stringify([last.archivedAt, last.runId]), "utf8").toString("base64url")
+      : null;
+  return {
+    total: sorted.length,
+    offset: start,
+    limit,
+    page,
+    has_more: hasMore,
+    next_cursor,
+  };
 }
 
 async function findArchive(dataDir: string, runId: string, projectId?: string): Promise<ArchiveEntry | null> {
@@ -248,12 +296,14 @@ export function registerArchiveRoutes(router: Router): void {
     const authProjectId = app.authEnabled ? getRequestAuth(req)?.projectId ?? null : null;
     let entries = await listArchiveEntries(app.dataDir, authProjectId ?? undefined);
     entries = filterArchiveEntries(entries, params);
-    const { total, offset, limit, page } = paginate(entries, params);
+    const { total, offset, limit, page, has_more, next_cursor } = paginate(entries, params);
     sendJson(res, 200, {
       total,
       count: page.length,
       offset,
       limit,
+      has_more,
+      next_cursor,
       archives: page.map(archiveJson),
     });
   });
@@ -266,13 +316,15 @@ export function registerArchiveRoutes(router: Router): void {
     const params = ctx.query ?? {};
     let entries = await listArchiveEntries(app.dataDir, projectId);
     entries = filterArchiveEntries(entries, params);
-    const { total, offset, limit, page } = paginate(entries, params);
+    const { total, offset, limit, page, has_more, next_cursor } = paginate(entries, params);
     sendJson(res, 200, {
       projectId,
       total,
       count: page.length,
       offset,
       limit,
+      has_more,
+      next_cursor,
       archives: page.map(archiveJson),
     });
   });
@@ -308,7 +360,7 @@ export function registerArchiveRoutes(router: Router): void {
     let entries = await listArchiveEntries(app.dataDir, projectId);
     entries = entries.filter((e) => e.agent.commit === agentCommit || e.agent.commit?.includes(agentCommit));
     entries = filterArchiveEntries(entries, params);
-    const { total, offset, limit, page } = paginate(entries, params);
+    const { total, offset, limit, page, has_more, next_cursor } = paginate(entries, params);
     sendJson(res, 200, {
       projectId,
       agentCommit,
@@ -316,6 +368,8 @@ export function registerArchiveRoutes(router: Router): void {
       count: page.length,
       offset,
       limit,
+      has_more,
+      next_cursor,
       archives: page.map(archiveJson),
     });
   });
@@ -345,23 +399,46 @@ export function registerArchiveRoutes(router: Router): void {
 }
 
 async function serveArchiveFile(res: ServerResponse, filePath: string, requested: string): Promise<void> {
+  // lstat (not stat) so a symlink planted inside a sealed archive can never be
+  // followed to a host file. Refuse symlinks and non-regular files outright.
   let metadata;
   try {
-    metadata = await stat(filePath);
+    metadata = await lstat(filePath);
   } catch {
     throw notFound(`archive file not found: ${requested}`);
   }
-  if (!metadata.isFile()) throw notFound(`archive file not found: ${requested}`);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw notFound(`archive file not found: ${requested}`);
+  }
 
-  const filename = requested.slice(requested.lastIndexOf("/") + 1).replace(/["\\]/g, "_");
+  // Strip CR/LF and control chars so a hostile path segment cannot inject a
+  // header line via Content-Disposition (or abort the response).
+  const filename = requested
+    .slice(requested.lastIndexOf("/") + 1)
+    .replace(/[\u0000-\u001f\u007f"\\]/g, "_")
+    .replace(/^\s+|\s+$/g, "") || "download";
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/octet-stream");
   res.setHeader("Content-Length", metadata.size);
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   res.setHeader("X-Content-Type-Options", "nosniff");
+  // Open with O_NOFOLLOW as defense in depth against a link swapped in between
+  // the lstat above and the read below. Use FileHandle.createReadStream so the
+  // handle owns its lifetime — passing the raw fd into fs.createReadStream
+  // leaves the FileHandle object unclosed and crashes Node 22+ on GC
+  // (ERR_INVALID_STATE), which previously took down the whole API mid-queue.
+  const fh = await open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   await new Promise<void>((resolveStream, reject) => {
-    const stream = createReadStream(filePath);
-    stream.on("error", reject);
+    const stream = fh.createReadStream({ autoClose: true });
+    const fail = (err: Error) => {
+      void fh.close().catch(() => undefined);
+      reject(err);
+    };
+    stream.on("error", fail);
+    res.on("close", () => {
+      // Client abort: ensure the handle cannot outlive the response.
+      if (!stream.destroyed) stream.destroy();
+    });
     stream.on("end", resolveStream);
     stream.pipe(res);
   });

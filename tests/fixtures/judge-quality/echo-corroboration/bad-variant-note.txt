@@ -1,0 +1,1 @@
+echo-corroboration/report-bad.yaml: a strength about what the agent did is backed by a web: ref (web:https://docs.example.com/api/dispatch) -> b-web-refs-not-findings

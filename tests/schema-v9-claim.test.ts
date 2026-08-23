@@ -252,6 +252,57 @@ async function exerciseClaimStore(q: QueryStore): Promise<void> {
     }),
   ).toThrow(/generation .* is closed/i);
 
+  // claimedRepeats is a cross-generation floor: a new batch must not re-claim
+  // work already claimed in a prior generation (E2E: API crash → new container
+  // was re-running finished evals and pushing claimedRepeats above repeats).
+  const bFloor = buildQueue(q, { itemRepeats: [1] });
+  const firstGen = q.claimQueueWork({
+    batchId: bFloor.batchId,
+    queueId: bFloor.queueId,
+    projectId: bFloor.projectId,
+    queueContainerId: bFloor.containerId,
+    snapshot: snapshot(bFloor),
+    agentId: "pi",
+  });
+  expect(firstGen.claimed).toBe(true);
+  expect(q.getEvalQueueItem(bFloor.itemIds[0]!)!.claimedRepeats).toBe(1);
+  q.updateQueueContainer(bFloor.containerId, { state: "stopped" });
+  const batch2 = q.createBatch({
+    taskId: null,
+    projectId: bFloor.projectId,
+    agentId: "pi",
+    model: "claude-opus-4-6",
+    provider: "anthropic",
+    repeats: 0,
+    trigger: "eval-queue",
+    triggerRef: bFloor.queueId,
+    queueId: bFloor.queueId,
+    queueRevision: 2,
+    accepting: true,
+  });
+  const container2 = q.createQueueContainer({
+    queueId: bFloor.queueId,
+    projectId: bFloor.projectId,
+    batchId: batch2.id,
+    image: "registry.example/pi:0123456",
+    state: "running",
+    workspaceDir: "/tmp/ws2",
+  });
+  const secondGen = q.claimQueueWork({
+    batchId: batch2.id,
+    queueId: bFloor.queueId,
+    projectId: bFloor.projectId,
+    queueContainerId: container2.id,
+    snapshot: {
+      ...snapshot({ queueId: bFloor.queueId, containerId: container2.id, batchId: batch2.id }),
+      queueRevision: 2,
+    },
+    agentId: "pi",
+  });
+  expect(secondGen.claimed).toBe(false);
+  expect(secondGen.closed).toBe(true);
+  expect(q.getEvalQueueItem(bFloor.itemIds[0]!)!.claimedRepeats).toBe(1);
+
   // Soft-deleted item is not claimable and not listed.
   const b2 = buildQueue(q, { itemRepeats: [1] });
   q.deleteEvalQueueItem(b2.itemIds[0]!);
@@ -334,11 +385,11 @@ describe("SCHEMA v9 + claim semantics (SQLite)", () => {
     await exerciseClaimStore(opened.queries);
   });
 
-  it("is schema version 9", async () => {
+  it("is schema version 10", async () => {
     const opened = openDb(await dataDir("agenteval-v9-schema-"));
     expect(opened.backend).toBe("sqlite");
-    expect(opened.raw!.pragma("user_version", { simple: true })).toBe(9);
-    expect(SCHEMA_VERSION).toBe(9);
+    expect(opened.raw!.pragma("user_version", { simple: true })).toBe(10);
+    expect(SCHEMA_VERSION).toBe(10);
     if (opened.raw) sqliteHandles.push(opened.raw);
   });
 
@@ -354,7 +405,7 @@ describe("SCHEMA v9 + claim semantics (SQLite)", () => {
     const reopened = openDb(dir);
     if (reopened.raw) sqliteHandles.push(reopened.raw);
     const rb = reopened.raw!;
-    expect(rb.pragma("user_version", { simple: true })).toBe(9);
+    expect(rb.pragma("user_version", { simple: true })).toBe(10);
     // task_id column now nullable.
     const taskCol = rb
       .prepare("PRAGMA table_info(run_batches)")
@@ -451,7 +502,7 @@ describe("SCHEMA v9 + claim semantics (SQLite)", () => {
     const reopened = openDb(dir);
     if (reopened.raw) sqliteHandles.push(reopened.raw);
     const rb = reopened.raw!;
-    expect(rb.pragma("user_version", { simple: true })).toBe(9);
+    expect(rb.pragma("user_version", { simple: true })).toBe(10);
 
     // The batch row survived the rebuild with its task link intact.
     const batched = rb

@@ -154,38 +154,20 @@ export async function handleWatcherCommit(input: {
   const resolved = await seams.resolveSha(rule.repo, targetRef);
   const sha = resolved.sha;
 
-  // Dedup: this watcher has already queued/launched/pending this exact SHA.
-  const already = queries.listWatcherEvents(rule.projectId, { ruleId: rule.id })
-    .some(
-      (e) =>
-        e.resolvedSha === sha &&
-        ["pending", "launching", "launched"].includes(e.status),
-    );
-  if (already) {
-    const ev = queries.recordWatcherEvent({
-      ruleId: rule.id,
-      projectId: rule.projectId,
-      queueId,
-      trigger: rule.trigger,
-      ref: targetRef,
-      resolvedSha: sha,
-      status: "deduped",
-    });
-    return { status: "deduped", event: ev };
-  }
-
-  // Durable pending FIFO event.
-  const fifoSeq = queries.nextWatcherFifoSeq(queueId);
-  const pending = queries.recordWatcherEvent({
+  // Durable pending FIFO event with atomic SHA dedupe. Concurrent identical
+  // webhooks cannot both become pending for the same rule+sha.
+  const enqueued = queries.enqueueWatcherPendingEvent({
     ruleId: rule.id,
     projectId: rule.projectId,
     queueId,
     trigger: rule.trigger,
     ref: targetRef,
     resolvedSha: sha,
-    status: "pending",
-    fifoSeq,
   });
+  if (enqueued.status === "deduped") {
+    return { status: "deduped", event: enqueued.event };
+  }
+  const pending = enqueued.event;
 
   // Launch immediately when no generation is active. If an active generation
   // exists, the pending event is auto-launched when it closes (FIFO).

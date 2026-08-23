@@ -25,6 +25,7 @@ import type {
   ProjectAgentAdapter,
   UpdateProjectAgentAdapterInput,
 } from "../db/queries.js";
+import { requireAdminRequest } from "./auth.js";
 import { badRequest, conflict, notFound } from "./errors.js";
 import { readJsonBody, sendJson, type RequestContext, type Router } from "./router.js";
 
@@ -37,6 +38,7 @@ const PARSERS = new Set<CliAdapterParserKind>([
 interface AdapterAppCtx {
   queries: DbQueries;
   dataDir: string;
+  authEnabled: boolean;
 }
 
 function appOf(ctx: RequestContext): AdapterAppCtx {
@@ -559,6 +561,13 @@ export function registerAdapterRoutes(router: Router): void {
     const projectId = ctx.params.id!;
     requireProject(app.queries, projectId);
     const body = await readJsonBody<Record<string, unknown>>(req);
+    if (
+      body.containerfile !== undefined ||
+      body.source_repo !== undefined ||
+      body.sourceRepo !== undefined
+    ) {
+      requireAdminRequest(req, app.queries, app.authEnabled);
+    }
     const agentId = body.agent_id ?? body.agentId;
     if (typeof agentId !== "string" || !/^[A-Za-z0-9._-]+$/.test(agentId)) {
       throw badRequest("agent_id is required and may contain letters, numbers, dot, underscore, or dash");
@@ -666,6 +675,15 @@ export function registerAdapterRoutes(router: Router): void {
       throw conflict("stop all project queue containers before editing the agent adapter");
     }
     const body = await readJsonBody<Record<string, unknown>>(req);
+    if (
+      body.containerfile !== undefined ||
+      body.source_repo !== undefined ||
+      body.sourceRepo !== undefined ||
+      body.install_type !== undefined ||
+      body.installType !== undefined
+    ) {
+      requireAdminRequest(req, app.queries, app.authEnabled);
+    }
     const references = queuesReferencingAdapter(app.queries, existing.id);
     const metadataOnly = new Set(["name", "description"]);
     const changesExecutionContract = Object.keys(body).some((key) => !metadataOnly.has(key));
@@ -762,10 +780,11 @@ export function registerAdapterRoutes(router: Router): void {
 
   router.post(
     "/api/projects/:id/adapters/:adapterId/build",
-    async (_req, res, ctx) => {
+    async (req, res, ctx) => {
       const app = appOf(ctx);
       const projectId = ctx.params.id!;
       requireProject(app.queries, projectId);
+      requireAdminRequest(req, app.queries, app.authEnabled);
       const adapter = requireAdapter(app.queries, projectId, ctx.params.adapterId!);
       const references = queuesReferencingAdapter(app.queries, adapter.id);
       if (references.length > 0) {
@@ -789,6 +808,7 @@ export function registerAdapterRoutes(router: Router): void {
       const app = appOf(ctx);
       const projectId = ctx.params.id!;
       requireProject(app.queries, projectId);
+      requireAdminRequest(req, app.queries, app.authEnabled);
       const body = await readJsonBody<{
         agent_id?: string;
         agentId?: string;
@@ -835,7 +855,12 @@ export function registerAdapterRoutes(router: Router): void {
         ...(sourceRef ? { sourceRef } : {}),
         provider,
         model,
-        credentials: collectHarnessCredentials(),
+        // The generator only needs credential NAMES to emit its contract; it
+        // must never receive real secret values (a caller-supplied script runs
+        // unsandboxed and could otherwise exfiltrate every provider key).
+        credentials: Object.fromEntries(
+          Object.keys(collectHarnessCredentials()).map((name) => [name, `<redacted:${name}>`]),
+        ),
       });
 
       // Validate the emitted structure through the same validators as raw POST.

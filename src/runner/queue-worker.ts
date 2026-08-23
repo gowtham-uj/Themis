@@ -1,6 +1,6 @@
 /** Sequential eval execution inside one persistent queue-owned container. */
 
-import { cp, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Adapter, RunContext } from "../adapters/types.js";
 import { getAdapter } from "../adapters/index.js";
@@ -161,6 +161,12 @@ export async function startQueueContainer(
     throw Object.assign(new Error(`queue ${queueId} already has a live container`), {
       code: "ALREADY_ACTIVE",
     });
+  }
+  // A crashed previous process can leave a permanent active container row with
+  // no live handle. Recover only clearly stale rows here; createServer also
+  // recovers every abandoned active generation at boot.
+  if (!existing) {
+    queries.recoverStaleQueueContainers({ olderThanMs: 5 * 60_000 });
   }
   if (queries.getActiveQueueContainer(queueId)) {
     throw Object.assign(new Error(`queue ${queueId} already has an active container record`), {
@@ -402,41 +408,52 @@ export async function startQueueContainer(
     networkPolicy: containerNetwork,
   };
 
-  // Create the generation record (batch = container-holding generation; one batch
-  // owns many evals; task_id null). No runs are pre-created.
-  const batch = queries.createBatch({
-    taskId: null,
-    projectId: queue.projectId,
-    agentId: queue.agentId,
-    model: queue.model,
-    provider: queue.provider,
-    params: seedResolved?.params ?? {},
-    repeats: 0,
-    trigger: "eval-queue",
-    triggerRef: queue.id,
-    agentImage: image,
-    agentImageId: builtEvalImage.imageId,
-    agentCommit: build ? build.commit : (queue.agentCommit ?? undefined),
-    agentVersion: build ? build.version : undefined,
-    buildId: build ? build.buildId : undefined,
-    queueId: queue.id,
-    queueRevision: queue.revision,
-  });
-  const containerRow = queries.createQueueContainer({
-    queueId: queue.id,
-    projectId: queue.projectId,
-    batchId: batch.id,
-    image,
-    imageId: builtEvalImage.imageId,
-    agentCommit: build ? build.commit : (queue.agentCommit ?? null),
-    agentVersion: build ? build.version : null,
-    buildId: build ? build.buildId : null,
-    state: "starting",
-    workspaceDir,
-  });
+  // Create the generation record atomically (batch + active container + queue
+  // status). Concurrent starts lose the unique-active race here instead of
+  // leaving an orphan accepting batch.
+  let batch;
+  let containerRow;
+  try {
+    const generation = queries.beginQueueGeneration({
+      batch: {
+        taskId: null,
+        projectId: queue.projectId,
+        agentId: queue.agentId,
+        model: queue.model,
+        provider: queue.provider,
+        params: seedResolved?.params ?? {},
+        repeats: 0,
+        trigger: "eval-queue",
+        triggerRef: queue.id,
+        agentImage: image,
+        agentImageId: builtEvalImage.imageId,
+        agentCommit: build ? build.commit : (queue.agentCommit ?? undefined),
+        agentVersion: build ? build.version : undefined,
+        buildId: build ? build.buildId : undefined,
+        queueId: queue.id,
+        queueRevision: queue.revision,
+      },
+      container: {
+        queueId: queue.id,
+        projectId: queue.projectId,
+        image,
+        imageId: builtEvalImage.imageId,
+        agentCommit: build ? build.commit : (queue.agentCommit ?? null),
+        agentVersion: build ? build.version : null,
+        buildId: build ? build.buildId : null,
+        state: "starting",
+        workspaceDir,
+      },
+    });
+    batch = generation.batch;
+    containerRow = generation.container;
+  } catch (err) {
+    const code = err && typeof err === "object" ? (err as { code?: unknown }).code : undefined;
+    if (code === "ALREADY_ACTIVE") throw err;
+    throw err;
+  }
   generationSnapshot.batchId = batch.id;
   generationSnapshot.queueContainerId = containerRow.id;
-  queries.updateEvalQueue(queue.id, { status: "starting", activeBatchId: batch.id });
 
   let handle: ContainerHandle;
   try {
@@ -914,7 +931,12 @@ export async function startQueueContainer(
       releaseSlot();
       queries.updateQueueContainer(containerRow.id, {
         state: tainted ? "tainted" : "completed",
-        ...(tainted ? { error: "queue workspace cleanup/reset failed" } : {}),
+        ...(tainted
+          ? {
+              error:
+                "queue workspace hygiene failed (package-cleanup, cleanup, cleanup-verification, or workspace reset); shared container is unsafe for further claims",
+            }
+          : {}),
         stoppedAt: new Date().toISOString(),
       });
       queries.updateEvalQueue(queue.id, {
@@ -1594,18 +1616,38 @@ async function executeEval(input: {
   }
 
   input.setRecorder(null);
+  // Queue-level "tainted" means the SHARED container workspace is unsafe for
+  // the next eval (cleanup/reset/package-cleanup failed). It must NOT fire for
+  // per-run scoring/evidence gaps — a missing agent log or a failing verifier
+  // is a failed eval, not a poisoned queue. E2E saw reward=0 + missing
+  // task/.reaper/logs mark the whole generation tainted with the misleading
+  // error "queue workspace cleanup/reset failed" even when reset.ok was true.
   return {
-    tainted:
-      packageCleanup.error !== null ||
-      cleanup.error !== null ||
-      verification.error !== null ||
-      verifierError !== null ||
-      evidence.missingRequired.length > 0 ||
-      evidence.errors.length > 0 ||
-      !reset.ok ||
-      finalizationErrors.length > 0 ||
-      archiveError !== null,
+    tainted: computeQueueWorkspaceTaint({
+      packageCleanupError: packageCleanup.error,
+      cleanupError: cleanup.error,
+      verificationError: verification.error,
+      resetOk: reset.ok,
+    }),
   };
+}
+
+/**
+ * Whether an eval's post-run hygiene failed in a way that endangers later
+ * claims on the same persistent queue container.
+ */
+export function computeQueueWorkspaceTaint(input: {
+  packageCleanupError: string | null;
+  cleanupError: string | null;
+  verificationError: string | null;
+  resetOk: boolean;
+}): boolean {
+  return (
+    input.packageCleanupError !== null ||
+    input.cleanupError !== null ||
+    input.verificationError !== null ||
+    !input.resetOk
+  );
 }
 
 async function verifyAdapterConnection(input: {
@@ -1750,13 +1792,15 @@ function collectApiKeys(): Record<string, string> {
     "NURALWATT_BASE_URL",
     "ANTHROPIC_BASE_URL",
     "DEEPSEEK_API_KEY",
-    // Self-signed / short-lived proxy TLS: the OpenAI-compatible provider uses
-    // Node fetch, which honors this in-process. It is deliberately passed so a
-    // CLI-proxy connection object can work without trusting its cert chain.
-    "NODE_TLS_REJECT_UNAUTHORIZED",
   ]) {
     const value = process.env[name];
     if (value) keys[name] = value;
+  }
+  // Disabling TLS verification inside the agent container enables MITM of model
+  // traffic. It is only carried in when the operator explicitly opts in for a
+  // self-signed proxy; it is never forwarded by default.
+  if (process.env.AGENTEVAL_ALLOW_INSECURE_TLS === "1" && process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
+    keys.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   }
   if (!keys.ANTHROPIC_API_KEY && keys.ANTHROPIC_AUTH_TOKEN) {
     keys.ANTHROPIC_API_KEY = keys.ANTHROPIC_AUTH_TOKEN;
@@ -1819,6 +1863,16 @@ async function copyRetainedEvidence(
     const source = resolve(root, relativePath);
     if (source !== root && !source.startsWith(`${root}${sep}`)) {
       errors.push(`adapter evidence path escapes workspace: ${relativePath}`);
+      continue;
+    }
+    // Reject symlinks: an agent can plant `ln -s /etc/passwd /workspace/outputs`
+    // and, if the link were copied into the retained tree and sealed, the archive
+    // API could later follow it back to the host. Symlinks are forbidden in
+    // retained evidence; a required symlink is a missing-required error.
+    const sourceStat = await lstat(source).catch(() => null);
+    if (sourceStat?.isSymbolicLink()) {
+      errors.push(`adapter evidence path is a symlink and was not retained: ${relativePath}`);
+      if (required.has(relativePath)) missingRequired.push(relativePath);
       continue;
     }
     try {

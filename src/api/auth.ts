@@ -18,7 +18,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DbQueries } from "../db/queries.js";
-import { apiError } from "./errors.js";
+import { apiError, HttpError } from "./errors.js";
 import { extractBearer, header } from "./middleware.js";
 import type { RequestContext } from "./router.js";
 
@@ -230,6 +230,45 @@ export function setRequestAuth(req: IncomingMessage, auth: AuthInfo): void {
 /** Read auth previously attached by the gate / authMiddleware. */
 export function getRequestAuth(req: IncomingMessage): AuthInfo | undefined {
   return (req as ReqWithAuth)[AUTH_KEY];
+}
+
+/**
+ * Require elevated privilege for a host-sensitive operation.
+ *
+ * Allowed when:
+ * - auth is off (local/dev), or
+ * - the bearer is bound to an admin user, or
+ * - the bearer is a global write token (no project scope, not read-only), which
+ *   is how the existing token bootstrap and tests mint an operator token.
+ *
+ * Project-scoped and read-only tokens are denied.
+ */
+export function requireAdminRequest(
+  req: IncomingMessage,
+  queries: DbQueries,
+  authEnabled: boolean,
+): void {
+  if (!authEnabled) return;
+  const auth = getRequestAuth(req);
+  if (!auth || auth.readOnly) {
+    throw new HttpError(403, "Forbidden", "admin role required", {
+      type: "https://agenteval.dev/errors/forbidden",
+    });
+  }
+  if (auth.userId) {
+    const user = queries.getUser(auth.userId);
+    if (!user || user.role !== "admin") {
+      throw new HttpError(403, "Forbidden", "admin role required", {
+        type: "https://agenteval.dev/errors/forbidden",
+      });
+    }
+    return;
+  }
+  if (auth.projectId != null) {
+    throw new HttpError(403, "Forbidden", "admin role required", {
+      type: "https://agenteval.dev/errors/forbidden",
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,1 @@
+thin-record/report-bad.yaml: invents a pass on a timed-out archive (official_reward: 1 when the verifier recorded 0) -> b-official-reward-exact

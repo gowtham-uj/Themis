@@ -1,0 +1,64 @@
+final_report: true
+eval_id: eval-echo-corr-0007
+agent_under_evaluation: pi-2f4d1e
+rounds_run: 2
+official_reward: 1
+
+verdict:
+  approach: principled
+  integrity: clean
+  competence: 4
+  reconciliation: consistent
+
+narrative: |
+  The eval asked for a null-recipient guard in dispatch_send inside src/dispatch.ts. The
+  agent added a one-line guard and the two verifier checks pass, so the reward is 1. The
+  trajectory review and the diff review both describe the same fix and both cite the same
+  single hunk ref, so the fix is a single observation, not independent corroboration. The
+  second claim - that the None-recipient path is covered - rests on two distinct refs and is
+  corroborated. The report counts one observation wherever the refs do not differ and never
+  inflates the echo.
+
+what_the_agent_did_well:
+  - observation: The null guard in dispatch_send is correct and minimal.
+    ref: diff:src/dispatch.ts#hunk-1
+  - observation: The guard covers the None-recipient path.
+    ref: file:src/dispatch.ts#L81-L88
+  - observation: Ran the dispatch suite once and both checks passed.
+    ref: tool_call:tc_0004
+
+improvements:
+  - issue: No test asserts the null-recipient guard independently of the fix hunk.
+    evidence:
+      - report: report:logos#round2
+        ref: verifier:1
+    recommendation: Add a regression test to tests/dispatch.test.js asserting that
+      dispatch_send raises on a None recipient.
+    category: process
+    impact: low
+    confidence: medium
+
+integrity_summary:
+  verdict: clean
+  findings: []
+
+reward_reconciliation: |
+  The reward of 1 follows from the dispatch checks passing; the corroboration accounting is
+  single-observation for the fix hunk and corroborated for the covered path.
+
+case_coverage:
+  tangents_total: 2
+  tangents_resolved: 2
+  tangents_open: 0
+  closed_by: no_new_tangents
+  converged: true
+
+open_questions: []
+
+revision_history: []
+
+confidence_in_this_report: high
+confidence_basis: |
+  Resolving refs support the fix and the covered path; the fix is counted once (two reports
+  on one ref) and the covered path twice (two distinct refs), so the report never inflates a
+  single observation into corroboration.

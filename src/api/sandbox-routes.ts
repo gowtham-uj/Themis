@@ -16,6 +16,7 @@
  */
 
 import type { DbQueries } from "../db/queries.js";
+import { requireAdminRequest } from "./auth.js";
 import {
   resolveSandboxPolicy,
   SANDBOX_PRESETS,
@@ -34,6 +35,7 @@ import {
 /** Minimal AppCtx surface these routes need. */
 export interface SandboxAppCtx {
   queries: DbQueries;
+  authEnabled: boolean;
 }
 
 function appOf(ctx: RequestContext): SandboxAppCtx {
@@ -44,6 +46,21 @@ function requireProject(queries: DbQueries, id: string) {
   const p = queries.getProject(id);
   if (!p || p.archived) throw notFound(`project not found: ${id}`);
   return p;
+}
+
+function needsAdmin(policy: SandboxPolicy): boolean {
+  const dangerousCaps = new Set(["ALL", "SYS_ADMIN", "SYS_PTRACE", "DAC_READ_SEARCH", "DAC_OVERRIDE"]);
+  return (
+    policy.profile === "privileged" ||
+    policy.privileged ||
+    policy.mounts.length > 0 ||
+    policy.devices.length > 0 ||
+    policy.capAdd.some((cap) => dangerousCaps.has(cap)) ||
+    policy.seccomp === "unconfined" ||
+    policy.user === "root" ||
+    policy.user === "0" ||
+    policy.user?.startsWith("0:") === true
+  );
 }
 
 /** Wire shape: snake_case, with the resolved policy alongside the raw blob. */
@@ -171,6 +188,9 @@ export function registerSandboxRoutes(router: Router): void {
     // Resolve before storing so a policy that resolves to nothing usable is
     // rejected loudly here rather than silently ignored at run start.
     const resolved = resolveSandboxPolicy(next);
+    if (needsAdmin(resolved)) {
+      requireAdminRequest(req, app.queries, app.authEnabled);
+    }
     const updated = app.queries.updateProject(project.id, { sandbox: next });
     sendJson(res, 200, sandboxJson(updated.id, updated.sandbox, resolved));
   };

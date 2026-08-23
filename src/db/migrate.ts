@@ -241,6 +241,9 @@ const DDL: string[] = [
     updated_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_queue_containers_queue_state ON queue_containers(queue_id, state)`,
+  `DROP INDEX IF EXISTS idx_queue_containers_one_active`,
+  // One active generation per queue. Matches isActiveContainerState().
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_containers_one_active ON queue_containers(queue_id) WHERE stopped_at IS NULL AND state NOT IN ('stopped','failed')`,
 
   `CREATE TABLE IF NOT EXISTS watcher_rules (
     id TEXT PRIMARY KEY,
@@ -311,6 +314,8 @@ const DDL: string[] = [
     processed_sha TEXT,
     error TEXT
   )`,
+  // Active watcher SHA dedupe (pending/launching/launched).
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_watcher_events_active_sha ON watcher_events(rule_id, resolved_sha) WHERE status IN ('pending','launching','launched') AND resolved_sha IS NOT NULL`,
 
   `CREATE TABLE IF NOT EXISTS queue_entries (
     id TEXT PRIMARY KEY,
@@ -398,6 +403,16 @@ const DDL: string[] = [
     revoked_at TEXT
   )`,
   `CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash)`,
+
+  // Project membership (v10): non-admin users are scoped to member projects.
+  `CREATE TABLE IF NOT EXISTS project_members (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(project_id, user_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_project_members_project ON project_members(project_id)`,
 
   // Deterministic check results (P9, rubric.md §5). This run-keyed table lets API consumers query deterministic check results.
   `CREATE TABLE IF NOT EXISTS check_results (
@@ -521,6 +536,28 @@ function dropRemovedCapabilityTables(db: Database.Database): void {
  * Idempotent — checks the live column constraint before rebuilding.
  */
 function rebuildRunBatchesNullableTaskId(db: Database.Database): void {
+  // Crash recovery: if a previous run died between `DROP TABLE run_batches`
+  // and `ALTER TABLE run_batches_v9 RENAME`, the live table is gone (and was
+  // recreated empty by the IF NOT EXISTS DDL) while run_batches_v9 still holds
+  // the real rows. Restore from the staging copy before anything else.
+  const staging = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='run_batches_v9'",
+  ).get();
+  if (staging) {
+    const liveCount = (
+      db.prepare("SELECT COUNT(*) AS n FROM run_batches").get() as { n: number }
+    ).n;
+    const stagingCount = (
+      db.prepare("SELECT COUNT(*) AS n FROM run_batches_v9").get() as { n: number }
+    ).n;
+    if (stagingCount > 0 && liveCount === 0) {
+      db.pragma("foreign_keys = OFF");
+      db.exec("DROP TABLE run_batches");
+      db.exec("ALTER TABLE run_batches_v9 RENAME TO run_batches");
+      db.pragma("foreign_keys = ON");
+    }
+  }
+
   const cols = db.prepare("PRAGMA table_info(run_batches)").all() as Array<{
     name: string;
     notnull: number;
@@ -529,7 +566,7 @@ function rebuildRunBatchesNullableTaskId(db: Database.Database): void {
   if (!taskCol || taskCol.notnull === 0) return; // already nullable / absent
 
   db.pragma("foreign_keys = OFF");
-  db.exec(`CREATE TABLE run_batches_v9 (
+  db.exec(`CREATE TABLE IF NOT EXISTS run_batches_v9 (
     id TEXT PRIMARY KEY,
     task_id TEXT REFERENCES tasks(id),
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -552,15 +589,29 @@ function rebuildRunBatchesNullableTaskId(db: Database.Database): void {
     closed_revision INTEGER,
     closed_at TEXT
   )`);
-  db.exec(`INSERT INTO run_batches_v9 (
-    id, task_id, project_id, agent_id, model, provider, params_json, repeats,
-    trigger, trigger_ref, agent_image, agent_commit, agent_image_id, agent_version,
-    build_id, queue_id, queue_revision, created_at, accepting, closed_revision, closed_at
-  ) SELECT
-    id, task_id, project_id, agent_id, model, provider, params_json, repeats,
-    trigger, trigger_ref, agent_image, agent_commit, NULL, NULL, NULL,
-    queue_id, queue_revision, created_at, 1, NULL, NULL
-  FROM run_batches`);
+  // Idempotent copy: only fill run_batches_v9 when it is empty, so a crash
+  // after the copy but before the rename restarts from the intact copy instead
+  // of re-running DDL against a half-migrated source.
+  const stagingCount = (db.prepare(
+    "SELECT COUNT(*) AS n FROM run_batches_v9",
+  ).get() as { n: number }).n;
+  if (stagingCount === 0) {
+    db.exec(`INSERT INTO run_batches_v9 (
+      id, task_id, project_id, agent_id, model, provider, params_json, repeats,
+      trigger, trigger_ref, agent_image, agent_commit, agent_image_id, agent_version,
+      build_id, queue_id, queue_revision, created_at, accepting, closed_revision, closed_at
+    ) SELECT
+      id, task_id, project_id, agent_id, model, provider, params_json, repeats,
+      trigger, trigger_ref, agent_image, agent_commit, NULL, NULL, NULL,
+      queue_id, queue_revision, created_at, 1, NULL, NULL
+    FROM run_batches`);
+  }
+  // The copy is durable in run_batches_v9; now swap. A crash between DROP and
+  // RENAME leaves run_batches missing but run_batches_v9 intact, and the next
+  // boot's early return (taskCol absent → rebuild skipped) would recreate an
+  // empty run_batches via IF NOT EXISTS. Guard that with a source-existence
+  // check: only rebuild when the live table actually holds the old NOT NULL
+  // constraint, and never when only run_batches_v9 survives.
   db.exec("DROP TABLE run_batches");
   db.exec("ALTER TABLE run_batches_v9 RENAME TO run_batches");
   db.pragma("foreign_keys = ON");

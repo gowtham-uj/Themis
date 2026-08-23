@@ -94,14 +94,50 @@ function repoForProjectAgent(
   return parsed;
 }
 
-/** Repo from the query string, or 400. */
-function repoFromQuery(ctx: RequestContext): RepoRef {
-  const raw = ctx.query.repo ?? ctx.query.repository ?? "";
-  const repo = parseRepoRef(raw);
-  if (!repo) {
-    throw badRequest("repo is required, as owner/name or a GitHub URL");
+/**
+ * The repo these routes may hit. Without `?repo=` the project adapter's own
+ * source repo is used (as before). When `?repo=` is supplied and the project
+ * has a source-built adapter, it MUST match that adapter's repo — otherwise any
+ * bearer could point the server's GitHub token at arbitrary private repos.
+ * The caller-supplied `?repo=` escape hatch remains only for projects that have
+ * no source-built adapter yet (browse a repo before pinning it).
+ */
+function repoForRequest(
+  queries: DbQueries,
+  projectId: string,
+  agentId: string,
+  ctx: RequestContext,
+): RepoRef {
+  const raw = ctx.query.repo ?? ctx.query.repository;
+  if (raw == null) {
+    return repoForProjectAgent(queries, projectId, agentId);
   }
-  return repo;
+  const requested = parseRepoRef(raw);
+  if (!requested) throw badRequest("repo is required, as owner/name or a GitHub URL");
+
+  // Find the adapter's source repo without throwing for projects that have none.
+  const project = queries.getProject(projectId);
+  if (!project || project.archived) {
+    throw notFound(`project not found: ${projectId}`);
+  }
+  const adapter = selectedAdapterForQueue(queries, projectId, agentId);
+  const repoSource = adapter?.sourceRepo;
+  if (adapter && repoSource && adapter.installType === "source-build") {
+    const pinned = parseRepoRef(repoSource);
+    if (
+      pinned &&
+      (pinned.owner.toLowerCase() !== requested.owner.toLowerCase() ||
+        pinned.name.toLowerCase() !== requested.name.toLowerCase())
+    ) {
+      throw new HttpError(
+        403,
+        "Forbidden",
+        "repo must match the project adapter's source_repo",
+        { type: "https://agenteval.dev/errors/forbidden" },
+      );
+    }
+  }
+  return requested;
 }
 
 /** Turn a GitHubError into the matching HTTP error. */
@@ -130,9 +166,7 @@ export function registerGitHubRoutes(router: Router): void {
     const projectId = ctx.params.id!;
     const agentId = ctx.query.agent_id ?? ctx.query.agentId;
     if (!agentId) throw badRequest("agent_id is required");
-    const repo = ctx.query.repo
-      ? repoFromQuery(ctx)
-      : repoForProjectAgent(app.queries, projectId, agentId);
+    const repo = repoForRequest(app.queries, projectId, agentId, ctx);
     try {
       const commits = await clientFor(app).listCommits(repo, {
         ...(ctx.query.ref ? { ref: ctx.query.ref } : {}),
@@ -164,9 +198,7 @@ export function registerGitHubRoutes(router: Router): void {
     const projectId = ctx.params.id!;
     const agentId = ctx.query.agent_id ?? ctx.query.agentId;
     if (!agentId) throw badRequest("agent_id is required");
-    const repo = ctx.query.repo
-      ? repoFromQuery(ctx)
-      : repoForProjectAgent(app.queries, projectId, agentId);
+    const repo = repoForRequest(app.queries, projectId, agentId, ctx);
     try {
       const [branches, tags] = await Promise.all([
         clientFor(app).listBranches(repo),
@@ -199,9 +231,7 @@ export function registerGitHubRoutes(router: Router): void {
     if (!agentId) throw badRequest("agent_id is required");
     const ref = body.ref ?? body.commit ?? body.sha;
     if (!ref || !String(ref).trim()) throw badRequest("ref is required");
-    const repo = ctx.query.repo
-      ? repoFromQuery(ctx)
-      : repoForProjectAgent(app.queries, projectId, agentId);
+    const repo = repoForRequest(app.queries, projectId, agentId, ctx);
     try {
       const c = await clientFor(app).resolveCommit(repo, String(ref).trim());
       sendJson(res, 200, {

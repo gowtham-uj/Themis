@@ -30,7 +30,7 @@ import {
   type ResolvedAgentCommit,
 } from "../runner/adapter-build.js";
 import { isTerminalStatus } from "../runner/status.js";
-import { getRequestAuth, isLoopbackAddress } from "./auth.js";
+import { getRequestAuth, isLoopbackAddress, requireAdminRequest } from "./auth.js";
 import { badRequest, conflict, HttpError, notFound } from "./errors.js";
 import {
   readJsonBody,
@@ -738,9 +738,12 @@ export function registerQueueRoutes(router: Router): void {
       // Body digest defaults to empty-body hash (this endpoint sends no body);
       // a retry with the same key and the same empty body replays the 202.
       "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      async (_req, res, ctx) => {
+      async (req, res, ctx) => {
         const app = appOf(ctx);
         const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
+        // Starting a generation may build caller-supplied OCI definitions with
+        // rootful Podman; keep it behind the privileged admin boundary.
+        requireAdminRequest(req, app.queries, app.authEnabled);
         const startOpts = { ...app.queueStartOpts };
         try {
           const live = await startQueueContainer(
@@ -812,6 +815,10 @@ export function registerQueueRoutes(router: Router): void {
       const app = appOf(ctx);
       const queue = requireQueue(app.queries, ctx.params.id!, ctx.params.queueId!);
       assertBridgeAccess(req, app, queue.projectId);
+      // The bridge executes arbitrary shell as root inside the persistent
+      // container. In authenticated deployments only a user-bound admin may use
+      // it; project-scoped system tokens are insufficient.
+      requireAdminRequest(req, app.queries, app.authEnabled);
       const live = requireLiveQueue(app, queue);
       const input = parseExecBody(
         await readJsonBody<ExecBody>(req, { limitBytes: 256 * 1024 }),

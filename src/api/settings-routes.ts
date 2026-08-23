@@ -42,6 +42,57 @@ import {
 // Settings shape
 // ---------------------------------------------------------------------------
 
+/** In-process brute-force guard for the public login endpoint. */
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_BASE_LOCK_MS = 1_000;
+const LOGIN_MAX_LOCK_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ENTRIES = 10_000;
+
+type LoginFailureState = { failures: number; firstFailureAt: number; lockedUntil: number };
+const loginFailures = new Map<string, LoginFailureState>();
+
+function loginAttemptKey(req: IncomingMessage, username: string): string {
+  return `${req.socket.remoteAddress ?? "unknown"}\0${username.trim().toLowerCase()}`;
+}
+
+function loginRetryAfterMs(key: string, now = Date.now()): number {
+  const state = loginFailures.get(key);
+  if (!state) return 0;
+  if (now - state.firstFailureAt > LOGIN_WINDOW_MS) {
+    loginFailures.delete(key);
+    return 0;
+  }
+  return Math.max(0, state.lockedUntil - now);
+}
+
+function recordLoginFailure(key: string, now = Date.now()): void {
+  let state = loginFailures.get(key);
+  if (!state || now - state.firstFailureAt > LOGIN_WINDOW_MS) {
+    state = { failures: 0, firstFailureAt: now, lockedUntil: 0 };
+  }
+  state.failures += 1;
+  // First four failures are allowed without a lock; subsequent failures use
+  // exponential backoff capped at 15 minutes.
+  if (state.failures >= 5) {
+    const lockMs = Math.min(
+      LOGIN_MAX_LOCK_MS,
+      LOGIN_BASE_LOCK_MS * 2 ** Math.min(20, state.failures - 5),
+    );
+    state.lockedUntil = now + lockMs;
+  }
+  loginFailures.delete(key);
+  loginFailures.set(key, state);
+  while (loginFailures.size > LOGIN_MAX_ENTRIES) {
+    const oldest = loginFailures.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    loginFailures.delete(oldest);
+  }
+}
+
+function clearLoginFailures(key: string): void {
+  loginFailures.delete(key);
+}
+
 /** Well-known setting keys stored in the settings table. */
 export const SETTINGS_KEYS = {
   defaultModels: "defaults.models",
@@ -232,6 +283,18 @@ export function buildExportBundle(
     void _ws;
     return { ...rest, webhookSecret: null };
   });
+  // Strip host-absolute storage paths (events/diff/package) from exported rows —
+  // they are internal deployment details, never part of a portable bundle.
+  const stripHostPaths = (row: Record<string, unknown> | null | undefined) => {
+    if (!row || typeof row !== "object") return row;
+    const { eventsPath, diffPath, packagePath, manifestPath, workspaceDir, buildLogPath, logPath, ...rest } =
+      row as Record<string, unknown>;
+    void eventsPath; void diffPath; void packagePath;
+    void manifestPath; void workspaceDir; void buildLogPath; void logPath;
+    return rest;
+  };
+  const runs = rows.runs.map((r) => stripHostPaths(r as unknown as Record<string, unknown>));
+  const tasks = rows.tasks.map((t) => stripHostPaths(t as unknown as Record<string, unknown>));
   const paths = listProjectSubtreePaths(dataDir, projectId);
   const manifestBody = JSON.stringify({ projectId, paths });
   const digest = createHash("sha256").update(manifestBody, "utf8").digest("hex");
@@ -240,8 +303,8 @@ export function buildExportBundle(
     version: 1,
     exportedAt: new Date().toISOString(),
     project: rows.project,
-    tasks: rows.tasks,
-    runs: rows.runs,
+    tasks,
+    runs,
     watchers,
     paths,
     manifest: {
@@ -288,14 +351,40 @@ export function registerSettingsRoutes(router: Router): void {
     if (!username || !password) {
       throw badRequest("username and password are required");
     }
-    const result = loginUser(app.queries, username, password);
+    const attemptKey = loginAttemptKey(req, username);
+    const retryAfterMs = loginRetryAfterMs(attemptKey);
+    if (retryAfterMs > 0) {
+      res.setHeader("Retry-After", Math.max(1, Math.ceil(retryAfterMs / 1000)));
+      throw new HttpError(429, "Too Many Requests", "too many login attempts; retry later", {
+        type: "https://agenteval.dev/errors/rate-limited",
+      });
+    }
+    const result = await loginUser(app.queries, username, password, {
+      allowGlobalForAnyUser: !app.authEnabled,
+    });
     if (!result) {
+      recordLoginFailure(attemptKey);
       throw new HttpError(401, "Unauthorized", "invalid username or password", {
         type: "https://agenteval.dev/errors/unauthorized",
       });
     }
+    if (result.tokens.length === 0) {
+      throw new HttpError(
+        403,
+        "Forbidden",
+        "user has no project memberships; ask an admin to grant access",
+        { type: "https://agenteval.dev/errors/forbidden" },
+      );
+    }
+    clearLoginFailures(attemptKey);
+    // Backward-compatible: expose the first token as `token`, and the full set
+    // as `tokens` for multi-project members.
     sendJson(res, 200, {
-      token: result.token,
+      token: result.tokens[0]!.token,
+      tokens: result.tokens.map((t) => ({
+        token: t.token,
+        project_id: t.projectId,
+      })),
       user: toPublicUser(result.user),
     });
   });
@@ -358,10 +447,15 @@ export function registerSettingsRoutes(router: Router): void {
       throw badRequest("username and password are required");
     }
     try {
+      // Only honor a caller-supplied role when auth is enabled (an admin has
+      // already been verified by requireAdmin). With auth off, ignore it so an
+      // unauthenticated caller cannot self-register an admin account; the store's
+      // bootstrap rule (first user → admin) still allows local seeding.
+      const role = app.authEnabled && typeof body.role === "string" ? body.role : undefined;
       const user = registerUser(app.queries, {
         username: body.username,
         password: body.password,
-        ...(body.role ? { role: body.role } : {}),
+        ...(role !== undefined ? { role } : {}),
         ...(body.email !== undefined ? { email: body.email } : {}),
       });
       sendJson(res, 201, toPublicUser(user));
@@ -382,6 +476,40 @@ export function registerSettingsRoutes(router: Router): void {
     if (!existing) throw notFound(`user not found: ${id}`);
     app.queries.deleteUser(id);
     sendJson(res, 200, { deleted: true, id });
+  });
+
+  // ---- Project membership ----
+
+  router.get("/api/projects/:id/members", (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireAdmin(req, app.queries, app.authEnabled);
+    const projectId = ctx.params.id!;
+    if (!app.queries.getProject(projectId) || app.queries.getProject(projectId)?.archived) {
+      throw notFound(`project not found: ${projectId}`);
+    }
+    sendJson(res, 200, { members: app.queries.listProjectMembers(projectId) });
+  });
+
+  router.put("/api/projects/:id/members/:userId", (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireAdmin(req, app.queries, app.authEnabled);
+    const projectId = ctx.params.id!;
+    const userId = ctx.params.userId!;
+    if (!app.queries.getProject(projectId) || app.queries.getProject(projectId)?.archived) {
+      throw notFound(`project not found: ${projectId}`);
+    }
+    if (!app.queries.getUser(userId)) throw notFound(`user not found: ${userId}`);
+    app.queries.addProjectMember(projectId, userId);
+    sendJson(res, 200, { project_id: projectId, user_id: userId, member: true });
+  });
+
+  router.delete("/api/projects/:id/members/:userId", (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireAdmin(req, app.queries, app.authEnabled);
+    const projectId = ctx.params.id!;
+    const userId = ctx.params.userId!;
+    app.queries.removeProjectMember(projectId, userId);
+    sendJson(res, 200, { project_id: projectId, user_id: userId, member: false });
   });
 
   // ---- Project export ----

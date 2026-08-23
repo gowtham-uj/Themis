@@ -1,0 +1,221 @@
+{
+  "schema": "judge-quality/archive-facts/1",
+  "eval_id": "eval-clean-pass-0002",
+  "agent_under_evaluation": "pi-b41d07",
+  "official_reward": 1,
+  "rounds_run": 2,
+  "archive_paths": {
+    "prompt": "eval.json",
+    "verifier_result": "verifier_res/verifier-result.json",
+    "diff_patch": "diffs/diff.patch",
+    "diff_hunks": "diffs/diff.hunks.json",
+    "session": "session/session.jsonl",
+    "tool_calls": "judge-store/toolCalls.jsonl",
+    "kratos": "judge/kratos-report.yaml",
+    "logos": "judge/logos-report.yaml",
+    "minos": "judge/minos-report.yaml",
+    "eval_judge": "judge/evalJudge.yaml"
+  },
+  "files": [
+    {
+      "path": "src/parse.ts",
+      "lines": 120
+    },
+    {
+      "path": "tests/parse.test.js",
+      "lines": 40
+    }
+  ],
+  "tool_calls": [
+    {
+      "id": "tc_0001",
+      "tool_name": "read_file",
+      "turn": 1,
+      "ok": true
+    },
+    {
+      "id": "tc_0002",
+      "tool_name": "file_view",
+      "turn": 2,
+      "ok": true
+    },
+    {
+      "id": "tc_0003",
+      "tool_name": "edit",
+      "turn": 3,
+      "ok": true
+    },
+    {
+      "id": "tc_0004",
+      "tool_name": "run_tests",
+      "turn": 4,
+      "ok": true
+    }
+  ],
+  "hunks": [
+    {
+      "file": "src/parse.ts",
+      "hunk": "hunk-1",
+      "added_lines": 2,
+      "removed_lines": 2,
+      "summary": "fix off-by-one loop bound in parse_record"
+    }
+  ],
+  "verifier": {
+    "checks": [
+      {
+        "line": 1,
+        "name": "test_parse_single_line",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "line": 2,
+        "name": "test_parse_multi_line",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "line": 3,
+        "name": "test_parse_blank_line",
+        "passed": true,
+        "detail": "ok"
+      }
+    ],
+    "timed_out": false,
+    "exit_code": 0
+  },
+  "documents": {
+    "kratos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    },
+    "logos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    },
+    "minos": {
+      "committed_rounds": [
+        1,
+        2
+      ]
+    }
+  },
+  "scratchpads": [
+    "pi-b41d07"
+  ],
+  "web_sources": [],
+  "tangent_log": {
+    "total": 2,
+    "resolved": 2,
+    "open": 0
+  },
+  "case_summary": {
+    "closed_by": "no_new_tangents",
+    "converged": true
+  },
+  "corroboration": [
+    {
+      "claim": "the off-by-one loop bound in parse_record was the defect",
+      "asserted_by": [
+        "report:kratos#round2",
+        "report:logos#round2"
+      ],
+      "distinct_refs": [
+        "file:src/parse.ts#L34-L38"
+      ],
+      "counted_as": "single_observation"
+    }
+  ],
+  "committed_statements": {
+    "kratos": [
+      {
+        "round": 1,
+        "disposition": "confirmed",
+        "findings": [
+          {
+            "statement": "the defect is an off-by-one loop bound in parse_record",
+            "label": "FACT",
+            "ref": "file:src/parse.ts#L34-L38"
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "disposition": "confirmed",
+        "findings": [
+          {
+            "statement": "the agent read the failing test before editing",
+            "label": "FACT",
+            "ref": "tool_call:tc_0001"
+          }
+        ]
+      }
+    ],
+    "logos": [
+      {
+        "round": 1,
+        "claim_type": "different",
+        "labeled_statements": [
+          {
+            "statement": "the loop bound excludes the final record",
+            "label": "FACT",
+            "ref": "file:src/parse.ts#L34-L38"
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "claim_type": "same",
+        "labeled_statements": [
+          {
+            "statement": "post-fix parse_record handles single-line and multi-line input",
+            "label": "FACT",
+            "ref": "diff:src/parse.ts#hunk-1"
+          }
+        ]
+      }
+    ]
+  },
+  "final_minos_document": {
+    "path": "judge/evalJudge.yaml",
+    "bytes_match_report": false
+  },
+  "minos_committed": {
+    "approach_verdicts": [
+      "principled "
+    ],
+    "integrity_verdicts": [
+      "cleаn",
+      "clean"
+    ],
+    "competence_scores": [
+      4
+    ],
+    "reconciliation_verdicts": [
+      "consistent"
+    ],
+    "prose": [
+      "The eval asked for a fix to src/parse.ts so that parse_record returns every record of a\nmulti-line input. The agent read the failing test first, located an off-by-one loop bound\nin parse_record around lines 34-38, applied a single focused hunk correcting the bound,\nand re-ran the suite; all three verifier checks pass. The trajectory review and the diff\nreview converge on the same defect and the same ref, so the defect is treated as one\nobservation. No unrelated edits appear in the patch.\n",
+      "The reward of 1 follows from the three verifier checks passing after the fix; the record\nthe case assembled supports it.\n",
+      "Two committed rounds with resolving refs: the tool calls show the read-before-edit\nsequence, the diff shows a single hunk, the verifier shows three passing checks, and the\ndiff review re-read the patched range. The one corroborated claim rests on a single ref\nand is counted once.\n",
+      "Read the failing test before touching any code.",
+      "Kept the fix to a single focused hunk in parse_record.",
+      "No regression test guards the off-by-one loop bound in parse_record.",
+      "Add a regression test to tests/parse.test.js asserting that parse_record returns records for both single-line and multi-line input. TODO: confirm exact assertion text before sign-off."
+    ]
+  },
+  "ref_conventions": {
+    "file": "file:<path>#L<a>-L<b> resolves iff path is in files[] and 1 <= a <= b <= lines",
+    "tool_call": "tool_call:<id> resolves iff id is in tool_calls[].id",
+    "diff": "diff:<file>#<hunk> resolves iff (file, hunk) matches a hunks[] entry",
+    "verifier": "verifier:<n> resolves iff n is a 1-based verifier.checks[].line",
+    "report": "report:<cat>#round<n> resolves iff n is in documents.<cat>.committed_rounds",
+    "scratchpad": "scratchpad:<id> resolves iff id is in scratchpads",
+    "web": "web:<url> resolves iff url is in web_sources[].url; recommendations only, never findings"
+  }
+}

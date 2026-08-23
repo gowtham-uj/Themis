@@ -7,6 +7,7 @@ import {
   cp,
   lstat,
   mkdir,
+  open,
   readdir,
   readFile,
   readlink,
@@ -41,8 +42,8 @@ export interface EvalArchiveManifest {
 
 /**
  * Reorganize a sealed eval archive into the target browsable layout. Only the
- * folder moves below happen here — no content is invented, dropped (except the
- * root canonical events file) or renamed across roles. The `retained/` tree is
+ * folder moves below happen here — no content is invented or dropped, and no
+ * evidence is renamed across roles. The `retained/` tree is
  * never touched. Applies to every archive (suite and legacy non-suite).
  *
  * ```
@@ -64,8 +65,9 @@ export interface EvalArchiveManifest {
  *
  * `verifier.json` is renamed to `verifier-result.json` and the duplicate removed;
  * `agent-stdout.log` is never created (the raw stream stays `raw-stdout.log`);
- * `platform/` is removed in favor of `eval_lifecycle_logs/`; `events.jsonl` is
- * dropped from the archive entirely. Idempotent (copy-then-cleanup per file).
+ * `platform/` is removed in favor of `eval_lifecycle_logs/`; the canonical
+ * `events.jsonl` moves into that folder and remains in the immutable archive.
+ * Idempotent (copy-then-cleanup per file).
  */
 export async function organizeArchiveLayout(runDir: string): Promise<void> {
   const root = resolve(runDir);
@@ -126,8 +128,13 @@ export async function organizeArchiveLayout(runDir: string): Promise<void> {
     await moveIf(join(root, name), join(root, "eval_lifecycle_logs", name));
   }
 
-  // The root canonical events file is removed from the archive (not copied anywhere).
-  await rm(join(root, "events.jsonl"), { force: true });
+  // Keep the canonical event trace in the immutable archive. It is platform
+  // lifecycle evidence (not the adapter-native session trace), so move it once
+  // rather than deleting it or duplicating it.
+  await moveIf(
+    join(root, "events.jsonl"),
+    join(root, "eval_lifecycle_logs", "events.jsonl"),
+  );
 }
 
 /**
@@ -167,16 +174,25 @@ export interface EvalContextRole {
  * evidence manifest snapshot. `archivePath` is where the hoist (roleFolder)
  * places the evidence in the sealed archive — a stable location regardless of
  * the adapter's deep native layout. Roles that are not hoisted resolve to
- * `retained/<literal path>`.
+ * `retained/agent/<literal path>` (the exact tree copyRetainedEvidence builds).
  */
 export function buildEvalContext(manifest: EvidenceEntry[]): { roles: EvalContextRole[] } {
   const roles: EvalContextRole[] = [];
   for (const entry of manifest) {
     const folder = roleFolder(entry.role);
-    const archivePath =
-      folder !== null
-        ? join(folder, basename(entry.path.replaceAll("*", "") || "evidence"))
-        : join("retained", entry.path);
+    let archivePath: string;
+    if (folder !== null) {
+      // The hoist copies a resolved FILE to folder/<basename>, but a directory
+      // role (format "dir") is hoisted by copying the directory's CONTENTS into
+      // folder/, and a trailing glob (`*.jsonl`) has no fixed filename — the
+      // file lands at folder/<resolved name>. Bind the folder itself in both
+      // cases rather than advertising a path that never exists.
+      const lastSegment = entry.path.split("/").pop() ?? "";
+      const literalName = !lastSegment.includes("*") && entry.format !== "dir" ? basename(entry.path) : "";
+      archivePath = literalName ? join(folder, literalName) : folder;
+    } else {
+      archivePath = join("retained", "agent", entry.path);
+    }
     roles.push({
       id: entry.id,
       role: entry.role,
@@ -210,8 +226,14 @@ async function resolveEvidenceEntry(
   const literal = literalWorkspacePath(entry);
   if (literal !== null) {
     const abs = resolve(retainedAgentRoot, literal);
+    // Literal manifest paths must stay inside the retained agent root. A hostile
+    // adapter manifest (`../..` or an absolute path) must never resolve to a host
+    // file that then gets hoisted and sealed into an attacker-visible archive.
+    if (abs !== retainedAgentRoot && !abs.startsWith(`${retainedAgentRoot}${sep}`)) {
+      return [];
+    }
     const stat = await lstat(abs).catch(() => null);
-    if (!stat) return [];
+    if (!stat || stat.isSymbolicLink()) return [];
     // Return the entry itself (file or directory); the copy step handles a
     // directory by copying its contents into the role folder, preserving any
     // nested structure (e.g. tmp/ subdirs).
@@ -317,7 +339,12 @@ export async function restructureSuiteArchive(runDir: string): Promise<void> {
   const root = resolve(runDir);
   const retainedRoot = join(root, "retained", "agent");
   const retainedStat = await lstat(retainedRoot).catch(() => null);
-  if (!retainedStat || !retainedStat.isDirectory()) return;
+  if (!retainedStat || !retainedStat.isDirectory()) {
+    // Nothing to hoist, but the standard folder layout still applies (the suite
+    // runner relies on this call to organize + drop events.jsonl before sealing).
+    await organizeArchiveLayout(runDir);
+    return;
+  }
 
   // Load the adapter's evidence manifest snapshot (Task #200 writes it at claim
   // time; it lives at the run root until organizeArchiveLayout moves it into
@@ -333,26 +360,44 @@ export async function restructureSuiteArchive(runDir: string): Promise<void> {
   }
 
   if (manifest !== null) {
+    const claimedDestinations = new Map<string, string>();
+    const claimDestination = (dest: string, source: string): void => {
+      const key = resolve(dest);
+      const prior = claimedDestinations.get(key);
+      if (prior && prior !== source) {
+        throw new Error(
+          `evidence hoist collision at ${relative(root, key)}: ${prior} and ${source}`,
+        );
+      }
+      claimedDestinations.set(key, source);
+    };
     for (const entry of manifest) {
       const folder = roleFolder(entry.role);
       if (folder === null) continue;
       const matches = await resolveEvidenceEntry(retainedRoot, entry);
       for (const file of matches) {
         const stat = await lstat(file).catch(() => null);
-        if (!stat) continue;
+        // Never hoist a symlink (it could point anywhere on the host); the archive
+        // read path additionally refuses symlinks with O_NOFOLLOW.
+        if (!stat || stat.isSymbolicLink()) continue;
         const destDir = join(root, folder);
         await mkdir(destDir, { recursive: true });
         if (stat.isDirectory()) {
           // Copy the directory's contents into the role folder (flattens the
           // `.reaper/logs/<id>/…` maze to model-calls/ tool-logs/ tmp/).
           for (const child of await readdir(file, { withFileTypes: true }).catch(() => [])) {
-            await cp(join(file, child.name), join(destDir, child.name), {
+            const source = join(file, child.name);
+            const destination = join(destDir, child.name);
+            claimDestination(destination, source);
+            await cp(source, destination, {
               recursive: true,
               force: true,
             });
           }
         } else {
-          await cp(file, join(destDir, basename(file)), { force: true });
+          const destination = join(destDir, basename(file));
+          claimDestination(destination, file);
+          await cp(file, destination, { force: true });
         }
       }
     }
@@ -476,11 +521,25 @@ export async function sealEvalArchive(
     batchId: string;
   },
 ): Promise<{ archive: EvalArchive; manifest: EvalArchiveManifest }> {
-  const existing = queries.getEvalArchive(ids.runId);
-  if (existing) {
-    throw new Error(`eval archive already sealed for run ${ids.runId}`);
-  }
   const root = resolve(runDir);
+  // Cross-process seal lock: only one worker may inventory, write the manifest,
+  // register the DB row, and harden a run directory. A sibling lock stays
+  // outside the archive tree so it is never sealed as evidence.
+  const lockPath = `${root}.seal.lock`;
+  let lock;
+  try {
+    lock = await open(lockPath, "wx", 0o600);
+  } catch (err) {
+    if (err && typeof err === "object" && (err as { code?: string }).code === "EEXIST") {
+      throw new Error(`eval archive sealing already in progress for run ${ids.runId}`);
+    }
+    throw err;
+  }
+  try {
+    const existing = queries.getEvalArchive(ids.runId);
+    if (existing) {
+      throw new Error(`eval archive already sealed for run ${ids.runId}`);
+    }
   const manifestRel = "eval_lifecycle_logs/archive.json";
   const manifestPath = join(root, manifestRel);
   await mkdir(dirname(manifestPath), { recursive: true });
@@ -515,8 +574,19 @@ export async function sealEvalArchive(
     sealedAt,
   });
   await makeReadOnly(root);
+  // Re-inventory after permission hardening to catch a write that raced the
+  // initial hash pass. Any mismatch taints finalization instead of publishing a
+  // manifest whose bytes do not describe the sealed tree.
+  const hardenedFiles = await inventory(root, root);
+  if (JSON.stringify(hardenedFiles) !== JSON.stringify(files)) {
+    throw new Error(`eval archive changed while sealing run ${ids.runId}`);
+  }
 
   return { archive, manifest };
+  } finally {
+    await lock.close().catch(() => undefined);
+    await rm(lockPath, { force: true }).catch(() => undefined);
+  }
 }
 
 /** Verify that every sealed file and the manifest itself still match their hashes. */

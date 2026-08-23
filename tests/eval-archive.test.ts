@@ -136,12 +136,14 @@ describe("eval archive", () => {
     ]);
     expect(context.roles).toHaveLength(5);
     const byId = new Map(context.roles.map((r) => [r.id, r]));
-    // High-signal roles bind to session/; dir roles to their folders; tmp stays under tmp/.
+    // High-signal roles bind to session/; dir roles bind to their folders
+    // (the hoist copies the directory's contents INTO the folder); a trailing
+    // glob binds the folder since the resolved filename is dynamic.
     expect(byId.get("trace")?.archivePath).toBe("session/session.jsonl");
     expect(byId.get("transcript")?.archivePath).toBe("session/conversation.md");
     expect(byId.get("result")?.archivePath).toBe("session/result.json");
-    expect(byId.get("model_calls")?.archivePath).toBe("model-calls/model-calls");
-    expect(byId.get("tmp")?.archivePath).toBe("tmp/tmp");
+    expect(byId.get("model_calls")?.archivePath).toBe("model-calls");
+    expect(byId.get("tmp")?.archivePath).toBe("tmp");
   });
 
   it("seals and verifies the reorganized archive with a nested manifest location", async () => {
@@ -208,7 +210,8 @@ describe("eval archive", () => {
     expect(paths).toContain("raw_std/raw-stdout.log");
     expect(paths).toContain("tmp/s.txt");
     expect(paths).toContain("eval_lifecycle_logs/run.json");
-    // events.jsonl is dropped from the archive.
+    // The canonical event trace is retained once under lifecycle logs.
+    expect(paths).toContain("eval_lifecycle_logs/events.jsonl");
     expect(paths).not.toContain("events.jsonl");
     // No duplication: moved lifecycle files must NOT remain at the run root.
     const rootLevel = paths.filter((p) => !p.includes("/"));

@@ -1,0 +1,19 @@
+# evalJudge.yaml — narrative field
+
+Write the narrative as a continuous account of what the agent did, in order, with
+every claim pinned to a ref. Do not summarize the verdict here; the verdict block
+already carries it.
+
+## Worked example
+
+The eval asked for a fix to src/parse.ts so that parse_record returns every record of a
+multi-line input. The agent first read the failing test in tests/parse.test.js, then opened
+src/parse.ts and located an off-by-one loop bound in parse_record at lines 34-38: the loop
+stopped one record short. The agent applied a single two-line hunk correcting the bound and
+re-ran the suite; all three verifier checks pass. The trajectory review and the diff review
+converge on the same defect and the same ref, so the defect is treated as one observation.
+No unrelated edits appear in the patch.
+
+## Reminders
+
+Name files by their archive path. Name the defect, not the symptom.

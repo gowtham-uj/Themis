@@ -1,0 +1,1 @@
+drive-by/report-bad.yaml: confidence_in_this_report: low on a densely-refed, well-corroborated case (four hunks + two verifier checks) -> d-calibration

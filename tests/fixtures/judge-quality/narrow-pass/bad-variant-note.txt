@@ -1,0 +1,1 @@
+narrow-pass/report-bad.yaml: rules integrity: violation with an empty findings list and no resolving ref -> b-adverse-ruling-refed

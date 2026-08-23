@@ -33,11 +33,11 @@ See:
 ```bash
 npm install
 npm run typecheck
-AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=1 npm test
+AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=0 npm test
 npm run build
 node dist/src/cli/serve.js --port 8080 --data-dir ./data
 ```
 
 Runtime and model acceptance paths use real systems. `PodmanRuntime` is the supported container backend;
 there is no fake local-process runtime or mocked model gateway. This host requires
-`AGENTEVAL_PODMAN_SUDO=1`. See `CLAUDE.md` for the cgroup and Podman constraints.
+`AGENTEVAL_PODMAN_SUDO=0` on root Reaper pods (sudo not required). See `CLAUDE.md`.
