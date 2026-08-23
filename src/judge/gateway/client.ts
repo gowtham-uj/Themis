@@ -91,11 +91,12 @@ export class ModelGateway {
   /** Chat completion with ledgered provider operation. */
   async chat(req: ChatRequest): Promise<ChatResult> {
     const model = req.model ?? this.config.model;
-    const maxTokens = Math.max(
-      req.maxTokens ?? this.config.maxTokensFloor,
-      this.config.maxTokensFloor,
-    );
     const effort = req.reasoningEffort ?? this.config.reasoningEffort;
+    // Reasoning effort scales the effective floor: `max` reasoning can consume
+    // thousands of tokens before any content, so a small cap starves the answer
+    // (WP-6: reasoning budget is a correctness issue, not a tuning knob).
+    const effortFloor = effort === "max" ? 8192 : this.config.maxTokensFloor;
+    const maxTokens = Math.max(req.maxTokens ?? effortFloor, effortFloor);
     const digest = digestRequest(model, req.messages);
 
     const op = await this.ledger.create({
