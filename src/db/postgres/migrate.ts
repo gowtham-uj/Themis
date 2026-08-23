@@ -194,6 +194,15 @@ CREATE TABLE IF NOT EXISTS judge_config_snapshots (
   UNIQUE (judge_queue_id, sha256)
 );
 
+CREATE TABLE IF NOT EXISTS judge_pending_archives (
+  judge_queue_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  base_manifest_sha256 TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (judge_queue_id, run_id)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   id TEXT PRIMARY KEY NOT NULL,
   project_id TEXT NOT NULL,

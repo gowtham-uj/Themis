@@ -1608,6 +1608,34 @@ async function executeEval(input: {
           sealedAt: queries.getEvalArchive(run.id)?.sealedAt ?? null,
         },
       });
+
+      // Themis judge ingestion: when a judge queue is linked to this eval queue,
+      // hand the freshly sealed archive to it. autoJudge ON → stream immediately;
+      // OFF → buffer for a later batch flush. Best-effort; never fails the run.
+      try {
+        const manifest = queries.getEvalArchive(run.id);
+        const baseManifestSha256 = manifest?.manifestSha256 ?? "";
+        const themisDb = await import("../judge/ingest/store.js");
+        // The ingestion store needs a SQLite handle; open the project-scoped
+        // themis sqlite file lazily so a judge-less eval never pays for it.
+        const { default: Database } = await import("better-sqlite3");
+        const { join } = await import("node:path");
+        const db = new Database(join(input.dataDir, "themis.sqlite"));
+        try {
+          const { migrate } = await import("../db/sqlite/migrate.js");
+          migrate(db);
+          themisDb.onArchiveSealed(db, {
+            runId: run.id,
+            projectId: queue.projectId,
+            evalQueueId: queue.id,
+            baseManifestSha256,
+          });
+        } finally {
+          db.close();
+        }
+      } catch {
+        // judge ingestion is best-effort and must never taint an eval run
+      }
     } catch (storeErr) {
       // best-effort: not fatal
     }

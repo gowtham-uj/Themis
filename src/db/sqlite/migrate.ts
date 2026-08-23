@@ -214,6 +214,16 @@ const MIGRATIONS: readonly string[] = [
     created_at TEXT NOT NULL,
     UNIQUE (judge_queue_id, sha256)
   )`,
+
+  // Buffered sealed archives awaiting an auto-judge-off batch flush.
+  `CREATE TABLE IF NOT EXISTS judge_pending_archives (
+    judge_queue_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    base_manifest_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (judge_queue_id, run_id)
+  )`,
 ];
 
 /** Apply the slice's DDL. Safe to call repeatedly on the same database. */

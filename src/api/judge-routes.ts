@@ -15,6 +15,13 @@ import { loadGatewayConfig } from "../judge/gateway/config.js";
 import { runPhase1 } from "../judge/graph/graph.js";
 import { publishJudgeArchiveView } from "../judge/results/publish-view.js";
 import { archiveStoreDir } from "../runner/archive-store.js";
+import {
+  countPending,
+  flushPending,
+  getLinkedJudgeQueue,
+  linkJudgeQueue,
+  submitStandaloneArchives,
+} from "../judge/ingest/store.js";
 import { badRequest, notFound } from "./errors.js";
 import { readJsonBody, sendJson, type Router } from "./router.js";
 
@@ -52,6 +59,86 @@ export function registerJudgeRoutes(router: Router): void {
       model: process.env.AGENTEVAL_DEFAULT_MODEL || "deepseek-v4-flash",
       reasoning_effort: process.env.THEMIS_REASONING_EFFORT || "max",
     });
+  });
+
+  // ---- Judge-queue ingestion (linked + standalone) -------------------------
+
+  /** Create a judge queue linked to an eval queue (one per eval queue). */
+  router.post("/api/judge/queues", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const body = (await readJsonBody<{
+      name: string;
+      project_id: string;
+      linked_eval_queue_id?: string | null;
+      auto_judge?: boolean;
+    }>(req).catch(() => ({}))) as {
+      name: string;
+      project_id: string;
+      linked_eval_queue_id?: string | null;
+      auto_judge?: boolean;
+    };
+    if (!body.name || !body.project_id) {
+      throw badRequest("name and project_id are required");
+    }
+    const db = openThemisDb(app.dataDir);
+    try {
+      const queue = linkJudgeQueue(db, {
+        name: body.name,
+        projectId: body.project_id,
+        linkedEvalQueueId: body.linked_eval_queue_id ?? "",
+        autoJudge: body.auto_judge ?? false,
+      });
+      sendJson(res, 200, { judge_queue: queue });
+    } finally {
+      db.close();
+    }
+  });
+
+  /** Submit archive run ids onto a (standalone or linked) judge queue. */
+  router.post("/api/judge/queues/:queueId/archives", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const body = (await readJsonBody<{ run_ids: string[] }>(req).catch(() => ({ run_ids: [] }))) as {
+      run_ids: string[];
+    };
+    if (!Array.isArray(body.run_ids) || body.run_ids.length === 0) {
+      throw badRequest("run_ids[] is required");
+    }
+    const db = openThemisDb(app.dataDir);
+    try {
+      const archives = body.run_ids.map((runId) => ({
+        runId,
+        projectId: "",
+        evalQueueId: null as string | null,
+        baseManifestSha256: "",
+      }));
+      const results = submitStandaloneArchives(db, ctx.params.queueId!, archives);
+      sendJson(res, 200, { submitted: results.length, results });
+    } finally {
+      db.close();
+    }
+  });
+
+  /** Flush buffered archives for a linked queue (auto-judge off path). */
+  router.post("/api/judge/queues/:queueId/flush", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const db = openThemisDb(app.dataDir);
+    try {
+      const results = flushPending(db, ctx.params.queueId!);
+      sendJson(res, 200, { flushed: results.length, results });
+    } finally {
+      db.close();
+    }
+  });
+
+  /** Inspect a linked queue's buffered archive count. */
+  router.get("/api/judge/queues/:queueId/pending", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const db = openThemisDb(app.dataDir);
+    try {
+      sendJson(res, 200, { pending: countPending(db, ctx.params.queueId!) });
+    } finally {
+      db.close();
+    }
   });
 
   router.post("/api/judge/runs/:runId/phase1", async (req, res, ctx) => {
