@@ -55,11 +55,21 @@ export function registerJudgeRoutes(router: Router): void {
       () => ({}) as { work_dir?: string; track_id?: string },
     )) as { work_dir?: string; track_id?: string };
     const archiveDir = archiveStoreDir(app.dataDir, runId);
-    try {
-      await import("node:fs/promises").then((m) => m.access(archiveDir));
-    } catch {
-      throw notFound(`sealed archive not found for run ${runId}`);
+    // The archive may appear in the catalog a moment before its directory is
+    // fully materialized (seal renames the tree). Retry briefly rather than
+    // 404-ing on a just-sealed run.
+    const { access } = await import("node:fs/promises");
+    let ready = false;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await access(archiveDir);
+        ready = true;
+        break;
+      } catch {
+        if (attempt < 4) await new Promise((r) => setTimeout(r, 1000));
+      }
     }
+    if (!ready) throw notFound(`sealed archive not found for run ${runId}`);
 
     let gateway: ModelGateway;
     try {
