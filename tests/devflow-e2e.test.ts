@@ -19,11 +19,15 @@ async function api(
   method: "GET" | "POST" | "PUT",
   path: string,
   body?: unknown,
+  timeoutMs = 60_000,
 ): Promise<{ status: number; json: Json }> {
+  // The judge POST runs the full Phase-1 pipeline (minutes); default undici
+  // headers timeout is ~300s and kills it, so callers pass a longer budget.
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(timeoutMs),
   });
   return { status: res.status, json: (await res.json().catch(() => ({}))) as Json };
 }
@@ -151,9 +155,12 @@ describe.skipIf(!LIVE)("developer-flow E2E", () => {
       expect(runId).toBeTruthy();
 
       // 6. Judge the sealed archive.
-      const judgeRes = await api("POST", `/api/judge/runs/${runId}/phase1`, {
-        track_id: "devflow",
-      });
+      const judgeRes = await api(
+        "POST",
+        `/api/judge/runs/${runId}/phase1`,
+        { track_id: "devflow" },
+        10 * 60_000,
+      );
       expect(judgeRes.status).toBeLessThan(300);
       const rv = (judgeRes.json as Json).result_version as Json;
       expect(rv).toBeTruthy();
