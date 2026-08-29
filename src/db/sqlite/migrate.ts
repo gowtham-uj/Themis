@@ -252,4 +252,8 @@ export function migrate(db: Database.Database): void {
     db.exec(`UPDATE project_pipeline_queues SET eval_queue_id = id WHERE eval_queue_id IS NULL`);
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_project_pipeline_eval_queue ON project_pipeline_queues(eval_queue_id)`);
   }
+  const itemCols = db.prepare(`PRAGMA table_info(project_pipeline_items)`).all() as Array<{name:string}>;
+  if (!itemCols.some((c) => c.name === "retry_count")) {
+    db.exec(`ALTER TABLE project_pipeline_items ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`);
+  }
 }
