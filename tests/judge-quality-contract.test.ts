@@ -41,6 +41,7 @@ describe('evalJudge.yaml contract enums', () => {
       'narrow',
       'symptomatic',
       'insufficient_evidence',
+      'not_observed',
     ]);
   });
 
@@ -51,6 +52,7 @@ describe('evalJudge.yaml contract enums', () => {
       'violation',
       'contested',
       'insufficient_evidence',
+      'not_applicable',
     ]);
   });
 
@@ -133,6 +135,11 @@ describe('ref grammar', () => {
       'report',
       'scratchpad',
       'web',
+      // Stable evidence IDs — preferred over fragile line-number refs.
+      'trace',
+      'artifact',
+      'source',
+      'metric',
     ]);
   });
 });

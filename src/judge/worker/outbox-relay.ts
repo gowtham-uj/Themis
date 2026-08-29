@@ -9,6 +9,7 @@ import {
   JUDGE_JOB_TRIGGER_KIND,
   type JudgeJobTriggerKind,
   type NewJudgeJob,
+  type ThemisDb,
 } from "../../db/contracts.js";
 import {
   claimOutboxEvent,
@@ -63,6 +64,19 @@ function isArchiveSealedPayload(v: unknown): v is ArchiveSealedPayload {
   return true;
 }
 
+/**
+ * A permanent, structurally-invalid event: no redelivery can fix it, so the
+ * relay must poison-pill it rather than re-claim it and wedge the queue. A
+ * transient failure (database hiccup) instead releases the lease for a later
+ * redelivery.
+ */
+class PermanentEventError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentEventError";
+  }
+}
+
 function toNewJudgeJob(p: ArchiveSealedPayload, now: string): NewJudgeJob {
   return {
     judgeQueueId: p.judgeQueueId,
@@ -91,10 +105,24 @@ function toNewJudgeJob(p: ArchiveSealedPayload, now: string): NewJudgeJob {
 
 /** Relay undelivered outbox events into durable judge jobs. */
 export class OutboxRelay {
-  private readonly jobs: SqliteJudgeJobRepository;
+  private readonly jobs: SqliteJudgeJobRepository | null;
+  private readonly themis: ThemisDb | null;
 
-  constructor(private readonly db: Database.Database) {
-    this.jobs = new SqliteJudgeJobRepository(db);
+  /**
+   * Two construction modes:
+   *  - SQLite dev/test: `new OutboxRelay(sqliteDb)`.
+   *  - PostgreSQL production: `new OutboxRelay(null, themisDb)` — the relay
+   *    claims and delivers entirely through ThemisDb; no SQLite file exists.
+   */
+  constructor(
+    private readonly db: Database.Database | null,
+    themis?: ThemisDb,
+  ) {
+    if (db === null && themis === undefined) {
+      throw new Error("OutboxRelay requires a SQLite database or a ThemisDb");
+    }
+    this.jobs = db !== null ? new SqliteJudgeJobRepository(db) : null;
+    this.themis = themis ?? null;
   }
 
   /** Process up to `limit` undelivered events. */
@@ -109,8 +137,54 @@ export class OutboxRelay {
     let delivered = 0;
     const errors: string[] = [];
 
+    if (this.themis !== null) {
+      // PostgreSQL production path: claim and deliver both in PG, so the
+      // delivered_time update and the judge-job upsert are ONE transaction
+      // (design §3). The SQLite handle is not consulted for outbox work here —
+      // no dual-write.
+      const claimedIds = new Set<string>();
+      for (let i = 0; i < limit; i += 1) {
+        const event = await this.themis.outboxEvents.claimNext({
+          now: opts.now,
+          leaseMs: opts.leaseMs,
+          workerId: opts.workerId,
+        });
+        if (event === null) break;
+        if (claimedIds.has(event.id)) break; // defensive: never hot-loop one event
+        claimedIds.add(event.id);
+        claimed += 1;
+        try {
+          await this.deliverPg(event, opts.now);
+          delivered += 1;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          errors.push(`${event.id}: ${msg}`);
+          if (err instanceof PermanentEventError) {
+            // Poison pill: a structurally invalid event can never succeed, so
+            // mark it delivered (terminal) instead of re-claiming it forever
+            // and wedging the queue behind one bad row. The error stays visible
+            // in the tick's `errors` result.
+            await this.themis.outboxEvents.markDelivered(event.id, {
+              leaseToken: event.leaseToken ?? 0,
+              leaseOwner: event.leaseOwner ?? "",
+            });
+            delivered += 1;
+          } else {
+            await this.themis.outboxEvents.releaseLease(
+              event.id,
+              { leaseToken: event.leaseToken ?? 0 },
+              msg.slice(0, 2000),
+            );
+          }
+        }
+      }
+      return { claimed, delivered, errors };
+    }
+
+    const db = this.db!;
+    const jobs = this.jobs!;
     for (let i = 0; i < limit; i += 1) {
-      const event = claimOutboxEvent(this.db, {
+      const event = claimOutboxEvent(db, {
         now: opts.now,
         leaseMs: opts.leaseMs,
         workerId: opts.workerId,
@@ -118,33 +192,80 @@ export class OutboxRelay {
       if (!event) break;
       claimed += 1;
       try {
-        await this.deliver(event, opts.now);
+        await this.deliver(db, jobs, event, opts.now);
         delivered += 1;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         errors.push(`${event.id}: ${msg}`);
-        this.db
-          .prepare(`UPDATE outbox_events SET last_error = ? WHERE id = ?`)
-          .run(msg.slice(0, 2000), event.id);
+        // Poison pill: a structurally invalid event can never succeed, so
+        // deliver it (with last_error) instead of re-claiming it forever and
+        // wedging the queue behind one bad row.
+        const poisoned = db
+          .prepare(
+            `UPDATE outbox_events
+               SET last_error = ?, delivered_at = ?, lease_owner = NULL,
+                   lease_token = NULL, lease_expires_at = NULL
+               WHERE id = ?`,
+          )
+          .run(msg.slice(0, 2000), opts.now, event.id);
+        if (poisoned.changes === 1) {
+          delivered += 1;
+        }
       }
     }
     return { claimed, delivered, errors };
   }
 
-  private async deliver(event: OutboxEventRow, now: string): Promise<void> {
+  private async deliver(
+    db: Database.Database,
+    jobs: SqliteJudgeJobRepository,
+    event: OutboxEventRow,
+    now: string,
+  ): Promise<void> {
     if (event.eventType !== "archive.sealed") {
       // Unknown types are marked delivered after no-op so the queue cannot wedge.
-      markOutboxDelivered(this.db, event.id, now);
+      markOutboxDelivered(db, event.id, now);
       return;
     }
     const payload = JSON.parse(event.payloadJson) as unknown;
     if (!isArchiveSealedPayload(payload)) {
       throw new Error("archive.sealed payload missing required NewJudgeJob fields");
     }
-    // Job upsert is idempotent on (queue, kind, trigger). Mark delivered only
-    // after upsert returns — crash before this line redelivers and dedupes.
-    await this.jobs.upsertByTrigger(toNewJudgeJob(payload, now));
-    const ok = markOutboxDelivered(this.db, event.id, now);
+    const job = toNewJudgeJob(payload, now);
+    await jobs.upsertByTrigger(job);
+    const ok = markOutboxDelivered(db, event.id, now);
     if (!ok) throw new Error(`failed to mark outbox ${event.id} delivered`);
+  }
+
+  /** PG delivery: job upsert + delivered_time in one transaction. */
+  private async deliverPg(
+    event: import("../../db/contracts.js").OutboxEventRow,
+    now: string,
+  ): Promise<void> {
+    if (event.eventType !== "archive.sealed") {
+      await this.themis!.outboxEvents.markDelivered(event.id, {
+        leaseToken: event.leaseToken ?? 0,
+        leaseOwner: event.leaseOwner ?? "",
+      });
+      return;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(event.payloadBody) as unknown;
+    } catch {
+      throw new PermanentEventError("archive.sealed payload is not valid JSON");
+    }
+    if (!isArchiveSealedPayload(payload)) {
+      throw new PermanentEventError("archive.sealed payload missing required NewJudgeJob fields");
+    }
+    const job = toNewJudgeJob(payload, now);
+    await this.themis!.transaction(async (tx) => {
+      await tx.judgeJobs.upsertByTrigger(job);
+      const ok = await tx.outboxEvents.markDelivered(event.id, {
+        leaseToken: event.leaseToken ?? 0,
+        leaseOwner: event.leaseOwner ?? "",
+      });
+      if (!ok) throw new Error(`failed to mark outbox ${event.id} delivered`);
+    });
   }
 }

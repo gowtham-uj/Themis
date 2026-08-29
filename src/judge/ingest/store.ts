@@ -83,7 +83,11 @@ function toPayload(
 function streamArchive(db: Database.Database, queue: JudgeQueueRow, ref: SealedArchiveRef, now: string): void {
   enqueueOutboxEvent(db, {
     aggregateType: "archive",
-    aggregateId: ref.runId,
+    // Queue-scoped identity: the same archive may legitimately be judged by
+    // multiple standalone/linked judge queues. A run-only aggregate id made a
+    // second queue's event collide with the first and silently omitted the job
+    // (observed in the durable 2-eval E2E).
+    aggregateId: `${queue.id}:${ref.runId}`,
     eventType: "archive.sealed",
     payload: toPayload(queue, ref, now),
     availableAt: now,
@@ -143,7 +147,9 @@ export function submitStandaloneArchives(
     payload.sourceTriggerKind = JUDGE_JOB_TRIGGER_KIND.standalone_item;
     enqueueOutboxEvent(db, {
       aggregateType: "archive",
-      aggregateId: ref.runId,
+      // Queue-scoped standalone trigger: same run on another judge queue is a
+      // distinct valid judgement, while replay on this queue still dedupes.
+      aggregateId: `${queue.id}:${ref.runId}`,
       eventType: "archive.sealed",
       payload,
       availableAt: now,

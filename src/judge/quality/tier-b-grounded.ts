@@ -71,6 +71,19 @@ export interface ArchiveFacts {
   readonly agentIds: ReadonlySet<string>;
   /** canonical URLs fetched during the case (for web:<url> refs). */
   readonly webUrls: ReadonlySet<string>;
+  /**
+   * Stable evidence IDs — line numbers shift, these do not.
+   * `traceSeqs`: runId -> the event sequence numbers that exist.
+   * `artifactPointers`: artifact path -> JSON pointers that resolve.
+   * `sourceSymbols`: source path -> symbol names defined in it.
+   * `metricNames`: named lifecycle measurements that exist.
+   * All optional so existing fixtures (which predate these kinds) still
+   * construct; an absent set means "no ref of that kind can resolve".
+   */
+  readonly traceSeqs?: ReadonlyMap<string, ReadonlySet<number>>;
+  readonly artifactPointers?: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly sourceSymbols?: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly metricNames?: ReadonlySet<string>;
   /** The verifier's official reward number (0/1). */
   readonly officialReward: number;
   /** Committed tangent-log rows (tangent-log.yaml documents). */
@@ -192,6 +205,24 @@ export function refResolves(ref: string, facts: ArchiveFacts): boolean {
       return parsed.line !== undefined && facts.verifierLines.has(parsed.line);
     case 'report':
       return facts.committedReports.has(parsed.raw);
+    // ---- stable evidence IDs -------------------------------------------
+    case 'trace': {
+      if (parsed.runId === undefined || parsed.seq === undefined) return false;
+      const seqs = facts.traceSeqs?.get(parsed.runId);
+      return seqs !== undefined && seqs.has(parsed.seq);
+    }
+    case 'artifact': {
+      if (parsed.path === undefined || parsed.pointer === undefined) return false;
+      const pointers = facts.artifactPointers?.get(parsed.path);
+      return pointers !== undefined && pointers.has(parsed.pointer);
+    }
+    case 'source': {
+      if (parsed.path === undefined || parsed.symbol === undefined) return false;
+      const symbols = facts.sourceSymbols?.get(parsed.path);
+      return symbols !== undefined && symbols.has(parsed.symbol);
+    }
+    case 'metric':
+      return parsed.metric !== undefined && (facts.metricNames?.has(parsed.metric) ?? false);
   }
 }
 

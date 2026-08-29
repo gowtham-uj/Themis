@@ -252,6 +252,7 @@ const EXPECTED_SURFACE: Readonly<Record<string, readonly string[]>> = {
     "claimNext",
     "heartbeat",
     "updateFenced",
+    "releaseClaimNoRetryCharge",
     "requeueExpiredLeases",
   ],
   judgeAttempts: ["create", "get", "getByJob", "transition"],

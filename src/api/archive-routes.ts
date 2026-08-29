@@ -24,6 +24,10 @@ import { relative, resolve, sep } from "node:path";
 import { getRequestAuth } from "./auth.js";
 import { HttpError, notFound } from "./errors.js";
 import { sendJson, type RequestContext, type Router } from "./router.js";
+import type { QueryStore, EvalArchive } from "../db/queries.js";
+import { createLocalArtifactStore } from "../storage/local-artifact-store.js";
+import { blobKey } from "../storage/content-address.js";
+import { normalizeArchivePath, parseManifest } from "../storage/archive-service.js";
 import {
   archiveStoreDir,
   assertSafeRunId,
@@ -56,13 +60,16 @@ export interface ArchiveEntry {
   reward: number | null;
   sealedAt: string | null;
   archivedAt: string;
-  /** Internal storage location; never serialized to API clients. */
+  /** Canonical immutable manifest key (new archives); internal only. */
+  manifestKey: string | null;
+  /** Internal compatibility materialization; never serialized to API clients. */
   storagePath: string;
 }
 
 interface AppCtxLike {
   dataDir: string;
   authEnabled: boolean;
+  queries: QueryStore;
 }
 
 function appOf(ctx: RequestContext): AppCtxLike {
@@ -79,8 +86,8 @@ function assertArchiveScope(req: IncomingMessage, app: AppCtxLike, projectId: st
   }
 }
 
-function archiveJson(entry: ArchiveEntry): Omit<ArchiveEntry, "storagePath"> {
-  const { storagePath: _storagePath, ...publicEntry } = entry;
+function archiveJson(entry: ArchiveEntry): Omit<ArchiveEntry, "storagePath" | "manifestKey"> {
+  const { storagePath: _storagePath, manifestKey: _manifestKey, ...publicEntry } = entry;
   return publicEntry;
 }
 
@@ -109,14 +116,65 @@ function entryFromRecord(dataDir: string, record: ArchiveIndexRecord): ArchiveEn
     reward: record.reward,
     sealedAt: record.sealedAt,
     archivedAt: record.archivedAt,
+    manifestKey: null,
     storagePath: archiveStoreDir(dataDir, record.dir || record.runId),
+  };
+}
+
+/** DB-backed catalog row — no archives/index.json scan. */
+function entryFromArchive(dataDir: string, queries: QueryStore, archive: EvalArchive): ArchiveEntry {
+  const run = queries.getRun(archive.runId);
+  const project = queries.getProject(archive.projectId);
+  const queue = archive.queueId ? queries.getEvalQueue(archive.queueId) : null;
+  const task = run ? queries.getTask(run.taskId) : null;
+  return {
+    projectId: archive.projectId,
+    projectName: project?.name ?? null,
+    queueId: archive.queueId ?? "",
+    queueName: queue?.name ?? null,
+    batchId: archive.batchId,
+    runId: archive.runId,
+    taskId: run?.taskId ?? "",
+    taskName: task?.name ?? null,
+    agent: {
+      id: run?.agentId ?? null,
+      commit: run?.agentCommit ?? null,
+      image: run?.agentImage ?? null,
+      imageId: null,
+      version: run?.agentCommit?.slice(0, 12) ?? null,
+      buildId: null,
+    },
+    queueRevision: null,
+    model: run?.model ?? "",
+    provider: run?.provider ?? "",
+    status: String(run?.status ?? "unknown"),
+    reward: null,
+    sealedAt: archive.sealedAt,
+    archivedAt: archive.archivedAt ?? archive.sealedAt,
+    manifestKey: archive.manifestKey,
+    // Compatibility materialization path while file reads cut over to CAS.
+    storagePath: archiveStoreDir(dataDir, archive.runId),
   };
 }
 
 /**
  * Load catalog rows. Project filter is applied in the index, not by walking dirs.
  */
-export async function listArchiveEntries(dataDir: string, projectIdFilter?: string): Promise<ArchiveEntry[]> {
+export async function listArchiveEntries(
+  dataDir: string,
+  projectIdFilter?: string,
+  queries?: QueryStore,
+): Promise<ArchiveEntry[]> {
+  if (queries) {
+    const archives = queries.listEvalArchives(projectIdFilter ? { projectId: projectIdFilter } : {});
+    if (archives.length > 0) {
+      return archives.map((archive) => entryFromArchive(dataDir, queries, archive));
+    }
+    // Migration compatibility for legacy archives not yet backfilled into
+    // eval_archives. New seals always write the DB row + canonical manifest, so
+    // this fallback disappears once the one-time backfill is complete.
+  }
+  // Migration-only compatibility for callers/data with no DB catalog row.
   const records = await listArchiveIndex(dataDir);
   const entries = records.map((record) => entryFromRecord(dataDir, record));
   return projectIdFilter ? entries.filter((entry) => entry.projectId === projectIdFilter) : entries;
@@ -253,14 +311,25 @@ function paginate(entries: ArchiveEntry[], params: Record<string, string | undef
   };
 }
 
-async function findArchive(dataDir: string, runId: string, projectId?: string): Promise<ArchiveEntry | null> {
+async function findArchive(
+  dataDir: string,
+  queries: QueryStore,
+  runId: string,
+  projectId?: string,
+): Promise<ArchiveEntry | null> {
   try {
     assertSafeRunId(runId);
   } catch {
     return null;
   }
-  const entries = await listArchiveEntries(dataDir, projectId);
-  return entries.find((entry) => entry.runId === runId) ?? null;
+  const archive = queries.getEvalArchive(runId);
+  if (archive) {
+    if (projectId && archive.projectId !== projectId) return null;
+    return entryFromArchive(dataDir, queries, archive);
+  }
+  // Legacy row not backfilled yet — bounded lookup in the compatibility index.
+  const legacy = await listArchiveEntries(dataDir, projectId);
+  return legacy.find((entry) => entry.runId === runId) ?? null;
 }
 
 function requestedFilePath(params: Record<string, string | undefined>): string {
@@ -271,6 +340,10 @@ function requestedFilePath(params: Record<string, string | undefined>): string {
 }
 
 async function sendArchiveFile(res: ServerResponse, entry: ArchiveEntry, requested: string): Promise<void> {
+  if (entry.manifestKey) {
+    await serveCanonicalArchiveFile(res, entry, requested);
+    return;
+  }
   const filePath = resolve(entry.storagePath, requested);
   const rel = relative(resolve(entry.storagePath), filePath);
   if (!requested || rel.startsWith(`..${sep}`) || rel === ".." || rel.startsWith(sep)) {
@@ -294,7 +367,7 @@ export function registerArchiveRoutes(router: Router): void {
     const app = appOf(ctx);
     const params = ctx.query ?? {};
     const authProjectId = app.authEnabled ? getRequestAuth(req)?.projectId ?? null : null;
-    let entries = await listArchiveEntries(app.dataDir, authProjectId ?? undefined);
+    let entries = await listArchiveEntries(app.dataDir, authProjectId ?? undefined, app.queries);
     entries = filterArchiveEntries(entries, params);
     const { total, offset, limit, page, has_more, next_cursor } = paginate(entries, params);
     sendJson(res, 200, {
@@ -314,7 +387,7 @@ export function registerArchiveRoutes(router: Router): void {
     const projectId = ctx.params.projectId!;
     assertArchiveScope(req, app, projectId);
     const params = ctx.query ?? {};
-    let entries = await listArchiveEntries(app.dataDir, projectId);
+    let entries = await listArchiveEntries(app.dataDir, projectId, app.queries);
     entries = filterArchiveEntries(entries, params);
     const { total, offset, limit, page, has_more, next_cursor } = paginate(entries, params);
     sendJson(res, 200, {
@@ -333,7 +406,7 @@ export function registerArchiveRoutes(router: Router): void {
   router.get("/api/archives/:runId", async (req, res, ctx) => {
     const app = appOf(ctx);
     const runId = ctx.params.runId!;
-    const entry = await findArchive(app.dataDir, runId);
+    const entry = await findArchive(app.dataDir, app.queries, runId);
     if (!entry) throw notFound(`eval archive not found: ${runId}`);
     assertArchiveScope(req, app, entry.projectId);
     sendJson(res, 200, { archive: archiveJson(entry) });
@@ -343,7 +416,7 @@ export function registerArchiveRoutes(router: Router): void {
     router.get(`/api/archives/:runId${suffix}`, async (req, res, ctx) => {
       const app = appOf(ctx);
       const runId = ctx.params.runId!;
-      const entry = await findArchive(app.dataDir, runId);
+      const entry = await findArchive(app.dataDir, app.queries, runId);
       if (!entry) throw notFound(`eval archive not found: ${runId}`);
       assertArchiveScope(req, app, entry.projectId);
       await sendArchiveFile(res, entry, requestedFilePath(ctx.params));
@@ -357,7 +430,7 @@ export function registerArchiveRoutes(router: Router): void {
     assertArchiveScope(req, app, projectId);
     const agentCommit = ctx.params.agentCommit!;
     const params = ctx.query ?? {};
-    let entries = await listArchiveEntries(app.dataDir, projectId);
+    let entries = await listArchiveEntries(app.dataDir, projectId, app.queries);
     entries = entries.filter((e) => e.agent.commit === agentCommit || e.agent.commit?.includes(agentCommit));
     entries = filterArchiveEntries(entries, params);
     const { total, offset, limit, page, has_more, next_cursor } = paginate(entries, params);
@@ -378,7 +451,7 @@ export function registerArchiveRoutes(router: Router): void {
   router.get("/api/archives/:projectId/:agentCommit/:runId", async (req, res, ctx) => {
     const app = appOf(ctx);
     assertArchiveScope(req, app, ctx.params.projectId!);
-    const entry = await findArchive(app.dataDir, ctx.params.runId!, ctx.params.projectId);
+    const entry = await findArchive(app.dataDir, app.queries, ctx.params.runId!, ctx.params.projectId);
     if (!entry || entry.agent.commit !== ctx.params.agentCommit) {
       throw notFound(`eval archive not found: ${ctx.params.runId}`);
     }
@@ -389,12 +462,62 @@ export function registerArchiveRoutes(router: Router): void {
     router.get(`/api/archives/:projectId/:agentCommit/:runId${suffix}`, async (req, res, ctx) => {
       const app = appOf(ctx);
       assertArchiveScope(req, app, ctx.params.projectId!);
-      const entry = await findArchive(app.dataDir, ctx.params.runId!, ctx.params.projectId);
+      const entry = await findArchive(app.dataDir, app.queries, ctx.params.runId!, ctx.params.projectId);
       if (!entry || entry.agent.commit !== ctx.params.agentCommit) {
         throw notFound(`eval archive not found: ${ctx.params.runId}`);
       }
       await sendArchiveFile(res, entry, requestedFilePath(ctx.params));
     });
+  }
+}
+
+async function serveCanonicalArchiveFile(
+  res: ServerResponse,
+  entry: ArchiveEntry,
+  requested: string,
+): Promise<void> {
+  const normalized = normalizeArchivePath(requested);
+  if (!normalized) throw notFound(`archive file not found: ${requested}`);
+
+  const dataDir = resolve(entry.storagePath, "..", "..");
+  const store = createLocalArtifactStore(resolve(dataDir, "artifacts"));
+  try {
+    const manifestRead = await store.get(entry.manifestKey!);
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of manifestRead.stream) {
+      const b = Buffer.from(chunk);
+      size += b.length;
+      if (size > 16 * 1024 * 1024) throw new Error("manifest too large");
+      chunks.push(b);
+    }
+    const parsed = parseManifest(Buffer.concat(chunks).toString("utf8"));
+    if (!parsed.ok) throw new Error("invalid canonical manifest");
+    const file = parsed.manifest.entries.find((e) => e.path === normalized && e.kind === "file");
+    if (!file || file.kind !== "file") throw notFound(`archive file not found: ${requested}`);
+
+    const read = await store.get(blobKey(file.sha256));
+    const filename = normalized
+      .slice(normalized.lastIndexOf("/") + 1)
+      .replace(/[\u0000-\u001f\u007f"\\]/g, "_")
+      .trim() || "download";
+    res.statusCode = 200;
+    res.setHeader("Content-Type", read.contentType ?? "application/octet-stream");
+    res.setHeader("Content-Length", file.bytes);
+    res.setHeader("ETag", `"${file.sha256}"`);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    await new Promise<void>((resolveStream, reject) => {
+      read.stream.on("error", reject);
+      read.stream.on("end", resolveStream);
+      res.on("close", () => {
+        if (!read.stream.destroyed) read.stream.destroy();
+      });
+      read.stream.pipe(res);
+    });
+  } catch (err) {
+    if (err instanceof HttpError) throw err;
+    throw notFound(`archive file not found: ${requested}`);
   }
 }
 

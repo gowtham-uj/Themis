@@ -1,0 +1,16 @@
+import { spawn } from "node:child_process";
+import { writePiModelsJson, writePiSubagentDefs, loadPromptAsset, resolvePiBin } from "../src/judge/pi/runtime.js";
+const agentDir = "/tmp/claude/dbg4-agent";
+const workDir = "/tmp/claude/dbg4-work";
+const { rm, mkdir } = await import("node:fs/promises");
+await rm(agentDir, {recursive:true,force:true});
+const conn = { baseUrl: process.env.OPENAI_BASE_URL!, apiKey: process.env.OPENAI_API_KEY!, model:"deepseek-v4-flash", reasoningEffort:"low" };
+await writePiModelsJson(agentDir, conn);
+const [k,l,m]=await Promise.all([loadPromptAsset("kratos.md"),loadPromptAsset("logos.md"),loadPromptAsset("minos.md")]);
+await writePiSubagentDefs(agentDir,{kratos:k,logos:l,minos:m});
+const piBin = resolvePiBin();
+const argv = [piBin,"--mode","json","-p","Reply OK","--provider","themis-proxy","--model","deepseek-v4-flash","--thinking","low","--tools","subagent,evidence_list,read_evidence,write_to_yaml_template,read_scratchpad,file_tangent,petition,grant,channel,web_search","--extension","/work/agenteval/node_modules/pi-subagents/index.ts","--extension","/work/agenteval/node_modules/@quintinshaw/pi-dynamic-workflows/extensions/workflow.ts","--extension","/work/agenteval/src/judge/tools/themis-tools-extension.ts","--no-session","--offline","--no-context-files"];
+const env = {...process.env, PI_CODING_AGENT_DIR: agentDir, OPENAI_API_KEY: conn.apiKey, OPENAI_BASE_URL: conn.baseUrl, PI_OFFLINE:"1", THEMIS_JUDGE_DIR: workDir, THEMIS_ARCHIVE_DIR:"/tmp"};
+const child = spawn(process.execPath, argv, {env, stdio:"inherit"});
+child.on("error",e=>console.log("SPAWN_ERROR",e.message));
+child.on("close",code=>console.log("CLOSE",code));

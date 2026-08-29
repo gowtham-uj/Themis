@@ -453,9 +453,12 @@ export const evalArchives = sqliteTable("eval_archives", {
     .notNull()
     .references(() => runBatches.id),
   manifestPath: text("manifest_path").notNull(),
+  /** Immutable canonical manifest key in the local ArtifactStore. */
+  manifestKey: text("manifest_key"),
   manifestSha256: text("manifest_sha256").notNull(),
   sizeBytes: integer("size_bytes").notNull(),
   sealedAt: text("sealed_at").notNull(),
+  archivedAt: text("archived_at"),
 });
 
 /** Versioned exact and derived per-eval metrics projection. */

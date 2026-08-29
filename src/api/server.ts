@@ -53,6 +53,8 @@ import { registerAdapterRoutes } from "./adapter-routes.js";
 import { registerSettingsRoutes } from "./settings-routes.js";
 import { registerArchiveRoutes } from "./archive-routes.js";
 import { registerJudgeRoutes } from "./judge-routes.js";
+import { Phase1Service } from "../judge/phase1-service.js";
+import { registerPipelineRoutes } from "./pipeline-routes.js";
 import { registerSandboxRoutes } from "./sandbox-routes.js";
 import { registerGitHubRoutes } from "./github-routes.js";
 import {
@@ -1252,6 +1254,7 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerSettingsRoutes(router);
   registerArchiveRoutes(router);
   registerJudgeRoutes(router);
+  registerPipelineRoutes(router, new Phase1Service(opts.dataDir));
   registerSandboxRoutes(router);
   registerGitHubRoutes(router);
 

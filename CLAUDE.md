@@ -13,13 +13,24 @@ The HTTP API is the only application interface.
 ## Stack and scope
 
 - Node ≥22, TypeScript ESM, `tsx`, Vitest.
-- SQLite (`better-sqlite3`/Drizzle) plus JSONL and immutable files under `data/`.
+- SQLite (`better-sqlite3`/Drizzle) for local/test plus PostgreSQL for production metadata/work control;
+  JSONL and immutable content-addressed files under `data/` remain byte authority locally.
 - Backend/server/API only. There is no application frontend in this repository.
-- No judge subsystem, judgement API, findings/regression API, reusable-rubric API, or run-artifact API.
-- Containers: one real Podman container per active eval queue; evals execute sequentially inside it.
+- Themis Phase 1 is in scope: per-eval judgement (Nodes 0–4), judge queues/jobs/outbox/leases/fencing,
+  mediated court tools, immutable `judge/` archive views, quality gates, result versions, and judge HTTP APIs.
+- Themis Phase 2 is in scope per `plan/themis-phase2-design.md`: black-box campaign analysis that finds
+  systemic agent patterns, researches remedies, and produces developer implementation handoffs plus
+  developer-run experiment plans. Phase 2 does not access/patch the tested agent source and does not run
+  control/treatment experiments itself.
+- Each project has one durable logical pipeline queue whose generations can orchestrate eval execution →
+  Phase 1 per sealed eval → Phase 2 after all Phase-1 results; each stage also supports explicit manual
+  trigger/retry/pause/resume controls through the HTTP API.
+- Containers: one real Podman container per active eval-execution queue; evals execute sequentially inside it.
+  Judge and Phase-2 workers use separate durable jobs and never hold DB transactions over model/object work.
 - Evals retain task rubrics/check definitions as package metadata, but there is no shared rubric CRUD API.
 - The central archive API is the durable interface for historical logs, traces, verifier output, metrics,
-  cleanup evidence, and generated outputs.
+  cleanup evidence, Phase-1 `judge/` output, Phase-2 `phase2/` output, and generated artifacts.
+- Still out of scope: reusable-rubric CRUD, automatic modification/merge of tested agent source, and frontend UI.
 
 ## Layout
 

@@ -33,6 +33,66 @@ async function readSnippet(root: string, rel: string, max = 12_000): Promise<str
   }
 }
 
+/** One deterministically extracted tool call, keyed by its real provider id. */
+interface ExtractedToolCall {
+  id: string;
+  name: string | null;
+  source: string;
+  seq: number | null;
+}
+
+/**
+ * Deterministic tool-call extraction from the sealed archive's event records.
+ *
+ * The ids here are the SAME ids investigators cite as `tool_call:<id>` refs, so
+ * they must be the provider's real call ids read out of the canonical
+ * `eval_lifecycle_logs/events.jsonl` (`tool.call`) and the adapter's native
+ * `session/session.jsonl` (`tool_started`) — never text scraped from prose. A
+ * scraped line carries no id, which silently makes every `tool_call:` ref
+ * unresolvable in Tier B.
+ */
+async function extractToolCalls(archiveDir: string): Promise<ExtractedToolCall[]> {
+  const byId = new Map<string, ExtractedToolCall>();
+  const sources = ["eval_lifecycle_logs/events.jsonl", "session/session.jsonl"];
+
+  for (const rel of sources) {
+    let text: string;
+    try {
+      text = await readFile(join(archiveDir, rel), "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(trimmed) as Record<string, unknown>;
+      } catch {
+        continue; // a malformed line is not an extractable fact
+      }
+      const type = typeof event.type === "string" ? event.type : "";
+      const isCanonical = type === "tool.call";
+      const isNative = type === "tool_started";
+      if (!isCanonical && !isNative) continue;
+
+      const rawId = isCanonical ? event.id : event.toolCallId;
+      if (typeof rawId !== "string" || !rawId) continue;
+      if (byId.has(rawId)) continue; // first source wins; ids are stable across both
+
+      const rawName = isCanonical ? event.name : event.toolName;
+      byId.set(rawId, {
+        id: rawId,
+        name: typeof rawName === "string" ? rawName : null,
+        source: rel,
+        seq: typeof event.seq === "number" ? event.seq : null,
+      });
+    }
+  }
+
+  return [...byId.values()].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0) || a.id.localeCompare(b.id));
+}
+
 /** Bind archive paths and produce grounded Node 0 summaries using the gateway. */
 export async function runNode0(input: {
   caseId: string;
@@ -95,15 +155,10 @@ export async function runNode0(input: {
   const sessionPath = join(outDir, "session.txt");
   await writeFile(sessionPath, summary.content);
   const toolCallsPath = join(outDir, "toolCalls.jsonl");
-  // Deterministic extraction of tool-looking lines from conversation if present
-  const conv = snippets["session/conversation.md"] || "";
-  const toolLines: string[] = [];
-  for (const line of conv.split(/\r?\n/)) {
-    if (/tool|bash|read_file|edit|write/i.test(line)) {
-      toolLines.push(JSON.stringify({ line: line.slice(0, 500) }));
-    }
-  }
-  await writeFile(toolCallsPath, toolLines.map((l) => l).join("\n") + (toolLines.length ? "\n" : ""));
+  await writeFile(
+    toolCallsPath,
+    (await extractToolCalls(input.archiveDir)).map((c) => `${JSON.stringify(c)}\n`).join(""),
+  );
 
   const state: Phase1GraphState = {
     caseId: input.caseId,

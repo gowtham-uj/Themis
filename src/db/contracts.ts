@@ -1062,6 +1062,13 @@ export interface JudgeJobRepository {
    *  provider operation of the lost attempt to unknown (classification
    *  worker_loss). REQUIRES a transaction scope. Returns the number requeued. */
   requeueExpiredLeases(opts: RequeueOptions): Promise<number>;
+  /**
+   * Release a lease WITHOUT charging a retry attempt. Used for provider
+   * quota/rate-limit pauses: the claim already incremented attempt_count, but a
+   * throttle is not a failed try — it must not count against the retry budget.
+   * Decrements attempt_count and drops the attempt row atomically.
+   */
+  releaseClaimNoRetryCharge(id: string, attemptId: string, expected: JudgeFencing): Promise<boolean>;
 }
 
 /** `judge_attempts` repository. */
@@ -1290,6 +1297,7 @@ export const THEMIS_CONTRACT = {
         "heartbeat",
         "updateFenced",
         "requeueExpiredLeases",
+        "releaseClaimNoRetryCharge",
       ],
     },
     judgeAttempts: {

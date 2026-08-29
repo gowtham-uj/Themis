@@ -35,7 +35,8 @@ import {
   verifyCleanupInContainer,
 } from "./env-provision.js";
 import { buildEvalContext, organizeArchiveLayout, restructureSuiteArchive, sealEvalArchive } from "./eval-archive.js";
-import { storeEvalArchive } from "./archive-store.js";
+import { ingestSealedArchive } from "../storage/archive-ingest.js";
+import { createLocalArtifactStore } from "../storage/local-artifact-store.js";
 import { classifyRunFailure } from "./run-failure.js";
 import { analyzeEvidenceIntegrity } from "./evidence-integrity.js";
 import { deriveRunMetrics, RUN_METRICS_SCHEMA_VERSION } from "./metrics.js";
@@ -1567,77 +1568,60 @@ async function executeEval(input: {
       // events.jsonl) before sealing.
       await organizeArchiveLayout(runDir);
     }
-    await sealEvalArchive(queries, runDir, {
+    const sealed = await sealEvalArchive(queries, runDir, {
       runId: run.id,
       projectId: queue.projectId,
       queueId: queue.id,
       batchId: run.batchId,
     });
-    // Central store: copy the sealed tree to archives/<runId> and upsert the
-    // catalog row in archives/index.json. Best-effort; never fails the run.
-    try {
-      const rowRun = queries.getRun(run.id);
-      const rowTask = queries.getTask(task.id);
-      const theProject = queries.getProject(queue.projectId);
-      const rowContainer = containerRow.runtimeContainerId
-        ? queries.getQueueContainer(containerRow.id)
-        : null;
-      await storeEvalArchive({
-        dataDir: input.dataDir,
-        sealedArchiveDir: runDir,
-        entry: {
-          projectId: queue.projectId,
-          projectName: theProject?.name ?? null,
-          queueId: queue.id,
-          queueName: queue.name ?? null,
-          batchId: run.batchId,
-          runId: run.id,
-          taskId: task.id,
-          taskName: rowTask?.name ?? null,
-          agentId: rowRun?.agentId ?? null,
-          agentCommit: rowRun?.agentCommit ?? null,
-          agentImage: rowRun?.agentImage ?? null,
-          agentImageId: rowContainer?.imageId ?? null,
-          agentVersion: rowContainer?.agentVersion ?? rowRun?.agentCommit?.slice(0, 12) ?? null,
-          buildId: rowContainer?.buildId ?? null,
-          queueRevision: queue.revision,
-          model: queue.model,
-          provider: queue.provider,
-          status: status,
-          reward: officialReward ?? null,
-          sealedAt: queries.getEvalArchive(run.id)?.sealedAt ?? null,
-        },
-      });
 
-      // Themis judge ingestion: when a judge queue is linked to this eval queue,
-      // hand the freshly sealed archive to it. autoJudge ON → stream immediately;
-      // OFF → buffer for a later batch flush. Best-effort; never fails the run.
+    // Canonical content-addressed archive (local ArtifactStore; S3 is out of
+    // scope). This is the byte authority: every file is streamed into its CAS
+    // key and the immutable generation-1 manifest is content-derived. Keep the
+    // legacy browsable copy during the compatibility cutover, but record the
+    // canonical manifest key on the authoritative eval_archives row now.
+    const canonical = await ingestSealedArchive({
+      store: createLocalArtifactStore(join(input.dataDir, "artifacts")),
+      runId: run.id,
+      rootDir: runDir,
+      files: sealed.manifest.files,
+    });
+    queries.storeEvalArchive({
+      runId: sealed.archive.runId,
+      projectId: sealed.archive.projectId,
+      queueId: sealed.archive.queueId,
+      batchId: sealed.archive.batchId,
+      manifestPath: sealed.archive.manifestPath,
+      manifestKey: canonical.manifestKey,
+      manifestSha256: canonical.manifestSha256,
+      sizeBytes: sealed.archive.sizeBytes,
+      sealedAt: sealed.archive.sealedAt,
+      archivedAt: sealed.archive.archivedAt ?? sealed.archive.sealedAt,
+    });
+    // Themis judge ingestion: when a judge queue is linked to this eval queue,
+    // hand the canonical sealed archive to it. autoJudge ON -> stream now;
+    // OFF -> buffer for generation-close flush. No duplicate archives/<runId>
+    // directory and no archives/index.json write.
+    try {
+      const manifest = queries.getEvalArchive(run.id);
+      const baseManifestSha256 = manifest?.manifestSha256 ?? "";
+      const themisDb = await import("../judge/ingest/store.js");
+      const { default: Database } = await import("better-sqlite3");
+      const db = new Database(join(input.dataDir, "themis.sqlite"));
       try {
-        const manifest = queries.getEvalArchive(run.id);
-        const baseManifestSha256 = manifest?.manifestSha256 ?? "";
-        const themisDb = await import("../judge/ingest/store.js");
-        // The ingestion store needs a SQLite handle; open the project-scoped
-        // themis sqlite file lazily so a judge-less eval never pays for it.
-        const { default: Database } = await import("better-sqlite3");
-        const { join } = await import("node:path");
-        const db = new Database(join(input.dataDir, "themis.sqlite"));
-        try {
-          const { migrate } = await import("../db/sqlite/migrate.js");
-          migrate(db);
-          themisDb.onArchiveSealed(db, {
-            runId: run.id,
-            projectId: queue.projectId,
-            evalQueueId: queue.id,
-            baseManifestSha256,
-          });
-        } finally {
-          db.close();
-        }
-      } catch {
-        // judge ingestion is best-effort and must never taint an eval run
+        const { migrate } = await import("../db/sqlite/migrate.js");
+        migrate(db);
+        themisDb.onArchiveSealed(db, {
+          runId: run.id,
+          projectId: queue.projectId,
+          evalQueueId: queue.id,
+          baseManifestSha256,
+        });
+      } finally {
+        db.close();
       }
-    } catch (storeErr) {
-      // best-effort: not fatal
+    } catch {
+      // judge ingestion is best-effort and must never taint an eval run
     }
   } catch (err) {
     archiveError = err instanceof Error ? err.message : String(err);

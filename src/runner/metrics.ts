@@ -290,21 +290,29 @@ function classifyCommand(command: string): CommandClassification {
   const text = command.trim().toLowerCase();
   if (text.length === 0) return "ambiguous";
   if (isTestCommand(text) || isCompileCommand(text)) return "verification";
+  // Strip heredoc bodies before classification: a `<<'EOF' ... EOF` block is
+  // code the interpreter consumes, not a shell command. Its `>` / `>=`
+  // comparisons and `->` arrows are NOT shell redirects — counting them as
+  // mutations was the `mutationCount=2 vs files_modified=1` false positive the
+  // courtroom flagged on the circuit-breaker run.
+  const shellOnly = text.replace(/<<[-]?['"]?\w+['"]?\s*[\s\S]*?\n\w+\s*$/m, "").trim();
+  if (shellOnly.length === 0) return "verification"; // pure heredoc run (probe/harness)
+  if (isTestCommand(shellOnly) || isCompileCommand(shellOnly)) return "verification";
   // Redirect writes into scratch paths (/tmp, /dev, /proc, /var/tmp, dot-scratch)
   // are scratch files (test harnesses, probes, logs), NOT submission mutations.
   // The agent writes a throwaway test harness to /tmp before verifying; counting
   // that as a mutation-after-verification would wrongly flag false_success.
-  if (/(^|[^<])\>{1,2}\s*(?:[^&;|]*\/)?(tmp|var\/tmp|dev|proc|sys)\b/.test(text)) {
+  if (/(^|[^<])\>{1,2}\s*(?:[^&;|]*\/)?(tmp|var\/tmp|dev|proc|sys)\b/.test(shellOnly)) {
     // Write to a scratch path — treat as neutral/verification scaffolding, not a submission mutation.
     return "neutral";
   }
   if (
-    /(^|[;&|]\s*)(rm|mv|cp|touch|mkdir|install)\b/.test(text) ||
-    /(^|[;&|]\s*)(sed|perl)\s+[^;&|]*\s-i\b/.test(text) ||
-    /(^|[;&|]\s*)git\s+(apply|checkout|restore|reset|clean)\b/.test(text) ||
-    /(^|[^<])>{1,2}\s*[^&]/.test(text)
+    /(^|[;&|]\s*)(rm|mv|cp|touch|mkdir|install)\b/.test(shellOnly) ||
+    /(^|[;&|]\s*)(sed|perl)\s+[^;&|]*\s-i\b/.test(shellOnly) ||
+    /(^|[;&|]\s*)git\s+(apply|checkout|restore|reset|clean)\b/.test(shellOnly) ||
+    /(^|[^<])>{1,2}\s*[^&]/.test(shellOnly)
   ) return "mutation";
-  if (/^(pwd|ls|find|rg|grep|cat|head|tail|git\s+(status|diff|log|show))\b/.test(text)) return "neutral";
+  if (/^(pwd|ls|find|rg|grep|cat|head|tail|git\s+(status|diff|log|show))\b/.test(shellOnly)) return "neutral";
   return "ambiguous";
 }
 

@@ -6,11 +6,29 @@
 import { createHash } from "node:crypto";
 
 import { loadGatewayConfig, type GatewayConfig } from "./config.js";
-import { GatewayError, ReasoningStarvedError } from "./errors.js";
+import { GatewayError, ProviderThrottledError, ReasoningStarvedError } from "./errors.js";
+export { ProviderThrottledError, GatewayError, ReasoningStarvedError };
 import {
   MemoryProviderOperationLedger,
   type ProviderOperationLedger,
 } from "./ledger.js";
+
+/**
+ * Map an OpenAI-compatible HTTP failure to the queue retry class.
+ *
+ * 429 → rate_limit, unless the body says quota/balance/insufficient. 402 and
+ * explicit quota wording → quota. Everything else stays a generic http error.
+ * This is what lets the worker pause on throttling instead of burning a retry.
+ */
+function classifyHttpError(status: number, body: string): "quota" | "rate_limit" | null {
+  const lower = body.toLowerCase();
+  const quotaSignal =
+    /quota|insufficient|balance|credits?|billing|exceeded|limit reached/.test(lower);
+  if (status === 429) return quotaSignal ? "quota" : "rate_limit";
+  if (status === 402 || status === 403) return quotaSignal ? "quota" : null;
+  if (quotaSignal && /4\d\d/.test(String(status))) return "quota";
+  return null;
+}
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -165,8 +183,13 @@ export class ModelGateway {
 
     if (!response.ok) {
       const msg = typeof raw?.error?.message === "string" ? raw.error.message : `HTTP ${response.status}`;
+      const errCls = classifyHttpError(response.status, msg);
       await this.ledger.transition(op.id, "in_flight", "failed", { error: msg });
-      throw new GatewayError(msg, "http");
+      if (errCls === "quota" || errCls === "rate_limit") {
+        const kind = errCls === "quota" ? "quota" : "rate_limit";
+        throw new ProviderThrottledError(msg, kind, response.status);
+      }
+      throw new GatewayError(msg, "http", response.status);
     }
 
     const choice = raw?.choices?.[0] ?? {};

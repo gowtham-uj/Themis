@@ -20,6 +20,7 @@ export const VERDICT_APPROACH_VALUES = Object.freeze([
   'narrow',
   'symptomatic',
   'insufficient_evidence',
+  'not_observed',
 ] as const);
 export type VerdictApproach = (typeof VERDICT_APPROACH_VALUES)[number];
 
@@ -29,9 +30,11 @@ export const VERDICT_INTEGRITY_VALUES = Object.freeze([
   'violation',
   'contested',
   'insufficient_evidence',
+  'not_applicable',
 ] as const);
 export type VerdictIntegrity = (typeof VERDICT_INTEGRITY_VALUES)[number];
 
+/** Competence is 1..5 for a valid agent run, else `null` (never observed). */
 export const COMPETENCE_VALUES = Object.freeze([1, 2, 3, 4, 5] as const);
 export type CompetenceScore = (typeof COMPETENCE_VALUES)[number];
 
@@ -85,6 +88,12 @@ export const REF_KIND_VALUES = Object.freeze([
   'report',
   'scratchpad',
   'web',
+  // Stable evidence IDs — line numbers shift, these do not. Preferred over
+  // `file:<path>#L<a>-L<b>` wherever the target has a canonical identity.
+  'trace',
+  'artifact',
+  'source',
+  'metric',
 ] as const);
 export type RefKind = (typeof REF_KIND_VALUES)[number];
 
@@ -104,6 +113,15 @@ export type ReportRef = `report:${ReportCategory}#round${number}`;
 export type ScratchpadRef = `scratchpad:${string}`;
 export type WebRef = `web:${string}`;
 
+/** `trace:<runId>:seq:<n>` — a canonical event-stream position. */
+export type TraceRef = `trace:${string}:seq:${number}`;
+/** `artifact:<path>#/<json-pointer>` — a value inside a JSON artifact. */
+export type ArtifactRef = `artifact:${string}#/${string}`;
+/** `source:<path>#symbol=<name>` — a symbol, not a line range. */
+export type SourceRef = `source:${string}#symbol=${string}`;
+/** `metric:<name>` — a named measurement from the lifecycle metrics. */
+export type MetricRef = `metric:${string}`;
+
 /** A well-formed ref of any kind, exactly as the contract's grammar states. */
 export type Ref =
   | ToolCallRef
@@ -112,7 +130,11 @@ export type Ref =
   | VerifierRef
   | ReportRef
   | ScratchpadRef
-  | WebRef;
+  | WebRef
+  | TraceRef
+  | ArtifactRef
+  | SourceRef
+  | MetricRef;
 
 /* ------------------------------------------------------------------ */
 /* evalJudge.yaml — the final judge report (contract template #4).     */
@@ -122,7 +144,7 @@ export type Ref =
 export interface Verdict {
   approach: VerdictApproach;
   integrity: VerdictIntegrity;
-  competence: CompetenceScore;
+  competence: CompetenceScore | null;
   reconciliation: ReconciliationVerdict;
 }
 
@@ -132,10 +154,14 @@ export interface AgentStrength {
   ref: Ref;
 }
 
-/** `improvements[].evidence[]` — a cited report plus the ref it cites. */
+/** `improvements[].evidence[]` — a cited report plus the ref it cites.
+ *  `kind: "web"` backs a recommendation with external research (a web: ref);
+ *  `kind: "archive"` (default when omitted) is a primary/report ref from the
+ *  sealed archive. */
 export interface ImprovementEvidence {
   report: ReportRef;
   ref: Ref;
+  kind?: "archive" | "web";
 }
 
 /** `improvements[]` — THE deliverable. */
@@ -196,6 +222,17 @@ export interface EvalJudgeReport {
   agent_under_evaluation: string;
   rounds_run: number;
   official_reward: number;
+  /** Validity/attribution gate (optional; absent = attributable, judged normally). */
+  eval_validity?: {
+    valid_for_agent_learning: boolean;
+    execution_status: "agent_ran" | "infrastructure_failure" | "unknown";
+    failure_owner: "agent" | "eval_harness" | "none" | "unknown";
+    agent_started: boolean;
+    official_reward_attributable_to_agent: boolean;
+    include_in_agent_patterns: boolean;
+    include_in_platform_patterns: boolean;
+    exclusion_reason: string | null;
+  };
 
   verdict: Verdict;
   narrative: string;

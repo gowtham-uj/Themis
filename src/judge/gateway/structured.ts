@@ -70,6 +70,33 @@ export async function chatJsonObject(
     throw new GatewayError(`schema validation failed after repair: ${err2}`, "schema");
   } catch (err) {
     if (err instanceof GatewayError) throw err;
+    // A truncated/partial JSON body (a model hitting its token ceiling
+    // mid-object) is a schema failure too, not an unrecoverable transport
+    // error. Plan §4: one local repair attempt before terminal failure.
+    if (err instanceof SyntaxError) {
+      repaired = true;
+      const repairedResult = await gateway.chat({
+        ...base,
+        metricOrRole: `${req.metricOrRole}:repair`,
+        messages: [
+          ...req.messages,
+          { role: "assistant", content: result.content },
+          {
+            role: "user",
+            content:
+              "Your previous reply was cut off before the JSON completed. " +
+              "Return the COMPLETE JSON object only — no commentary, no code fences, and do not stop until every brace is closed.",
+          },
+        ],
+      });
+      const repairedValue = parseJsonContent(repairedResult.content);
+      const repairedErr = req.validate(repairedValue);
+      if (repairedErr === null) return { value: repairedValue, result: repairedResult, repaired };
+      throw new GatewayError(
+        `structured output parse failed after repair: ${repairedErr}`,
+        "schema",
+      );
+    }
     throw new GatewayError(
       `structured output parse failed: ${err instanceof Error ? err.message : String(err)}`,
       "schema",

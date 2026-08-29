@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { QueryStore } from "../db/queries.js";
 
 import { migrate as migrateThemis } from "../db/sqlite/migrate.js";
 import { advanceCurrentPointer } from "../db/sqlite/pointers.js";
@@ -14,7 +15,12 @@ import { ModelGateway } from "../judge/gateway/client.js";
 import { loadGatewayConfig } from "../judge/gateway/config.js";
 import { runPhase1 } from "../judge/graph/graph.js";
 import { publishJudgeArchiveView } from "../judge/results/publish-view.js";
-import { archiveStoreDir } from "../runner/archive-store.js";
+import { archiveStoreDir, readArchiveStoreManifest } from "../runner/archive-store.js";
+import {
+  judgeQueueStatus,
+  pauseJudgeQueue,
+  resumeJudgeQueue,
+} from "../judge/ingest/pause.js";
 import {
   countPending,
   flushPending,
@@ -25,7 +31,7 @@ import {
 import { badRequest, notFound } from "./errors.js";
 import { readJsonBody, sendJson, type Router } from "./router.js";
 
-type App = { dataDir: string };
+type App = { dataDir: string; queries: QueryStore };
 
 function openThemisDb(dataDir: string): Database.Database {
   const db = new Database(join(dataDir, "themis.sqlite"));
@@ -40,7 +46,7 @@ function appOf(ctx: { app: unknown }): App {
 /** In-flight phase1 runs keyed by runId: resolved with the result once done. */
 const phase1InFlight = new Map<
   string,
-  Promise<{ result_version: unknown; current_pointer: unknown }>
+  Promise<{ result_version?: unknown; current_pointer?: unknown; paused?: boolean; run_id?: string; reason?: string }>
 >();
 
 /** Register judge health + Phase-1 execution routes. */
@@ -105,12 +111,37 @@ export function registerJudgeRoutes(router: Router): void {
     }
     const db = openThemisDb(app.dataDir);
     try {
-      const archives = body.run_ids.map((runId) => ({
-        runId,
-        projectId: "",
-        evalQueueId: null as string | null,
-        baseManifestSha256: "",
-      }));
+      // Resolve real archive identity (projectId + manifest sha) so the durable
+      // job carries truthful provenance rather than empty placeholders.
+      const { readFile } = await import("node:fs/promises");
+      const { createHash } = await import("node:crypto");
+      const archives = [];
+      for (const runId of body.run_ids) {
+        const row = app.queries.getEvalArchive(runId);
+        const legacy = row ? null : await readArchiveStoreManifest(archiveStoreDir(app.dataDir, runId));
+        const projectId = row?.projectId ?? String(
+          (legacy?.project as Record<string, unknown> | undefined)?.id ?? "",
+        );
+        // New archives carry the canonical manifest hash in eval_archives.
+        // Legacy rows fall back to the sealed manifest bytes.
+        let baseManifestSha256 = row?.manifestSha256 ?? "";
+        if (!baseManifestSha256) try {
+          const sealed = await readFile(
+            join(archiveStoreDir(app.dataDir, runId), "eval_lifecycle_logs", "archive.json"),
+          );
+          baseManifestSha256 = createHash("sha256").update(sealed).digest("hex");
+        } catch {
+          baseManifestSha256 = createHash("sha256")
+            .update(JSON.stringify(legacy ?? {}))
+            .digest("hex");
+        }
+        archives.push({
+          runId,
+          projectId,
+          evalQueueId: null as string | null,
+          baseManifestSha256,
+        });
+      }
       const results = submitStandaloneArchives(db, ctx.params.queueId!, archives);
       sendJson(res, 200, { submitted: results.length, results });
     } finally {
@@ -125,6 +156,66 @@ export function registerJudgeRoutes(router: Router): void {
     try {
       const results = flushPending(db, ctx.params.queueId!);
       sendJson(res, 200, { flushed: results.length, results });
+    } finally {
+      db.close();
+    }
+  });
+
+  /**
+   * Pause a judge queue (design §3). `kind` records WHY — provider_quota and
+   * provider_rate_limit pause WITHOUT consuming a retry attempt, so resume
+   * continues from the last committed checkpoint.
+   */
+  router.post("/api/judge/queues/:queueId/pause", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const body = (await readJsonBody<{ kind?: string; reason?: string }>(req).catch(
+      () => ({}),
+    )) as { kind?: string; reason?: string };
+    const allowed = [
+      "manual",
+      "provider_quota",
+      "provider_rate_limit",
+      "budget",
+      "operator_safety",
+    ];
+    if (body.kind && !allowed.includes(body.kind)) {
+      throw badRequest(`kind must be one of: ${allowed.join(", ")}`);
+    }
+    const db = openThemisDb(app.dataDir);
+    try {
+      const out = pauseJudgeQueue(db, ctx.params.queueId!, {
+        kind: (body.kind as never) ?? undefined,
+        reason: body.reason ?? null,
+      });
+      sendJson(res, 200, out);
+    } finally {
+      db.close();
+    }
+  });
+
+  /** Resume a paused judge queue; paused jobs requeue from their checkpoints. */
+  router.post("/api/judge/queues/:queueId/resume", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const body = (await readJsonBody<{ only_kind?: string }>(req).catch(() => ({}))) as {
+      only_kind?: string;
+    };
+    const db = openThemisDb(app.dataDir);
+    try {
+      const out = resumeJudgeQueue(db, ctx.params.queueId!, {
+        onlyKind: (body.only_kind as never) ?? undefined,
+      });
+      sendJson(res, 200, out);
+    } finally {
+      db.close();
+    }
+  });
+
+  /** Queue status: job counts by state and the pause kinds in effect. */
+  router.get("/api/judge/queues/:queueId/status", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const db = openThemisDb(app.dataDir);
+    try {
+      sendJson(res, 200, judgeQueueStatus(db, ctx.params.queueId!));
     } finally {
       db.close();
     }
@@ -147,7 +238,15 @@ export function registerJudgeRoutes(router: Router): void {
     const body = (await readJsonBody<{ work_dir?: string; track_id?: string }>(req).catch(
       () => ({}) as { work_dir?: string; track_id?: string },
     )) as { work_dir?: string; track_id?: string };
-    const archiveDir = archiveStoreDir(app.dataDir, runId);
+    const archiveRow = app.queries.getEvalArchive(runId);
+    const canonicalDir = archiveRow
+      ? join(app.dataDir, "projects", archiveRow.projectId, "evals", runId)
+      : null;
+    const legacyDir = archiveStoreDir(app.dataDir, runId);
+    const { access: canAccess } = await import("node:fs/promises");
+    const archiveDir = canonicalDir && (await canAccess(canonicalDir).then(() => true).catch(() => false))
+      ? canonicalDir
+      : legacyDir;
     // The archive may appear in the catalog a moment before its directory is
     // fully materialized (seal renames the tree). Retry briefly rather than
     // 404-ing on a just-sealed run.
@@ -171,11 +270,17 @@ export function registerJudgeRoutes(router: Router): void {
       throw badRequest(err instanceof Error ? err.message : String(err));
     }
 
+    // Stable per-run work/session path. Re-posting after a quota/rate-limit
+    // pause resumes the exact PI session via --continue; it never starts the
+    // courtroom from scratch. Callers may still supply an explicit work_dir.
     const workDir =
       typeof body.work_dir === "string" && body.work_dir.length > 0
         ? body.work_dir
-        : await mkdtemp(join(tmpdir(), "ae-judge-"));
-    const viewDir = await mkdtemp(join(tmpdir(), "ae-judge-view-"));
+        : join(app.dataDir, "judge_work", runId);
+    const viewDir = join(app.dataDir, "judge_views", runId);
+    const { mkdir: ensureDir } = await import("node:fs/promises");
+    await ensureDir(workDir, { recursive: true });
+    await ensureDir(viewDir, { recursive: true });
 
     // Phase-1 is a minutes-long model pipeline. Return 202 immediately and run
     // in the background — holding an HTTP response open across model calls is
@@ -183,21 +288,60 @@ export function registerJudgeRoutes(router: Router): void {
     let existing = phase1InFlight.get(runId);
     if (!existing) {
       const task = (async () => {
-        const state = await runPhase1({
-          caseId: `case_${runId}`,
-          runId,
-          archiveDir,
-          workDir,
-          gateway,
-          attemptId: `att_${runId}_${Date.now()}`,
-        });
+        let state;
+        try {
+          state = await runPhase1({
+            caseId: `case_${runId}`,
+            runId,
+            archiveDir,
+            workDir,
+            gateway,
+            attemptId: `att_${runId}_${Date.now()}`,
+            // Real PI courtroom wired to the same saved connection object.
+            pi: {
+              baseUrl: process.env.OPENAI_BASE_URL ?? "",
+              apiKey: process.env.OPENAI_API_KEY ?? "",
+              model: process.env.AGENTEVAL_DEFAULT_MODEL || "deepseek-v4-flash",
+              reasoningEffort: process.env.THEMIS_REASONING_EFFORT || "max",
+            },
+          });
+        } catch (err) {
+          // A provider throttle must NOT be surfaced as a crash: pause any
+          // linked judge queue without consuming a retry, so a later resume
+          // continues from the committed checkpoint.
+          const { ProviderThrottledError } = await import("../judge/gateway/client.js");
+          if (err instanceof ProviderThrottledError) {
+            const { pauseJudgeQueue } = await import("../judge/ingest/pause.js");
+            const { getLinkedJudgeQueue } = await import("../judge/ingest/store.js");
+            const db = openThemisDb(app.dataDir);
+            try {
+              const q = getLinkedJudgeQueue(db, runId) ?? db
+                .prepare(`SELECT id FROM judge_queues WHERE project_id = (SELECT project_id FROM judge_jobs WHERE run_id = ? LIMIT 1) LIMIT 1`)
+                .get(runId) as { id: string } | undefined;
+              if (q) {
+                pauseJudgeQueue(db, q.id, {
+                  kind: err.throttleKind === "quota" ? "provider_quota" : "provider_rate_limit",
+                  reason: err.message,
+                });
+              }
+            } finally {
+              db.close();
+            }
+            return { paused: true, run_id: runId, reason: err.message };
+          }
+          throw err;
+        }
 
         const published = await publishJudgeArchiveView({
           runId,
           trackId: body.track_id || "default",
           baseArchiveDir: archiveDir,
-          judgeDir: join(workDir, "judge"),
+          // The mediated tools write under THEMIS_JUDGE_DIR = workDir/node4,
+          // so the court records live at node4/judge.
+          judgeDir: join(workDir, "node4", "judge"),
           viewDir,
+          // PI orchestrator + subagent session logs -> judge_traces/
+          traceDir: join(workDir, "node4"),
         });
 
         const db = openThemisDb(app.dataDir);

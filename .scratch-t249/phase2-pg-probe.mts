@@ -1,0 +1,11 @@
+import {createPostgresPhase2Db} from "../src/db/phase2/postgres-store.ts";
+const db=await createPostgresPhase2Db(process.env.AGENTEVAL_DATABASE_URL!);
+const p=`probe_${crypto.randomUUID().slice(0,8)}`;
+const q=await db.pipeline.createQueue({projectId:p,name:"probe"});
+const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+const item=await db.pipeline.addItem({generationId:g.id,evalId:"e1",ordinal:1});
+const c=await db.phase2.createCampaign({projectId:p,pipelineGenerationId:g.id,sutFingerprint:"ab".repeat(32),ontologyVersion:"v1",membershipSha256:"cd".repeat(32),configJson:"{}"});
+await db.phase2.addMember({campaignId:c.id,pipelineItemId:item.id,runId:`r_${p}`,phase1ResultVersionId:"rv",phase1ArchiveViewId:"view",validForAgentLearning:true,ordinal:1});
+const rec=await db.phase2.upsertRecord({campaignId:c.id,kind:"observation",signature:"TOOL_RESULT_OVERSIZED",sourceOperationId:"obs",payloadJson:"{}"});
+console.log(JSON.stringify({queue:q.id,generation:g.id,campaign:c.id,record:rec.record.signature}));
+await db.close();

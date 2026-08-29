@@ -7,6 +7,8 @@
 
 import type Database from "better-sqlite3";
 
+import { PHASE2_SQLITE_DDL } from "../phase2/ddl.js";
+
 const MIGRATIONS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS judge_jobs (
     id TEXT PRIMARY KEY NOT NULL,
@@ -50,8 +52,14 @@ const MIGRATIONS: readonly string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_judge_jobs_ready
      ON judge_jobs (available_at, priority, created_at, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_judge_jobs_claim
+     ON judge_jobs (judge_queue_id, priority DESC, available_at, created_at, id)
+     WHERE state IN ('queued', 'waiting_retry')`,
   `CREATE INDEX IF NOT EXISTS idx_judge_jobs_lease_expiry
      ON judge_jobs (lease_expires_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_judge_jobs_reap
+     ON judge_jobs (lease_expires_at, id)
+     WHERE state IN ('leased', 'running', 'sealing')`,
   `CREATE INDEX IF NOT EXISTS idx_judge_jobs_run ON judge_jobs (run_id, created_at, id)`,
   `CREATE INDEX IF NOT EXISTS idx_judge_jobs_queue ON judge_jobs (judge_queue_id, created_at, id)`,
   `CREATE INDEX IF NOT EXISTS idx_judge_jobs_project ON judge_jobs (project_id, created_at, id)`,
@@ -148,6 +156,9 @@ const MIGRATIONS: readonly string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_outbox_undelivered
      ON outbox_events (available_at, created_at, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_outbox_pending
+     ON outbox_events (available_at, created_at, id)
+     WHERE delivered_at IS NULL`,
 
   `CREATE TABLE IF NOT EXISTS idempotency_keys (
     id TEXT PRIMARY KEY NOT NULL,
@@ -162,6 +173,7 @@ const MIGRATIONS: readonly string[] = [
     expires_at TEXT NOT NULL,
     UNIQUE (project_id, route, caller_key)
   )`,
+  `CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_keys (expires_at)`,
 
   // WP-7 document ledger
   `CREATE TABLE IF NOT EXISTS judge_documents (
@@ -230,7 +242,14 @@ const MIGRATIONS: readonly string[] = [
 export function migrate(db: Database.Database): void {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
-  for (const ddl of MIGRATIONS) {
+  for (const ddl of [...MIGRATIONS, ...PHASE2_SQLITE_DDL]) {
     db.exec(ddl);
+  }
+  // Guarded compatibility for databases created by the first Phase-2 slice.
+  const pipelineCols = db.prepare(`PRAGMA table_info(project_pipeline_queues)`).all() as Array<{name:string}>;
+  if (!pipelineCols.some((c) => c.name === "eval_queue_id")) {
+    db.exec(`ALTER TABLE project_pipeline_queues ADD COLUMN eval_queue_id TEXT`);
+    db.exec(`UPDATE project_pipeline_queues SET eval_queue_id = id WHERE eval_queue_id IS NULL`);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_project_pipeline_eval_queue ON project_pipeline_queues(eval_queue_id)`);
   }
 }

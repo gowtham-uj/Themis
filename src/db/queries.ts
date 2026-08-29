@@ -841,9 +841,12 @@ export interface EvalArchive {
   queueId: string | null;
   batchId: string;
   manifestPath: string;
+  /** Immutable canonical manifest key in the local ArtifactStore. */
+  manifestKey: string | null;
   manifestSha256: string;
   sizeBytes: number;
   sealedAt: string;
+  archivedAt: string | null;
 }
 
 export interface StoreEvalArchiveInput {
@@ -852,9 +855,11 @@ export interface StoreEvalArchiveInput {
   queueId?: string | null;
   batchId: string;
   manifestPath: string;
+  manifestKey?: string | null;
   manifestSha256: string;
   sizeBytes: number;
   sealedAt?: string;
+  archivedAt?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1705,9 +1710,11 @@ function mapEvalArchiveRow(row: typeof evalArchives.$inferSelect): EvalArchive {
     queueId: row.queueId ?? null,
     batchId: row.batchId,
     manifestPath: row.manifestPath,
+    manifestKey: row.manifestKey ?? null,
     manifestSha256: row.manifestSha256,
     sizeBytes: row.sizeBytes,
     sealedAt: row.sealedAt,
+    archivedAt: row.archivedAt ?? null,
   };
 }
 
@@ -3405,11 +3412,14 @@ export class SqliteQueries implements QueryStore {
     this.db.insert(evalArchives).values({
       runId: input.runId, projectId: input.projectId, queueId: input.queueId ?? null,
       batchId: input.batchId, manifestPath: input.manifestPath,
+      manifestKey: input.manifestKey ?? null,
       manifestSha256: input.manifestSha256, sizeBytes: input.sizeBytes, sealedAt,
+      archivedAt: input.archivedAt ?? sealedAt,
     }).onConflictDoUpdate({
       target: evalArchives.runId,
-      set: { manifestPath: input.manifestPath, manifestSha256: input.manifestSha256,
-        sizeBytes: input.sizeBytes, sealedAt },
+      set: { manifestPath: input.manifestPath, manifestKey: input.manifestKey ?? null,
+        manifestSha256: input.manifestSha256, sizeBytes: input.sizeBytes, sealedAt,
+        archivedAt: input.archivedAt ?? sealedAt },
     }).run();
     return this.getEvalArchive(input.runId)!;
   }
@@ -5086,8 +5096,10 @@ export class MemoryQueries implements QueryStore {
     const row: EvalArchive = {
       runId: input.runId, projectId: input.projectId, queueId: input.queueId ?? null,
       batchId: input.batchId, manifestPath: input.manifestPath,
+      manifestKey: input.manifestKey ?? null,
       manifestSha256: input.manifestSha256, sizeBytes: input.sizeBytes,
       sealedAt: input.sealedAt ?? nowIso(),
+      archivedAt: input.archivedAt ?? input.sealedAt ?? nowIso(),
     };
     this.evalArchives.set(row.runId, row);
     return { ...row };

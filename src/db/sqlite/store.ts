@@ -486,6 +486,33 @@ export class SqliteJudgeJobRepository implements JudgeJobRepository {
    * output nobody recorded. `unknown` is the honest state and is what the design
    * requires the sweeper to write.
    */
+  async releaseClaimNoRetryCharge(
+    id: string,
+    attemptId: string,
+    expected: JudgeFencing,
+  ): Promise<boolean> {
+    // A provider quota/rate-limit pause must not count the claim as a retry
+    // attempt. Roll the job's attempt_count back and drop the attempt row, all
+    // fenced on the token the claimer still holds.
+    const tx = this.db.transaction((): boolean => {
+      const moved = this.db
+        .prepare(
+          `UPDATE judge_jobs
+             SET attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,
+                 active_attempt_id = NULL, active_attempt_number = NULL,
+                 updated_at = ?
+             WHERE id = ? AND state = ? AND fencing_token = ? AND active_attempt_id = ?`,
+        )
+        .run(new Date().toISOString(), id, expected.activeState, expected.fencingToken, attemptId);
+      if (moved.changes !== 1) return false;
+      this.db
+        .prepare(`DELETE FROM judge_attempts WHERE id = ?`)
+        .run(attemptId);
+      return true;
+    });
+    return tx();
+  }
+
   async requeueExpiredLeases(opts: RequeueOptions): Promise<number> {
     const limit = clampLimit(opts.limit);
     const cutoff = new Date(Date.parse(opts.now) - opts.maxLeaseAgeMs).toISOString();

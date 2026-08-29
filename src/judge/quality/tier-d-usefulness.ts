@@ -109,11 +109,12 @@ function pathIsKnown(path: string, archive: ArchiveFacts): boolean {
 function namesResolvablePath(recommendation: string, archive: ArchiveFacts): boolean {
   if (archive.filePaths.some((fp) => recommendation.includes(stripDotSlash(fp)))) return true;
   // Basename fallback: naming "main.ts" when src/main.ts is archived still
-  // names a resolvable artifact.
+  // names a resolvable artifact. Length floor keeps a short generic token like
+  // "py" from falsely matching every Python archive.
   const basenames = new Set<string>();
   for (const fp of archive.filePaths) {
     const base = fp.split('/').pop();
-    if (base !== undefined && base.length > 0) basenames.add(base);
+    if (base !== undefined && base.length >= 4) basenames.add(base);
   }
   for (const base of basenames) {
     if (recommendation.includes(base)) return true;

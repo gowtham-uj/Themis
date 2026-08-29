@@ -348,9 +348,11 @@ const DDL: string[] = [
     queue_id TEXT REFERENCES eval_queues(id),
     batch_id TEXT NOT NULL REFERENCES run_batches(id),
     manifest_path TEXT NOT NULL,
+    manifest_key TEXT,
     manifest_sha256 TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
-    sealed_at TEXT NOT NULL
+    sealed_at TEXT NOT NULL,
+    archived_at TEXT
   )`,
 
   `CREATE TABLE IF NOT EXISTS eval_metrics (
@@ -435,6 +437,9 @@ const DDL: string[] = [
  */
 function ensureColumns(db: Database.Database): void {
   const alters = [
+    // Canonical content-addressed archive identity (local ArtifactStore).
+    "ALTER TABLE eval_archives ADD COLUMN manifest_key TEXT",
+    "ALTER TABLE eval_archives ADD COLUMN archived_at TEXT",
     "ALTER TABLE users ADD COLUMN username TEXT",
     "ALTER TABLE users ADD COLUMN password_hash TEXT",
     "ALTER TABLE users ADD COLUMN role TEXT",

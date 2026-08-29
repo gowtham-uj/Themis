@@ -152,10 +152,13 @@ export function runQualityGate(cases: readonly GateCase[]): QualityReport {
     const a = checkTierA(gateCase.yamlText);
     tierA.push(...a.violations);
 
-    // Tier A owns parsing. If the document does not parse, Tiers B and D have
-    // no object to check and are skipped FOR THIS CASE — not marked passing.
-    // The Tier A violation is what the reader acts on.
-    if (!a.passed && a.violations.some((v) => v.rule === 'a-yaml-parses')) continue;
+    // Tier A owns STRUCTURE (parse + required keys + container shapes + enums +
+    // ref shapes). If any Tier A rule fails, the document is not a well-formed
+    // evalJudge report, so Tiers B and D have no reliable object to check and
+    // are skipped FOR THIS CASE — not marked passing. (Running B/D on a report
+    // whose `improvements` is a string crashed with `forEach` on undefined;
+    // the structural failure is the actionable result, not the downstream crash.)
+    if (!a.passed) continue;
 
     let report: EvalJudgeReport;
     try {

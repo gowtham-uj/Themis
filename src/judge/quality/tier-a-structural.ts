@@ -27,7 +27,7 @@
  * object so that serialize(parse(serialize(x))) === serialize(x).
  */
 
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, parseAllDocuments } from 'yaml';
 
 import type {
   EvalJudgeReport,
@@ -106,6 +106,16 @@ export interface ParsedRef {
   category?: ReportCategory;
   /** report round number. */
   round?: number;
+  /** trace ref: the run id whose event stream is cited. */
+  runId?: string;
+  /** trace ref: the event sequence number. */
+  seq?: number;
+  /** artifact ref: the JSON pointer into the artifact. */
+  pointer?: string;
+  /** source ref: the symbol name. */
+  symbol?: string;
+  /** metric ref: the measurement name. */
+  metric?: string;
 }
 
 const REF_PREFIXES = Object.freeze([
@@ -116,6 +126,11 @@ const REF_PREFIXES = Object.freeze([
   'report:',
   'scratchpad:',
   'web:',
+  // Stable evidence IDs (preferred over line-number refs).
+  'trace:',
+  'artifact:',
+  'source:',
+  'metric:',
 ] as const);
 
 /**
@@ -182,6 +197,41 @@ export function parseRef(ref: string): ParsedRef | null {
         if (!Number.isSafeInteger(round) || round < 1) return null;
         return { kind: 'report', raw: ref, category: m[1] as ReportCategory, round };
       }
+      // ---- stable evidence IDs -------------------------------------------
+      case 'trace:': {
+        // trace:<runId>:seq:<n> — a canonical event-stream position.
+        const m = /^([^\s:]+):seq:(\d+)$/.exec(rest);
+        if (m === null) return null;
+        const seq = Number(m[2]);
+        if (!Number.isSafeInteger(seq) || seq < 0) return null;
+        return { kind: 'trace', raw: ref, runId: m[1], seq };
+      }
+      case 'artifact:': {
+        // artifact:<path>#/<json-pointer>
+        const hashIdx = rest.indexOf('#');
+        if (hashIdx <= 0) return null;
+        const path = rest.slice(0, hashIdx);
+        const pointer = rest.slice(hashIdx + 1);
+        if (!pointer.startsWith('/') || pointer.length < 2) return null;
+        if (/\s/.test(path) || /\s/.test(pointer)) return null;
+        return { kind: 'artifact', raw: ref, path, pointer };
+      }
+      case 'source:': {
+        // source:<path>#symbol=<name>
+        const hashIdx = rest.indexOf('#');
+        if (hashIdx <= 0) return null;
+        const path = rest.slice(0, hashIdx);
+        const sym = rest.slice(hashIdx + 1);
+        const m = /^symbol=(.+)$/.exec(sym);
+        if (m === null || m[1] === undefined || m[1].length === 0) return null;
+        if (/\s/.test(path)) return null;
+        return { kind: 'source', raw: ref, path, symbol: m[1] };
+      }
+      case 'metric:': {
+        // metric:<name> — a named lifecycle measurement.
+        if (rest.length === 0 || /\s/.test(rest)) return null;
+        return { kind: 'metric', raw: ref, metric: rest };
+      }
     }
   }
   return null;
@@ -211,6 +261,22 @@ const REPORT_KEYS = Object.freeze([
   'confidence_basis',
 ] as const);
 
+/** Optional top-level keys — allowed but NOT required (backward compatible). */
+const OPTIONAL_REPORT_KEYS = Object.freeze(['eval_validity'] as const);
+
+/** `eval_validity` is OPTIONAL: absent means "attributable, judged normally"
+ *  (backward compatible). Present, it must carry exactly these keys. */
+const VALIDITY_CHILD_KEYS = Object.freeze([
+  'valid_for_agent_learning',
+  'execution_status',
+  'failure_owner',
+  'agent_started',
+  'official_reward_attributable_to_agent',
+  'include_in_agent_patterns',
+  'include_in_platform_patterns',
+  'exclusion_reason',
+] as const);
+
 /** Nested required/known key sets, keyed by the parent field name. */
 const VERDICT_CHILD_KEYS = Object.freeze(['approach', 'integrity', 'competence', 'reconciliation']);
 const STRENGTH_CHILD_KEYS = Object.freeze(['observation', 'ref']);
@@ -222,7 +288,11 @@ const IMPROVEMENT_CHILD_KEYS = Object.freeze([
   'impact',
   'confidence',
 ]);
-const EVIDENCE_CHILD_KEYS = Object.freeze(['report', 'ref']);
+/** Keys every evidence entry MUST carry. `kind` is optional (defaults archive). */
+const EVIDENCE_REQUIRED_KEYS = Object.freeze(['report', 'ref']);
+/** Keys an evidence entry MAY carry — required + the optional `kind`. */
+const EVIDENCE_CHILD_KEYS = Object.freeze(['report', 'ref', 'kind']);
+const EVIDENCE_KINDS = Object.freeze(['archive', 'web']);
 const INTEGRITY_SUMMARY_CHILD_KEYS = Object.freeze(['verdict', 'findings']);
 const FINDING_CHILD_KEYS = Object.freeze(['finding', 'ref', 'round']);
 const CASE_COVERAGE_CHILD_KEYS = Object.freeze([
@@ -236,6 +306,7 @@ const OPEN_QUESTION_CHILD_KEYS = Object.freeze(['question', 'why_unresolved', 'w
 const REVISION_CHILD_KEYS = Object.freeze(['ruling', 'changed_in_round', 'from', 'to', 'why']);
 
 const CHILD_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  eval_validity: VALIDITY_CHILD_KEYS,
   verdict: VERDICT_CHILD_KEYS,
   strength: STRENGTH_CHILD_KEYS,
   improvement: IMPROVEMENT_CHILD_KEYS,
@@ -427,7 +498,7 @@ export function checkRequiredKeys(report: unknown): Violation[] {
         );
         return;
       }
-      for (const key of EVIDENCE_CHILD_KEYS) {
+      for (const key of EVIDENCE_REQUIRED_KEYS) {
         if (!(key in evidence)) {
           violations.push(
             violation(
@@ -517,7 +588,10 @@ export function checkNoInventedKeys(report: unknown): Violation[] {
   if (!isObject(report)) return violations;
 
   for (const key of Object.keys(report)) {
-    if (!(REPORT_KEYS as readonly string[]).includes(key)) {
+    if (
+      !(REPORT_KEYS as readonly string[]).includes(key) &&
+      !(OPTIONAL_REPORT_KEYS as readonly string[]).includes(key)
+    ) {
       violations.push(
         violation('a-no-invented-keys', `invented top-level key "${key}"`, key),
       );
@@ -540,6 +614,7 @@ export function checkNoInventedKeys(report: unknown): Violation[] {
   };
 
   const reportObj = report;
+  if (isObject(reportObj.eval_validity)) checkMap(reportObj.eval_validity, VALIDITY_CHILD_KEYS, 'eval_validity');
   if (isObject(reportObj.verdict)) checkMap(reportObj.verdict, VERDICT_CHILD_KEYS, 'verdict');
   if (isObject(reportObj.integrity_summary)) {
     checkMap(reportObj.integrity_summary, INTEGRITY_SUMMARY_CHILD_KEYS, 'integrity_summary');
@@ -554,6 +629,20 @@ export function checkNoInventedKeys(report: unknown): Violation[] {
     if (!isObject(item)) return;
     checkMap(item, IMPROVEMENT_CHILD_KEYS, `improvements[${i}]`);
     checkList(asArray(item.evidence), EVIDENCE_CHILD_KEYS, `improvements[${i}].evidence`);
+    asArray(item.evidence).forEach((evidence, j) => {
+      if (!isObject(evidence)) return;
+      const kind = evidence.kind;
+      if (kind === undefined || kind === null) return; // defaults to archive
+      if (!(EVIDENCE_KINDS as readonly string[]).includes(String(kind))) {
+        violations.push(
+          violation(
+            'a-enums-exact',
+            `improvements[${i}].evidence[${j}].kind must be one of {${EVIDENCE_KINDS.join(', ')}} (got ${JSON.stringify(kind)})`,
+            `improvements[${i}].evidence[${j}].kind`,
+          ),
+        );
+      }
+    });
   });
   checkList(asArray(reportObj.open_questions), OPEN_QUESTION_CHILD_KEYS, 'open_questions');
   checkList(asArray(reportObj.revision_history), REVISION_CHILD_KEYS, 'revision_history');
@@ -628,9 +717,24 @@ export function checkEnumsExact(report: unknown): Violation[] {
     const integrity = inEnum(verdict.integrity, VERDICT_INTEGRITY_VALUES, 'verdict.integrity', 'integrity');
     if (integrity !== undefined) violations.push(integrity);
     const competenceValue = verdict.competence;
-    if (typeof competenceValue !== 'number' || !Number.isInteger(competenceValue)) {
+    // A non-attributable run (agent never executed) has competence `null` —
+    // "not observed" must NOT be encoded as a numeric score, which would poison
+    // Phase-2 agent statistics.
+    if (competenceValue === null || competenceValue === undefined) {
+      // allowed only when the validity gate says the agent never ran
+      const validity = isObject(reportObj.eval_validity) ? reportObj.eval_validity : undefined;
+      if (validity === undefined || validity.valid_for_agent_learning !== false) {
+        violations.push(
+          violation(
+            'a-enums-exact',
+            'verdict.competence may be null only when eval_validity.valid_for_agent_learning is false (agent never ran)',
+            'verdict.competence',
+          ),
+        );
+      }
+    } else if (typeof competenceValue !== 'number' || !Number.isInteger(competenceValue)) {
       violations.push(
-        violation('a-enums-exact', 'verdict.competence must be an integer in 1..5', 'verdict.competence'),
+        violation('a-enums-exact', 'verdict.competence must be an integer in 1..5, or null when the agent never ran', 'verdict.competence'),
       );
     } else if (competenceValue < 1 || competenceValue > 5) {
       violations.push(
@@ -787,8 +891,15 @@ function collectRefFields(report: unknown): { ref: string; path: string; kind: '
     if (!isObject(item)) return;
     asArray(item.evidence).forEach((evidence, j) => {
       if (!isObject(evidence)) return;
+      // `kind: web` evidence cites an external source in BOTH `report` and
+      // `ref` as a `web:<url>` ref, so neither is a report: ref there.
+      const isWeb = evidence.kind === 'web';
       if (typeof evidence.report === 'string') {
-        out.push({ ref: evidence.report, path: `improvements[${i}].evidence[${j}].report`, kind: 'report' });
+        out.push({
+          ref: evidence.report,
+          path: `improvements[${i}].evidence[${j}].report`,
+          kind: isWeb ? 'ref' : 'report',
+        });
       }
       if (typeof evidence.ref === 'string') {
         out.push({ ref: evidence.ref, path: `improvements[${i}].evidence[${j}].ref`, kind: 'ref' });
@@ -865,10 +976,15 @@ const BARE_PLACEHOLDER_RE = /\b(?:TODO|FIXME|TBD|N\/A|WIP)\b/;
 export function checkPlaceholderResidue(report: unknown): Violation[] {
   const violations: Violation[] = [];
   for (const { path, value } of collectStringLeaves(report)) {
+    // An email address quoted in angle brackets (`Eval Setup <eval@…>`) is
+    // evidence text, not a template placeholder. Strip email-shaped pairs
+    // before testing so a legitimately quoted seed-commit author does not
+    // read as unfinished work.
+    const stripped = value.replace(/<[^>\s]*@[^>]*>/g, "");
     if (
-      PLACEHOLDER_RE.test(value) ||
-      EMPTY_ANGLE_RE.test(value) ||
-      BARE_PLACEHOLDER_RE.test(value)
+      PLACEHOLDER_RE.test(stripped) ||
+      EMPTY_ANGLE_RE.test(stripped) ||
+      BARE_PLACEHOLDER_RE.test(stripped)
     ) {
       violations.push(
         violation(
@@ -1127,7 +1243,26 @@ export function canonicalSerializeReport(report: unknown): string {
  * form carries neither).
  */
 export function parseEvalJudgeYaml(yamlText: string): unknown {
-  const parsed = parseYaml(yamlText, { uniqueKeys: true, maxAliasCount: 0 });
+  // The report contract is append-only multi-document YAML: every round appends
+  // a new `---` document and touches nothing above it. The FINAL position is the
+  // final ruling, so parse all documents and take the last non-empty one.
+  // (Single-document parse() rejected a valid multi-doc stream with "Source
+  // contains multiple documents" — observed live on a real evalJudge.yaml.)
+  const docs = parseAllDocuments(yamlText, { uniqueKeys: true });
+  // parseAllDocuments collects per-document errors instead of throwing. Any
+  // document-level error means the stream does not parse — same contract as the
+  // single-doc parse() this replaced.
+  for (const doc of docs) {
+    if (doc.errors.length > 0) {
+      throw new Error(doc.errors[0]!.message);
+    }
+  }
+  let parsed: unknown = null;
+  for (const doc of docs) {
+    const v = doc.toJS();
+    if (v === null || v === undefined) continue;
+    parsed = v;
+  }
   if (parsed === null || parsed === undefined) {
     throw new Error('evalJudge.yaml parses to an empty document');
   }
