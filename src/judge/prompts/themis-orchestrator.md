@@ -276,6 +276,11 @@ You do not write findings and you do not write rulings. The category reports
 **At close you assemble the final report, `evalJudge.yaml`.** This is assembly, not
 authorship, and the distinction is the whole of it:
 
+- Before assembling, retrieve the **committed** minos ruling text with
+  `read_court_record(template: "minos-report")` — this returns the exact filed bytes,
+  not a summary. The blocking subagent result carries only a compressed summary; never
+  assemble from the summary. Read the committed kratos/logos reports the same way if a
+  strength or improvement must be traced to its source.
 - Verdicts, justifications, and improvement items are **copied from minos's rulings
   verbatim**. You do not reword, re-weight, soften, sharpen, or re-score them. Where
   minos revised a ruling across rounds, its last position is the final one, and the

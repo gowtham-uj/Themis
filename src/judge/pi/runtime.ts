@@ -288,7 +288,7 @@ export async function runPiOrchestrator(input: PiRunInput): Promise<PiRunResult>
     // Mediated surface only (plan §6): the orchestrator reads evidence, spawns
     // investigators/judge via the subagent tool, and writes judge/ output. No
     // general shell. The subagents' own allowlists are in their .md frontmatter.
-    "--tools", "subagent,evidence_list,read_evidence,write_to_yaml_template,read_scratchpad,file_tangent,petition,grant,channel,web_search",
+    "--tools", "subagent,evidence_list,read_evidence,read_court_record,write_to_yaml_template,read_scratchpad,file_tangent,petition,grant,channel,web_search",
     "--extension", subagentsExt,
     "--extension", dynamicExt,
     "--extension", themisToolsExt,

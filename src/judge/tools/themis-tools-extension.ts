@@ -477,6 +477,28 @@ export default function registerThemisTools(pi: ExtensionAPI): void {
     },
   });
 
+  // ---- read_court_record --------------------------------------------------
+  pi.registerTool({
+    name: "read_court_record",
+    label: "Read court record",
+    description:
+      "Read a COMMITTED court document by template name (kratos-report, logos-report, minos-report, round-log, tangent-log, case-summary). This is how the orchestrator retrieves the VERBATIM text of a filed report for final assembly — never a host path, never a scratchpad.",
+    parameters: schema({ template: Type.String() }),
+    async execute(_id, params) {
+      try {
+        const template = String(params.template ?? "");
+        const target = TEMPLATE_TARGETS[template];
+        if (!target) return err(`unknown template "${template}". Allowed: ${Object.keys(TEMPLATE_TARGETS).join(", ")}`);
+        const p = safeJoin(judgeDir(), target);
+        const text = await readFile(p, "utf8").catch(() => null);
+        if (text === null) return err(`no committed court record for ${template}`);
+        return ok(text);
+      } catch (e) {
+        return err(e instanceof Error ? e.message : String(e));
+      }
+    },
+  });
+
   // ---- read_scratchpad ---------------------------------------------------
   const scratchInProgress = new Set<string>();
   pi.registerTool({
