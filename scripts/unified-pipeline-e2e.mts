@@ -43,14 +43,19 @@ console.log("pipeline queue",pipeline.id);
 const gen=ok(await api("POST",`/api/projects/${projectId}/pipeline/generation`,{}),"create generation");
 console.log("generation",gen.id);
 
-// Advance until completed or terminal.
-for(let i=0;i<120;i++){
+// Advance until completed or terminal. Real evals + Phase1 + Phase2 take many
+// minutes; poll with a generous wall-clock budget instead of a fixed tick count.
+const deadline=Date.now()+45*60*1000;
+let final:any=null;
+while(Date.now()<deadline){
   const r=await api("POST",`/api/projects/${projectId}/pipeline/generation/${gen.id}/advance`,{trigger:"auto"});
   const b=r.body;
-  if(b.generation?.state==="completed"||b.generation?.state==="failed"||b.generation?.state==="cancelled"){console.log("final",b.generation.state,b.waitingFor??"");break}
-  if(i%5===0)console.log("tick",i,b.generation?.state,b.items?.map((x:any)=>`${x.evalId}:${x.state}`).join(","));
-  await new Promise(x=>setTimeout(x,1500));
+  const state=b.generation?.state;
+  if(state==="completed"||state==="failed"||state==="cancelled"){final=b;console.log("final",state,b.waitingFor??"");break}
+  console.log("tick",b.generation?.state,b.items?.map((x:any)=>`${x.evalId.slice(0,8)}:${x.state}`).join(","));
+  await new Promise(x=>setTimeout(x,3000));
 }
+if(!final){final=(await api("GET",`/api/projects/${projectId}/pipeline/generation/${gen.id}`)).body}
 
 const status=ok(await api("GET",`/api/projects/${projectId}/pipeline/generation/${gen.id}`),"get generation");
 console.log("STATUS",JSON.stringify(status,null,2).slice(0,2000));

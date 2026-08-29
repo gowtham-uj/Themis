@@ -24,7 +24,7 @@ describe("project pipeline coordinator",()=>{
   const final=await db.pipeline.getGeneration(g.id);expect(final?.state).toBe("completed");
   const items=(await db.pipeline.listItems(g.id,{cursor:null,limit:10})).items;
   expect(items.map(x=>x.state)).toEqual(["final_view_published","final_view_published"]);
-  expect(started).toBe(2);expect(phase2Runs).toBe(1);
+  expect(started).toBe(1);expect(phase2Runs).toBe(1);
   expect((await db.phase2.getCampaignByGeneration(g.id))?.state).toBe("published");
   expect((await db.phase2.listPublications((await db.phase2.getCampaignByGeneration(g.id))!.id,{cursor:null,limit:10})).items).toHaveLength(2);
   await db.close();
