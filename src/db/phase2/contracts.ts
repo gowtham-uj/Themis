@@ -35,7 +35,7 @@ export interface PipelineItemRow {
   state: PipelineItemState; runId: string | null; baseArchiveId: string | null;
   phase1ResultVersionId: string | null; phase1ArchiveViewId: string | null;
   finalArchiveViewId: string | null; errorKind: string | null;
-  errorDetail: string | null; createdAt: Phase2Timestamp; updatedAt: Phase2Timestamp;
+  errorDetail: string | null; retryCount: number; createdAt: Phase2Timestamp; updatedAt: Phase2Timestamp;
 }
 export interface PipelineEventRow {
   id: string; generationId: string; itemId: string | null; operationId: string;
@@ -84,7 +84,7 @@ export interface AddPipelineItemInput { generationId: string; evalId: string; or
 export interface PipelineItemPatch {
   state?: PipelineItemState; runId?: string | null; baseArchiveId?: string | null;
   phase1ResultVersionId?: string | null; phase1ArchiveViewId?: string | null;
-  finalArchiveViewId?: string | null; errorKind?: string | null; errorDetail?: string | null;
+  finalArchiveViewId?: string | null; errorKind?: string | null; errorDetail?: string | null; retryCount?: number;
 }
 export interface CreatePhase2CampaignInput {
   projectId: string; pipelineGenerationId: string; sutFingerprint: string;

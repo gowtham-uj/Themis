@@ -34,6 +34,10 @@ export interface ProjectPipelineServices{
 
 export interface AdvanceResult{generation:PipelineGenerationRow;items:readonly PipelineItemRow[];changed:boolean;waitingFor:string|null}
 const PAGE={cursor:null,limit:1000} as const;
+/** Bounded retries for a transient Phase-1 failure (e.g. the PI courtroom hit
+ *  its context ceiling and ended without evalJudge.yaml). A manual or automatic
+ *  re-advance resumes the SAME PI session via the worker's checkpoint recovery. */
+const MAX_PHASE1_RETRIES=2;
 
 function shaMembers(items:readonly PipelineItemRow[]):string{return createHash("sha256").update(JSON.stringify(items.map(x=>[x.id,x.runId,x.phase1ResultVersionId,x.phase1ArchiveViewId,x.ordinal]))).digest("hex")}
 function isAllowed(trigger:PipelineTrigger,auto:boolean):boolean{return trigger==="auto"?auto:true}
@@ -72,7 +76,22 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
  for(const item of items.filter(x=>x.state==="archive_sealed")){await input.db.pipeline.updateItem(item.id,"archive_sealed",{state:"phase1_pending"});changed=true}
  items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];
  // Poll all running Phase1 jobs (worker concurrency is independent of eval sequentiality).
- for(const item of items.filter(x=>x.state==="phase1_running"&&x.runId)){const s=await input.services.getPhase1Status(item.runId!);if(s.state==="published"){if(!s.resultVersionId||!s.archiveViewId)throw new Error(`published Phase1 ${item.runId} missing ids`);await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"phase1_published",phase1ResultVersionId:s.resultVersionId,phase1ArchiveViewId:s.archiveViewId});await input.db.pipeline.appendEvent({generationId:gen.id,itemId:item.id,operationId:`phase1.published:${item.id}:${s.resultVersionId}`,eventType:"phase1.result_published",payloadJson:JSON.stringify(s)});changed=true}else if(s.state==="failed"){await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"failed",errorKind:"phase1",errorDetail:s.error??"Phase1 failed"});changed=true}}
+ for(const item of items.filter(x=>x.state==="phase1_running"&&x.runId)){
+  const s=await input.services.getPhase1Status(item.runId!);
+  if(s.state==="published"){
+   if(!s.resultVersionId||!s.archiveViewId)throw new Error(`published Phase1 ${item.runId} missing ids`);
+   await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"phase1_published",phase1ResultVersionId:s.resultVersionId,phase1ArchiveViewId:s.archiveViewId});
+   await input.db.pipeline.appendEvent({generationId:gen.id,itemId:item.id,operationId:`phase1.published:${item.id}:${s.resultVersionId}`,eventType:"phase1.result_published",payloadJson:JSON.stringify(s)});changed=true;
+  }else if(s.state==="failed"){
+   const n=item.retryCount+1;
+   if(n<=MAX_PHASE1_RETRIES){
+    await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"phase1_pending",errorKind:"phase1",errorDetail:s.error??"Phase1 failed",retryCount:n});
+    await input.db.pipeline.appendEvent({generationId:gen.id,itemId:item.id,operationId:`phase1.retry:${item.id}:${n}`,eventType:"phase1.retry",payloadJson:JSON.stringify({error:s.error,retryCount:n})});changed=true;
+   }else{
+    await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"failed",errorKind:"phase1",errorDetail:s.error??"Phase1 failed"});changed=true;
+   }
+  }
+ }
  items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];
  if(isAllowed(trigger,queue.autoPhase1)&&(trigger==="auto"||trigger==="phase1")){for(const item of items.filter(x=>x.state==="phase1_pending")){await input.services.startPhase1(item,gen);await input.db.pipeline.updateItem(item.id,"phase1_pending",{state:"phase1_running"});changed=true}}
  items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];

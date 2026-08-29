@@ -21,7 +21,8 @@ export const PHASE2_SQLITE_DDL: readonly string[] = [
   ordinal INTEGER NOT NULL, eval_id TEXT NOT NULL, state TEXT NOT NULL,
   run_id TEXT, base_archive_id TEXT, phase1_result_version_id TEXT,
   phase1_archive_view_id TEXT, final_archive_view_id TEXT,
-  error_kind TEXT, error_detail TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  error_kind TEXT, error_detail TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   UNIQUE(generation_id, ordinal), UNIQUE(generation_id, eval_id))`,
 `CREATE INDEX IF NOT EXISTS idx_pipeline_item_ready ON project_pipeline_items(generation_id, state, ordinal, id)`,
 `CREATE TABLE IF NOT EXISTS project_pipeline_events (
