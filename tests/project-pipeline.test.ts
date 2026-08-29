@@ -11,9 +11,9 @@ describe("project pipeline coordinator",()=>{
   const g=await db.pipeline.createGeneration({queueId:q.id,configJson:'{"agent":"reapercode"}'});
   await db.pipeline.addItem({generationId:g.id,evalId:"e1",ordinal:1});
   await db.pipeline.addItem({generationId:g.id,evalId:"e2",ordinal:2});
-  const evalPoll=new Map<string,number>(),p1Poll=new Map<string,number>();let started=0,phase2Runs=0;
+  const evalPoll=new Map<string,number>(),p1Poll=new Map<string,number>();let started=0,phase2Runs=0;let evalQueueStarted=false;
   const services:ProjectPipelineServices={
-   async startEvalQueue(){started++;return{started:true}},
+   async startEvalQueue(){if(!evalQueueStarted){evalQueueStarted=true;started++}return{started:true}},
    async pollEvalItem(item){const n=(evalPoll.get(item.evalId)??0)+1;evalPoll.set(item.evalId,n);const runId=`run-${item.evalId}`;return n>=1?{state:"completed",runId,archiveId:`archive-${runId}`}:{state:"running",runId}},
    async startPhase1(item){return{operationId:`p1-${item.id}`}},
    async getPhase1Status(runId){const n=(p1Poll.get(runId)??0)+1;p1Poll.set(runId,n);return n>=1?{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`}:{state:"running"}},
@@ -32,7 +32,7 @@ describe("project pipeline coordinator",()=>{
  it("honors manual Phase2 trigger when autoPhase2 is disabled",async()=>{
   const db=createSqlitePhase2Db(new Database(":memory:"));
   const q=await db.pipeline.createQueue({projectId:"p2",evalQueueId:"eq2",name:"q",autoPhase2:false});const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});const item=await db.pipeline.addItem({generationId:g.id,evalId:"e",ordinal:1});
-  const services:ProjectPipelineServices={async startEval(){return{runId:"r"}},async getEvalStatus(){return{state:"completed",archiveId:"a"}},async startPhase1(){return{operationId:"p1"}},async getPhase1Status(){return{state:"published",resultVersionId:"rv",archiveViewId:"v"}},async runPhase2(){return{developerPackSha256:"a".repeat(64),artifactDir:"/p2"}},async publishFinalView(){return{finalArchiveViewId:"fv",manifestSha256:"b".repeat(64)}}};
+  const services:ProjectPipelineServices={async startEvalQueue(){return{started:true}},async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:`a-${item.evalId}`}},async startPhase1(){return{operationId:"p1"}},async getPhase1Status(){return{state:"published",resultVersionId:"rv",archiveViewId:"v"}},async runPhase2(){return{developerPackSha256:"a".repeat(64),artifactDir:"/p2"}},async publishFinalView(){return{finalArchiveViewId:"fv",manifestSha256:"b".repeat(64)}}};
   let r;for(let i=0;i<10;i++){r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.waitingFor==="phase2_trigger")break}expect(r?.waitingFor).toBe("phase2_trigger");
   const done=await advanceProjectPipeline({db,services,generationId:g.id,trigger:"phase2"});expect(done.generation.state).toBe("completed");
   await db.close();
