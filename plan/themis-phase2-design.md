@@ -1,7 +1,7 @@
 # Themis Phase 2 — Agent Improvement Intelligence
 
 > **Status: FIVE-COMPONENT PIPELINE IMPLEMENTED, BOARD RUNS ON PI.** Campaign manager,
-> cohort-aware pattern analyzer with CANDIDATE/PROVISIONAL/CANONICAL registry, and the
+> per-campaign pattern analyzer, and the
 > four-role analytical board (investigator, researcher, designer, reviewer) are live, as
 > are the executive brief, hypotheses, R&D memory, per-eval `phase2/` reseal, and the
 > `developer-improvement-pack.zip`.
@@ -96,7 +96,10 @@ Responsibilities:
 
 - freeze an immutable campaign;
 - record the exact Phase-1 results included;
-- record the tested agent/model/configuration fingerprint;
+- record the tested agent/model/configuration fingerprint (as built, `sutFingerprint` is
+  `sha256` of the generation config JSON, which carries the eval queue and project ID but
+  not the adapter version, agent image, model, or provider — it identifies the campaign, not
+  the agent);
 - separate valid agent runs from platform failures;
 - keep Agent Intelligence and Platform Intelligence separate.
 
@@ -183,6 +186,32 @@ CANDIDATE → PROVISIONAL → CANONICAL → DEPRECATED / ALIAS
 
 Historical campaign results are never rewritten.
 
+### What the analyzer computes today
+
+The built analyzer is narrower than the section above, and the gaps are worth naming rather
+than leaving a reader to discover them in `patterns.ts`.
+
+| Documented | As built |
+|---|---|
+| Token and latency impact | `averageTokens` only. Wall time rides on each observation but is never aggregated. |
+| Repeated behavioral sequences | Not built. |
+| Cohorts by task family, difficulty, language, repo size, edit size, model, token budget | Four fixed axes: `language`, `category`, `profile`, `model`. |
+| CANDIDATE → PROVISIONAL → CANONICAL → DEPRECATED / ALIAS | Frequency thresholds inside one campaign: 3 or more occurrences is canonical, 2 is provisional, 1 is candidate. No cross-campaign registry, no deprecation, no aliases. |
+| Emergent patterns | Not built. Signatures come from a closed list, and anything unmatched is dropped as `UNCLASSIFIED`. |
+
+Two things the analyzer does that the section above does not mention. Agent observations
+are read only from minos's `improvements` list, falling back to the narrative when that
+list is empty, because keyword-matching the narrative attributed the verifier's own
+`python3: command not found` to the agent as an interpreter assumption. And each case
+carries `rewardAttributable`, derived from the sealed verifier record, which gates pass and
+fail counting, silent-weakness counting, and a designer rule that forbids using pass rate
+as the primary metric when rewards cannot be attributed.
+
+Platform-fault classification is also deterministic and undocumented above:
+`load-cases.ts` reads the verifier record for `verifier_crash`, `verifier_timeout`,
+`setup_failure`, or `empty_workspace`, and overrides a stale Phase-1 `failure_owner: none`
+when it finds one. Those become the five canned platform findings in the platform report.
+
 ---
 
 ## 3. Investigation and Research
@@ -196,6 +225,12 @@ Three roles contribute:
 | Kratos | Confirms that the behavior repeats across representative evals |
 | Logos | Infers the likely mechanism from black-box traces and controlled observations |
 | Research | Finds relevant external techniques, papers, and framework guidance |
+
+As built, Kratos and Logos are one `investigator` subagent and Research is the `researcher`
+subagent. Both Phase-2 responsibilities above are black-box trace reading over the same
+court records, and splitting them produced two agents citing the same evidence. The
+responsibilities in this table still hold; only the role count changed. See
+[Roles](#roles).
 
 Phase 2 is **black-box only**.
 
@@ -452,6 +487,19 @@ If the developer later provides experiment results, a future review can add:
 EXTERNALLY_VALIDATED
 ```
 
+Four of those five rungs are reachable today. The normalizer maps model output onto
+`research_supported`, `mechanistically_supported`, `experiment_proposed`, or
+`observational`, and anything it does not recognize falls to `observational`, so a
+recommendation filed as `developer_implementation_required` is silently downgraded.
+`EXTERNALLY_VALIDATED` is not in the type at all. Two more coercions matter for the same
+reason: a `research_backed` recommendation with an empty research basis is demoted to
+`direct_fix`, and `themisKnowsExactSourceLocation` is forced false no matter what the
+designer wrote. Recommendation classes are enforced by coercion, not by validation, which
+means a malformed model response degrades quietly instead of failing.
+
+Review can also be a no-op. If the reviewer files an empty `keptIds` and an empty `dropped`,
+every drafted recommendation passes through unreviewed.
+
 ### Final outputs
 
 Phase 2 produces a **Developer Improvement Pack** containing:
@@ -461,7 +509,10 @@ Phase 2 produces a **Developer Improvement Pack** containing:
 3. **Root-Cause Hypotheses** — supported and contradicting observations.
 4. **Improvement Portfolio** — prioritized direct, research-backed, and experimental ideas.
 5. **Experiment Plans** — exactly how the developer can test each proposal.
-6. **Platform Reliability Report** — separate from agent findings.
+
+The **Platform Reliability Report** is a sixth document, but it is not part of the pack. It
+goes to whoever operates Themis, and the pack zip excludes it deliberately. See
+[Pack structure](#pack-structure).
 
 ---
 
@@ -479,6 +530,11 @@ hand-rolled loop reimplemented tool dispatch, retry, and session persistence bad
 already does all three, and reusing it means one resume path and one tool surface across
 both phases.
 
+The older gateway board (`agent-loop.ts`, `GatewayPhase2Board`, and the parallel tool table
+in `phase2/tools.ts`) is still in the tree and reachable from tests, but no live route
+constructs it. `PiPhase2Board` is what `pipeline-routes.ts` wires in. Treat the gateway
+board as a test fixture, not a supported fallback.
+
 ## Roles
 
 One orchestrator dispatches four specialist subagents. Dispatch is strictly ordered and
@@ -492,6 +548,11 @@ for.
 | researcher | `phase2-researcher.md` | `phase2-research` | What published techniques address those mechanisms |
 | designer | `phase2-designer.md` | `phase2-recommendations` | What the developer should change, and how they can prove it worked |
 | reviewer | `phase2-reviewer.md` | `phase2-review` | Which recommendations survive scrutiny |
+
+The campaign runner awaits four board methods in sequence, but they are not four
+processes. The first call launches the PI orchestrator once and caches its result; the
+other three read slices of that same run. Ordering lives in the orchestrator prompt, not in
+the host code that appears to sequence it.
 
 Mapping back to the five components: the investigator is component 3's Kratos and Logos
 roles merged (both are black-box trace reading, and splitting them produced two agents
@@ -528,15 +589,9 @@ re-attaches to the existing session with `--continue` rather than restarting the
 Traces are copied into each eval's `phase2/` archive view alongside the Phase-1 `judge/`
 tree, so a campaign's reasoning stays auditable from the archive API.
 
-Control is over HTTP, matching Phase 1:
-
-```text
-GET  /api/projects/:id/pipeline/campaign/:campaignId          campaign + records + board status
-GET  /api/projects/:id/pipeline/campaign/:campaignId/status   subagent status, session, resumability
-POST /api/projects/:id/pipeline/campaign/:campaignId/pause    SIGTERM the board, keep the session
-POST /api/projects/:id/pipeline/campaign/:campaignId/resume   re-attach and continue
-GET  /api/projects/:id/pipeline/campaign/:campaignId/pack     download the developer pack
-```
+Control is over HTTP, matching Phase 1. The five campaign routes and what they actually do
+to the generation are listed in
+[As-built routes and controls](#as-built-routes-and-controls).
 
 ## Pack structure
 
@@ -599,6 +654,12 @@ external_experiment_result:
 
 This prevents the system from recommending the same failed idea repeatedly.
 
+As built, memory is write-only. Each campaign writes `rd-memory.yaml` with the rejected
+recommendation IDs and the reviewer's reasons, and nothing reads it back into the next
+campaign yet. The designer prompt already honors a `memory.rejectedRecommendationIds` list,
+so feeding the previous campaign's file into the next run is the remaining work.
+`external_experiment_result` import is not built.
+
 ---
 
 # Data and storage
@@ -620,6 +681,16 @@ signature definitions and aliases
 ```
 
 Large logs, traces, diffs, and evidence remain content-addressed outside database rows.
+
+As built, the live path opens SQLite at `<dataDir>/themis.sqlite`. A PostgreSQL store
+implements the same contract but no route selects it yet. Of the record kinds above, only
+one is written: a `decision` row per campaign carrying the whole pack result as JSON.
+Observations, patterns, hypotheses, recommendations, and experiment plans exist as YAML
+files under `data/phase2_artifacts/<campaignId>/` and in the sealed archive view, not as
+queryable rows. Campaign membership rows also hardcode `valid_for_agent_learning: true`;
+the real validity split runs later, in `load-cases.ts`, off the sealed verifier record, and
+only reaches the YAML artifacts. Anything that needs to query across campaigns has to wait
+for those rows to be written for real.
 
 ---
 
@@ -792,6 +863,39 @@ pipeline.final_views_published
 Workers claim with leases/fencing. A stale worker may finish external work, but cannot
 advance queue or publication state after losing its token.
 
+Four events exist today: `archive.sealed`, `phase1.result_published`, and two the list
+above omits, `phase1.retry` and `phase1.resume`. The last three in the list are not emitted;
+stage advancement reads generation state directly instead.
+
+## As-built routes and controls
+
+Every stage starts through one route. There is no separate Phase-2 start endpoint.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/projects/:id/pipeline` | Create the project's pipeline queue |
+| POST | `/api/projects/:id/pipeline/generation` | Open a generation |
+| POST | `/api/projects/:id/pipeline/generation/:gid/advance` | Advance with `trigger: auto \| eval \| phase1 \| phase2 \| finalize` |
+| GET | `/api/projects/:id/pipeline/generation/:gid` | Generation status |
+| POST | `/api/projects/:id/runs/:runId/phase1/pause` | Pause one Phase-1 courtroom |
+| GET | `/api/projects/:id/pipeline/campaign/:cid` | Campaign, filed records, and PI status |
+| GET | `/api/projects/:id/pipeline/campaign/:cid/status` | PI status alone |
+| POST | `/api/projects/:id/pipeline/campaign/:cid/pause` | SIGTERM then SIGKILL the PI process |
+| POST | `/api/projects/:id/pipeline/campaign/:cid/resume` | 202, restart PI from the on-disk snapshot |
+| GET | `/api/projects/:id/pipeline/campaign/:cid/pack` | Stream the pack zip |
+
+The pack route rebuilds the path from `dataDir` and the campaign ID rather than trusting a
+stored host path, opens with `O_NOFOLLOW`, and rejects symlinks.
+
+Three gaps against the manual-controls list. Cancel has no route, though `cancelled` exists
+in the state machines. Phase-2 pause and resume act on the PI process, not the generation:
+pause kills the pid without moving the generation to `paused`, and resume restarts the
+subprocess from its snapshot without going through generation advancement, so it throws if
+Phase 2 has never run. And Phase-2 resume idempotency is not durable: an in-process map
+guards concurrent requests and dies with the server, and the ordering guarantee that stops
+a resumed campaign from re-running a finished stage is a sentence in the orchestrator
+prompt telling it to skip any stage whose YAML already exists.
+
 ## Phase-2 archive layout
 
 Phase 2 is campaign-level analysis, but each eval receives a final view so developers
@@ -800,12 +904,21 @@ still have one complete archive per eval:
 ```text
 phase2/
   campaign.yaml             campaign identity, SUT fingerprint, membership
+  executive-brief.yaml      the largest recurring weaknesses
+  hypotheses.yaml           root-cause hypotheses with supporting/contradicting refs
   patterns.yaml             recurring agent patterns relevant to this eval/campaign
   developer-pack.yaml       prioritized source-owner implementation handoffs
   experiment-plans.yaml     developer-run validation plans
-  platform-report.yaml      dev/platform intelligence, separate from agent findings
+  rd-memory.yaml            rejected recommendations and why
+  platform-report.yaml      platform intelligence, written only when there is any
   manifest.json             schema version + hashes of all Phase-2 documents
+  developer-improvement-pack.zip   the agent-facing pack, sealed with the view
+  traces/                   PI stdout, session JSONL, and subagent artifacts
 ```
+
+The publisher requires every file above except `platform-report.yaml`, which
+`run-campaign.ts` writes only when the campaign found at least one platform finding or
+harness-owned pattern.
 
 The final view is a strict superset of that eval's immutable Phase-1 view. It never
 changes base evidence or `judge/` bytes. Historical Phase-1 and earlier Phase-2 views

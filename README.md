@@ -95,6 +95,12 @@ Anything owned by the harness goes to a separate `platform-report.yaml`, for who
 Shipping harness bugs to an agent developer as if they were agent weaknesses wastes their time and
 discredits the rest of the pack.
 
+The design doc marks where the build is thinner than the plan, and the gaps are real ones.
+The pattern analyzer scores frequency inside a single campaign rather than maintaining a
+cross-campaign registry. R&D memory is written but never read back. Phase-2 artifacts live
+as YAML in the archive, not as queryable rows. Each is called out in place rather than left
+for a reader to find in the source.
+
 Full design: [`plan/themis-phase2-design.md`](./plan/themis-phase2-design.md).
 
 ## Underneath: the execution platform
