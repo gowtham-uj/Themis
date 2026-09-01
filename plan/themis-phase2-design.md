@@ -562,9 +562,11 @@ Including `phase1/` matters. A recommendation is only as good as the evidence un
 a developer who wants to check one is otherwise stuck making separate archive API calls per
 eval.
 
-`platform-report.yaml` is written separately, and only when there is something to report.
-It carries platform findings, harness-owned patterns, and `nextPlatformAction`. It is for
-whoever operates THEMIS, never for the agent developer.
+`platform-report.yaml` is written beside the zip, not inside it, and only when there is
+something to report. It carries platform findings, harness-owned patterns, and
+`nextPlatformAction`. It is for whoever operates THEMIS, never for the agent developer.
+`rd-memory.yaml` is likewise kept out of the pack: it is the R&D memory described below,
+internal to Themis across campaigns.
 
 ---
 
