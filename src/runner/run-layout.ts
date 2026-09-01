@@ -6,7 +6,8 @@
  * when present; otherwise the conventional path is derived.
  */
 
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 /** On-disk dir for a run: `<dataDir>/projects/<pid>/runs/<rid>`. */
 export function runDirPath(
@@ -17,15 +18,23 @@ export function runDirPath(
   return join(dataDir, "projects", projectId, "runs", runId);
 }
 
-/** Conventional on-disk events path for a run (whether or not it is live). */
+/**
+ * Conventional on-disk events path for a run (whether or not it is live).
+ *
+ * Sealing moves the canonical trace into `eval_lifecycle_logs/`. Runs sealed
+ * before that move was recorded still carry the pre-seal path in the DB, so a
+ * missing file falls back to the sealed location before giving up.
+ */
 export function resolveEventsPath(
   dataDir: string,
   projectId: string,
   runId: string,
   dbPath?: string | null,
 ): string {
-  if (dbPath) return dbPath;
-  return join(runDirPath(dataDir, projectId, runId), "events.jsonl");
+  const path = dbPath ?? join(runDirPath(dataDir, projectId, runId), "events.jsonl");
+  if (existsSync(path)) return path;
+  const sealed = join(dirname(path), "eval_lifecycle_logs", "events.jsonl");
+  return existsSync(sealed) ? sealed : path;
 }
 
 /** Conventional on-disk diff path for a run. */

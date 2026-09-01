@@ -111,6 +111,27 @@ describe("ModelGateway.chat", () => {
     });
     expect(body.max_tokens).toBeGreaterThanOrEqual(2048);
   });
+
+  it("floors max_tokens at 32768 for max reasoning effort (starve-proof)", async () => {
+    let body: any;
+    const gw = gatewayWithFetch(fetch);
+    await gw.chat({
+      attemptId: "att_5",
+      node: "node0",
+      metricOrRole: "summarize",
+      messages: [{ role: "user", content: "x" }],
+      maxTokens: 4096, // caller's preference is below the max-reasoning floor
+      fetchImpl: (async (_url, init) => {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] }),
+          { status: 200 },
+        );
+      }) as typeof fetch,
+    });
+    expect(body.max_tokens).toBe(32768);
+    expect(body.reasoning_effort).toBe("max");
+  });
 });
 
 describe("chatJsonObject", () => {

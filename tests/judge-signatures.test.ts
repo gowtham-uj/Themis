@@ -32,6 +32,28 @@ describe("finding signatures", () => {
     expect(sigs).toContain("INFRA_SETUP_FAILURE");
   });
 
+  it("does not treat a .reaper-only workspace mention as self-context search", () => {
+    const sigs = classifySignatures(
+      "The final blocker attributed 'workspace contains only .reaper' to a list_directory call; the observation came from bash ls -la.",
+    );
+    expect(sigs).not.toContain("TOOL_SEARCH_SELF_CONTEXT");
+  });
+
+  it("does not treat 'malformed tool calls' as an edge-verification gap", () => {
+    const sigs = classifySignatures(
+      "Three parse-dropped or malformed tool calls (missing required args, path_escape on absolute path) wasted turns",
+    );
+    expect(sigs).not.toContain("INSUFFICIENT_EDGE_VERIFICATION");
+  });
+
+  it("does not treat 'any interpreter' as INTERPRETER_ASSUMPTION; npm-test skip is VERIFICATION_GAP", () => {
+    const sigs = classifySignatures(
+      "The agent never invoked npm, node, or any interpreter (test_attempts 0). The task commanded npm test.",
+    );
+    expect(sigs).not.toContain("INTERPRETER_ASSUMPTION");
+    expect(sigs).toContain("VERIFICATION_GAP");
+  });
+
   it("falls back to UNCLASSIFIED rather than inventing a label", () => {
     expect(classifySignatures("something entirely unrelated to any known pattern")).toEqual([
       "UNCLASSIFIED",

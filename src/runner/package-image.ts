@@ -1,10 +1,10 @@
 /**
  * Build the agent image for a suite eval task. Suite evals share ONE
- * platform-provided "fat base" image (Debian + build-essential + git) across the
- * whole queue; each eval installs its own language toolchain at eval time via
- * setup.sh and removes it via cleanup.sh. The reaper CLI runtime is overlaid onto
- * the fat base once per adapter. Heterogeneous suite evals resolve to the same
- * image, so they can run sequentially in one persistent queue container.
+ * platform-provided "fat base" image (Debian + build-essential + git + the
+ * baked-in node/python/go/rust toolchains) across the whole queue. The reaper
+ * CLI runtime is overlaid onto the fat base once per adapter. Heterogeneous
+ * suite evals resolve to the same image, so they can run sequentially in one
+ * persistent queue container.
  */
 
 import { createHash } from "node:crypto";
@@ -27,9 +27,11 @@ export interface BuiltEvalAgentImage {
 }
 
 /**
- * Platform fat base for suite-format evals: one shared image carrying only the
- * common toolchain (build-essential, git, apt, sudo). Each eval's setup.sh
- * installs its own language at eval time and cleanup.sh removes it. The reaper
+ * Platform fat base for suite-format evals: one shared image carrying the common
+ * build toolchain (build-essential, git, apt, sudo) AND the supported language
+ * toolchains baked in by default (node/npm, python3/pip/venv, go, rust/cargo).
+ * Baked languages are never re-installed or purged at eval time; per-eval
+ * setup/cleanup is reserved for languages the base does not carry. The reaper
  * CLI is layered on top via the wrapper stage (see {@link buildEvalAgentImage}).
  */
 const SUITE_BASE_CONTAINERFILE = [
@@ -37,6 +39,7 @@ const SUITE_BASE_CONTAINERFILE = [
   "RUN apt-get update \\",
   " && apt-get install -y --no-install-recommends \\",
   "      build-essential libc6-dev git sudo apt procps ca-certificates bash coreutils findutils \\",
+  "      nodejs npm python3 python3-pip python3-venv golang-go rustc cargo \\",
   " && rm -rf /var/lib/apt/lists/* \\",
   " && useradd --create-home --uid 10001 --shell /bin/bash agent \\",
   " && echo 'agent ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \\",

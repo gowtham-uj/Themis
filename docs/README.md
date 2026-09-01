@@ -2,6 +2,7 @@
 
 Use these documents to operate the backend/API platform without reading implementation source:
 
+- [API reference](./api-reference.md) — every endpoint, request body, and response shape, as implemented.
 - [Canonical eval authoring](./eval-authoring.md) — required package tree, `task.toml`, environment,
   solution/verifier isolation, lifecycle scripts, validation gates, JSON and archive creation.
 - [Platform API operator guide](./platform-api-guide.md) — projects, adapters, evals/categories, queues,

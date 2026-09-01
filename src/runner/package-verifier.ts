@@ -60,6 +60,7 @@ export async function runCanonicalPackageVerifier(input: {
   const verifierContext = config.suite
     ? await verifierSuiteContext(task.packagePath)
     : join(task.packagePath, "tests");
+  if (config.suite) await ensureVerifierPython(verifierContext);
   const image = `agenteval/verifier:${task.packageDigest.slice(0, 24)}`;
   const build = await input.runtime.buildImage({
     contextDir: verifierContext,
@@ -104,6 +105,7 @@ export async function runCanonicalPackageVerifier(input: {
       stdout,
       config,
       wait.exitCode,
+      stderr,
     );
     const checks = wait.timedOut
       ? (config.suite
@@ -149,8 +151,9 @@ async function readVerifierResults(
   stdout: Buffer,
   config: EvalPackageRuntimeConfig,
   exitCode: number,
+  stderr: Buffer,
 ): Promise<{ checks: CheckResult[]; sha256: string | null }> {
-  if (config.suite) return parseSuiteVerifier(stdout, exitCode);
+  if (config.suite) return parseSuiteVerifier(stdout, exitCode, stderr);
   // ---- legacy canonical verifier-results.json contract ----
   const raw = await readFile(path).catch(() => null);
   const errorChecks = (detail: string): CheckResult[] => config.verifierChecks.map((check) => ({
@@ -212,7 +215,7 @@ async function readVerifierResults(
  * The last non-empty stdout line carries the JSON. Map each check name to a kind:
  * public_tests->functional, hidden_contract->hidden_test, else test_suite.
  */
-function parseSuiteVerifier(stdout: Buffer, exitCode: number): { checks: CheckResult[]; sha256: string | null } {
+export function parseSuiteVerifier(stdout: Buffer, exitCode: number, stderr: Buffer): { checks: CheckResult[]; sha256: string | null } {
   const text = stdout.toString("utf8");
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   let payload: unknown = null;
@@ -226,7 +229,14 @@ function parseSuiteVerifier(stdout: Buffer, exitCode: number): { checks: CheckRe
   }
   const sha = sha256(stdout);
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    return { checks: [{ checkId: "verifier", kind: "test_suite", status: "error", detail: "suite verifier stdout was not valid JSON" }], sha256: sha };
+    // Surface the real crash cause (e.g. "python3: command not found", exit 127)
+    // instead of only "stdout was not valid JSON" — that is what the developer
+    // and Phase 2 need to fix the verifier image.
+    const cause = stderr.toString("utf8").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-3).join(" | ");
+    const detail = cause
+      ? `suite verifier stdout was not valid JSON (exit ${exitCode}) — stderr: ${cause.slice(0, 400)}`
+      : `suite verifier stdout was not valid JSON (exit ${exitCode})`;
+    return { checks: [{ checkId: "verifier", kind: "test_suite", status: "error", detail }], sha256: sha };
   }
   const record = payload as { reward?: unknown; passed?: unknown; checks?: unknown };
   if (!Array.isArray(record.checks)) {
@@ -278,6 +288,28 @@ async function verifierSuiteContext(packageRoot: string): Promise<string> {
     });
   }
   return dir;
+}
+
+/**
+ * Suite test.sh often runs `python3 verifier.py` on a node-only Dockerfile.
+ * If the script needs python3 and the Containerfile does not install it, inject
+ * an apt install after the FROM line (observed live: exit 127, python3 missing).
+ */
+async function ensureVerifierPython(contextDir: string): Promise<void> {
+  const dfPath = join(contextDir, "tests", "Dockerfile");
+  const shPath = join(contextDir, "tests", "test.sh");
+  let df = "";
+  let sh = "";
+  try { df = await readFile(dfPath, "utf8"); } catch { return; }
+  try { sh = await readFile(shPath, "utf8"); } catch { /* no test.sh */ }
+  const needsPy = /\bpython3\b|\.py\b/.test(sh) || /\bpython3\b/.test(df);
+  const hasPy = /apt-get[^\n]*python3|python:/.test(df);
+  if (!needsPy || hasPy) return;
+  const injected = df.replace(
+    /^(FROM[^\n]+\n)/m,
+    "$1USER root\nRUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*\n",
+  );
+  if (injected !== df) await writeFile(dfPath, injected, "utf8");
 }
 
 async function drain(stream: AsyncIterable<Buffer>): Promise<Buffer> {

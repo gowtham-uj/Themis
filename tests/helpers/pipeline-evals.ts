@@ -29,10 +29,10 @@ public_test_command = "npm test"
     "seed_repo/src/value.js":input.seedSource,
     "seed_repo/test.mjs":input.seedTest,
     "environment/Dockerfile":"FROM node:24-bookworm-slim\nUSER root\nWORKDIR /workspace/task\nCOPY seed_repo/ /workspace/task/\nCOPY instruction.md /workspace/instruction.md\nUSER 10001\n",
-    "environment/setup.sh":"#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p \"${1:-/workspace/task}\"\n",
+    "environment/setup.sh":"#!/usr/bin/env bash\nset -euo pipefail\nDEST=\"${1:-/workspace/task}\"\nSEED=\"$(cd \"$(dirname \"$0\")/..\" && pwd)/seed_repo\"\nmkdir -p \"$DEST\"\ncp -a \"$SEED\"/. \"$DEST\"/\n",
     "environment/cleanup.sh":"#!/usr/bin/env bash\nset -euo pipefail\nrm -rf \"${1:-/workspace/task}\"\n",
     "environment/healthcheck.sh":"#!/usr/bin/env bash\nset -euo pipefail\ntest -f /workspace/task/src/value.js\n",
-    "tests/Dockerfile":"FROM node:24-bookworm-slim\nWORKDIR /verifier\nCOPY tests/ /verifier/\nENTRYPOINT [\"/verifier/test.sh\"]\n",
+    "tests/Dockerfile":"FROM node:24-bookworm-slim\nUSER root\nRUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*\nWORKDIR /verifier\nCOPY tests/ /verifier/\nRUN chmod +x /verifier/test.sh /verifier/verifier.py\nENTRYPOINT [\"/verifier/test.sh\"]\n",
     "tests/test.sh":"#!/usr/bin/env bash\nset -euo pipefail\npython3 \"$(dirname \"${BASH_SOURCE[0]}\")/verifier.py\" \"${1:-/workspace/task}\"\n",
     "tests/verifier.py":`import json,sys,subprocess
 from pathlib import Path

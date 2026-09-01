@@ -44,19 +44,19 @@ export type FindingSignature = (typeof FINDING_SIGNATURES)[number];
 
 /** keyword → signature. First match wins; order is precedence. */
 const KEYWORD_SIGNATURES: ReadonlyArray<{ re: RegExp; signature: FindingSignature }> = [
-  { re: /\.reaper|session\.log|own (?:session|conversation|thinking)|self[- ]context|live (?:session )?log|grep[^\n]*workspace/i, signature: "TOOL_SEARCH_SELF_CONTEXT" },
+  { re: /own (?:session|conversation|thinking|transcript)|self[- ]context|live[- ](?:session )?log|conversation\.md|(?:read|grep|search)[^\n]{0,80}\.reaper|\.reaper[^\n]{0,80}(?:session|transcript|conversation|audit)/i, signature: "TOOL_SEARCH_SELF_CONTEXT" },
   { re: /(?:87,?993|88k|oversized|huge|massive|excessive)[^\n]*(?:result|output|context|characters)|result[^\n]*(?:too|overly|excessively)[^\n]*(?:large|big)|max_result_chars/i, signature: "TOOL_RESULT_OVERSIZED" },
   { re: /counterexample|backtracking|contradict(?:s|ion) (?:own|its) (?:solution|algorithm|implementation)|found (?:a )?counterexample|waived|proceeded anyway|proceeded despite/i, signature: "COUNTEREXAMPLE_IGNORED" },
   { re: /guess(?:ing|ed)? (?:the )?(?:test|tests|hidden)|assum(?:e|ed|ing)[^\n]*(?:test|hidden|simple)|likely (?:tests|hidden)|probably (?:simple|enough)/i, signature: "TEST_SUITE_GUESSING" },
-  { re: /interpreter|python3?\b|python: command not found|which python/i, signature: "INTERPRETER_ASSUMPTION" },
+  { re: /python3?: command not found|which python|assumed python|interpreter (?:missing|not found|assumption)|no python3?\b/i, signature: "INTERPRETER_ASSUMPTION" },
   { re: /localiz(?:e|ation|ing)|find(?:ing)? (?:the )?(?:right|relevant|correct) (?:file|symbol|location)|repo(?:sitory)? (?:search|map|explor)/i, signature: "POOR_CODE_LOCALIZATION" },
-  { re: /did not test|untested|never test|no (?:test|verification)[^\n]*(?:for|of)|verification gap|not verified/i, signature: "VERIFICATION_GAP" },
+  { re: /did not test|untested|never (?:test|invoked (?:npm|node|pytest))|no (?:test|verification)[^\n]*(?:for|of)|verification gap|not verified|test_attempts 0/i, signature: "VERIFICATION_GAP" },
   { re: /spec[^\n]*(?:ambigu|both readings|unclear|admits both)|ambiguous (?:spec|requirement)/i, signature: "SPEC_AMBIGUITY" },
   { re: /setup[^\n]*(?:fail|abort|exit)|never reached the agent|agent (?:never|did not) (?:start|run|execute)|infrastructure|harness (?:fail|abort|bug)|refusing non-empty target/i, signature: "INFRA_SETUP_FAILURE" },
   { re: /metric[^\n]*(?:mislabel|attribution|labeling)|stop_reason|verified_completion (?:false|true)[^\n]*artifact|bookkeeping artifact/i, signature: "METRIC_ATTRIBUTION_ERROR" },
   { re: /verifier[^\n]*(?:ran|scored|evaluated)[^\n]*(?:seed|untouched|wrong)|graded the (?:untouched|seed)/i, signature: "VERIFIER_ON_WRONG_TREE" },
   { re: /premature|implemented? before|jumped to (?:code|implementation)|without (?:reading|understanding) the (?:spec|task)/i, signature: "PREMATURE_IMPLEMENTATION" },
-  { re: /edge case|boundary|corner case|malformed|invalid input|^0\.x/i, signature: "INSUFFICIENT_EDGE_VERIFICATION" },
+  { re: /edge case|boundary condition|corner case|invalid input|did not (?:cover|test) (?:edges|boundaries)/i, signature: "INSUFFICIENT_EDGE_VERIFICATION" },
   { re: /read[^\n]*irrelevant|unrelated file|decoy|not referenced by/i, signature: "IRRELEVANT_FILE_READING" },
 ];
 

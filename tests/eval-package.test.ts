@@ -108,6 +108,9 @@ describe("canonical eval packages", () => {
       // language drives the apt packages setup.sh installs.
       expect(config.setupPath).toBe("/workspace/.agenteval/lifecycle-setup.sh");
       expect(config.cleanupPath).toBe("/workspace/.agenteval/lifecycle-cleanup.sh");
+      // Post-setup healthcheck must be surfaced so the worker can fail a setup
+      // that "succeeded" but never seeded the workspace.
+      expect(config.healthcheckPath).toBe("/workspace/.agenteval/environment/healthcheck.sh");
       expect(config.language).toBe("javascript");
       expect(config.cleanupTimeoutMs).toBe(900_000);
     } finally {
@@ -140,12 +143,16 @@ describe("canonical eval packages", () => {
     }
   });
 
-  it("synthesizes suite lifecycle wrappers that install the language toolchain", async () => {
+  it("synthesizes suite lifecycle wrappers that skip baked-in language toolchains", async () => {
     const { languageToAptPackages, synthesizeSuiteLifecycleScripts } = await import("../src/evals/package.ts");
-    expect(languageToAptPackages("python")).toEqual(["python3", "python3-pip", "python3-venv"]);
-    expect(languageToAptPackages("javascript")).toEqual(["nodejs", "npm"]);
-    expect(languageToAptPackages("c")).toEqual(["gcc"]);
-    expect(languageToAptPackages("cpp")).toEqual(["g++"]);
+    // All supported language toolchains are baked into the fat base image, so
+    // no per-eval apt install/purge is declared for any of them.
+    expect(languageToAptPackages("python")).toEqual([]);
+    expect(languageToAptPackages("javascript")).toEqual([]);
+    expect(languageToAptPackages("c")).toEqual([]);
+    expect(languageToAptPackages("cpp")).toEqual([]);
+    expect(languageToAptPackages("go")).toEqual([]);
+    expect(languageToAptPackages("rust")).toEqual([]);
     expect(languageToAptPackages("bash")).toEqual([]);
     expect(languageToAptPackages(null)).toEqual([]);
 
@@ -164,11 +171,14 @@ describe("canonical eval packages", () => {
       expect(setupPath).toBe("/workspace/.agenteval/lifecycle-setup.sh");
       expect(cleanupPath).toBe("/workspace/.agenteval/lifecycle-cleanup.sh");
       const setup = await readFile(join(workspace, ".agenteval/lifecycle-setup.sh"), "utf8");
-      expect(setup).toContain("apt-get install -y --no-install-recommends python3 python3-pip python3-venv");
+      // Baked python: no apt-get install, but the author's setup body still runs.
+      expect(setup).not.toContain("apt-get install");
       expect(setup).toContain("/workspace/.agenteval/environment/setup.sh");
+      expect(setup).toContain("cp -a /workspace/.agenteval/seed_repo/. /workspace/task/");
       expect(setup).toContain("chown -R 10001:10001 /workspace/task");
       const cleanup = await readFile(join(workspace, ".agenteval/lifecycle-cleanup.sh"), "utf8");
-      expect(cleanup).toContain("apt-get purge -y python3 python3-pip python3-venv");
+      // Baked python: no apt-get purge, but the author's cleanup body still runs.
+      expect(cleanup).not.toContain("apt-get purge");
       expect(cleanup).toContain("/workspace/.agenteval/environment/cleanup.sh");
 
       // bash: empty deps — wrappers still call the author scripts without apt.

@@ -46,6 +46,30 @@ function judgeDir(): string {
   return resolve(d);
 }
 
+/** Sealed verifier reward, read at write time so official_reward is never authored. */
+async function readSealedOfficialReward(): Promise<number | null> {
+  let root: string;
+  try {
+    root = archiveDir();
+  } catch {
+    return null;
+  }
+  try {
+    const names = await readdir(join(root, "verifier_res"));
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const o = JSON.parse(await readFile(join(root, "verifier_res", name), "utf8")) as {
+          officialReward?: unknown; reward?: unknown;
+        };
+        const v = typeof o.officialReward === "number" ? o.officialReward : o.reward;
+        if (typeof v === "number") return v;
+      } catch { /* not the verifier result */ }
+    }
+  } catch { /* no verifier_res */ }
+  return null;
+}
+
 function archiveDir(): string {
   const d = process.env.THEMIS_ARCHIVE_DIR;
   if (!d) throw new Error("THEMIS_ARCHIVE_DIR is not set");
@@ -64,6 +88,10 @@ const TEMPLATE_TARGETS: Record<string, string> = {
   "access-log": "judge/access-log.md",
   "channel": "judge/channel.md",
   "developer-brief": "judge/developer-brief.yaml",
+  "phase2-hypotheses": "judge/phase2-hypotheses.yaml",
+  "phase2-research": "judge/phase2-research.yaml",
+  "phase2-recommendations": "judge/phase2-recommendations.yaml",
+  "phase2-review": "judge/phase2-review.yaml",
 };
 
 function safeJoin(root: string, rel: string): string {
@@ -368,6 +396,13 @@ export default function registerThemisTools(pi: ExtensionAPI): void {
         if (template === "evalJudge") {
           const reason = validateEvalJudge(fields);
           if (reason !== null) return err(reason);
+          // Locked rule: official_reward is reproduced from the sealed verifier,
+          // never authored or changed by the court. Reject any value that does
+          // not equal the sealed record.
+          const sealed = await readSealedOfficialReward();
+          if (sealed !== null && fields.official_reward !== sealed) {
+            return err(`official_reward ${JSON.stringify(fields.official_reward)} does not match the sealed verifier reward ${sealed}; it is reproduced, never authored`);
+          }
         }
         // Investigator reports establish facts with refs; a malformed ref or a
         // mislabeled finding poisons every downstream resolution check, so the
@@ -633,7 +668,39 @@ export default function registerThemisTools(pi: ExtensionAPI): void {
         // the guardrail is the point: no arbitrary URL, no private ranges.
         const endpoint = process.env.THEMIS_WEB_SEARCH_ENDPOINT;
         if (!endpoint) {
-          return err("web search endpoint not configured for this case");
+          // Provider-native search via the same OpenAI-compatible proxy PI uses.
+          const base = (process.env.THEMIS_PROXY_BASE_URL || "").replace(/\/+$/, "");
+          const key = process.env.THEMIS_PROXY_API_KEY || "";
+          const model = process.env.THEMIS_PROXY_MODEL || "deepseek-v4-flash";
+          if (!base || !key) return err("web search: no THEMIS_WEB_SEARCH_ENDPOINT and no THEMIS_PROXY_*");
+          const res = await fetch(`${base}/chat/completions`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+            body: JSON.stringify({
+              model,
+              messages: [
+                { role: "system", content: "Use web search. Return a concise brief with source URLs." },
+                { role: "user", content: q },
+              ],
+              // This proxy's Chat Completions schema requires tools[].type=function
+              // (a bare type:"web_search" is rejected before the query is sent —
+              // observed live: researcher 9/9 DENIED). The provider still executes
+              // the named web_search tool.
+              tools: [{
+                type: "function",
+                function: {
+                  name: "web_search",
+                  description: "Search the web",
+                  parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+                },
+              }],
+              tool_choice: "auto",
+              max_tokens: 4096,
+            }),
+            signal: AbortSignal.timeout(60_000),
+          });
+          const raw = await res.text();
+          return ok(raw.slice(0, 64 * 1024));
         }
         const url = new URL(endpoint);
         if (["http:", "https:"].indexOf(url.protocol) < 0) return err("search endpoint must be http(s)");
@@ -649,6 +716,120 @@ export default function registerThemisTools(pi: ExtensionAPI): void {
         });
         const text = await res.text();
         return ok(text.slice(0, 64 * 1024));
+      } catch (e) {
+        return err(e instanceof Error ? e.message : String(e));
+      }
+    },
+  });
+
+  // ---- Phase-2 campaign tools (no-ops unless THEMIS_PHASE2_CAMPAIGN_DIR is set)
+  function phase2Dir(): string | null {
+    const d = process.env.THEMIS_PHASE2_CAMPAIGN_DIR;
+    return d ? resolve(d) : null;
+  }
+  async function phase2Json(name: string): Promise<unknown> {
+    const root = phase2Dir();
+    if (!root) throw new Error("THEMIS_PHASE2_CAMPAIGN_DIR is not set");
+    return JSON.parse(await readFile(join(root, name), "utf8"));
+  }
+
+  pi.registerTool({
+    name: "list_evals",
+    label: "List Phase-2 evals",
+    description: "List campaign evals (validity, reward, cohort, tokens). Phase-2 only.",
+    parameters: schema({}),
+    async execute() {
+      try {
+        const cases = await phase2Json("cases.json");
+        return ok(JSON.stringify(cases));
+      } catch (e) {
+        return err(e instanceof Error ? e.message : String(e));
+      }
+    },
+  });
+  pi.registerTool({
+    name: "list_patterns",
+    label: "List Phase-2 patterns",
+    description: "List deterministic campaign patterns. Phase-2 only.",
+    parameters: schema({}),
+    async execute() {
+      try {
+        const patterns = await phase2Json("patterns.json");
+        return ok(JSON.stringify(patterns));
+      } catch (e) {
+        return err(e instanceof Error ? e.message : String(e));
+      }
+    },
+  });
+  pi.registerTool({
+    name: "read_pattern",
+    label: "Read Phase-2 pattern",
+    description: "Read one pattern including evidence. Phase-2 only.",
+    parameters: schema({ patternId: Type.String() }),
+    async execute(_id, params) {
+      try {
+        const patterns = (await phase2Json("patterns.json")) as Array<{ id: string }>;
+        const p = patterns.find((x) => x.id === params.patternId);
+        return p ? ok(JSON.stringify(p)) : err("unknown patternId");
+      } catch (e) {
+        return err(e instanceof Error ? e.message : String(e));
+      }
+    },
+  });
+  pi.registerTool({
+    name: "read_improvements",
+    label: "Read minos improvements",
+    description: "Read Phase-1 improvement items for one campaign eval. Phase-2 only.",
+    parameters: schema({ runId: Type.String() }),
+    async execute(_id, params) {
+      try {
+        const cases = (await phase2Json("cases.json")) as Array<{ runId: string; improvements?: unknown }>;
+        const c = cases.find((x) => x.runId === params.runId);
+        return c ? ok(JSON.stringify(c.improvements ?? [])) : err("unknown runId");
+      } catch (e) {
+        return err(e instanceof Error ? e.message : String(e));
+      }
+    },
+  });
+  pi.registerTool({
+    name: "read_lifecycle",
+    label: "Read lifecycle file",
+    description: "Read an allowlisted lifecycle/verifier/judge file for one campaign eval. Phase-2 only.",
+    parameters: schema({ runId: Type.String(), path: Type.String() }),
+    async execute(_id, params) {
+      try {
+        const allow = new Set([
+          "eval_lifecycle_logs/run-metrics.json",
+          "eval_lifecycle_logs/run.json",
+          "eval_lifecycle_logs/eval.json",
+          "verifier_res/verifier-result.json",
+          "verifier_res/verifier-stderr.log",
+          "judge/evalJudge.yaml",
+        ]);
+        const rel = String(params.path ?? "");
+        if (!allow.has(rel)) return err(`path not allowlisted: ${rel}`);
+        const views = (await phase2Json("views.json")) as Record<string, string>;
+        const view = views[String(params.runId)];
+        if (!view) return err("unknown runId");
+        const text = await readFile(join(view, ...rel.split("/")), "utf8");
+        return ok(text.slice(0, 16_000));
+      } catch (e) {
+        return err(e instanceof Error ? e.message : String(e));
+      }
+    },
+  });
+  pi.registerTool({
+    name: "read_judge_report",
+    label: "Read evalJudge.yaml",
+    description: "Read the Phase-1 evalJudge.yaml for one campaign eval. Phase-2 only.",
+    parameters: schema({ runId: Type.String() }),
+    async execute(_id, params) {
+      try {
+        const views = (await phase2Json("views.json")) as Record<string, string>;
+        const view = views[String(params.runId)];
+        if (!view) return err("unknown runId");
+        const text = await readFile(join(view, "judge", "evalJudge.yaml"), "utf8");
+        return ok(text.slice(0, 16_000));
       } catch (e) {
         return err(e instanceof Error ? e.message : String(e));
       }

@@ -392,10 +392,11 @@ d("PodmanRuntime (live containers)", () => {
     }
   }, 180_000);
 
-  it("suite fat base installs a language via setup.sh and purges it via cleanup.sh", async () => {
-    // Proves the one-container + per-eval setup/cleanup model: the shared fat
-    // base image carries no language; setup.sh apt-installs python3 as root,
-    // then cleanup.sh purges it — restoring the base for the next eval.
+  it("suite fat base ships baked language toolchains that setup.sh/cleanup.sh leave in place", async () => {
+    // Proves the baked-toolchain model: the shared fat base image already carries
+    // the supported languages; setup.sh/cleanup.sh do NOT apt-install/purge a
+    // baked language — they only run the author's setup/cleanup bodies — so the
+    // toolchain survives a full eval lifecycle.
     const rt = runtime();
     const workspaceDir = mkdtempSync(join(tmpdir(), "agenteval-fatbase-ws-"));
     try {
@@ -418,12 +419,11 @@ d("PodmanRuntime (live containers)", () => {
       });
       expect(setupPath).toBe("/workspace/.agenteval/lifecycle-setup.sh");
 
-      // Use the production PI fat base (node:22-bookworm) as the stand-in: it
-      // ships git/sudo/apt that the platform-synthesized lifecycle scripts
-      // require (setup.sh runs `git config --system` for the bind-mount trust
-      // fix) but, like bookworm-slim, has no python3 until setup.sh installs it.
+      // python:3.12-bookworm stands in for the fat base: it ships git (needed by
+      // the wrapper's `git config --system` bind-mount trust fix) AND python3
+      // already baked — the exact property the fat base Containerfile provides.
       const s: RunContainerSpec = {
-        ...spec({ image: "docker.io/library/node:22-bookworm", workspaceDir,
+        ...spec({ image: "docker.io/library/python:3.12-bookworm", workspaceDir,
           argv: ["sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"] }),
         timeoutMs: 0,
         nonRoot: false,
@@ -435,6 +435,9 @@ d("PodmanRuntime (live containers)", () => {
           cwd: "/workspace", env: {}, user: "root", timeoutMs: 300_000,
         });
         expect(setupRes.exitCode).toBe(0);
+        const setupOut = await drain(setupRes.stdout).catch(() => "");
+        expect(setupOut).toContain("AUTHOR_SETUP_RAN");
+
         const probe = await handle.exec({
           argv: ["python3", "--version"], cwd: "/workspace", env: {}, timeoutMs: 30_000,
         });
@@ -446,12 +449,16 @@ d("PodmanRuntime (live containers)", () => {
           cwd: "/workspace", env: {}, user: "root", timeoutMs: 300_000,
         });
         expect(cleanRes.exitCode).toBe(0);
-        const gone = await handle.exec({
-          argv: ["sh", "-c", "command -v python3 >/dev/null 2>&1 && echo MISSING_PURGE || echo PURGED"],
+        const cleanOut = await drain(cleanRes.stdout).catch(() => "");
+        expect(cleanOut).toContain("AUTHOR_CLEANUP_RAN");
+
+        // Baked toolchain survives cleanup — setup/cleanup must not purge it.
+        const stillThere = await handle.exec({
+          argv: ["sh", "-c", "command -v python3 >/dev/null 2>&1 && echo STILL_PRESENT || echo PURGED"],
           cwd: "/workspace", env: {}, timeoutMs: 30_000,
         });
-        const goneOut = await drain(gone.stdout).catch(() => "");
-        expect(goneOut).toContain("PURGED");
+        const stillOut = await drain(stillThere.stdout).catch(() => "");
+        expect(stillOut).toContain("STILL_PRESENT");
       } finally {
         await handle.remove();
       }

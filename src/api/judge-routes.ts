@@ -369,6 +369,18 @@ export function registerJudgeRoutes(router: Router): void {
   });
 
   /** Poll Phase-1 completion: 200 when a result exists, 202 while still running. */
+  router.post("/api/judge/runs/:runId/phase1/pause", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const runId = ctx.params.runId!;
+    const { pausePiWorkDir } = await import("../judge/pi/runtime.js");
+    const primary = join(app.dataDir, "judge_work", `case_${runId}`, "node4");
+    let out = await pausePiWorkDir(primary);
+    if (!out.killed) out = await pausePiWorkDir(join(app.dataDir, "judge_work", runId));
+    sendJson(res, 200, { paused: out.killed, pid: out.pid, run_id: runId, resumable: true });
+  });
+
+  /** Resume is POST /api/judge/runs/:runId/phase1 — it --continues the PI session. */
+
   router.get("/api/judge/runs/:runId/phase1", (_req, res, ctx) => {
     const app = appOf(ctx);
     const runId = ctx.params.runId!;

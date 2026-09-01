@@ -1,6 +1,11 @@
 # Themis Phase 2 — Agent Improvement Intelligence
 
-> **Status: SETTLED DESIGN — NOT YET IMPLEMENTED**
+> **Status: FIVE-COMPONENT PIPELINE IMPLEMENTED.** Campaign manager, cohort-aware pattern
+> analyzer with CANDIDATE/PROVISIONAL/CANONICAL registry, investigator, researcher (web
+> search when THEMIS_WEB_SEARCH_ENDPOINT is set), improvement designer, Minos-portfolio
+> review, executive brief, hypotheses, R&D memory, per-eval `phase2/` reseal, and a single
+> `developer-improvement-pack.zip` are live. THEMIS still does not access agent source or
+> run experiments.
 >
 > Phase 2 is intentionally black-box and advisory. THEMIS does not access or patch the
 > tested agent's source code, and it does not run experiments itself. The recipient of

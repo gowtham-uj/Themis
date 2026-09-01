@@ -7,7 +7,8 @@
 - Project-owned adapter CRUD, explicit adapter sharing, source-commit build provenance, and image reuse.
 - Strict canonical eval-package creation/import and immutable project eval storage.
 - Persistent named eval queues with one real Podman container per active queue.
-- Fat suite base image with per-eval setup and cleanup.
+- Fat suite base image with node/python/go/rust toolchains baked in, plus per-eval setup and cleanup for
+  author dependencies.
 - Separate hidden verifier execution outside the agent container.
 - Provider quota/rate/context/model failure classification.
 - Deterministic run metrics and evidence-integrity artifacts.

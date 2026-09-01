@@ -6,10 +6,14 @@ Every evaluated agent runs as a real CLI inside a queue-owned persistent Podman 
 
 - One persistent container per active queue.
 - Evals run sequentially inside that queue container; separate queues provide parallelism.
-- Suite evals share a fat Debian base with build essentials, git, apt, sudo, and non-root uid 10001.
+- Suite evals share a fat Debian base with build essentials, git, apt, sudo, non-root uid 10001, and the
+  supported language toolchains baked in by default: node/npm, python3/pip/venv, go, and rust/cargo
+  (gcc/g++ ship via build-essential).
 - The selected project/shared/built-in adapter is overlaid into the base image.
-- Per-eval setup installs the declared language toolchain and dependencies.
-- Per-eval cleanup removes temporary toolchains/dependencies and verifies a clean next-run state.
+- Baked language toolchains are never re-installed or purged at eval time. Per-eval setup/cleanup is
+  reserved for author dependencies (via `environment/setup.sh` / `cleanup.sh`) and any language the base
+  does not carry; the platform synthesizes no apt install for the baked languages.
+- Per-eval cleanup removes temporary author dependencies and verifies a clean next-run state.
 - `/workspace` is reset between evals only after evidence is copied and the eval archive is sealed.
 
 ## Eval lifecycle

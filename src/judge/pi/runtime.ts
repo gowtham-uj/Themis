@@ -53,6 +53,10 @@ export interface PiRunInput {
    * (session replay). The previous orchestrator/subagent work is preserved.
    */
   resumeSessionPath?: string;
+  /** Override the orchestrator --tools allowlist (Phase-2 PI board uses a different set). */
+  tools?: string;
+  /** Extra env for this PI process (Phase-2 campaign dir, proxy for provider search). */
+  extraEnv?: NodeJS.ProcessEnv;
 }
 
 export interface PiRunResult {
@@ -67,6 +71,18 @@ export interface PiRunResult {
 }
 
 /** Resolve the pi CLI entry. */
+/** SIGTERM then SIGKILL the PI process recorded in workDir/pi.pid. Session jsonl stays. */
+export async function pausePiWorkDir(workDir: string): Promise<{ killed: boolean; pid: number | null }> {
+  let raw = "";
+  try { raw = await readFile(join(workDir, "pi.pid"), "utf8"); } catch { return { killed: false, pid: null }; }
+  const pid = Number(raw.trim());
+  if (!Number.isInteger(pid) || pid <= 0) return { killed: false, pid: null };
+  try { process.kill(pid, "SIGTERM"); } catch { return { killed: false, pid }; }
+  await new Promise((r) => setTimeout(r, 1500));
+  try { process.kill(pid, "SIGKILL"); } catch { /* already dead */ }
+  return { killed: true, pid };
+}
+
 export function resolvePiBin(): string {
   const pkgRoot = join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent");
   return join(pkgRoot, "dist", "cli.js");
@@ -197,7 +213,12 @@ export async function writePiSubagentDefs(
     {
       name: "minos",
       description: "The bench: receives the assembled case and rules; never investigates",
-      tools: "evidence_list, read_evidence, write_to_yaml_template, petition, read_scratchpad, channel",
+      // read_court_record is load-bearing: minos does NOT investigate the sealed
+      // archive, it weighs the COMMITTED investigator reports, which live in the
+      // judge/ court-record store (THEMIS_JUDGE_DIR), not the archive. Without it
+      // minos loops on read_evidence against archive paths that don't exist
+      // (observed live: 136 denied reads, no minos-report filed).
+      tools: "evidence_list, read_evidence, read_court_record, write_to_yaml_template, petition, read_scratchpad, channel",
       body: prompts.minos,
     },
     {
@@ -288,7 +309,7 @@ export async function runPiOrchestrator(input: PiRunInput): Promise<PiRunResult>
     // Mediated surface only (plan §6): the orchestrator reads evidence, spawns
     // investigators/judge via the subagent tool, and writes judge/ output. No
     // general shell. The subagents' own allowlists are in their .md frontmatter.
-    "--tools", "subagent,evidence_list,read_evidence,read_court_record,write_to_yaml_template,read_scratchpad,file_tangent,petition,grant,channel,web_search",
+    "--tools", input.tools ?? "subagent,evidence_list,read_evidence,read_court_record,write_to_yaml_template,read_scratchpad,file_tangent,petition,grant,channel,web_search",
     "--extension", subagentsExt,
     "--extension", dynamicExt,
     "--extension", themisToolsExt,
@@ -336,6 +357,7 @@ export async function runPiOrchestrator(input: PiRunInput): Promise<PiRunResult>
     // Scoped judge/archive roots for the mediated tool surface (WP-7).
     THEMIS_JUDGE_DIR: input.workDir,
     THEMIS_ARCHIVE_DIR: input.archiveDir ?? process.env.THEMIS_ARCHIVE_DIR ?? "",
+    ...(input.extraEnv ?? {}),
   };
 
   // Stream stdout to disk so a long courtroom run is observable and never
@@ -359,6 +381,7 @@ export async function runPiOrchestrator(input: PiRunInput): Promise<PiRunResult>
     // where stdin is inherited).
     stdio: ["ignore", "pipe", "pipe"],
   });
+  await writeFile(join(input.workDir, "pi.pid"), `${child.pid ?? ""}\n`).catch(() => undefined);
   // A courtroom run can stream hundreds of MB of JSONL (multi-round subagent
   // transcripts). Never accumulate it all in one JS string — that overflowed a
   // 200MB run with `Invalid string length`. We keep only a bounded TAIL in

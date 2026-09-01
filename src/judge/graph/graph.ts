@@ -5,6 +5,7 @@
 
 import { MemoryDocumentLedger } from "../documents/ledger.js";
 import { GatewayError, type ModelGateway } from "../gateway/client.js";
+import { loadCheckpoint } from "./checkpoint.js";
 import { runNode0 } from "./node0-bind-summarize.js";
 import { runNode1 } from "./node1-extract.js";
 import { runNode2 } from "./node2-metrics.js";
@@ -32,25 +33,35 @@ export async function runPhase1(input: {
   };
 }): Promise<Phase1GraphState> {
   const ledger = input.ledger ?? new MemoryDocumentLedger();
-  let state = await runNode0(input);
-  state = await runNode1(state, input);
-  state = await runNode2(state, input);
-  state = await runNode3(state, input);
+  // Crash-resume: every node persists a checkpoint after it completes. A worker
+  // loss mid-case (server crash/restart, timeout kill) resumes from the latest
+  // committed node instead of re-running Node 0–3 model calls. Node 4 resumes the
+  // SAME persisted PI session (see runNode4Pi), so subagent work is never redone
+  // from scratch.
+  let state = await resumePhase1Graph(input);
   if (input.pi) {
     // Real PI courtroom: themis-orchestrator spawns kratos/logos/minos subagents.
-    const { state: piState, result } = await runNode4Pi(
-      { ...state, round: 1 },
-      {
-        connection: {
-          baseUrl: input.pi.baseUrl,
-          apiKey: input.pi.apiKey,
-          model: input.pi.model ?? "deepseek-v4-flash",
-          reasoningEffort: input.pi.reasoningEffort ?? "max",
+    // If a node4 checkpoint exists, runNode4Pi already returned once (and its
+    // session + committed reports persist); skip re-dispatching and continue to
+    // verbatim assembly + quality gate below.
+    const node4Cp = await loadCheckpoint(input.workDir, "node4");
+    if (!node4Cp) {
+      const { state: piState, result } = await runNode4Pi(
+        { ...state, round: 1 },
+        {
+          connection: {
+            baseUrl: input.pi.baseUrl,
+            apiKey: input.pi.apiKey,
+            model: input.pi.model ?? "deepseek-v4-flash",
+            reasoningEffort: input.pi.reasoningEffort ?? "max",
+          },
+          timeoutMs: input.pi.timeoutMs,
         },
-        timeoutMs: input.pi.timeoutMs,
-      },
-    );
-    state = piState;
+      );
+      state = piState;
+    } else {
+      state = node4Cp;
+    }
     {
       // WP-10 mechanical assembly, ALWAYS enforced in code: the orchestrator
       // directs the court and writes the log books, but the final evalJudge.yaml
@@ -179,4 +190,44 @@ export async function runPhase1(input: {
     );
   }
   return { ...state, node: "done" };
+}
+
+/**
+ * Resume Node 0–3 from the latest committed checkpoint, running only the nodes
+ * that have not completed yet. Node 0 is the only node with no upstream paths,
+ * so a missing node0 checkpoint means a fresh start.
+ */
+export async function resumePhase1Graph(input: {
+  caseId: string;
+  runId: string;
+  archiveDir: string;
+  workDir: string;
+  gateway: ModelGateway;
+  attemptId: string;
+}): Promise<Phase1GraphState> {
+  const cp =
+    (await loadCheckpoint(input.workDir, "node3")) ??
+    (await loadCheckpoint(input.workDir, "node2")) ??
+    (await loadCheckpoint(input.workDir, "node1")) ??
+    (await loadCheckpoint(input.workDir, "node0"));
+  if (!cp) {
+    let s = await runNode0(input);
+    s = await runNode1(s, input);
+    s = await runNode2(s, input);
+    s = await runNode3(s, input);
+    return s;
+  }
+  let s = cp;
+  if (cp.node === "node0") {
+    s = await runNode1(s, input);
+    s = await runNode2(s, input);
+    s = await runNode3(s, input);
+  } else if (cp.node === "node1") {
+    s = await runNode2(s, input);
+    s = await runNode3(s, input);
+  } else if (cp.node === "node2") {
+    s = await runNode3(s, input);
+  }
+  // node3 (or later): Nodes 0–3 are complete; proceed to Node 4.
+  return s;
 }

@@ -1218,6 +1218,33 @@ async function executeEval(input: {
             : `eval setup exited ${setup.exitCode}`,
         );
       }
+      // Post-setup healthcheck: a setup that "succeeds" but never seeded the
+      // workspace (empty-workspace fault) must fail here, not score the agent on
+      // nothing. suite: environment/healthcheck.sh; legacy: [lifecycle].healthcheck.
+      if (packageRuntime.healthcheckPath) {
+        const hc = await handle.exec({
+          argv: ["/bin/bash", packageRuntime.healthcheckPath, ...(packageRuntime.suite ? [AGENT_TASK_WORKSPACE] : [])],
+          cwd: "/workspace",
+          env: { ...packageRuntime.agentEnv, AGENTEVAL_TRIAL_ID: run.id },
+          user: "root",
+          timeoutMs: packageRuntime.setupTimeoutMs,
+        });
+        await writeJson(join(runDir, "healthcheck.json"), {
+          healthcheck_status: hc.exitCode === 0 && !hc.timedOut ? "success" : "failed",
+          duration_ms: hc.durationMs,
+          exit_code: hc.exitCode,
+          timed_out: hc.timedOut,
+          stdout: hc.stdout,
+          stderr: hc.stderr,
+        });
+        if (hc.exitCode !== 0 || hc.timedOut) {
+          throw new Error(
+            hc.timedOut
+              ? "eval healthcheck timed out"
+              : `eval healthcheck exited ${hc.exitCode} — workspace was not seeded correctly`,
+          );
+        }
+      }
       // Suite task dir was empty until setup seeded it; baseline now.
       if (packageRuntime.suite) {
         workspaceCommit = await commitWorkspaceBaseline(gitBaselineRoot, gitSafeDirEnv);
@@ -1568,6 +1595,14 @@ async function executeEval(input: {
       // events.jsonl) before sealing.
       await organizeArchiveLayout(runDir);
     }
+
+    // Both layout passes move the canonical trace into eval_lifecycle_logs/.
+    // The run row still points at the pre-seal top-level path, so event replay
+    // (GET /api/runs/:id/events) found nothing for sealed runs. Re-point it.
+    const sealedEventsPath = join(runDir, "eval_lifecycle_logs", EVENTS);
+    const sealedEventsExists = await lstat(sealedEventsPath).then(() => true, () => false);
+    if (sealedEventsExists) queries.setRunEventsPath(run.id, sealedEventsPath);
+
     const sealed = await sealEvalArchive(queries, runDir, {
       runId: run.id,
       projectId: queue.projectId,

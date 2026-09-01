@@ -1,314 +1,59 @@
-# pi-subagents — Agent Config Schema & Environment-Variable Support
+# Phase-2 PI Orchestrator Session Summary — campaign p2c_ca54584b1d404080b9fd3eaf0e91e55a
 
-## Summary Answer
+## File
+`/tmp/ae-p2-pi-1dUHdA/node/sessions/2026-08-30T05-14-50-808Z_ae-phase2_p2c_ca54584b1d404080b9fd3eaf0e91e55a.jsonl`
+- 237 JSONL lines, ~796 KB. Timeline: 05:14:50Z → 05:47:58Z (~33 min).
 
-**No.** pi-subagents has **no per-subagent environment-variable override** anywhere in its agent
-config schema or launch API.
+## Overall structure (237 entries)
+- `session` (L1) — session record, version 3, cwd `/work/agenteval`.
+- `model_change` (L2) — provider `themis-proxy`, model `deepseek-v4-flash`.
+- `thinking_level_change` (L3) — thinkingLevel `high`.
+- `message` (231 entries): roles `user`(3), `assistant`(115), `toolResult`(113).
+- `custom_message` (2): L14 `subagent_supervisor_request` (researcher blocked), L207 `subagent-notify` (researcher detached-task completion).
+- `compaction` (1): L206 (05:32:09Z) — context compaction of the orchestrator session.
+- Tool calls are recorded as `toolResult` messages with `toolName`; the dominant tool is `subagent` (plus `list_evals` L6, `list_patterns` L7, `web_search` L16, `read_court_record` L204/209/214/228/232).
 
-1. The `AgentConfig` object (used to describe/register an agent) has **no `env`/`environment`/
-   `envVars` field**. The full field list is enumerated below.
-2. The runtime `RuntimeAgentDefinition` accepted by `registerAgent` validates against an
-   **explicit allow-list of fields** that does not include any env field; unknown fields are
-   rejected with an error.
-3. The per-launch params object (`SubagentParamsLike`) and the preflight `LaunchBindingInput`
-   projection also have **no env field**.
-4. The only mechanism by which a child subagent gets environment variables is **process
-   inheritance**: at spawn time the child env is built as `{ ...process.env, ...sharedEnv }`
-   (see below), i.e. it inherits the *entire parent process environment* wholesale. There is no
-   API to inject a per-agent or per-run override map.
+## The four Phase-2 pipeline steps (as recorded)
 
----
+### Step 1 — investigator → `phase2-hypotheses` — SUCCESS
+- Dispatch L10–11; run **d497387a-8edf-4c90-a75c-4246a1d7f9f5** completed blocking (`ok:true`, 05:19:58Z).
+- Verdicts (L12, L233): PAT-VERIFICATION_GAP CONFIRMED-REPEATS (qualified, medium); PAT-PREMATURE_IMPLEMENTATION SINGLE-OCCURRENCE; PAT-TOOL_SEARCH_SELF_CONTEXT SINGLE-OCCURRENCE; HYP-OVER-ENUMERATION (unregistered) CONFIRMED-REPEATS (high). Both evals were platform-faulted (verifier exit 127 / python3 missing, empty workspace), excluded from hypotheses per brief.
 
-## 1. Does the agent config support an env override field?
+### Step 2 — researcher → `phase2-research` — SUCCESS (with platform defect + intercom stall)
+- Dispatch L13; run **f02449fe-0d79-4551-9194-02804650419d**.
+- L13: run **detached** ("Run 'main' detached ... for intercom coordination").
+- L14: `subagent_supervisor_request` — researcher BLOCKED because `web_search` fails on every call with a platform-level deserialization error. Asked for a decision ((a) retry, (b) file `techniques: []`, (c) other).
+- L16: orchestrator reproduced the same `web_search` error at its own level — confirms platform-wide defect: `tools[0].type: unknown variant 'web_search', expected 'function'`.
+- Intercom coordination problem: harness references tools `subagent_supervisor`/`subagent_wait`, but these are NOT in the orchestrator's declared tool schema (L21, L47, L65, L87, L115, ...). Many "Unknown action: reply/supervisor/wait/contact_supervisor" rejections (L22, L46, L54, L86, L96, ...). The orchestrator eventually resolved the mission's open decision **e4c2ff2a-058a-4919-8992-c61a5f17d794** via `mission.resolve-decision` (L80–82, 05:24:31Z).
+- L199: child resumed; L207: `subagent-notify` — detached researcher completed; filed `phase2-research` (4,772 bytes) with all four mechanisms mapped, empty `techniques: []` (per no-invented-URLs rule), full notes, and ready-to-run re-search queries. Child noted supervisor never replied (timeout) and web_search deterministically broken.
+- L209: `read_court_record` confirms committed record.
 
-**No.**
+### Step 3 — designer → `phase2-recommendations` — SUCCESS (after 1 SIGABRT crash + 1 misclassified re-run)
+- First dispatch (after compaction/resume, L212): L215 designer call returned "No result provided" (detached/interrupted).
+- L222: designer run **1ccb9901-8978-42aa-bcd1-f37e026976c3** **SIGABRT** — platform-level crash, "Subagent process terminated by signal SIGABRT", "failed before producing output", exit 1, acceptance rejected (05:43:36Z). No record filed (read_court_record DENIED L214, L225).
+- Re-dispatch: L226 — workflow "failed" with **"Subagent completed without making edits for an implementation task"**, BUT the designer actually wrote `phase2-recommendations` (28,914 bytes, 4 recommendations: REC-VERIFICATION_GAP-01 P0 direct_fix, etc.). L227–229: orchestrator classifies the "failed" as a **harness misclassification** (designer's job is a court record, not repo edits); L228 read_court_record confirms record committed.
 
-### Primary `AgentConfig` type
-File: `node_modules/pi-subagents/src/agents/agents.ts` (lines 125–160)
+### Step 4 — reviewer → `phase2-review` — SUCCESS
+- L230: run **2a1d7844-5794-4eab-89b1-189af0b92e47** completed blocking, `ok:true`; filed `phase2-review`.
+- L232: read_court_record shows decisions (e.g., REC-VERIFICATION_GAP-01 → KEEP-WITH-CONDITIONS; mechanism HYP-VERIFICATION_GAP CONFIRMED-REPEATS).
+- L233: pipeline complete; all four court records committed. Orchestrator STOPPED as instructed (no evalJudge.yaml, no fifth role).
 
-```ts
-export interface AgentConfig {
-	name: string;
-	runner?: AgentRunnerConfig;
-	localName?: string;
-	packageName?: string;
-	packageSourceName?: string;
-	packageSourceVersion?: string;
-	packageSourceRoot?: string;
-	description: string;
-	aliases?: string[];
-	tools?: string[];
-	mcpDirectTools?: string[];
-	model?: string;
-	fallbackModels?: string[];
-	thinking?: string | false;
-	systemPromptMode: SystemPromptMode;
-	inheritProjectContext: boolean;
-	inheritSkills: boolean;
-	defaultContext?: AgentDefaultContext;
-	defaultAsync?: boolean;
-	defaultTimeoutMs?: number;
-	defaultToolTimeoutMs?: number;
-	defaultTurnBudget?: TurnBudgetConfig;
-	defaultAcceptance?: AcceptanceInput;
-	acceptanceRole?: AcceptanceRole;
-	systemPrompt: string;
-	source: AgentSource;
-	filePath: string;
-	discoveryPriority?: number;
-	skills?: string[];
-	skillPath?: string[];
-	extensions?: string[];
-	extensionsFromDefault?: boolean;
-	subagentOnlyExtensions?: string[];
-	output?: string;
-	outputMode?: OutputMode;
-	defaultReads?: string[];
-	defaultProgress?: boolean;
-	interactive?: boolean;
-	maxSubagentDepth?: number;
-	completionGuard?: boolean;
-	toolBudget?: ToolBudgetConfig;
-	permissions?: PermissionRules;
-	memory?: AgentMemoryConfig;
-	disabled?: boolean;
-	extraFields?: Record<string, string>;
-	override?: BuiltinAgentOverrideInfo;
-	modelSource?: AgentModelSourceInfo;
-}
-```
+## Errors / retries / anomalies worth noting
+- **web_search platform defect (blocker severity):** deterministic deserialization error on all 9 researcher calls and at orchestrator level (L16, L207) — harness serializes tool type `web_search` but search backend requires type `function`. Not transient. Result: researcher filed `techniques: []` (no invented URLs) — compliant fallback.
+- **Intercom tool mismatch (blocker for coordination):** harness instructs `subagent_supervisor`/`subagent_wait`, which are absent from the orchestrator tool schema → ~40 failed "Unknown action" attempts (L20–196). Worked around via `mission.resolve-decision`, but reply delivery to child was delayed/uncertain (child timed out).
+- **Researcher run detached** (L13, L207) and **designer dispatch returned "No result provided"** (L212, L215, L217).
+- **Designer SIGABRT platform crash** (L222, L224) — run 1ccb9901, retried.
+- **Harness misclassification** of successful designer record as "no edits for implementation task" (L226–229).
+- **Session/mission directory change:** missions at `/tmp/ae-p2-pi-agent-1PSxg8` → `/tmp/ae-p2-pi-agent-6tNTc1` (L218–221); mission db99c377-e8f2-4ba1-acf1-4c08a4fcec62 was in the old dir; "no project missions" found after restart.
+- **Compaction** at L206 (05:32:09Z) — second orchestrator turn restarts with re-injected brief (L211).
+- **Run fan-out:** consistently "1/64 used, 63 remaining" (i.e., one active subagent at a time, blocking).
+- Ending turns (L234–237) are the user pasting this same session log path and the orchestrator noting it could delegate inspection to a scout — no bearing on the campaign outcome.
 
-There is **no `env`, `environment`, `envVars`, or similar field** here. (`extraFields` is a
-`Record<string, string>` for arbitrary/extra metadata but it is metadata only — it is not
-injected into the child process environment; it appears nowhere in the child env builder.)
+## Key facts / line pointers
+- investigator run id d497387a (L11); researcher run id f02449fe (L13, L14, L74); designer crash run 1ccb9901 (L222, L224); reviewer run id 2a1d7844 (L230).
+- Mission id db99c377-e8f2-4ba1-acf1-4c08a4fcec62; decision resolved e4c2ff2a (L80–82).
+- Court records: phase2-hypotheses (L11, L233), phase2-research (L207, L209), phase2-recommendations (L226–229), phase2-review (L230, L232).
+- Completion summary at L233 (05:47:53Z).
 
-### Runtime `RuntimeAgentDefinition` (the programmatic create/update schema)
-File: `node_modules/pi-subagents/src/agents/runtime-agent-registry.ts` (lines 18–57)
-
-```ts
-export interface RuntimeAgentDefinition {
-	description: string;
-	systemPrompt: string;
-	aliases?: readonly string[];
-	tools?: readonly string[];
-	mcpDirectTools?: readonly string[];
-	model?: string;
-	// ... fallbackModels, thinking, systemPromptMode, inheritProjectContext,
-	// inheritSkills, defaultContext, defaultAsync, defaultTimeoutMs,
-	// defaultToolTimeoutMs, defaultTurnBudget, defaultAcceptance, acceptanceRole,
-	// runner, skills, skillPath, extensions, subagentOnlyExtensions, output,
-	// outputMode, defaultReads, defaultProgress, interactive, maxSubagentDepth,
-	// completionGuard, toolBudget, permissions
-	maxSubagentDepth?: number;
-	completionGuard?: boolean;
-	toolBudget?: ToolBudgetConfig;
-	permissions?: PermissionRules;
-}
-
-export interface RegisterRuntimeAgentInput {
-	pi: ExtensionAPI;
-	name: string;
-	definition: RuntimeAgentDefinition;
-}
-```
-
-`validateDefinition` (runtime-agent-registry.ts lines ~202–243) enforces a **strict allow-list**
-of supported keys:
-
-```ts
-const supported = new Set([
-	"description", "systemPrompt", "aliases", "tools", "mcpDirectTools", "model", "fallbackModels", "thinking",
-	"systemPromptMode", "inheritProjectContext", "inheritSkills", "defaultContext", "defaultAsync", "defaultTimeoutMs",
-	"defaultToolTimeoutMs", "defaultTurnBudget", "defaultAcceptance", "acceptanceRole", "runner", "skills", "skillPath",
-	"extensions", "subagentOnlyExtensions", "output", "outputMode", "defaultReads", "defaultProgress", "interactive",
-	"maxSubagentDepth", "completionGuard", "toolBudget", "permissions",
-]);
-const unknown = Object.keys(definition).filter((key) => !supported.has(key));
-if (unknown.length > 0) throw new Error(`Runtime agent definition has unknown fields: ${unknown.join(", ")}.`);
-```
-
-An `env` field would be rejected with "Runtime agent definition has unknown fields".
-
----
-
-## 2. Any other mechanism to pass env vars to a child subagent at launch?
-
-**No explicit/per-agent mechanism.** The only env injection is **whole-parent-process inheritance**.
-
-### Per-launch params — `SubagentParamsLike`
-File: `node_modules/pi-subagents/src/runs/foreground/subagent-executor.ts` (lines 270–360).
-This is the object the runtime accepts for launching a subagent (`agent`, `task`, `model`,
-`output`, `intercomBridge`, `timeoutMs`, `toolBudget`, `acceptance`, etc.). **No env field** exists
-in it.
-
-### Preflight launch binding — `LaunchBindingInput`
-File: `node_modules/pi-subagents/src/shared/launch-contract.ts` (lines ~82–97).
-
-```ts
-export interface LaunchBindingInput {
-	definitionDigest: string;
-	task?: string;
-	model?: string;
-	modelCandidates?: string[];
-	thinking?: string;
-	systemPrompt?: string | null;
-	systemPromptMode?: AgentConfig["systemPromptMode"];
-	inheritProjectContext: boolean;
-	inheritSkills: boolean;
-	skills?: string[];
-	tools?: string[];
-	extensions?: string[];
-	subagentOnlyExtensions?: string[];
-	mcpDirectTools?: string[];
-	outputPath?: string;
-	outputMode?: string;
-	structuredOutputSchema?: unknown;
-}
-```
-
-No env field. `projectLaunchBinding` (the canonical evidence projection of resolved inputs)
-also contains no env.
-
-### How the child env is actually built — inheritance only
-File: `node_modules/pi-subagents/src/runs/foreground/execution.ts` (line 489):
-
-```ts
-const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
-```
-
-`sharedEnv` comes from `buildPiArgs` (`runs/shared/pi-args.ts`, lines ~678–863) and contains only
-**internal pi plumbing variables** (e.g. `PI_SUBAGENT_CHILD`, `PI_SUBAGENT_PARENT_SESSION`,
-`MCP_DIRECT_TOOLS`, capability-ceiling, watchdog config, etc.). There is no user-supplied env map.
-Everything else in the child env is simply the parent's entire `process.env` copied through.
-
-**Implication:** to set an env var visible to a subagent, a caller would have to mutate
-`process.env` (or the parent process environment) before launching — there is no per-agent/
-per-run override field, and such mutations would also leak to every other spawned child.
-
----
-
-## 3. All fields accepted in the agent config object
-
-### A. `AgentConfig` (agents.ts lines 125–160) — complete field list with types
-- `name: string`
-- `runner?: AgentRunnerConfig`
-- `localName?: string`
-- `packageName?: string`
-- `packageSourceName?: string`
-- `packageSourceVersion?: string`
-- `packageSourceRoot?: string`
-- `description: string`
-- `aliases?: string[]`
-- `tools?: string[]`
-- `mcpDirectTools?: string[]`
-- `model?: string`
-- `fallbackModels?: string[]`
-- `thinking?: string | false`
-- `systemPromptMode: SystemPromptMode` ("replace" | "append")
-- `inheritProjectContext: boolean`
-- `inheritSkills: boolean`
-- `defaultContext?: AgentDefaultContext` ("fresh" | "fork")
-- `defaultAsync?: boolean`
-- `defaultTimeoutMs?: number`
-- `defaultToolTimeoutMs?: number`
-- `defaultTurnBudget?: TurnBudgetConfig`
-- `defaultAcceptance?: AcceptanceInput`
-- `acceptanceRole?: AcceptanceRole` ("read-only" | "writer")
-- `systemPrompt: string`
-- `source: AgentSource`
-- `filePath: string`
-- `discoveryPriority?: number`
-- `skills?: string[]`
-- `skillPath?: string[]`
-- `extensions?: string[]`
-- `extensionsFromDefault?: boolean`
-- `subagentOnlyExtensions?: string[]`
-- `output?: string`
-- `outputMode?: OutputMode` ("inline" | "file-only")
-- `defaultReads?: string[]`
-- `defaultProgress?: boolean`
-- `interactive?: boolean`
-- `maxSubagentDepth?: number`
-- `completionGuard?: boolean`
-- `toolBudget?: ToolBudgetConfig`
-- `permissions?: PermissionRules`
-- `memory?: AgentMemoryConfig`
-- `disabled?: boolean`
-- `extraFields?: Record<string, string>` (metadata only, not env)
-- `override?: BuiltinAgentOverrideInfo`
-- `modelSource?: AgentModelSourceInfo`
-
-### B. Runtime `RuntimeAgentDefinition` (runtime-agent-registry.ts lines 18–51) — the strict
-allow-listed create/update schema (the subset of AgentConfig accepted by `registerAgent`):
-- `description: string`
-- `systemPrompt: string`
-- `aliases?: readonly string[]`
-- `tools?: readonly string[]`
-- `mcpDirectTools?: readonly string[]`
-- `model?: string`
-- `fallbackModels?: readonly string[]`
-- `thinking?: string | false`
-- `systemPromptMode?: "append" | "replace"`
-- `inheritProjectContext?: boolean`
-- `inheritSkills?: boolean`
-- `defaultContext?: "fresh" | "fork"`
-- `defaultAsync?: boolean`
-- `defaultTimeoutMs?: number`
-- `defaultToolTimeoutMs?: number`
-- `defaultTurnBudget?: TurnBudgetConfig`
-- `defaultAcceptance?: AcceptanceInput`
-- `acceptanceRole?: "read-only" | "writer"`
-- `runner?: AgentRunnerConfig`
-- `skills?: readonly string[]`
-- `skillPath?: readonly string[]`
-- `extensions?: readonly string[]`
-- `subagentOnlyExtensions?: readonly string[]`
-- `output?: string`
-- `outputMode?: "inline" | "file-only"`
-- `defaultReads?: readonly string[]`
-- `defaultProgress?: boolean`
-- `interactive?: boolean`
-- `maxSubagentDepth?: number`
-- `completionGuard?: boolean`
-- `toolBudget?: ToolBudgetConfig`
-- `permissions?: PermissionRules`
-
-Also `BuiltinAgentOverrideBase`/`BuiltinAgentOverrideConfig` (agents.ts lines 48–102) used for
-builtin-agent overrides: same shape, no env field.
-
----
-
-## Documentation check
-
-`node_modules/pi-subagents/docs/`:
-- `docs/agents.md` — no occurrence of "env" (grep returned no matches).
-- `docs/configuration.md` — documents internal `PI_SUBAGENT_*` env vars (task delivery, wait-tool,
-  command override, fs-retry caps, etc.) and the `config.json` keys. **None** allow per-agent env
-  injection; they are library-internal plumbing knobs.
-
-`/work/_inspect/pi/packages/coding-agent/docs/` exists but has **no `subagents.md`**. Docs present
-are generic (extensions, rpc, sdk, settings, providers, etc.). No subagent config/env documentation
-found there.
-
----
-
-## Files Retrieved (evidence)
-
-1. `node_modules/pi-subagents/src/agents/agents.ts` (lines 48–160) — `AgentConfig` + override config types; no env field.
-2. `node_modules/pi-subagents/src/agents/runtime-agent-registry.ts` (lines 18–57, 202–243) — `RuntimeAgentDefinition`, allow-list validation rejecting env.
-3. `node_modules/pi-subagents/src/shared/launch-contract.ts` (lines 82–130) — `LaunchBindingInput`, `projectLaunchBinding`; no env.
-4. `node_modules/pi-subagents/src/runs/foreground/subagent-executor.ts` (lines 270–360) — `SubagentParamsLike`; no env.
-5. `node_modules/pi-subagents/src/runs/foreground/execution.ts` (line 489) — `spawnEnv = { ...process.env, ...sharedEnv }`.
-6. `node_modules/pi-subagents/src/runs/shared/pi-args.ts` (lines 678–863) — `buildPiArgs`; internal-only env plumbing.
-7. `node_modules/pi-subagents/src/api/agents.ts` (lines 1–8) — exports `registerAgent` (wraps `registerRuntimeAgent`); no env.
-8. `node_modules/pi-subagents/docs/agents.md`, `docs/configuration.md` — no per-agent env support.
-
-## Residual Risks / Notes
-
-- If the real need is to put an env var into the agent's process, the only supported route is to
-  set it in the parent `process.env` before the subagent spawns (children inherit all of it).
-  There is no scoped per-agent/per-run override.
-- `extraFields` in `AgentConfig` might look like an escape hatch but is metadata only; it is not
-  consulted when building the child env.
-- Extension config file (`~/.pi/agent/extensions/subagent/config.json`) fields are validated
-  (`extension/config.ts`) and none of them carry per-agent env injection.
+## Net result
+All four Phase-2 court records were filed and committed. The campaign completed despite two platform-level incidents (web_search broken → techniques empty; designer SIGABRT → re-run) and intercom/coordination tooling gaps (missing supervisor/wait tools; mission-directory change across a harness restart).

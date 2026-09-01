@@ -53,6 +53,8 @@ export interface EvalPackageVerifierCheck {
 export interface EvalPackageRuntimeConfig {
   setupPath: string | null;
   cleanupPath: string | null;
+  /** Post-setup healthcheck (suite: environment/healthcheck.sh). Null when absent. */
+  healthcheckPath: string | null;
   setupTimeoutMs: number;
   cleanupTimeoutMs: number;
   agentTimeoutMs: number;
@@ -185,6 +187,7 @@ export function evalPackageRuntimeConfig(
   // (legacy canonical) tasks use the [lifecycle] table when present.
   const setup = suite ? "lifecycle-setup.sh" : text(lifecycle.setup);
   const cleanup = suite ? "lifecycle-cleanup.sh" : text(lifecycle.cleanup);
+  const healthcheck = suite ? "healthcheck.sh" : text(lifecycle.healthcheck);
   const verifierChecks = arrayOfTables(verifier.checks)
     .map((entry) => ({ id: text(entry.id), kind: text(entry.kind) }))
     .filter((entry): entry is EvalPackageVerifierCheck => entry.id !== null && entry.kind !== null);
@@ -194,6 +197,9 @@ export function evalPackageRuntimeConfig(
       : null,
     cleanupPath: cleanup
       ? (suite ? SUITE_LIFECYCLE_CLEANUP_PATH : runtimeEnvironmentPath(cleanup))
+      : null,
+    healthcheckPath: healthcheck
+      ? (suite ? "/workspace/.agenteval/environment/healthcheck.sh" : runtimeEnvironmentPath(healthcheck))
       : null,
     setupTimeoutMs: Math.trunc(
       Number(
@@ -420,25 +426,41 @@ export const SUITE_LIFECYCLE_SETUP_PATH = "/workspace/.agenteval/lifecycle-setup
 /** In-container path of the platform-synthesized suite cleanup wrapper. */
 export const SUITE_LIFECYCLE_CLEANUP_PATH = "/workspace/.agenteval/lifecycle-cleanup.sh";
 
-/** Map a task.toml `language` value to the apt packages setup.sh must install. */
+/**
+ * Toolchains baked into the fat suite base image (see SUITE_BASE_CONTAINERFILE
+ * in src/runner/package-image.ts): node/npm, python3/pip/venv, go, rust/cargo,
+ * and gcc/g++ via build-essential. These are never re-installed at eval time and
+ * never purged at cleanup.
+ */
+const BAKED_IN_LANGUAGES = new Set([
+  "python", "python3",
+  "javascript", "js", "node", "nodejs",
+  "c", "cpp", "c++",
+  "go", "golang",
+  "rust", "rs",
+  "bash", "shell", "sh",
+]);
+
+/**
+ * Map a task.toml `language` value to the apt packages setup.sh must install at
+ * eval time. Languages baked into the fat base image return no packages — their
+ * toolchain is already present. Only a language the base does not carry would
+ * declare per-eval apt installs here.
+ */
 export function languageToAptPackages(language: string | null): string[] {
   if (!language) return [];
-  const lang = language.trim().toLowerCase();
-  if (lang === "python" || lang === "python3") return ["python3", "python3-pip", "python3-venv"];
-  if (lang === "javascript" || lang === "js" || lang === "node" || lang === "nodejs") return ["nodejs", "npm"];
-  if (lang === "c") return ["gcc"];
-  if (lang === "cpp" || lang === "c++") return ["g++"];
-  if (lang === "bash" || lang === "shell" || lang === "sh") return [];
-  return [];
+  return BAKED_IN_LANGUAGES.has(language.trim().toLowerCase()) ? [] : [];
 }
 
 /**
  * Write the platform-synthesized suite lifecycle wrappers into the workspace:
- *  - lifecycle-setup.sh: apt-get install the language toolchain, then run the
- *    author's environment/setup.sh (which seeds /workspace/task), then chown
+ *  - lifecycle-setup.sh: apt-get install any NON-baked language toolchain (the
+ *    node/python/go/rust toolchains are already in the fat base image), then run
+ *    the author's environment/setup.sh (which seeds /workspace/task), then chown
  *    /workspace/task to the non-root agent (uid 10001).
  *  - lifecycle-cleanup.sh: run the author's environment/cleanup.sh (delete
- *    /workspace/task), then apt-get purge + autoremove the toolchain.
+ *    /workspace/task), then apt-get purge + autoremove any toolchain this eval
+ *    installed. Baked toolchains are never purged.
  *
  * Both run as root inside the persistent queue container. Runtime-only: the
  * package on disk is left pristine (digest unchanged). Idempotent — safe to
@@ -462,8 +484,9 @@ export async function synthesizeSuiteLifecycleScripts(input: {
   const cleanupHostPath = join(dir, "lifecycle-cleanup.sh");
   await writeFile(setupHostPath, [
     "#!/usr/bin/env bash",
-    "# Platform-synthesized suite setup: install the language toolchain for this",
-    "# eval, then run the author's setup.sh body (which seeds /workspace/task).",
+    "# Platform-synthesized suite setup: install any NON-baked language toolchain",
+    "# for this eval (node/python/go/rust are already in the fat base), then run",
+    "# the author's setup.sh body (which seeds /workspace/task).",
     "set -euo pipefail",
     "# The /workspace bind mount is host-owned; rootful podman + a non-matching",
     "# uid makes git 2.39+ refuse operations with 'dubious ownership'. Trust the",
@@ -471,6 +494,13 @@ export async function synthesizeSuiteLifecycleScripts(input: {
     "# Written to the system gitconfig so it applies to root AND the non-root agent (uid 10001).",
     "git config --system --add safe.directory '*'",
     installBlock,
+    "# Platform seed: copy seed_repo into /workspace/task BEFORE the author's",
+    "# setup.sh. An author script that only mkdir'd the dest left the workspace",
+    "# empty (observed live: workspace.source=empty, no src/value.js).",
+    "if [ -d /workspace/.agenteval/seed_repo ]; then",
+    "  mkdir -p /workspace/task",
+    "  cp -a /workspace/.agenteval/seed_repo/. /workspace/task/",
+    "fi",
     "# Run the author's setup body. cwd=/workspace/.agenteval so its",
     "# `dirname $0/..`/seed_repo reference resolves to the staged copy.",
     "cd /workspace/.agenteval",
@@ -481,7 +511,8 @@ export async function synthesizeSuiteLifecycleScripts(input: {
   await writeFile(cleanupHostPath, [
     "#!/usr/bin/env bash",
     "# Platform-synthesized suite cleanup: run the author's cleanup.sh, then",
-    "# remove the language toolchain this eval installed (best-effort restore).",
+    "# remove any NON-baked toolchain this eval installed (best-effort restore).",
+    "# Baked toolchains (node/python/go/rust) are never purged.",
     "set -euo pipefail",
     '/workspace/.agenteval/environment/cleanup.sh "$@"',
     purgeBlock,

@@ -18,6 +18,19 @@ Read all of it before forming any view. The reports were written independently a
 were not reconciled with each other before reaching you. Reconciling them is your
 job, not theirs.
 
+The investigator reports are COMMITTED court records, not sealed archive files. When
+the orchestrator's brief references a report rather than inlining it, retrieve the
+exact filed bytes with `read_court_record`:
+
+  kratos report   read_court_record(template: "kratos-report")
+  logos report    read_court_record(template: "logos-report")
+  your own prior  read_court_record(template: "minos-report")   (round 2+)
+
+Do not try to reach these through `read_evidence` — that tool reads the sealed
+archive only, and the committed reports live in the court-record store, so such reads
+return DENIED. If a report you need is not retrievable, petition the orchestrator for
+it rather than guessing paths.
+
 ## Rounds
 
 The case is worked in rounds. Each round investigates every tangent then open; the

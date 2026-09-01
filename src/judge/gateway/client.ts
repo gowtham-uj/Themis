@@ -43,14 +43,20 @@ export interface ChatMessage {
   }>;
 }
 
-export interface ChatTool {
-  type: "function";
-  function: {
-    name: string;
-    description?: string;
-    parameters?: Record<string, unknown>;
-  };
-}
+export type ChatTool =
+  | {
+      type: "function";
+      function: {
+        name: string;
+        description?: string;
+        parameters?: Record<string, unknown>;
+      };
+    }
+  | {
+      /** Provider-native web search (OpenAI-compatible built-in tool). */
+      type: "web_search";
+      web_search?: Record<string, unknown>;
+    };
 
 export interface ChatToolCall {
   id: string;
@@ -111,9 +117,12 @@ export class ModelGateway {
     const model = req.model ?? this.config.model;
     const effort = req.reasoningEffort ?? this.config.reasoningEffort;
     // Reasoning effort scales the effective floor: `max` reasoning can consume
-    // thousands of tokens before any content, so a small cap starves the answer
-    // (WP-6: reasoning budget is a correctness issue, not a tuning knob).
-    const effortFloor = effort === "max" ? 8192 : this.config.maxTokensFloor;
+    // tens of thousands of tokens before any content, so a small cap starves the
+    // answer (WP-6: reasoning budget is a correctness issue, not a tuning knob).
+    // The PI path (models.json) proves 32768 is enough for `max` on
+    // deepseek-v4-flash; 8192 still starved Node 0's 60KB summarize input
+    // (observed live: finish_reason=length with empty content).
+    const effortFloor = effort === "max" ? 32768 : this.config.maxTokensFloor;
     const maxTokens = Math.max(req.maxTokens ?? effortFloor, effortFloor);
     const digest = digestRequest(model, req.messages);
 
@@ -194,7 +203,6 @@ export class ModelGateway {
 
     const choice = raw?.choices?.[0] ?? {};
     const message = choice?.message ?? {};
-    const content = typeof message.content === "string" ? message.content : "";
     const reasoning =
       typeof message.reasoning_content === "string"
         ? message.reasoning_content
@@ -204,15 +212,24 @@ export class ModelGateway {
     const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : null;
     const usage = (raw?.usage as Record<string, unknown> | undefined) ?? null;
 
+    const content =
+      typeof message.content === "string"
+        ? message.content
+        : Array.isArray(message.content)
+          ? (message.content as Array<{ type?: string; text?: string }>)
+              .filter((p) => p && (p.type === "text" || typeof p.text === "string"))
+              .map((p) => p.text ?? "")
+              .join("")
+          : "";
     const toolCallsRaw = Array.isArray(message.tool_calls) ? message.tool_calls : [];
     const toolCalls: ChatToolCall[] = toolCallsRaw
-      .filter((t: any) => t && typeof t.id === "string" && t.function?.name)
+      .filter((t: any) => t && typeof t.id === "string" && (t.function?.name || t.type === "web_search"))
       .map((t: any) => ({
         id: String(t.id),
         type: "function" as const,
         function: {
-          name: String(t.function.name),
-          arguments: String(t.function.arguments ?? "{}"),
+          name: String(t.function?.name ?? "web_search"),
+          arguments: String(t.function?.arguments ?? JSON.stringify(t.web_search ?? t.action ?? {})),
         },
       }));
 

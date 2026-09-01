@@ -15,8 +15,11 @@ export type PipelineTrigger="auto"|"eval"|"phase1"|"phase2"|"finalize";
 export interface EvalQueueStartResult{started:boolean}
 export interface EvalItemStatus{state:"running"|"completed"|"failed";runId?:string;archiveId?:string;error?:string}
 export interface Phase1StartResult{operationId:string}
-export interface Phase1Status{state:"running"|"published"|"failed";resultVersionId?:string;archiveViewId?:string;error?:string}
-export interface Phase2RunResult{developerPackSha256:string;artifactDir:string}
+/** `not_started` means no in-flight run AND no published result — i.e. the worker
+ *  that owned this Phase-1 run was lost (crash/restart) and must be re-launched
+ *  so its persisted PI session can be resumed. */
+export interface Phase1Status{state:"running"|"published"|"failed"|"not_started";resultVersionId?:string;archiveViewId?:string;error?:string}
+export interface Phase2RunResult{developerPackSha256:string;developerPackZip:string;artifactDir:string}
 export interface FinalViewResult{finalArchiveViewId:string;manifestSha256:string}
 
 /** Real-system seams; server wiring supplies queue/worker/analysis/publisher implementations. */
@@ -90,6 +93,12 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
    }else{
     await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"failed",errorKind:"phase1",errorDetail:s.error??"Phase1 failed"});changed=true;
    }
+  }else if(s.state==="not_started"){
+   // Worker loss: the run that owned this Phase-1 case is gone (server crash or
+   // restart) and no result version exists. Re-launch WITHOUT consuming a retry —
+   // this is a resume of the persisted PI session, not a failure retry.
+   await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"phase1_pending"});
+   await input.db.pipeline.appendEvent({generationId:gen.id,itemId:item.id,operationId:`phase1.resume:${item.id}`,eventType:"phase1.resume",payloadJson:JSON.stringify({runId:item.runId})});changed=true;
   }
  }
  items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];
