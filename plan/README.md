@@ -1,6 +1,7 @@
-# agenteval plan
+# Themis plan
 
-This plan defines an API-only backend for executing agent evals and retaining immutable evidence.
+This plan defines Themis: an API-only system that executes agent evals, retains immutable evidence,
+judges each run (Phase 1), and aggregates those judgements into developer improvement packs (Phase 2).
 
 ## Product contract
 
@@ -16,16 +17,22 @@ This plan defines an API-only backend for executing agent evals and retaining im
 9. Archives are copied into a flat central store (`archives/<runId>/`) with one metadata index.
 10. The archive API lists, filters, and retrieves retained results. It is the historical evidence interface.
 
+11. Phase 1 judges each sealed archive and seals its court record as a `judge/` archive view.
+12. Phase 2 analyzes a campaign of Phase-1 results and produces a developer improvement pack plus a
+    separate platform report.
+
 ## Current interface
 
-The REST API and its event streams are the only application interface. There is no bundled frontend,
-judge subsystem, judgement/report API, findings/regression subsystem, reusable-rubric CRUD API, or
-standalone run-artifact API.
+The REST API and its event streams are the application interface; a React console in `web/` consumes
+that API and adds nothing of its own. There is no findings/regression subsystem, reusable-rubric CRUD
+API, or standalone run-artifact API.
 
 ## Documents
 
 | Document | Purpose |
 |---|---|
+| [themis-phase1-implementation.md](themis-phase1-implementation.md) | Phase 1 judgement design and work packages |
+| [themis-phase2-design.md](themis-phase2-design.md) | Phase 2 campaign analysis, PI board, and pack contract |
 | [architecture.md](architecture.md) | Backend components and data flow |
 | [api.md](api.md) | REST API contract |
 | [data-model.md](data-model.md) | SQLite and on-disk storage |

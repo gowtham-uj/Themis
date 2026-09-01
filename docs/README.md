@@ -1,6 +1,6 @@
-# Agenteval user documentation
+# Themis user documentation
 
-Use these documents to operate the backend/API platform without reading implementation source:
+Use these documents to operate Themis without reading implementation source:
 
 - [API reference](./api-reference.md) — every endpoint, request body, and response shape, as implemented.
 - [Canonical eval authoring](./eval-authoring.md) — required package tree, `task.toml`, environment,

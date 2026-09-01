@@ -1,11 +1,18 @@
 # Themis Phase 2 — Agent Improvement Intelligence
 
-> **Status: FIVE-COMPONENT PIPELINE IMPLEMENTED.** Campaign manager, cohort-aware pattern
-> analyzer with CANDIDATE/PROVISIONAL/CANONICAL registry, investigator, researcher (web
-> search when THEMIS_WEB_SEARCH_ENDPOINT is set), improvement designer, Minos-portfolio
-> review, executive brief, hypotheses, R&D memory, per-eval `phase2/` reseal, and a single
-> `developer-improvement-pack.zip` are live. THEMIS still does not access agent source or
-> run experiments.
+> **Status: FIVE-COMPONENT PIPELINE IMPLEMENTED, BOARD RUNS ON PI.** Campaign manager,
+> cohort-aware pattern analyzer with CANDIDATE/PROVISIONAL/CANONICAL registry, and the
+> four-role analytical board (investigator, researcher, designer, reviewer) are live, as
+> are the executive brief, hypotheses, R&D memory, per-eval `phase2/` reseal, and the
+> `developer-improvement-pack.zip`.
+>
+> Components 3 through 5 are no longer a hand-rolled agent loop. They run as PI
+> coding-agent subagents under a Phase-2 orchestrator, using the same mediated tool
+> surface and session-resume machinery as the Phase-1 courtroom. See
+> [As-built: the Phase-2 PI board](#as-built-the-phase-2-pi-board). Component 1 (campaign
+> manager) and component 2 (pattern analyzer) remain deterministic and model-free.
+>
+> THEMIS still does not access agent source or run experiments.
 >
 > Phase 2 is intentionally black-box and advisory. THEMIS does not access or patch the
 > tested agent's source code, and it does not run experiments itself. The recipient of
@@ -74,6 +81,10 @@ PHASE-1 RESULTS
       ▼
 5. REVIEW + DEVELOPER PACK
 ```
+
+Components 1 and 2 are deterministic. Components 3, 4, and 5 are agentic and run as PI
+subagents under one orchestrator; the mapping from these five components to the four
+implemented roles is in [As-built: the Phase-2 PI board](#as-built-the-phase-2-pi-board).
 
 ---
 
@@ -454,6 +465,109 @@ Phase 2 produces a **Developer Improvement Pack** containing:
 
 ---
 
+# As-built: the Phase-2 PI board
+
+Components 3, 4, and 5 above describe *what* the analytical stage must produce. This
+section describes *how* it runs, and supersedes any earlier reading of those components as
+a bespoke agent loop.
+
+Phase 2 uses the same coding agent as the Phase-1 courtroom: PI
+(`@earendil-works/pi-coding-agent`) with the `pi-subagents` extension. The reasoning behind
+that choice is simple. Investigating a mechanism from trace evidence, reading across
+dozens of court records, and drafting an implementation handoff are coding-agent work. A
+hand-rolled loop reimplemented tool dispatch, retry, and session persistence badly; PI
+already does all three, and reusing it means one resume path and one tool surface across
+both phases.
+
+## Roles
+
+One orchestrator dispatches four specialist subagents. Dispatch is strictly ordered and
+blocking; each subagent's report is its return value, not something the orchestrator polls
+for.
+
+| Role | Prompt | Files | Question it answers |
+|---|---|---|---|
+| orchestrator | `phase2-orchestrator.md` | none | Which specialists run, in what order, with what brief |
+| investigator | `phase2-investigator.md` | `phase2-hypotheses` | Which agent-owned patterns genuinely repeat, and by what mechanism |
+| researcher | `phase2-researcher.md` | `phase2-research` | What published techniques address those mechanisms |
+| designer | `phase2-designer.md` | `phase2-recommendations` | What the developer should change, and how they can prove it worked |
+| reviewer | `phase2-reviewer.md` | `phase2-review` | Which recommendations survive scrutiny |
+
+Mapping back to the five components: the investigator is component 3's Kratos and Logos
+roles merged (both are black-box trace reading, and splitting them produced two agents
+citing the same evidence), the researcher is component 3's research role, the designer is
+component 4, and the reviewer is component 5's meta-review. Component 5's Minos portfolio
+judgment is applied by the reviewer against the same evidence ladder.
+
+Prompts live in `src/judge/prompts/phase2-*.md` and are customized per role. They are not
+the Phase-1 prompts with the nouns swapped: each states its own objective, boundaries,
+where to look, and what "done" means, and each is told explicitly that platform defects
+(empty workspace, crashed verifier) are never agent weaknesses.
+
+## Tools
+
+Subagents reach evidence only through the mediated tool surface in
+`themis-tools-extension.ts`. There is no filesystem, shell, or database access. Phase 2
+adds campaign-scoped tools to the Phase-1 set: `list_evals`, `list_patterns`,
+`read_pattern`, `read_improvements`, `read_lifecycle`, `read_judge_report`,
+`read_court_record`, `write_to_yaml_template`, and `web_search`. Each role gets a subset.
+The researcher is the only role holding `web_search`; the reviewer cannot read raw
+lifecycle evidence, which keeps it reviewing rather than re-investigating.
+
+`web_search` uses the model provider's own search rather than a separate search service.
+When `THEMIS_WEB_SEARCH_ENDPOINT` is unset, the tool calls the same OpenAI-compatible proxy
+PI uses, declaring search as a function-typed tool. This detail is load-bearing: the proxy
+rejects a bare `type: "web_search"` entry before the query is ever sent, which silently
+denied 9 of 9 research queries until it was fixed.
+
+## Durability and control
+
+The board writes to `data/platform/phase2/<campaignId>`. The PI session JSONL, the filed
+reports, and `pi.pid` all live there, which is what makes the stage resumable: a resume
+re-attaches to the existing session with `--continue` rather than restarting the campaign.
+Traces are copied into each eval's `phase2/` archive view alongside the Phase-1 `judge/`
+tree, so a campaign's reasoning stays auditable from the archive API.
+
+Control is over HTTP, matching Phase 1:
+
+```text
+GET  /api/projects/:id/pipeline/campaign/:campaignId          campaign + records + board status
+GET  /api/projects/:id/pipeline/campaign/:campaignId/status   subagent status, session, resumability
+POST /api/projects/:id/pipeline/campaign/:campaignId/pause    SIGTERM the board, keep the session
+POST /api/projects/:id/pipeline/campaign/:campaignId/resume   re-attach and continue
+GET  /api/projects/:id/pipeline/campaign/:campaignId/pack     download the developer pack
+```
+
+## Pack structure
+
+The design above lists six outputs. In the built system they split across two artifacts,
+because mixing them was actively harmful: the first pack shipped harness bugs to the agent
+developer as if they were agent weaknesses.
+
+`developer-improvement-pack.zip` is agent-facing only:
+
+```text
+phase2/
+  campaign.yaml            campaign identity + membership
+  executive-brief.yaml     agent weaknesses + next action
+  hypotheses.yaml          root-cause hypotheses + research notes
+  patterns.yaml            agent-owned patterns (frequency, cohorts, evidence)
+  developer-pack.yaml      prioritized implementation handoffs + experiment cards
+  experiment-plans.yaml    developer-run control/treatment plans
+  manifest.json            artifact hashes
+phase1/<runId>/judge/      each member eval's complete Phase-1 court record
+```
+
+Including `phase1/` matters. A recommendation is only as good as the evidence under it, and
+a developer who wants to check one is otherwise stuck making separate archive API calls per
+eval.
+
+`platform-report.yaml` is written separately, and only when there is something to report.
+It carries platform findings, harness-owned patterns, and `nextPlatformAction`. It is for
+whoever operates THEMIS, never for the agent developer.
+
+---
+
 # R&D memory
 
 Phase 2 remembers:
@@ -695,6 +809,12 @@ The final view is a strict superset of that eval's immutable Phase-1 view. It ne
 changes base evidence or `judge/` bytes. Historical Phase-1 and earlier Phase-2 views
 remain queryable; a current pointer selects the default view.
 
+This per-eval archive view is not the same artifact as the downloadable developer pack. The
+archive view is the complete campaign record attached to one eval, platform findings
+included, retrieved through the archive API. The pack is the agent-facing subset, zipped
+for the agent's developer, and it excludes `platform-report.yaml` by design. See
+[Pack structure](#pack-structure).
+
 ## API-only developer workflow
 
 The required E2E uses only HTTP APIs:
@@ -713,8 +833,12 @@ The required E2E uses only HTTP APIs:
 
 # Implementation order
 
-1. Resolve the repository-scope conflict (`CLAUDE.md` currently declares no judge
-   subsystem/API while Phase 1 judge code and this contract require it).
+All eleven steps are delivered. Step 6 through 8 landed twice: first as a hand-rolled agent
+loop, then rebuilt on the PI board described in
+[As-built: the Phase-2 PI board](#as-built-the-phase-2-pi-board).
+
+1. ~~Resolve the repository-scope conflict~~. Done. `CLAUDE.md` now declares Phase 1 and
+   Phase 2 in scope.
 2. PostgreSQL/SQLite unified queue generation + item + stage-event schema and contracts.
 3. Wire eval archive seal → Phase 1 worker → `phase1.result_published` event.
 4. Campaign Manager, exact membership, validity split, and Phase-2 persistence.

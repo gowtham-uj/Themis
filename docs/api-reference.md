@@ -1,4 +1,4 @@
-# Agenteval API Reference
+# Themis API Reference
 
 The HTTP API is the only application interface. Every endpoint is documented here as
 implemented in the current codebase (`src/api/*`). Request bodies accept both
