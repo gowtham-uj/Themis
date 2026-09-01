@@ -16,8 +16,6 @@ export default function App() {
         <nav aria-label="Primary">
           <NavLink to="/projects" end>Projects</NavLink>
           <NavLink to="/archives">Archives</NavLink>
-          <span className="nav-disabled" aria-disabled="true" title="Phase 1 panel is disabled">Phase 1</span>
-          <span className="nav-disabled" aria-disabled="true" title="Phase 2 panel is disabled">Phase 2</span>
         </nav>
       </aside>
       <main className="main">
@@ -31,8 +29,6 @@ export default function App() {
           <Route path="/projects/:id/live" element={<EvalLive />} />
           <Route path="/runs/:id" element={<RunDetail />} />
           <Route path="/archives" element={<Archives />} />
-          <Route path="/phase1" element={<Projects />} />
-          <Route path="/phase2" element={<Projects />} />
         </Routes>
       </main>
     </div>
