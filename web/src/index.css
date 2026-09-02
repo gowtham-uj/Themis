@@ -131,6 +131,10 @@ tr:hover td { background: var(--surface); }
 .chip.platform { border-color: var(--violet); color: var(--violet); }
 .chip.agent { border-color: var(--ok); color: var(--ok); }
 .chip.accent { border-color: var(--accent); color: var(--accent); }
+.chip.phase1 { border-color: var(--info); color: var(--info); }
+.chip.phase2 { border-color: var(--violet); color: var(--violet); }
+
+.hint { font-size: 11px; color: var(--text-faint); }
 
 .banner { border: 1px solid; border-radius: var(--r-panel); padding: var(--s3) var(--s4); font-size: 13px; }
 .banner.danger { border-color: var(--danger); color: #ffb3ae; background: rgba(248,81,73,0.08); }

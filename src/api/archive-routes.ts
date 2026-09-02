@@ -22,6 +22,11 @@ import { lstat, open } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { relative, resolve, sep } from "node:path";
 import { getRequestAuth } from "./auth.js";
+import {
+  BASE_PHASE_STATE,
+  readArchivePhaseStates,
+  type ArchivePhaseState,
+} from "./archive-phase-state.js";
 import { HttpError, notFound } from "./errors.js";
 import { sendJson, type RequestContext, type Router } from "./router.js";
 import type { QueryStore, EvalArchive } from "../db/queries.js";
@@ -60,6 +65,12 @@ export interface ArchiveEntry {
   reward: number | null;
   sealedAt: string | null;
   archivedAt: string;
+  /**
+   * Which phase views are sealed over this archive's base evidence. Tells a
+   * reader whether they are looking at raw execution evidence, a Phase-1
+   * judged archive, or one resealed by a Phase-2 campaign.
+   */
+  phase: ArchivePhaseState;
   /** Canonical immutable manifest key (new archives); internal only. */
   manifestKey: string | null;
   /** Internal compatibility materialization; never serialized to API clients. */
@@ -91,7 +102,11 @@ function archiveJson(entry: ArchiveEntry): Omit<ArchiveEntry, "storagePath" | "m
   return publicEntry;
 }
 
-function entryFromRecord(dataDir: string, record: ArchiveIndexRecord): ArchiveEntry {
+function entryFromRecord(
+  dataDir: string,
+  record: ArchiveIndexRecord,
+  phases: Map<string, ArchivePhaseState>,
+): ArchiveEntry {
   return {
     projectId: record.projectId,
     projectName: record.projectName,
@@ -116,13 +131,19 @@ function entryFromRecord(dataDir: string, record: ArchiveIndexRecord): ArchiveEn
     reward: record.reward,
     sealedAt: record.sealedAt,
     archivedAt: record.archivedAt,
+    phase: phases.get(record.runId) ?? BASE_PHASE_STATE,
     manifestKey: null,
     storagePath: archiveStoreDir(dataDir, record.dir || record.runId),
   };
 }
 
 /** DB-backed catalog row — no archives/index.json scan. */
-function entryFromArchive(dataDir: string, queries: QueryStore, archive: EvalArchive): ArchiveEntry {
+function entryFromArchive(
+  dataDir: string,
+  queries: QueryStore,
+  archive: EvalArchive,
+  phases: Map<string, ArchivePhaseState>,
+): ArchiveEntry {
   const run = queries.getRun(archive.runId);
   const project = queries.getProject(archive.projectId);
   const queue = archive.queueId ? queries.getEvalQueue(archive.queueId) : null;
@@ -151,6 +172,7 @@ function entryFromArchive(dataDir: string, queries: QueryStore, archive: EvalArc
     reward: null,
     sealedAt: archive.sealedAt,
     archivedAt: archive.archivedAt ?? archive.sealedAt,
+    phase: phases.get(archive.runId) ?? BASE_PHASE_STATE,
     manifestKey: archive.manifestKey,
     // Compatibility materialization path while file reads cut over to CAS.
     storagePath: archiveStoreDir(dataDir, archive.runId),
@@ -165,10 +187,12 @@ export async function listArchiveEntries(
   projectIdFilter?: string,
   queries?: QueryStore,
 ): Promise<ArchiveEntry[]> {
+  // One read per listing, not one per row.
+  const phases = readArchivePhaseStates(dataDir);
   if (queries) {
     const archives = queries.listEvalArchives(projectIdFilter ? { projectId: projectIdFilter } : {});
     if (archives.length > 0) {
-      return archives.map((archive) => entryFromArchive(dataDir, queries, archive));
+      return archives.map((archive) => entryFromArchive(dataDir, queries, archive, phases));
     }
     // Migration compatibility for legacy archives not yet backfilled into
     // eval_archives. New seals always write the DB row + canonical manifest, so
@@ -176,7 +200,7 @@ export async function listArchiveEntries(
   }
   // Migration-only compatibility for callers/data with no DB catalog row.
   const records = await listArchiveIndex(dataDir);
-  const entries = records.map((record) => entryFromRecord(dataDir, record));
+  const entries = records.map((record) => entryFromRecord(dataDir, record, phases));
   return projectIdFilter ? entries.filter((entry) => entry.projectId === projectIdFilter) : entries;
 }
 
@@ -325,7 +349,7 @@ async function findArchive(
   const archive = queries.getEvalArchive(runId);
   if (archive) {
     if (projectId && archive.projectId !== projectId) return null;
-    return entryFromArchive(dataDir, queries, archive);
+    return entryFromArchive(dataDir, queries, archive, readArchivePhaseStates(dataDir));
   }
   // Legacy row not backfilled yet — bounded lookup in the compatibility index.
   const legacy = await listArchiveEntries(dataDir, projectId);
