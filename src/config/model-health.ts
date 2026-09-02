@@ -7,7 +7,13 @@
  * minimal completion and reports what came back.
  */
 
-import { resolveModelConfig, ModelConfigError, type ModelStage, type ModelStageConfig } from "./model-config.js";
+import {
+  resolveModelConfig,
+  ModelConfigError,
+  type ModelStage,
+  type ModelStageConfig,
+  type StoredModelConfig,
+} from "./model-config.js";
 
 export interface ModelHealthResult {
   stage: ModelStage;
@@ -36,11 +42,11 @@ const PROBE_TIMEOUT_MS = 30_000;
  */
 export async function checkModelHealth(
   stage: ModelStage,
-  opts: { env?: NodeJS.ProcessEnv; fetchImpl?: typeof fetch } = {},
+  opts: { env?: NodeJS.ProcessEnv; fetchImpl?: typeof fetch; stored?: StoredModelConfig } = {},
 ): Promise<ModelHealthResult> {
   let cfg: ModelStageConfig;
   try {
-    cfg = resolveModelConfig(stage, { env: opts.env });
+    cfg = resolveModelConfig(stage, { env: opts.env, stored: opts.stored });
   } catch (err) {
     return {
       stage,

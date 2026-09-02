@@ -16,9 +16,11 @@ import { join } from "node:path";
 
 import { ProviderThrottledError } from "../gateway/errors.js";
 import {
+  mergeStoredModelConfig,
   resolveModelConfig,
   type ModelApiType,
   type ModelStage,
+  type StoredModelConfig,
 } from "../../config/model-config.js";
 
 export interface PiConnection {
@@ -42,8 +44,9 @@ export interface PiConnection {
 export function piConnectionFor(
   stage: ModelStage,
   env: NodeJS.ProcessEnv = process.env,
+  project?: StoredModelConfig | null,
 ): PiConnection {
-  const cfg = resolveModelConfig(stage, { env });
+  const cfg = resolveModelConfig(stage, { env, stored: mergeStoredModelConfig(project) });
   return {
     baseUrl: cfg.baseUrl,
     apiKey: cfg.apiKey,

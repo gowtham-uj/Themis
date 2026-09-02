@@ -66,6 +66,8 @@ export interface Project {
   /** Retention policy for generated run outputs. */
   /** Per-project sandbox controls; null when the project configures none. */
   sandbox: Record<string, unknown> | null;
+  /** Per-stage model provider overrides; null when the project sets none. */
+  modelConfig: Record<string, unknown> | null;
   archived: boolean;
   createdAt: string;
   updatedAt: string;
@@ -85,6 +87,7 @@ export interface CreateProjectInput {
   networkPolicy?: string;
   retentionRuns?: number | null;
   sandbox?: Record<string, unknown> | null;
+  modelConfig?: Record<string, unknown> | null;
   id?: string;
 }
 
@@ -101,6 +104,7 @@ export interface UpdateProjectInput {
   networkPolicy?: string;
   retentionRuns?: number | null;
   sandbox?: Record<string, unknown> | null;
+  modelConfig?: Record<string, unknown> | null;
 }
 
 export interface Task {
@@ -1332,6 +1336,7 @@ function mapProject(row: typeof projects.$inferSelect): Project {
     networkPolicy: row.networkPolicy ?? "allow",
     retentionRuns: row.retentionRuns,
     sandbox: parseJson(row.sandboxJson, null),
+    modelConfig: parseJson(row.modelConfigJson, null),
     archived: row.archived === 1,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -1753,6 +1758,7 @@ export class SqliteQueries implements QueryStore {
       networkPolicy: input.networkPolicy ?? "allow",
       retentionRuns: input.retentionRuns ?? null,
       sandboxJson: stringifyJson(input.sandbox ?? null),
+      modelConfigJson: stringifyJson(input.modelConfig ?? null),
       archived: 0,
       createdAt: ts,
       updatedAt: ts,
@@ -1826,6 +1832,10 @@ export class SqliteQueries implements QueryStore {
           patch.sandbox !== undefined
             ? stringifyJson(patch.sandbox)
             : stringifyJson(existing.sandbox),
+        modelConfigJson:
+          patch.modelConfig !== undefined
+            ? stringifyJson(patch.modelConfig)
+            : stringifyJson(existing.modelConfig),
         updatedAt: ts,
       })
       .where(eq(projects.id, id))
@@ -3777,6 +3787,7 @@ export class MemoryQueries implements QueryStore {
       networkPolicy: input.networkPolicy ?? "allow",
       retentionRuns: input.retentionRuns ?? null,
       sandbox: input.sandbox ?? null,
+      modelConfig: input.modelConfig ?? null,
       archived: false,
       createdAt: ts,
       updatedAt: ts,
@@ -3837,6 +3848,8 @@ export class MemoryQueries implements QueryStore {
           ? patch.retentionRuns
           : existing.retentionRuns,
       sandbox: patch.sandbox !== undefined ? patch.sandbox : existing.sandbox,
+      modelConfig:
+        patch.modelConfig !== undefined ? patch.modelConfig : existing.modelConfig,
       updatedAt: nowIso(),
     };
     this.projects.set(id, next);

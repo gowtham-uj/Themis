@@ -2,7 +2,11 @@
 
 import { cp, lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { resolveModelConfig } from "../config/model-config.js";
+import {
+  mergeStoredModelConfig,
+  parseStoredModelConfig,
+  resolveModelConfig,
+} from "../config/model-config.js";
 import type { Adapter, RunContext } from "../adapters/types.js";
 import { getAdapter } from "../adapters/index.js";
 import { createDeclarativeAdapter } from "../adapters/declarative.js";
@@ -297,6 +301,7 @@ export async function startQueueContainer(
     seedTask,
     workspaceDir,
     resolveAdapterOverrides(project, seedOverrides),
+    project.modelConfig,
   );
   // For a source-built adapter the built image is the commit-addressed tag
   // (build.image), which must be the `FROM`/`COPY --from` source for the eval
@@ -343,7 +348,7 @@ export async function startQueueContainer(
     const raw = mergeOverrides(queue.adapterOverrides, item.overrides);
     const resolved = resolveAdapterOverrides(project, raw);
     const itemAdapterImage = queueAdapter.image(
-      makeRunContext(`queue-image-${queue.id}-${item.id}`, queue, task, workspaceDir, resolved),
+      makeRunContext(`queue-image-${queue.id}-${item.id}`, queue, task, workspaceDir, resolved, project.modelConfig),
     );
     if (itemAdapterImage !== adapterImage) {
       throw new Error(
@@ -633,6 +638,7 @@ export async function startQueueContainer(
         workspaceDir,
         task: seedTask,
         overrides: resolveAdapterOverrides(project, seedOverrides),
+        projectModelConfig: project.modelConfig,
       });
       const connectionReset = await clearWorkspaceInContainer(handle);
       if (!connectionReset.ok) {
@@ -662,6 +668,7 @@ export async function startQueueContainer(
           seedTask,
           workspaceDir,
           resolveAdapterOverrides(project, seedOverrides),
+          project.modelConfig,
         );
         const configureProbe = queueAdapter.configure(configureCtx);
         if (configureProbe && !live.stopRequested) {
@@ -1097,7 +1104,7 @@ async function executeEval(input: {
   const project = queries.getProject(queue.projectId);
   if (!project) throw new Error(`project not found: ${queue.projectId}`);
   const overrides = resolveAdapterOverrides(project, entry.overrides);
-  const ctx = makeRunContext(run.id, queue, task, workspaceDir, overrides);
+  const ctx = makeRunContext(run.id, queue, task, workspaceDir, overrides, project.modelConfig);
   const envSpec = parseEvalEnvSpec(task.env);
   const startedAt = Date.now();
   let nextSeq = 0;
@@ -1707,6 +1714,7 @@ async function verifyAdapterConnection(input: {
   workspaceDir: string;
   task: Task;
   overrides: ReturnType<typeof resolveAdapterOverrides>;
+  projectModelConfig?: Record<string, unknown> | null;
 }): Promise<{
   ok: boolean;
   exitCode: number;
@@ -1732,6 +1740,7 @@ async function verifyAdapterConnection(input: {
     input.task,
     input.workspaceDir,
     input.overrides,
+    input.projectModelConfig,
   );
   const probe = input.adapter.connectionCheck(ctx);
   const session = await input.handle.startExec({
@@ -1810,6 +1819,7 @@ function makeRunContext(
   task: Task,
   workspaceDir: string,
   overrides: ReturnType<typeof resolveAdapterOverrides>,
+  projectModelConfig?: Record<string, unknown> | null,
 ): RunContext {
   return {
     runId,
@@ -1821,12 +1831,12 @@ function makeRunContext(
     provider: queue.provider,
     params: overrides?.params ?? {},
     workspaceDir,
-    apiKeys: collectApiKeys(),
+    apiKeys: collectApiKeys(projectModelConfig),
     ...(overrides ? { overrides } : {}),
   };
 }
 
-function collectApiKeys(): Record<string, string> {
+function collectApiKeys(projectModelConfig?: Record<string, unknown> | null): Record<string, string> {
   const keys: Record<string, string> = {};
   for (const name of [
     "ANTHROPIC_API_KEY",
@@ -1860,21 +1870,29 @@ function collectApiKeys(): Record<string, string> {
   if (!keys.NURALWATT_API_KEY && keys.NEURALWATT_API_KEY) {
     keys.NURALWATT_API_KEY = keys.NEURALWATT_API_KEY;
   }
-  applyEvalStageConfig(keys);
+  applyEvalStageConfig(keys, projectModelConfig);
   return keys;
 }
 
 /**
- * Overlay the operator's `eval` stage config onto the agent container env.
+ * Overlay the resolved `eval` stage config onto the agent container env.
  *
  * Agent harnesses read the conventional OPENAI_/ANTHROPIC_ variables, so the
- * unified config lands under the pair matching its API compatibility type. An
- * unconfigured stage leaves the ambient environment exactly as it was.
+ * unified config lands under the pair matching its API compatibility type. The
+ * project's own overrides win over the global config; an unconfigured stage
+ * leaves the ambient environment exactly as it was.
  */
-function applyEvalStageConfig(keys: Record<string, string>): void {
+function applyEvalStageConfig(
+  keys: Record<string, string>,
+  projectModelConfig?: Record<string, unknown> | null,
+): void {
   let cfg;
   try {
-    cfg = resolveModelConfig("eval");
+    cfg = resolveModelConfig("eval", {
+      stored: mergeStoredModelConfig(
+        projectModelConfig ? parseStoredModelConfig(projectModelConfig) : null,
+      ),
+    });
   } catch {
     return;
   }

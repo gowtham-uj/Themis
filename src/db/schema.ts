@@ -51,6 +51,8 @@ export const projects = sqliteTable("projects", {
   retentionRuns: integer("retention_runs"),
   /** Per-project sandbox controls (capabilities, mounts, devices, ports…). */
   sandboxJson: text("sandbox_json"),
+  /** Per-stage model provider overrides; falls through to the global config. */
+  modelConfigJson: text("model_config_json"),
   archived: integer("archived").notNull().default(0),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),

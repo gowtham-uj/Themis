@@ -15,6 +15,7 @@ import { ModelGateway } from "../judge/gateway/client.js";
 import { loadGatewayConfig } from "../judge/gateway/config.js";
 import { runPhase1 } from "../judge/graph/graph.js";
 import { piConnectionFor } from "../judge/pi/runtime.js";
+import { projectStoredModelConfig } from "../config/model-config.js";
 import { publishJudgeArchiveView } from "../judge/results/publish-view.js";
 import { archiveStoreDir, readArchiveStoreManifest } from "../runner/archive-store.js";
 import {
@@ -298,8 +299,15 @@ export function registerJudgeRoutes(router: Router): void {
             workDir,
             gateway,
             attemptId: `att_${runId}_${Date.now()}`,
-            // Real PI courtroom on the Phase-1 stage config.
-            pi: piConnectionFor("phase1"),
+            // Real PI courtroom on the Phase-1 stage config, with this
+            // project's own overrides layered above the global one.
+            pi: piConnectionFor(
+              "phase1",
+              process.env,
+              archiveRow
+                ? projectStoredModelConfig(app.queries.getProject(archiveRow.projectId)?.modelConfig)
+                : null,
+            ),
           });
         } catch (err) {
           // A provider throttle must NOT be surfaced as a crash: pause any

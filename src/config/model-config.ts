@@ -302,6 +302,53 @@ export function viewModelConfig(
   }
 }
 
+/**
+ * Parse a whole stored config, one entry per stage. Used for the settings blob
+ * and for a project's `model_config_json` column, which share a shape.
+ */
+export function parseStoredModelConfig(body: unknown): StoredModelConfig {
+  if (body === null || typeof body !== "object") return {};
+  const b = body as Record<string, unknown>;
+  const out: StoredModelConfig = {};
+  for (const stage of MODEL_STAGES) {
+    if (!(stage in b) || b[stage] == null) continue;
+    const patch = parseStoredStageConfig(b[stage], stage);
+    if (Object.keys(patch).length > 0) out[stage] = patch;
+  }
+  return out;
+}
+
+/**
+ * Parse a project's stored blob without letting a stale or hand-edited value
+ * stop a run. An unparseable override falls back to the global config.
+ */
+export function projectStoredModelConfig(raw: unknown): StoredModelConfig | null {
+  if (!raw) return null;
+  try {
+    return parseStoredModelConfig(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Layer a project's overrides above the process-global config, field by field.
+ * A field the project leaves blank keeps whatever the global config resolved,
+ * which then keeps falling through to env vars and defaults.
+ */
+export function mergeStoredModelConfig(
+  project: StoredModelConfig | null | undefined,
+  base: StoredModelConfig = storedConfig,
+): StoredModelConfig {
+  if (!project) return base;
+  const out: StoredModelConfig = {};
+  for (const stage of MODEL_STAGES) {
+    const merged = { ...(base[stage] ?? {}), ...(project[stage] ?? {}) };
+    if (Object.keys(merged).length > 0) out[stage] = merged;
+  }
+  return out;
+}
+
 /** Validate and normalize a console-supplied stage patch. */
 export function parseStoredStageConfig(body: unknown, stage: ModelStage): StoredStageConfig {
   if (body === null || typeof body !== "object") return {};

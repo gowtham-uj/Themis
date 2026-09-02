@@ -8,6 +8,8 @@ export interface Project {
   network_policy?: string
   archived?: boolean
   created_at?: string
+  /** Per-stage model provider overrides; null when the project inherits the global config. */
+  model_config?: Record<string, Record<string, unknown>> | null
 }
 
 export interface Adapter {

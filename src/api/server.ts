@@ -51,6 +51,7 @@ import { registerWatcherRoutes } from "./watcher-routes.js";
 import { registerQueueRoutes } from "./queue-routes.js";
 import { registerAdapterRoutes } from "./adapter-routes.js";
 import { loadStoredModelConfig, registerSettingsRoutes } from "./settings-routes.js";
+import { parseStoredModelConfig } from "../config/model-config.js";
 import { registerArchiveRoutes } from "./archive-routes.js";
 import { registerJudgeRoutes } from "./judge-routes.js";
 import { Phase1Service } from "../judge/phase1-service.js";
@@ -168,6 +169,21 @@ export interface ApiServer {
 // Serialization helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Validate a submitted per-project model config. Returns null for an empty or
+ * cleared blob so the project falls straight back to the global settings.
+ */
+function parseProjectModelConfig(raw: unknown): Record<string, unknown> | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  let parsed;
+  try {
+    parsed = parseStoredModelConfig(raw);
+  } catch (err) {
+    throw badRequest(err instanceof Error ? err.message : String(err));
+  }
+  return Object.keys(parsed).length > 0 ? (parsed as Record<string, unknown>) : null;
+}
+
 function projectJson(p: Project) {
   return {
     id: p.id,
@@ -184,6 +200,7 @@ function projectJson(p: Project) {
     network_policy: p.networkPolicy,
     retention_runs: p.retentionRuns,
     sandbox: p.sandbox,
+    model_config: p.modelConfig,
     archived: p.archived,
     created_at: p.createdAt,
     updated_at: p.updatedAt,
@@ -604,6 +621,7 @@ function registerRoutes(router: Router): void {
       default_model?: string;
       default_provider?: string;
       network_policy?: string;
+      model_config?: unknown;
     }>(req);
 
     if (!body.name || !String(body.name).trim()) {
@@ -626,6 +644,7 @@ function registerRoutes(router: Router): void {
       defaultModel: body.default_model,
       defaultProvider: body.default_provider,
       networkPolicy: body.network_policy,
+      modelConfig: parseProjectModelConfig(body.model_config),
     });
     resolveProjectDir(app.dataDir, project.id);
     sendJson(res, 201, projectJson(project));
@@ -682,6 +701,9 @@ function registerRoutes(router: Router): void {
     }
     if ("network_policy" in body && typeof body.network_policy === "string") {
       patch.networkPolicy = body.network_policy;
+    }
+    if ("model_config" in body) {
+      patch.modelConfig = parseProjectModelConfig(body.model_config);
     }
     const updated = app.queries.updateProject(ctx.params.id!, patch);
     sendJson(res, 200, projectJson(updated));

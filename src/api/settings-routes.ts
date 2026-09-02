@@ -22,6 +22,7 @@ import { resolveProjectDir } from "../db/index.js";
 import {
   MODEL_STAGES,
   ModelConfigError,
+  mergeStoredModelConfig,
   parseStoredStageConfig,
   setStoredModelConfig,
   viewModelConfig,
@@ -406,14 +407,27 @@ export function registerSettingsRoutes(router: Router): void {
   // Real request against the configured endpoint. Config presence is not
   // health: this catches a dead URL, a revoked key, a model the provider does
   // not serve, and an API compatibility type that does not match the endpoint.
-  router.post("/api/settings/models/:stage/health", async (_req, res, ctx) => {
+  //
+  // An optional body carries an unsaved stage patch, so the project creation
+  // form can test what the operator just typed before anything is stored.
+  router.post("/api/settings/models/:stage/health", async (req, res, ctx) => {
     const app = appOf(ctx);
     const stage = ctx.params.stage as ModelStage;
     if (!MODEL_STAGES.includes(stage)) {
       throw badRequest(`unknown stage "${stage}"; expected one of ${MODEL_STAGES.join(", ")}`);
     }
-    loadStoredModelConfig(app.queries);
-    sendJson(res, 200, await checkModelHealth(stage));
+    const base = loadStoredModelConfig(app.queries);
+    const body = await readJsonBody<Record<string, unknown>>(req).catch(() => ({}));
+    let patch: StoredModelConfig = {};
+    try {
+      if (body && typeof body === "object" && Object.keys(body).length > 0) {
+        patch = { [stage]: parseStoredStageConfig(body, stage) };
+      }
+    } catch (err) {
+      if (err instanceof ModelConfigError) throw badRequest(err.message);
+      throw err;
+    }
+    sendJson(res, 200, await checkModelHealth(stage, { stored: mergeStoredModelConfig(patch, base) }));
   });
 
   // ---- Auth: login / me / users ----
