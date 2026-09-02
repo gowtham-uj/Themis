@@ -39,7 +39,7 @@ export default function Archives() {
   const file = useQuery({
     queryKey: ['archive-file', detailId, filePath],
     enabled: !!detailId && !!filePath,
-    queryFn: () => api.get<string>(`/api/archives/${detailId}/files/${filePath}`).then((t) => t as string),
+    queryFn: () => api.text(`/api/archives/${detailId}/files/${filePath}`),
     retry: false,
   })
 

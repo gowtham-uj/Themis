@@ -33,8 +33,28 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T
 }
 
+/**
+ * Fetch a path as raw text.
+ *
+ * Archive files are served as octet-stream regardless of content, so a JSON
+ * file parsed through `request` returns an object. Rendering that object as a
+ * React child throws, and a .jsonl file fails JSON.parse and silently reads
+ * back as null. Both cases want the bytes, not a parse.
+ */
+async function requestText(path: string): Promise<string> {
+  const res = await fetch(BASE + path)
+  const body = await res.text()
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`
+    try { detail = (JSON.parse(body) as Partial<ApiError>).detail ?? detail } catch { /* not a problem+json body */ }
+    throw new HttpError(res.status, detail)
+  }
+  return body
+}
+
 export const api = {
   get: <T>(path: string) => request<T>('GET', path),
+  text: (path: string) => requestText(path),
   post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
   patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body),
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
