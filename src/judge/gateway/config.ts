@@ -1,8 +1,9 @@
 /**
- * Gateway configuration from the environment only.
+ * Gateway configuration, resolved through the unified per-stage model config.
  * Base URL / key / model are never hardcoded as production secrets.
  */
 
+import { resolveModelConfig, type ModelStage } from "../../config/model-config.js";
 import { GatewayError } from "./errors.js";
 
 export interface GatewayConfig {
@@ -16,29 +17,34 @@ export interface GatewayConfig {
   timeoutMs: number;
 }
 
-/** Load OpenAI-compatible gateway config from env. */
-export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
-  const baseUrl = (env.OPENAI_BASE_URL || env.DEEPSEEK_BASE_URL || "").replace(/\/+$/, "");
-  const apiKey = env.OPENAI_API_KEY || env.DEEPSEEK_API_KEY || "";
-  if (!baseUrl) {
+/**
+ * Load one stage's OpenAI-compatible gateway config.
+ *
+ * Defaults to the Phase-1 stage because every existing caller is a Phase-1
+ * path. Phase 2 passes "phase2" so the two can point at different endpoints.
+ */
+export function loadGatewayConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  stage: ModelStage = "phase1",
+): GatewayConfig {
+  let cfg;
+  try {
+    cfg = resolveModelConfig(stage, { env });
+  } catch (err) {
+    throw new GatewayError(err instanceof Error ? err.message : String(err), "config");
+  }
+  if (cfg.apiType !== "openai") {
     throw new GatewayError(
-      "OPENAI_BASE_URL (or DEEPSEEK_BASE_URL) is required for the judge model gateway",
+      `the ${stage} model is configured as ${cfg.apiType}-compatible, but the judge gateway speaks OpenAI Chat Completions`,
       "config",
     );
   }
-  if (!apiKey) {
-    throw new GatewayError(
-      "OPENAI_API_KEY (or DEEPSEEK_API_KEY) is required for the judge model gateway",
-      "config",
-    );
-  }
-  const floor = Number(env.THEMIS_MAX_TOKENS_FLOOR ?? 2048);
   return {
-    baseUrl,
-    apiKey,
-    model: env.AGENTEVAL_DEFAULT_MODEL || env.THEMIS_MODEL || "deepseek-v4-flash",
-    reasoningEffort: env.THEMIS_REASONING_EFFORT || "max",
-    maxTokensFloor: Number.isFinite(floor) && floor > 0 ? floor : 2048,
-    timeoutMs: Number(env.THEMIS_GATEWAY_TIMEOUT_MS ?? 300_000) || 300_000,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    model: cfg.model,
+    reasoningEffort: cfg.reasoningEffort,
+    maxTokensFloor: cfg.maxTokensFloor,
+    timeoutMs: cfg.timeoutMs,
   };
 }

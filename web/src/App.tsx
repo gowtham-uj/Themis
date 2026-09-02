@@ -7,6 +7,7 @@ import Queue from './pages/Queue'
 import EvalLive from './pages/EvalLive'
 import RunDetail from './pages/RunDetail'
 import Archives from './pages/Archives'
+import Models from './pages/Models'
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
         <nav aria-label="Primary">
           <NavLink to="/projects" end>Projects</NavLink>
           <NavLink to="/archives">Archives</NavLink>
+          <NavLink to="/models">Models</NavLink>
         </nav>
       </aside>
       <main className="main">
@@ -29,6 +31,7 @@ export default function App() {
           <Route path="/projects/:id/live" element={<EvalLive />} />
           <Route path="/runs/:id" element={<RunDetail />} />
           <Route path="/archives" element={<Archives />} />
+          <Route path="/models" element={<Models />} />
         </Routes>
       </main>
     </div>

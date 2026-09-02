@@ -2,6 +2,7 @@
 
 import { cp, lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
+import { resolveModelConfig } from "../config/model-config.js";
 import type { Adapter, RunContext } from "../adapters/types.js";
 import { getAdapter } from "../adapters/index.js";
 import { createDeclarativeAdapter } from "../adapters/declarative.js";
@@ -1859,7 +1860,32 @@ function collectApiKeys(): Record<string, string> {
   if (!keys.NURALWATT_API_KEY && keys.NEURALWATT_API_KEY) {
     keys.NURALWATT_API_KEY = keys.NEURALWATT_API_KEY;
   }
+  applyEvalStageConfig(keys);
   return keys;
+}
+
+/**
+ * Overlay the operator's `eval` stage config onto the agent container env.
+ *
+ * Agent harnesses read the conventional OPENAI_/ANTHROPIC_ variables, so the
+ * unified config lands under the pair matching its API compatibility type. An
+ * unconfigured stage leaves the ambient environment exactly as it was.
+ */
+function applyEvalStageConfig(keys: Record<string, string>): void {
+  let cfg;
+  try {
+    cfg = resolveModelConfig("eval");
+  } catch {
+    return;
+  }
+  if (cfg.apiType === "anthropic") {
+    keys.ANTHROPIC_BASE_URL = cfg.baseUrl;
+    keys.ANTHROPIC_API_KEY = cfg.apiKey;
+    keys.ANTHROPIC_AUTH_TOKEN = cfg.apiKey;
+  } else {
+    keys.OPENAI_BASE_URL = cfg.baseUrl;
+    keys.OPENAI_API_KEY = cfg.apiKey;
+  }
 }
 
 function mergeOverrides(

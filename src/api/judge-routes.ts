@@ -14,6 +14,7 @@ import { getResultVersion, listResultVersionsByRun, upsertResultVersion } from "
 import { ModelGateway } from "../judge/gateway/client.js";
 import { loadGatewayConfig } from "../judge/gateway/config.js";
 import { runPhase1 } from "../judge/graph/graph.js";
+import { piConnectionFor } from "../judge/pi/runtime.js";
 import { publishJudgeArchiveView } from "../judge/results/publish-view.js";
 import { archiveStoreDir, readArchiveStoreManifest } from "../runner/archive-store.js";
 import {
@@ -297,13 +298,8 @@ export function registerJudgeRoutes(router: Router): void {
             workDir,
             gateway,
             attemptId: `att_${runId}_${Date.now()}`,
-            // Real PI courtroom wired to the same saved connection object.
-            pi: {
-              baseUrl: process.env.OPENAI_BASE_URL ?? "",
-              apiKey: process.env.OPENAI_API_KEY ?? "",
-              model: process.env.AGENTEVAL_DEFAULT_MODEL || "deepseek-v4-flash",
-              reasoningEffort: process.env.THEMIS_REASONING_EFFORT || "max",
-            },
+            // Real PI courtroom on the Phase-1 stage config.
+            pi: piConnectionFor("phase1"),
           });
         } catch (err) {
           // A provider throttle must NOT be surfaced as a crash: pause any

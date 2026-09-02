@@ -20,6 +20,16 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DbQueries, Project, User } from "../db/queries.js";
 import { resolveProjectDir } from "../db/index.js";
 import {
+  MODEL_STAGES,
+  ModelConfigError,
+  parseStoredStageConfig,
+  setStoredModelConfig,
+  viewModelConfig,
+  type ModelStage,
+  type StoredModelConfig,
+} from "../config/model-config.js";
+import { checkModelHealth } from "../config/model-health.js";
+import {
   getRequestAuth,
   isPublicApiPath,
 } from "./auth.js";
@@ -99,7 +109,34 @@ export const SETTINGS_KEYS = {
   limits: "limits",
   /** List of secret key NAMES only (never values). */
   keyNames: "keys.names",
+  /** Per-stage provider config. Holds env var names, never key values. */
+  modelStages: "models.stages",
 } as const;
+
+/**
+ * Load the stored per-stage model config from the settings table into this
+ * process. Call at startup and after every save so worker paths that have no
+ * QueryStore in scope still resolve what the operator configured.
+ */
+export function loadStoredModelConfig(queries: DbQueries): StoredModelConfig {
+  const raw = queries.getSetting(SETTINGS_KEYS.modelStages);
+  const out: StoredModelConfig = {};
+  if (raw && typeof raw === "object") {
+    for (const stage of MODEL_STAGES) {
+      const patch = (raw as Record<string, unknown>)[stage];
+      if (patch) {
+        try {
+          out[stage] = parseStoredStageConfig(patch, stage);
+        } catch {
+          // A stored value that no longer parses must not stop the server.
+          // viewModelConfig reports the stage as unconfigured instead.
+        }
+      }
+    }
+  }
+  setStoredModelConfig(out);
+  return out;
+}
 
 /** Public GET /api/settings response. Secrets are name-only. */
 export interface SettingsResponse {
@@ -336,6 +373,47 @@ export function registerSettingsRoutes(router: Router): void {
     const body = await readJsonBody<SettingsPutBody>(req);
     const updated = writeSettings(app.queries, body ?? {});
     sendJson(res, 200, updated);
+  });
+
+  // ---- Per-stage model config ----
+
+  // Views only. Every response names the env var holding each stage's key and
+  // says whether that variable is set; the value itself never leaves the host.
+  router.get("/api/settings/models", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    loadStoredModelConfig(app.queries);
+    sendJson(res, 200, { stages: MODEL_STAGES.map((s) => viewModelConfig(s)) });
+  });
+
+  router.put("/api/settings/models", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireAdmin(req, app.queries, app.authEnabled);
+    const body = await readJsonBody<Record<string, unknown>>(req);
+    const stored: StoredModelConfig = {};
+    try {
+      for (const stage of MODEL_STAGES) {
+        if (body && stage in body) stored[stage] = parseStoredStageConfig(body[stage], stage);
+      }
+    } catch (err) {
+      if (err instanceof ModelConfigError) throw badRequest(err.message);
+      throw err;
+    }
+    app.queries.setSetting(SETTINGS_KEYS.modelStages, stored);
+    setStoredModelConfig(stored);
+    sendJson(res, 200, { stages: MODEL_STAGES.map((s) => viewModelConfig(s)) });
+  });
+
+  // Real request against the configured endpoint. Config presence is not
+  // health: this catches a dead URL, a revoked key, a model the provider does
+  // not serve, and an API compatibility type that does not match the endpoint.
+  router.post("/api/settings/models/:stage/health", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const stage = ctx.params.stage as ModelStage;
+    if (!MODEL_STAGES.includes(stage)) {
+      throw badRequest(`unknown stage "${stage}"; expected one of ${MODEL_STAGES.join(", ")}`);
+    }
+    loadStoredModelConfig(app.queries);
+    sendJson(res, 200, await checkModelHealth(stage));
   });
 
   // ---- Auth: login / me / users ----

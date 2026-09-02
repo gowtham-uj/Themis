@@ -15,6 +15,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { ProviderThrottledError } from "../gateway/errors.js";
+import {
+  resolveModelConfig,
+  type ModelApiType,
+  type ModelStage,
+} from "../../config/model-config.js";
 
 export interface PiConnection {
   /** OpenAI-compatible base URL (e.g. the saved proxy). */
@@ -25,6 +30,27 @@ export interface PiConnection {
   model: string;
   /** Reasoning effort for the orchestrator run. */
   reasoningEffort: string;
+  /** API compatibility type, written into pi's models.json. */
+  apiType?: ModelApiType;
+}
+
+/**
+ * Build a PI connection from one stage's unified model config. Every PI call
+ * site goes through here, so Phase 1 and Phase 2 cannot drift apart the way
+ * the hand-rolled env chains they replace did.
+ */
+export function piConnectionFor(
+  stage: ModelStage,
+  env: NodeJS.ProcessEnv = process.env,
+): PiConnection {
+  const cfg = resolveModelConfig(stage, { env });
+  return {
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    model: cfg.model,
+    reasoningEffort: cfg.reasoningEffort,
+    apiType: cfg.apiType,
+  };
 }
 
 export interface PiRunInput {
@@ -105,7 +131,11 @@ export async function writePiModelsJson(agentDir: string, conn: PiConnection): P
     providers: {
       "themis-proxy": {
         baseUrl: conn.baseUrl,
-        api: "openai-completions",
+        // pi names the two wire formats it speaks. The API compatibility type
+        // comes from the stage's unified config, so an Anthropic-compatible
+        // endpoint is reached with Anthropic's Messages API rather than a 404
+        // against /chat/completions.
+        api: conn.apiType === "anthropic" ? "anthropic-messages" : "openai-completions",
         // Literal key, written only into this run's ephemeral mkdtemp agent dir
         // (removed after the run; never committed). Env interpolation breaks in
         // subagent child processes, which resolve against a different env (401).

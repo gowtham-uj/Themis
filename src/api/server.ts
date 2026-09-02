@@ -50,7 +50,7 @@ import {
 import { registerWatcherRoutes } from "./watcher-routes.js";
 import { registerQueueRoutes } from "./queue-routes.js";
 import { registerAdapterRoutes } from "./adapter-routes.js";
-import { registerSettingsRoutes } from "./settings-routes.js";
+import { loadStoredModelConfig, registerSettingsRoutes } from "./settings-routes.js";
 import { registerArchiveRoutes } from "./archive-routes.js";
 import { registerJudgeRoutes } from "./judge-routes.js";
 import { Phase1Service } from "../judge/phase1-service.js";
@@ -1252,6 +1252,9 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerQueueRoutes(router);
   // Settings + password auth + project export (P9).
   registerSettingsRoutes(router);
+  // Install the operator's saved per-stage model config before any worker,
+  // judge, or Phase-2 path resolves a provider.
+  loadStoredModelConfig(app.queries);
   registerArchiveRoutes(router);
   registerJudgeRoutes(router);
   registerPipelineRoutes(router, new Phase1Service(opts.dataDir));
