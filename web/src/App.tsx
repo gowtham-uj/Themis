@@ -1,6 +1,7 @@
 import { NavLink, Route, Routes } from 'react-router-dom'
 import Projects from './pages/Projects'
 import Project from './pages/Project'
+import ProjectSettings from './pages/ProjectSettings'
 import Adapters from './pages/Adapters'
 import Evals from './pages/Evals'
 import Queue from './pages/Queue'
@@ -25,6 +26,7 @@ export default function App() {
           <Route path="/" element={<Projects />} />
           <Route path="/projects" element={<Projects />} />
           <Route path="/projects/:id" element={<Project />} />
+          <Route path="/projects/:id/settings" element={<ProjectSettings />} />
           <Route path="/projects/:id/adapters" element={<Adapters />} />
           <Route path="/projects/:id/evals" element={<Evals />} />
           <Route path="/projects/:id/queue" element={<Queue />} />

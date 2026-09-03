@@ -13,6 +13,7 @@ import {
 } from "../runner/adapter-build.js";
 
 const execFileAsync = promisify(execFile);
+import { listAdapters } from "../adapters/index.js";
 import { runAdapterGenerator, GENERATOR_CONTRACT } from "../adapters/generator.js";
 import { createDeclarativeAdapter, renderTemplate } from "../adapters/declarative.js";
 import type { EvidenceEntry, EvidenceRole, RunContext } from "../adapters/types.js";
@@ -977,6 +978,11 @@ export function registerAdapterRoutes(router: Router): void {
   });
 
   // --- Shared adapters: cross-project discovery ---
+
+  /** Registered built-in adapter ids a queue may select. */
+  router.get("/api/adapters/builtin", (_req, res, _ctx) => {
+    sendJson(res, 200, { adapters: listAdapters() });
+  });
 
   router.get("/api/adapters/store", (_req, res, ctx) => {
     const app = appOf(ctx);

@@ -76,6 +76,12 @@ input, select, textarea {
   padding: 5px 8px;
   color: var(--text);
 }
+textarea {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  resize: vertical;
+  min-height: 64px;
+}
 input:focus-visible, select:focus-visible, textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;

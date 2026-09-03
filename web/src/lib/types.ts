@@ -57,6 +57,23 @@ export interface EvalQueue {
   networkPolicy?: string
   revision?: number
   createdAt?: string
+  description?: string | null
+  agentCommit?: string | null
+  ports?: unknown[]
+  sandbox?: Record<string, unknown> | null
+  adapterOverrides?: Record<string, unknown> | null
+}
+
+export interface PipelineQueue {
+  id: string
+  projectId?: string
+  evalQueueId?: string
+  name?: string
+  status?: string
+  revision: number
+  autoEval?: boolean
+  autoPhase1?: boolean
+  autoPhase2?: boolean
 }
 
 export interface QueueItem {
