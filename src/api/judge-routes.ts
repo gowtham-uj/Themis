@@ -265,9 +265,15 @@ export function registerJudgeRoutes(router: Router): void {
     }
     if (!ready) throw notFound(`sealed archive not found for run ${runId}`);
 
+    // Node 0-3 call the gateway directly, so it needs the same project
+    // overrides the PI court below gets. Resolving it from env alone made the
+    // console's per-project Phase-1 settings apply to only half the pipeline.
+    const projectModelConfig = archiveRow
+      ? projectStoredModelConfig(app.queries.getProject(archiveRow.projectId)?.modelConfig)
+      : null;
     let gateway: ModelGateway;
     try {
-      gateway = ModelGateway.fromEnv();
+      gateway = ModelGateway.fromEnv(process.env, undefined, "phase1", projectModelConfig);
     } catch (err) {
       throw badRequest(err instanceof Error ? err.message : String(err));
     }
@@ -301,13 +307,7 @@ export function registerJudgeRoutes(router: Router): void {
             attemptId: `att_${runId}_${Date.now()}`,
             // Real PI courtroom on the Phase-1 stage config, with this
             // project's own overrides layered above the global one.
-            pi: piConnectionFor(
-              "phase1",
-              process.env,
-              archiveRow
-                ? projectStoredModelConfig(app.queries.getProject(archiveRow.projectId)?.modelConfig)
-                : null,
-            ),
+            pi: piConnectionFor("phase1", process.env, projectModelConfig),
           });
         } catch (err) {
           // A provider throttle must NOT be surfaced as a crash: pause any

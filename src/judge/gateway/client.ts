@@ -6,6 +6,7 @@
 import { createHash } from "node:crypto";
 
 import { loadGatewayConfig, type GatewayConfig } from "./config.js";
+import type { ModelStage, StoredModelConfig } from "../../config/model-config.js";
 import { GatewayError, ProviderThrottledError, ReasoningStarvedError } from "./errors.js";
 export { ProviderThrottledError, GatewayError, ReasoningStarvedError };
 import {
@@ -104,12 +105,20 @@ export class ModelGateway {
     private readonly ledger: ProviderOperationLedger = new MemoryProviderOperationLedger(),
   ) {}
 
-  /** Construct from process env. */
+  /**
+   * Construct from the resolved stage config.
+   *
+   * `stage` and `project` are not optional extras: a Phase-2 caller that omits
+   * the stage silently judges on the Phase-1 endpoint, and a caller that omits
+   * the project's stored overrides silently ignores what the console saved.
+   */
   static fromEnv(
     env?: NodeJS.ProcessEnv,
     ledger?: ProviderOperationLedger,
+    stage: ModelStage = "phase1",
+    project?: StoredModelConfig | null,
   ): ModelGateway {
-    return new ModelGateway(loadGatewayConfig(env), ledger);
+    return new ModelGateway(loadGatewayConfig(env, stage, project), ledger);
   }
 
   /** Chat completion with ledgered provider operation. */

@@ -1836,7 +1836,18 @@ function makeRunContext(
   };
 }
 
-function collectApiKeys(projectModelConfig?: Record<string, unknown> | null): Record<string, string> {
+/** Test hook: the exact env map the agent container receives for a project. */
+export function collectAgentEnvForTest(
+  projectModelConfig?: Record<string, unknown> | null,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  return collectApiKeys(projectModelConfig, env);
+}
+
+function collectApiKeys(
+  projectModelConfig?: Record<string, unknown> | null,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
   const keys: Record<string, string> = {};
   for (const name of [
     "ANTHROPIC_API_KEY",
@@ -1851,14 +1862,14 @@ function collectApiKeys(projectModelConfig?: Record<string, unknown> | null): Re
     "ANTHROPIC_BASE_URL",
     "DEEPSEEK_API_KEY",
   ]) {
-    const value = process.env[name];
+    const value = env[name];
     if (value) keys[name] = value;
   }
   // Disabling TLS verification inside the agent container enables MITM of model
   // traffic. It is only carried in when the operator explicitly opts in for a
   // self-signed proxy; it is never forwarded by default.
-  if (process.env.AGENTEVAL_ALLOW_INSECURE_TLS === "1" && process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
-    keys.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+  if (env.AGENTEVAL_ALLOW_INSECURE_TLS === "1" && env.NODE_TLS_REJECT_UNAUTHORIZED) {
+    keys.NODE_TLS_REJECT_UNAUTHORIZED = env.NODE_TLS_REJECT_UNAUTHORIZED;
   }
   if (!keys.ANTHROPIC_API_KEY && keys.ANTHROPIC_AUTH_TOKEN) {
     keys.ANTHROPIC_API_KEY = keys.ANTHROPIC_AUTH_TOKEN;
@@ -1870,7 +1881,7 @@ function collectApiKeys(projectModelConfig?: Record<string, unknown> | null): Re
   if (!keys.NURALWATT_API_KEY && keys.NEURALWATT_API_KEY) {
     keys.NURALWATT_API_KEY = keys.NEURALWATT_API_KEY;
   }
-  applyEvalStageConfig(keys, projectModelConfig);
+  applyEvalStageConfig(keys, projectModelConfig, env);
   return keys;
 }
 
@@ -1885,10 +1896,12 @@ function collectApiKeys(projectModelConfig?: Record<string, unknown> | null): Re
 function applyEvalStageConfig(
   keys: Record<string, string>,
   projectModelConfig?: Record<string, unknown> | null,
+  env: NodeJS.ProcessEnv = process.env,
 ): void {
   let cfg;
   try {
     cfg = resolveModelConfig("eval", {
+      env,
       stored: mergeStoredModelConfig(
         projectModelConfig ? parseStoredModelConfig(projectModelConfig) : null,
       ),

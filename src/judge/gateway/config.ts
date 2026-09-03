@@ -3,7 +3,12 @@
  * Base URL / key / model are never hardcoded as production secrets.
  */
 
-import { resolveModelConfig, type ModelStage } from "../../config/model-config.js";
+import {
+  mergeStoredModelConfig,
+  resolveModelConfig,
+  type ModelStage,
+  type StoredModelConfig,
+} from "../../config/model-config.js";
 import { GatewayError } from "./errors.js";
 
 export interface GatewayConfig {
@@ -26,10 +31,11 @@ export interface GatewayConfig {
 export function loadGatewayConfig(
   env: NodeJS.ProcessEnv = process.env,
   stage: ModelStage = "phase1",
+  project?: StoredModelConfig | null,
 ): GatewayConfig {
   let cfg;
   try {
-    cfg = resolveModelConfig(stage, { env });
+    cfg = resolveModelConfig(stage, { env, stored: mergeStoredModelConfig(project) });
   } catch (err) {
     throw new GatewayError(err instanceof Error ? err.message : String(err), "config");
   }

@@ -15,6 +15,7 @@ import {
   type NewJudgeResultVersion,
   type ThemisDb,
 } from "../../db/contracts.js";
+import type { StoredModelConfig } from "../../config/model-config.js";
 import { migrate } from "../../db/sqlite/migrate.js";
 import { advanceCurrentPointer } from "../../db/sqlite/pointers.js";
 import { upsertResultVersion } from "../../db/sqlite/results.js";
@@ -39,6 +40,8 @@ export interface ClaimWorkerOptions {
   /** Production PostgreSQL handle. When set, ALL durable work-control and
    *  publication writes go through it (no SQLite dual-write). */
   themis?: ThemisDb;
+  /** Per-project stage overrides, layered over the global Phase-1 config. */
+  projectModelConfig?: StoredModelConfig | null;
 }
 
 /** One tick: claim a job for the queue and run Phase-1 end-to-end. */
@@ -53,7 +56,8 @@ export class JudgeClaimWorker {
     migrate(this.db);
     this.themis = opts.themis ?? null;
     this.jobs = this.themis !== null ? this.themis.judgeJobs : new SqliteJudgeJobRepository(this.db);
-    this.gateway = opts.gateway ?? ModelGateway.fromEnv();
+    const project = opts.projectModelConfig ?? null;
+    this.gateway = opts.gateway ?? ModelGateway.fromEnv(process.env, undefined, "phase1", project);
     // When a gateway is injected (tests, custom backends), there may be no env;
     // otherwise load from the environment the gateway itself would use.
     this.gatewayConfig = opts.gateway
@@ -65,7 +69,7 @@ export class JudgeClaimWorker {
           maxTokensFloor: 2048,
           timeoutMs: 300_000,
         }
-      : loadGatewayConfig();
+      : loadGatewayConfig(process.env, "phase1", project);
   }
 
   /** Resolved gateway config (baseUrl/apiKey/model/effort) for the PI court. */
