@@ -14,6 +14,7 @@ const proxy = {
 const build = Date.now().toString(36)
 
 export default defineConfig({
+  define: { __BUILD_ID__: JSON.stringify(build) },
   plugins: [react()],
   server: { host: '0.0.0.0', port: 5173, proxy },
   preview: { host: '0.0.0.0', port: 5173, proxy },

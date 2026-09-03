@@ -20,6 +20,9 @@ export default function App() {
           <NavLink to="/archives">Archives</NavLink>
           <NavLink to="/models">Models</NavLink>
         </nav>
+        <div className="build-id" title="Build id of the loaded bundle. Hard-reload if it differs from the deployed one.">
+          build {__BUILD_ID__}
+        </div>
       </aside>
       <main className="main">
         <Routes>
