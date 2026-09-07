@@ -191,8 +191,19 @@ export function registerPipelineRoutes(router:Router,phase1:Phase1Service):void{
     // Pausing the board parks its generation so no tick republishes a half-filed
     // campaign. Resume has to lift that park too, or the board runs while the
     // ticker still refuses to touch the generation and nothing ever publishes.
+    // A board that exhausted its attempt budget parks in `waiting_retry` instead,
+    // and the ticker deliberately leaves that state alone. Resume is the operator
+    // retry, so it resets the budget and reopens the generation the same way the
+    // explicit phase2 trigger does — otherwise a quota-stalled campaign is stuck
+    // with no route back from the console.
     const gen=await db.pipeline.getGeneration(c.pipelineGenerationId);
     if(gen?.state==="paused")await db.pipeline.transitionGeneration(gen.id,"paused",gen.fencingToken,"phase2_running");
+    else if(gen?.state==="waiting_retry"){
+     await db.pipeline.appendEvent({generationId:gen.id,itemId:null,
+      operationId:`phase2.budget_reset:${gen.id}:${Date.now()}`,
+      eventType:"phase2.budget_reset",payloadJson:"{}"});
+     await db.pipeline.transitionGeneration(gen.id,"waiting_retry",gen.fencingToken,"phase2_running");
+    }
     sendJson(res,202,{...r,status:await getPhase2PiStatus(app.dataDir,campaignId)});
   }finally{await db.close()}
  });

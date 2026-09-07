@@ -252,17 +252,19 @@ export default function Queue() {
   // A paused board keeps its campaign in `analyzing` on purpose: that is what
   // makes resume continue the same session instead of publishing a half-filed
   // pass. So `analyzing` alone does not mean running — the generation parking in
-  // `paused` is what says the board stopped.
+  // `paused` (operator pause) or `waiting_retry` (attempt budget spent, often on
+  // a provider 402/429) is what says the board stopped.
   const genState = gen.data?.generation.state ?? pipeline.data?.generation?.state
+  const acrossStopped = genState === 'paused' || genState === 'waiting_retry'
   const acrossRunning =
     Boolean(campaign.data?.pi?.running) ||
-    (gen.data?.campaign?.state === 'analyzing' && genState !== 'paused')
+    (gen.data?.campaign?.state === 'analyzing' && !acrossStopped)
   // A published, cancelled, or failed campaign is finished; the API answers 409
   // to a resume on one. The button offered it anyway, and clicking it used to
   // relaunch the whole board over already-sealed artifacts.
   const acrossFinished = ['published', 'cancelled', 'failed'].includes(campaign.data?.campaign?.state ?? gen.data?.campaign?.state ?? '')
   const acrossResumable =
-    (Boolean(campaign.data?.pi?.resumable) || genState === 'paused') &&
+    (Boolean(campaign.data?.pi?.resumable) || acrossStopped) &&
     !campaign.data?.pi?.running &&
     !acrossFinished
   const busy = control.isPending || pauseJudge.isPending || resumeJudge.isPending || pauseAcross.isPending || resumeAcross.isPending || holdPipeline.isPending

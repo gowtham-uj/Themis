@@ -3,6 +3,7 @@
  * Boots createServer on the given port and stays up. Auth off by default for
  * loopback testing; set AGENTEVAL_AUTH=1 to require bearer tokens.
  */
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { createServer } from "../api/server.js";
 
@@ -47,3 +48,15 @@ const shutdown = async (sig: string): Promise<void> => {
 };
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+// A stray rejection from a background ticker or a detached agent launch used to
+// take the whole API down with it, which loses every in-flight run. Log it with
+// an id an operator can grep for and keep serving; the request that owns the
+// failure still gets its own error through handleError.
+const logFatal = (kind: string, err: unknown): void => {
+  const id = randomUUID();
+  // eslint-disable-next-line no-console
+  console.error(`[api] ${kind} ${id}:`, err instanceof Error ? (err.stack ?? err.message) : String(err));
+};
+process.on("uncaughtException", (err) => logFatal("uncaughtException", err));
+process.on("unhandledRejection", (reason) => logFatal("unhandledRejection", reason));

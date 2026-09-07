@@ -187,7 +187,15 @@ function ago(ts?: string): string {
   return `${Math.round(s / 3600)}h ago`
 }
 
-function happening(it: PipelineItem): string {
+/**
+ * Pausing freezes the agent container, not the item row, so a paused eval still
+ * reads `eval_running` in the database. The table has to say frozen anyway, or
+ * it insists the agent is working while the run panel above says paused.
+ */
+function happening(it: PipelineItem, frozen = false): string {
+  if (frozen && (it.state === 'eval_running' || it.state === 'phase1_running')) {
+    return it.state === 'eval_running' ? 'Paused. Resume to continue' : 'Judge paused. Resume continues the session'
+  }
   switch (it.state) {
     case 'eval_pending': return 'Waiting for the agent'
     case 'eval_running': return 'Agent is working'
@@ -262,6 +270,12 @@ function nowCopy(opts: {
   const p = opts.progress
   if (opts.pipelineHeld) return 'The pipeline is held. Nothing new will start until you release it.'
   if (opts.paused) return `Frozen on ${who}. Resume to continue.`
+  // The across-evals board spends a bounded number of attempts and then parks, so
+  // the ticker stops retrying real model spend. Saying "generation is waiting
+  // retry" told the operator nothing; this says what stopped and what to do.
+  if (opts.genState === 'waiting_retry') {
+    return 'The across-evals pass stopped after its retries ran out, usually a provider error. Every verdict is still published. Resume to run it again.'
+  }
   if (opts.acrossRunning || opts.genState === 'phase2_running') return `Looking across ${p?.phase1.published ?? opts.total ?? 0} verdicts for patterns and a fix plan.`
   if (opts.genState === 'finalizing') return 'Sealing the across-evals view onto each archive.'
   if (p?.stage === 'phase1') {
@@ -394,7 +408,15 @@ export default function EvalLive() {
     ?? null
   const currentItem = items.find((it) => it.runId === currentRunId) ?? items.find((it) => it.state?.endsWith('_running'))
   const prog = progress.data
-  const acrossRunning = Boolean(prog?.phase2.running) || Boolean(campaign.data?.pi?.running) || gen.data?.campaign?.state === 'analyzing' || pipeline.data?.generation?.state === 'phase2_running'
+  // A parked board keeps its campaign in `analyzing` so resume continues the same
+  // session, so `analyzing` alone does not mean the board is working. The
+  // generation sitting in `paused` or `waiting_retry` is what says it stopped.
+  const acrossGenState = gen.data?.generation.state ?? pipeline.data?.generation?.state
+  const acrossStopped = acrossGenState === 'paused' || acrossGenState === 'waiting_retry'
+  const acrossRunning =
+    Boolean(prog?.phase2.running) ||
+    Boolean(campaign.data?.pi?.running) ||
+    ((gen.data?.campaign?.state === 'analyzing' || acrossGenState === 'phase2_running') && !acrossStopped)
   const active = stageOf(prog, runLive, runPaused, acrossRunning)
   const currentIndex = currentItem ? items.findIndex((it) => it.id === currentItem.id) + 1 : undefined
   const currentRun = (runs.data?.runs ?? []).find((r) => r.id === currentRunId)
@@ -431,7 +453,12 @@ export default function EvalLive() {
     // appeared twice. Events carry a run-scoped seq, so drop anything we already
     // hold rather than trusting the connection to happen only once.
     let highestSeq = -1
+    // EventSource reconnects on its own, so a dropped connection that comes back
+    // is not a broken feed. Clearing here and in onopen is what stops the warning
+    // from latching on while lines are visibly still arriving.
+    src.onopen = () => setFeedError(null)
     src.onmessage = (e) => {
+      setFeedError(null)
       try {
         const obj = JSON.parse(e.data) as FeedEvent
         if (typeof obj.seq === 'number') {
@@ -446,11 +473,21 @@ export default function EvalLive() {
     // The server sends this when the run is terminal and no more events exist.
     // Close deliberately so EventSource does not reconnect and replay.
     src.addEventListener('end', () => src.close())
+    // A reconnect that succeeds within a few seconds is invisible to the user and
+    // should stay that way, so hold the warning back until the gap is long enough
+    // to be worth reporting.
+    let warnTimer: ReturnType<typeof setTimeout> | null = null
     src.onerror = () => {
-      if (src.readyState === EventSource.CLOSED) return
-      setFeedError('event stream ended or unavailable')
+      if (src.readyState === EventSource.CLOSED || warnTimer) return
+      warnTimer = setTimeout(() => {
+        warnTimer = null
+        if (src.readyState !== EventSource.OPEN) setFeedError('event stream ended or unavailable')
+      }, 8000)
     }
-    return () => src.close()
+    return () => {
+      if (warnTimer) clearTimeout(warnTimer)
+      src.close()
+    }
   }, [currentRunId])
 
   // Follow the newest line by scrolling the list itself. scrollIntoView would drag
@@ -730,9 +767,11 @@ export default function EvalLive() {
           <p>
             {prog?.phase2.running
               ? `Board running${campaign.data?.pi?.subagents?.length ? ` · ${campaign.data.pi.subagents.length} seats` : ''}`
-              : prog?.phase2.stalled
-                ? 'Board stopped mid-pass'
-                : prog?.phase2.campaignState ?? gen.data?.campaign?.state ?? (pipeline.data?.queue?.autoPhase2 ? 'Armed for this run' : 'Not part of this run')}
+              : acrossGenState === 'waiting_retry'
+                ? 'Retries spent · resume to run it again'
+                : prog?.phase2.stalled
+                  ? 'Board stopped mid-pass'
+                  : prog?.phase2.campaignState ?? gen.data?.campaign?.state ?? (pipeline.data?.queue?.autoPhase2 ? 'Armed for this run' : 'Not part of this run')}
           </p>
           {prog?.phase2.stalled && (
             <p className="hint warn">
@@ -831,9 +870,9 @@ export default function EvalLive() {
                       <td className="num">{it.ordinal ?? ''}</td>
                       <td style={{ color: 'var(--text)' }}>
                         {nameOf(it.evalId)}
-                        <div className="hint">{happening(it)}</div>
+                        <div className="hint">{happening(it, it.state === 'eval_running' ? runPaused : judgePaused)}</div>
                       </td>
-                      <td><StateBadge state={it.state} /></td>
+                      <td><StateBadge state={(it.state === 'eval_running' && runPaused) || (it.state === 'phase1_running' && judgePaused) ? 'paused' : it.state} /></td>
                       <td><span className="chip">{archiveLayer(it.state)}</span></td>
                       <td>
                         {it.state === 'failed' && it.errorKind === 'eval' && (
