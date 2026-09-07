@@ -284,6 +284,26 @@ describe('Tier A — structural validity', () => {
     expect(ruleIds(checkTierA(yaml).violations)).not.toContain('a-no-placeholder-residue');
   });
 
+  it('does not flag a metavariable inside a quoted object literal (observed live)', () => {
+    // A judgement explaining the correct inverse of a whole-document JSON Patch
+    // was rejected three times over for this sentence. The angle brackets name
+    // the shape of a value inside an object the report is quoting; the
+    // surrounding sentence is the authoring.
+    const report = goodReport();
+    report.narrative =
+      "The inverse of a whole-document replacement is {op:'replace', path:'', value:<original root>}, which no move op can express.";
+    const yaml = canonicalSerializeReport(report);
+    expect(ruleIds(checkTierA(yaml).violations)).not.toContain('a-no-placeholder-residue');
+  });
+
+  it('still flags a bare bracketed slot inside braces with no key', () => {
+    // The carve-out is for quoted objects, not for any pair of braces.
+    const report = goodReport();
+    report.narrative = 'Replace the document with {<original root>} before reading.';
+    const yaml = canonicalSerializeReport(report);
+    expect(ruleIds(checkTierA(yaml).violations)).toContain('a-no-placeholder-residue');
+  });
+
   it('rejects a field that restates its own name (a-no-field-echo)', () => {
     const report = goodReport();
     report.narrative = 'narrative';

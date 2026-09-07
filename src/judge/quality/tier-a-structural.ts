@@ -1009,6 +1009,14 @@ export function checkRefShapes(report: unknown): Violation[] {
 // path or command (`sh <dir>/-name`, observed live) is evidence text, not an
 // unfilled slot, because `>` is followed by `/` rather than a word boundary.
 const PLACEHOLDER_RE = /(?:^|[\s([{"'=:,])<[^>\s][^>]*>(?=$|[\s)\]}"'.,;:!?])/;
+// An inline object literal quoted in prose: `{op:'replace', path:'', value:<x>}`.
+// A metavariable standing inside one is the report describing the shape of a
+// value, not a slot the writer failed to fill. Observed live: a judgement
+// explaining that the correct inverse of a whole-document patch is
+// `{op:'replace', path:'', value:<original root>}` was rejected three times over
+// for the same sentence. The `\w+:` requirement is what makes this narrow: a
+// bare `{<int>}` carries no key and is still residue.
+const OBJECT_LITERAL_RE = /\{[^{}]*\b[A-Za-z_]\w*\s*:[^{}]*\}/g;
 // Degenerate empty angle-bracket pair.
 const EMPTY_ANGLE_RE = /<>/;
 // Bare unfinished-work tokens left when a field is skipped. Without this,
@@ -1041,7 +1049,9 @@ export function checkPlaceholderResidue(report: unknown): Violation[] {
     // evidence text, not a template placeholder. Strip email-shaped pairs
     // before testing so a legitimately quoted seed-commit author does not
     // read as unfinished work.
-    const stripped = value.replace(/<[^>\s]*@[^>]*>/g, "");
+    const stripped = value
+      .replace(/<[^>\s]*@[^>]*>/g, "")
+      .replace(OBJECT_LITERAL_RE, "");
     if (
       PLACEHOLDER_RE.test(stripped) ||
       EMPTY_ANGLE_RE.test(stripped) ||
