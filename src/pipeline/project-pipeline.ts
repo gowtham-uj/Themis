@@ -97,8 +97,13 @@ export async function retryFailedPhase1(input:{db:Phase2Db;generationId:string})
   revived.push(item.id);
  }
  // A generation parked in `failed` cannot advance, so reopen it to the stage its
- // revived items are actually in.
- if(revived.length>0&&gen.state==="failed"){
+ // revived items are actually in. `completed` needs the same treatment: a
+ // generation completes on the campaign's frozen membership, so an item revived
+ // afterwards sits in phase1_pending while the ticker skips the generation, and
+ // its verdict is never produced at all. Reopening runs the judge for it; the
+ // Phase-2 block below refuses to re-run an already-published campaign, so this
+ // costs a judge pass for the revived item and nothing more.
+ if(revived.length>0&&(gen.state==="failed"||gen.state==="completed")){
   await input.db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"phase1_running");
  }
  return{revived};
@@ -230,6 +235,17 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
    eventType:"phase2.budget_reset",payloadJson:"{}"});
   await transition("phase2_ready");
  }
+ // A campaign that already published is final: its developer pack is assembled and
+ // its members' archives carry a phase2/ layer. An item revived after that point
+ // reopens the generation for its own judge pass, and re-entering the board here
+ // would spend a full second board run to re-publish what is already sealed. Take
+ // the generation straight back to completed instead.
+ const priorCampaign=await input.db.phase2.getCampaignByGeneration(gen.id);
+ if(priorCampaign?.state==="published"){
+  // `stillGoing` is false here, so nothing is mid-flight and completing is safe.
+  if(gen.state!=="completed")await transition("completed");
+  return{generation:gen,items,changed,waitingFor:null};
+ }
  if(["phase2_ready","phase2_running","finalizing"].includes(gen.state)&&isAllowed(trigger,queue.autoPhase2)&&(trigger==="auto"||trigger==="phase2")){
   // Phase 2 is one long PI board run. Without a bound, a board that throws on
   // every attempt is retried by the 3s ticker forever, and each retry is real
@@ -266,7 +282,15 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
   const published=await step("reviewing","published",await step("analyzing","reviewing",analyzing));
   if(gen.state==="phase2_running")await transition("finalizing");
   campaign=published;
-  for(const x of eligible){await input.db.pipeline.updateItem(x.id,"phase1_published",{state:"phase2_attached"});}
+  // Attach exactly the campaign's frozen membership, not the freshly recomputed
+  // eligible set. A revived item whose Phase 1 published after the campaign froze
+  // is eligible now but has no member row, so the publish loop below would never
+  // reach it: it would sit in `phase2_attached` while the generation completed,
+  // stranded in a non-terminal state with no phase2/ layer on its archive. It
+  // stays `phase1_published` — a complete, addressable verdict — and the next
+  // campaign covers it.
+  const memberItemIds=new Set(members.map(m=>m.pipelineItemId));
+  for(const x of eligible){if(memberItemIds.has(x.id))await input.db.pipeline.updateItem(x.id,"phase1_published",{state:"phase2_attached"});}
   items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];
   for(const member of members){
    const item=items.find(x=>x.id===member.pipelineItemId);
@@ -280,6 +304,14 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
    if(!verified)throw new Error(`publication fenced while verifying ${pub.id}`);
    if(!await input.db.phase2.transitionPublication(pub.id,"verified","published"))throw new Error(`publication fenced while publishing ${pub.id}`);
    await input.db.pipeline.updateItem(item.id,"phase2_attached",{state:"final_view_published",finalArchiveViewId:final.finalArchiveViewId});
+  }
+  // Only finish the generation when nothing is still working. An item revived
+  // while the board was running is judging right now, and `completed` is a state
+  // the ticker skips: transitioning here would abandon that verdict mid-flight
+  // with no route back. Stay in `finalizing` so the next tick keeps polling it.
+  items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];
+  if(items.some(x=>["eval_pending","eval_running","archive_sealed","phase1_pending","phase1_running"].includes(x.state))){
+   return{generation:gen,items,changed:true,waitingFor:"phase1"};
   }
   await transition("completed");items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];return{generation:gen,items,changed:true,waitingFor:null};
   }catch(err){

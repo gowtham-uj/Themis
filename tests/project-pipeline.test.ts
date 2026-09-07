@@ -215,6 +215,98 @@ describe("project pipeline coordinator",()=>{
   await db.close();
  });
 
+ it("never strands an item that published after the campaign froze its membership",async()=>{
+  // The board freezes its membership when it starts. An item whose verdict lands
+  // after that point is Phase-2 eligible but has no member row, so the publish
+  // loop can never reach it. Attaching it anyway left it in phase2_attached while
+  // the generation completed: a non-terminal state nothing would ever finish, and
+  // an archive with no phase2/ layer that the run panel still counted as attached.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  const a=await db.pipeline.addItem({generationId:g.id,evalId:"member",ordinal:1});
+  const late=await db.pipeline.addItem({generationId:g.id,evalId:"late",ordinal:2});
+  for(const x of [a,late]){
+   await db.pipeline.updateItem(x.id,"eval_pending",{state:"phase1_published",runId:`run-${x.evalId}`,
+    baseArchiveId:`arch-${x.evalId}`,phase1ResultVersionId:`rv-${x.evalId}`,phase1ArchiveViewId:`view-${x.evalId}`});
+  }
+  // The campaign froze over `member` only, exactly as it would if `late` were
+  // still judging when the board started.
+  const campaign=await db.phase2.createCampaign({projectId:"p",pipelineGenerationId:g.id,
+   sutFingerprint:"f".repeat(64),ontologyVersion:"phase2-v1",membershipSha256:"e".repeat(64),configJson:"{}"});
+  await db.phase2.addMember({campaignId:campaign.id,pipelineItemId:a.id,runId:"run-member",
+   phase1ResultVersionId:"rv-member",phase1ArchiveViewId:"view-member",validForAgentLearning:true,ordinal:1});
+  const gen=(await db.pipeline.getGeneration(g.id))!;
+  await db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"phase2_ready");
+
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:`arch-${item.evalId}`}},
+   async startPhase1(){return{operationId:"op"}},
+   async getPhase1Status(runId){return{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`}},
+   async runPhase2(c,ms){expect(ms).toHaveLength(1);return{developerPackSha256:"ab".repeat(32),developerPackZip:"/p/pack.zip",artifactDir:`/p/${c.id}`}},
+   async publishFinalView({member}){return{finalArchiveViewId:`final-${member.runId}`,manifestSha256:"cd".repeat(32)}},
+  };
+  for(let i=0;i<25;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed")break;}
+
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
+  expect((await db.pipeline.getItem(a.id))?.state).toBe("final_view_published");
+  // The non-member keeps its published verdict instead of being stranded.
+  expect((await db.pipeline.getItem(late.id))?.state).toBe("phase1_published");
+  await db.close();
+ });
+
+ it("does not complete a generation while a revived item is still judging",async()=>{
+  // Reviving an item while the board runs leaves it judging when Phase 2
+  // publishes. Completing there is unrecoverable: the ticker skips completed
+  // generations, so that verdict is abandoned mid-flight with no route back.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  const a=await db.pipeline.addItem({generationId:g.id,evalId:"member",ordinal:1});
+  const late=await db.pipeline.addItem({generationId:g.id,evalId:"late",ordinal:2});
+  await db.pipeline.updateItem(a.id,"eval_pending",{state:"phase1_published",runId:"run-member",
+   baseArchiveId:"arch-member",phase1ResultVersionId:"rv-member",phase1ArchiveViewId:"view-member"});
+  await db.pipeline.updateItem(late.id,"eval_pending",{state:"failed",runId:"run-late",
+   baseArchiveId:"arch-late",errorKind:"phase1",errorDetail:"judge exhausted"});
+  const campaign=await db.phase2.createCampaign({projectId:"p",pipelineGenerationId:g.id,
+   sutFingerprint:"f".repeat(64),ontologyVersion:"phase2-v1",membershipSha256:"e".repeat(64),configJson:"{}"});
+  await db.phase2.addMember({campaignId:campaign.id,pipelineItemId:a.id,runId:"run-member",
+   phase1ResultVersionId:"rv-member",phase1ArchiveViewId:"view-member",validForAgentLearning:true,ordinal:1});
+  const gen=(await db.pipeline.getGeneration(g.id))!;
+  await db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"phase2_ready");
+
+  let lateDone=false;
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:`arch-${item.evalId}`}},
+   async startPhase1(){return{operationId:"op"}},
+   async getPhase1Status(runId){return runId==="run-late"&&!lateDone
+    ?{state:"running"}
+    :{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`}},
+   // The board takes minutes. An operator retries the failed item while it runs,
+   // so by the time Phase 2 publishes, that item is judging again.
+   async runPhase2(c,ms){
+    await db.pipeline.updateItem(late.id,"failed",{state:"phase1_running",errorKind:null,errorDetail:null});
+    return{developerPackSha256:"ab".repeat(32),developerPackZip:"/p/pack.zip",artifactDir:`/p/${c.id}`};
+   },
+   async publishFinalView({member}){return{finalArchiveViewId:`final-${member.runId}`,manifestSha256:"cd".repeat(32)}},
+  };
+  // Phase 2 publishes its members while the revived item is still judging.
+  for(let i=0;i<10;i++){await advanceProjectPipeline({db,services,generationId:g.id})}
+  expect((await db.pipeline.getItem(a.id))?.state).toBe("final_view_published");
+  // The generation must NOT be completed: its live item still needs ticks.
+  expect((await db.pipeline.getGeneration(g.id))?.state).not.toBe("completed");
+  expect((await db.pipeline.getItem(late.id))?.state).toBe("phase1_running");
+
+  // Once its verdict lands, the generation finishes and the verdict survives.
+  lateDone=true;
+  for(let i=0;i<10;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed")break}
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
+  expect((await db.pipeline.getItem(late.id))?.state).toBe("phase1_published");
+  await db.close();
+ });
+
  it("fails a generation only when no eval produced a Phase1 result",async()=>{
   const db=createSqlitePhase2Db(new Database(":memory:"));
   const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
