@@ -1,0 +1,112 @@
+Themis Personal Use and No-AI License
+Version 1.0
+
+Copyright (c) 2026 the Themis authors
+
+This is a source-available license, not an open source license. It is not
+approved by the Open Source Initiative and it is not a Free Software license.
+It restricts who may use this software and what they may use it for. Read it
+before you use, copy, or distribute anything in this repository.
+
+## 1. Definitions
+
+"Software" means the source code, documentation, configuration, prompts,
+schemas, and any other files in this repository, together with any derivative
+work of them.
+
+"You" means the person or entity exercising rights under this license.
+
+"Individual" means a natural person acting on their own behalf. An Individual
+is not a company, partnership, nonprofit, government body, university,
+foundation, association, or any other legal entity, and is not a natural person
+acting for or on behalf of one.
+
+"Personal Purpose" means use by an Individual for their own study, learning,
+hobby projects, private experimentation, or evaluation, where the use does not
+generate revenue and does not support the operations, products, services,
+research, or internal tooling of any legal entity.
+
+"Commercial Purpose" means any use that is intended for or directed toward
+commercial advantage or monetary compensation, and any use by or for a legal
+entity, whether or not that entity is for-profit.
+
+"AI System" means a machine learning model, foundation model, language model,
+agent, or other automated system that learns statistical patterns from data,
+along with the software that trains, fine-tunes, distills, evaluates against, or
+serves such a system.
+
+## 2. Grant
+
+Subject to every condition and limitation below, you are granted a worldwide,
+royalty-free, non-exclusive, non-sublicensable, revocable license to use, copy,
+modify, and create derivative works of the Software, and to distribute those
+derivative works, but only if you are an Individual and only for a Personal
+Purpose.
+
+## 3. Prohibited uses
+
+You may not do any of the following without a separate written license from the
+copyright holder.
+
+**3.1 No commercial or organizational use.** You may not use the Software for a
+Commercial Purpose. You may not use it as, or as part of, an employee,
+contractor, consultant, or volunteer of any legal entity, or on behalf of any
+legal entity, including internal tooling, research, evaluation, benchmarking,
+consulting work, or a hosted service.
+
+**3.2 No AI training.** You may not use the Software, or any part of it, as
+training data, fine-tuning data, distillation data, evaluation data, or
+retrieval corpus for any AI System. You may not include it in a dataset intended
+or reasonably likely to be used for any of those purposes.
+
+**3.3 No AI-driven use.** You may not operate the Software as a component,
+backend, tool, or evaluation harness of an AI System offered to any third party,
+and you may not permit an AI System to use the Software to produce output for a
+third party.
+
+**3.4 No relicensing.** You may not distribute the Software or a derivative work
+under different terms, and you may not remove or alter this license, the
+copyright notices, or the notices required by section 4.
+
+## 4. Conditions
+
+Every copy or derivative work you distribute must include this license file
+unchanged and a prominent notice stating that you changed the files and what you
+changed.
+
+## 5. Third-party components
+
+The Software depends on third-party packages distributed under their own terms.
+This license covers only the Software itself. Nothing here grants you rights to
+any third-party component, model, service, or dataset.
+
+## 6. Termination
+
+Your rights under this license terminate automatically if you breach any term.
+They may be reinstated if you cure the breach within 30 days of first learning
+of it and the copyright holder has not already given you notice of termination.
+Termination does not affect anyone who received a copy from you in compliance
+with this license.
+
+## 7. No trademark license
+
+This license grants no rights in the names, logos, or trademarks of the
+copyright holder.
+
+## 8. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+## 9. Limitation of liability
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+## 10. Other uses
+
+Commercial licenses, organizational licenses, and AI-related licenses are
+available on request. Open an issue or contact the copyright holder.

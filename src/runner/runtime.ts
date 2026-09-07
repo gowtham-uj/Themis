@@ -34,6 +34,14 @@ export interface ContainerExecHandle {
   wait(): Promise<{ exitCode: number; timedOut: boolean; durationMs: number }>;
   /** Stop this command session without stopping the queue container. */
   stop(graceMs?: number): Promise<void>;
+  /**
+   * Freeze the command timeout while the container is paused. Without this a
+   * long pause spends the agent's whole budget on frozen wall-clock time and
+   * the eval times out on resume.
+   */
+  holdTimeout?(): void;
+  /** Restart the timeout with the time that was left when it was held. */
+  releaseTimeout?(): void;
 }
 
 /** Captured result of a command run through {@link ContainerHandle.exec}. */

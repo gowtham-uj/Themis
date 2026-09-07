@@ -117,6 +117,14 @@ describe("project agent adapter API", () => {
       agent_id: "another-agent",
     });
     expect(wrongAgent.status).toBe(400);
+
+    const versions = await request(
+      base,
+      "GET",
+      `/api/projects/${projectId}/adapters/${adapter.id as string}/versions`,
+    );
+    expect(versions.status).toBe(200);
+    expect(Array.isArray(versions.body.versions)).toBe(true);
   });
 
   it("requires explicit valid shared adapter references and protects consumers", async () => {

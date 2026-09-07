@@ -50,7 +50,7 @@ const KEYWORD_SIGNATURES: ReadonlyArray<{ re: RegExp; signature: FindingSignatur
   { re: /guess(?:ing|ed)? (?:the )?(?:test|tests|hidden)|assum(?:e|ed|ing)[^\n]*(?:test|hidden|simple)|likely (?:tests|hidden)|probably (?:simple|enough)/i, signature: "TEST_SUITE_GUESSING" },
   { re: /python3?: command not found|which python|assumed python|interpreter (?:missing|not found|assumption)|no python3?\b/i, signature: "INTERPRETER_ASSUMPTION" },
   { re: /localiz(?:e|ation|ing)|find(?:ing)? (?:the )?(?:right|relevant|correct) (?:file|symbol|location)|repo(?:sitory)? (?:search|map|explor)/i, signature: "POOR_CODE_LOCALIZATION" },
-  { re: /did not test|untested|never (?:test|invoked (?:npm|node|pytest))|no (?:test|verification)[^\n]*(?:for|of)|verification gap|not verified|test_attempts 0/i, signature: "VERIFICATION_GAP" },
+  { re: /did not test|untested|never (?:test|invoked (?:npm|node|pytest))|no (?:test|verification)[^\n]*(?:for|of)|verification (?:gap|step|discipline)|not verified|test_attempts 0|without (?:ever )?running (?:the )?(?:test|suite)/i, signature: "VERIFICATION_GAP" },
   { re: /spec[^\n]*(?:ambigu|both readings|unclear|admits both)|ambiguous (?:spec|requirement)/i, signature: "SPEC_AMBIGUITY" },
   { re: /setup[^\n]*(?:fail|abort|exit)|never reached the agent|agent (?:never|did not) (?:start|run|execute)|infrastructure|harness (?:fail|abort|bug)|refusing non-empty target/i, signature: "INFRA_SETUP_FAILURE" },
   { re: /metric[^\n]*(?:mislabel|attribution|labeling)|stop_reason|verified_completion (?:false|true)[^\n]*artifact|bookkeeping artifact/i, signature: "METRIC_ATTRIBUTION_ERROR" },

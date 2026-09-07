@@ -69,6 +69,30 @@ describe("mechanical evalJudge assembly", () => {
     expect((doc.case_coverage as Record<string, unknown>).converged).toBe(true);
   });
 
+  it("projects a single verdict_basis paragraph as the narrative (observed live)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ae-assemble-basis-"));
+    const basis =
+      "officialReward 1 with public_tests 13/13 and hidden_contract pass is consistent with the process the round documented.";
+    await writeFile(
+      join(dir, "minos-report.yaml"),
+      ["case_id: c1", "round: 1", "verdict:", "  approach: principled", "  integrity: clean", "  competence: 5", "  reconciliation: consistent", `verdict_basis: "${basis}"`, "---"].join("\n"),
+    );
+
+    const out = await assembleEvalJudge({
+      judgeDir: dir,
+      caseId: "c1",
+      runId: "r1",
+      roundsRun: 1,
+      closedBy: "no_new_tangents",
+      converged: true,
+      officialReward: 1,
+      agentUnderEvaluation: "reapercode",
+    });
+    const doc = parseAllDocuments(await readFile(out!, "utf8"))[0]!.toJS() as Record<string, unknown>;
+    expect(doc.narrative).toBe(basis);
+    expect(doc.confidence_basis).toBe(basis);
+  });
+
   it("returns null when minos never ruled", async () => {
     const dir = await mkdtemp(join(tmpdir(), "ae-assemble-empty-"));
     expect(

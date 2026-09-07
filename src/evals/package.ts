@@ -12,7 +12,21 @@ import { parse as parseToml } from "smol-toml";
 import type { AgentCategory, RubricAxis, TaskProfile, TaskSpec } from "../domain.js";
 
 export const EVAL_PACKAGE_SCHEMA_VERSION = 1 as const;
+/** Platform-written manifest. It is never package content and never manifested. */
+export const EVAL_PACKAGE_MANIFEST_NAME = ".agenteval-package.json";
 const MAX_PACKAGE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The suite agent container's egress allowlist.
+ *
+ * There is exactly one list and it is an allowlist: nothing leaves the
+ * container unless an entry names it. The single entry is the whole IPv4 space,
+ * so egress is currently open, because the agent CLI has to reach whichever
+ * model endpoint the project points it at and that host is not knowable when a
+ * package is authored. Narrowing this is an edit here, and the nftables filter
+ * that enforces it is already in the path either way.
+ */
+export const SUITE_AGENT_ALLOWLIST: readonly string[] = ["0.0.0.0/0"];
 
 export interface EvalPackageFileUpload {
   encoding?: "utf8" | "base64";
@@ -93,9 +107,15 @@ export async function materializeEvalPackage(input: {
   destination: string;
 }): Promise<MaterializedEvalPackage> {
   const files = decodePackageFiles(input.upload);
+  // The manifest file is ours, not package content. An upload that carries one
+  // (a re-uploaded, already-materialized package) would otherwise record a hash
+  // for a file we immediately overwrite, and verification could never pass.
+  files.delete(EVAL_PACKAGE_MANIFEST_NAME);
   const inspected = inspectEvalPackage(files);
   if (!inspected.validation.valid) {
-    throw new Error(`invalid eval package: ${inspected.validation.errors.join("; ")}`);
+    throw new Error(
+      formatEvalPackageError(`invalid eval package: ${inspected.validation.errors.join("; ")}`),
+    );
   }
   const manifestFiles = [...files.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
@@ -126,7 +146,7 @@ export async function materializeEvalPackage(input: {
       await writeFile(absolute, content);
       if (path.endsWith(".sh")) await chmod(absolute, 0o755);
     }
-    await writeFile(join(tmp, ".agenteval-package.json"), `${JSON.stringify({
+    await writeFile(join(tmp, EVAL_PACKAGE_MANIFEST_NAME), `${JSON.stringify({
       packageDigest,
       manifest,
       validation: inspected.validation,
@@ -250,17 +270,19 @@ function wrapSuiteConfig(flat: Record<string, unknown>): Record<string, unknown>
   const taskVersion = scalarText(flat.version);
   const name = text(flat.name);
   const primaryCapability = text(flat.primary_capability);
+  const suiteCategory = text(flat.category);
   const language = text(flat.language);
   const agentTimeout = Number(flat.agent_timeout_seconds);
   const verifierTimeout = Number(flat.verifier_timeout_seconds);
   const cpuCores = Number(flat.cpu_cores);
   const memoryMb = Number(flat.memory_mb);
-  // Suite agent container network is always `allow` (reaper must reach the
-  // model provider); `internet` governs the isolated verifier only.
-  const networkPolicy = "allow";
+  // The suite agent container always filters through SUITE_AGENT_ALLOWLIST so
+  // the agent can reach its model provider; `internet` governs the isolated
+  // verifier only.
+  const networkPolicy = "allowlist";
   return {
-    suite: { id: taskId, version: taskVersion, name, primary_capability: primaryCapability, language },
-    task: { id: taskId, version: taskVersion, name, category: "simple",
+    suite: { id: taskId, version: taskVersion, name, category: suiteCategory, primary_capability: primaryCapability, language },
+    task: { id: taskId, version: taskVersion, name, category: suiteCategory ?? "simple",
       language, tags: [primaryCapability, language].filter((entry): entry is string => Boolean(entry)),
       profile: "bugfix", agent_category: "coding" },
     timeouts: {
@@ -274,7 +296,7 @@ function wrapSuiteConfig(flat: Record<string, unknown>): Record<string, unknown>
       disk_mb: Math.trunc(Number(flat.disk_mb)),
       gpu: 0,
     },
-    network: { policy: networkPolicy, allowlist: [], allow: networkPolicy === "allow" },
+    network: { policy: networkPolicy, allowlist: [...SUITE_AGENT_ALLOWLIST] },
     agent_env: {},
     lifecycle: {},
     verifier: {
@@ -305,9 +327,21 @@ export async function verifyMaterializedEvalPackage(input: {
       sha256: text(raw.sha256)!,
     });
   }
-  const actualPaths = await listPackageFiles(input.packagePath, input.packagePath);
+  // A missing package directory is an operator-visible state (an interrupted
+  // materialize, a cleared data dir), not an internal fault. Say which eval and
+  // which path so the caller can re-import it instead of reading a bare ENOENT.
+  const actualPaths = await listPackageFiles(input.packagePath, input.packagePath)
+    .catch((err: unknown) => {
+      if (isNotFound(err)) {
+        throw new Error(
+          `eval package is not materialized at ${input.packagePath}. ` +
+          `Re-import the eval so its package files are written back to disk.`,
+        );
+      }
+      throw err;
+    });
   for (const path of actualPaths) {
-    if (path === ".agenteval-package.json") continue;
+    if (path === EVAL_PACKAGE_MANIFEST_NAME) continue;
     if (!expected.has(path)) throw new Error(`unmanifested eval package file: ${path}`);
   }
   for (const file of expected.values()) {
@@ -494,17 +528,20 @@ export async function synthesizeSuiteLifecycleScripts(input: {
     "# Written to the system gitconfig so it applies to root AND the non-root agent (uid 10001).",
     "git config --system --add safe.directory '*'",
     installBlock,
-    "# Platform seed: copy seed_repo into /workspace/task BEFORE the author's",
-    "# setup.sh. An author script that only mkdir'd the dest left the workspace",
-    "# empty (observed live: workspace.source=empty, no src/value.js).",
-    "if [ -d /workspace/.agenteval/seed_repo ]; then",
-    "  mkdir -p /workspace/task",
-    "  cp -a /workspace/.agenteval/seed_repo/. /workspace/task/",
-    "fi",
-    "# Run the author's setup body. cwd=/workspace/.agenteval so its",
+    "# Run the author's setup body first. cwd=/workspace/.agenteval so its",
     "# `dirname $0/..`/seed_repo reference resolves to the staged copy.",
     "cd /workspace/.agenteval",
     '/workspace/.agenteval/environment/setup.sh "$@"',
+    "# Platform seed, fallback only: an author script that only mkdir'd the dest",
+    "# left the workspace empty (observed live: workspace.source=empty, no",
+    "# src/value.js). Seeding BEFORE the author's script instead trips the guard",
+    "# in a script that seeds itself and refuses a non-empty target, so this runs",
+    "# after and only when the author left /workspace/task with nothing in it.",
+    "if [ -d /workspace/.agenteval/seed_repo ] && \\",
+    "   [ -z \"$(find /workspace/task -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)\" ]; then",
+    "  mkdir -p /workspace/task",
+    "  cp -a /workspace/.agenteval/seed_repo/. /workspace/task/",
+    "fi",
     "# setup ran as root; the non-root agent (uid 10001) must own its workspace.",
     "[ -d /workspace/task ] && chown -R 10001:10001 /workspace/task || true",
   ].join("\n") + "\n", "utf8");
@@ -522,6 +559,42 @@ export async function synthesizeSuiteLifecycleScripts(input: {
   return { setupPath: SUITE_LIFECYCLE_SETUP_PATH, cleanupPath: SUITE_LIFECYCLE_CLEANUP_PATH };
 }
 
+export const EVAL_PACKAGE_REQUIRED_FILES = [
+  "instruction.md",
+  "task.toml",
+  "README.md",
+  "environment/Dockerfile",
+  "environment/setup.sh",
+  "environment/cleanup.sh",
+  "environment/healthcheck.sh",
+  "tests/Dockerfile",
+  "tests/test.sh",
+  "tests/verifier.py",
+  "solution/solve.sh",
+  "solution/reference.patch",
+  "validation/expected.json",
+  "validation/known_bad.patch",
+] as const;
+
+export const EVAL_PACKAGE_REQUIRED_DIRS = [
+  "seed_repo/",
+  "solution/reference_files/",
+  "tests/",
+  "validation/known_bad/",
+] as const;
+
+export const EVAL_PACKAGE_DOCS = "docs/eval-authoring.md";
+
+/** Turn a validator failure into a rejection people can act on. */
+export function formatEvalPackageError(message: string): string {
+  return (
+    `${message}. ` +
+    `Need these files: ${EVAL_PACKAGE_REQUIRED_FILES.join(", ")}. ` +
+    `Need content under: ${EVAL_PACKAGE_REQUIRED_DIRS.join(", ")}. ` +
+    `Full tree and task.toml keys: ${EVAL_PACKAGE_DOCS}`
+  );
+}
+
 /**
  * Validate a suite-style eval task: flat task.toml, seed_repo workspace,
  * environment/self-contained Dockerfile, tests/verifier.py, solution/,
@@ -535,22 +608,7 @@ export function inspectEvalPackage(files: Map<string, Buffer>): {
   const errors: string[] = [];
   const warnings: string[] = [];
 
-  for (const required of [
-    "instruction.md",
-    "task.toml",
-    "README.md",
-    "environment/Dockerfile",
-    "environment/setup.sh",
-    "environment/cleanup.sh",
-    "environment/healthcheck.sh",
-    "tests/Dockerfile",
-    "tests/test.sh",
-    "tests/verifier.py",
-    "solution/solve.sh",
-    "solution/reference.patch",
-    "validation/expected.json",
-    "validation/known_bad.patch",
-  ]) {
+  for (const required of EVAL_PACKAGE_REQUIRED_FILES) {
     if (!files.has(required)) errors.push(`missing required file ${required}`);
   }
   requirePrefix(files, "seed_repo/", errors);
@@ -602,12 +660,14 @@ export function inspectEvalPackage(files: Map<string, Buffer>): {
     errors.push("task.toml internet must be allow|allowlist|offline|disabled");
   }
   // The suite `internet` field describes the TASK's intended network safety and
-  // is honored by the isolated verifier (always offline). But the agent
-  // container runs the real reaper CLI which must reach its model provider, so
-  // the suite agent container is always network `allow` (the verifier is forced
-  // offline independently in the verifier runner). `internet` is preserved as
+  // is honored by the isolated verifier (always offline). The agent container
+  // runs the real agent CLI, which must reach its model provider, so it goes
+  // through the allowlist filter rather than around it. Its one entry is
+  // currently the whole address space: egress is open, but it is open because
+  // the allowlist says so, so tightening it later is an edit to this list and
+  // not a switch to a different enforcement path. `internet` is preserved as
   // informational authoring metadata and to reject invalid values.
-  const networkPolicy = "allow";
+  const networkPolicy = "allowlist";
   if (!publicTestCommand) errors.push("task.toml public_test_command is required");
 
   // ---- wrap flat keys into the internal config tables the runtime reads ----
@@ -616,7 +676,7 @@ export function inspectEvalPackage(files: Map<string, Buffer>): {
       id: taskId,
       version: taskVersion,
       name,
-      category: "simple",
+      category: suiteCategory ?? "simple",
       language,
       tags: [primaryCapability, language].filter((entry): entry is string => Boolean(entry)),
       profile: "bugfix",
@@ -633,7 +693,7 @@ export function inspectEvalPackage(files: Map<string, Buffer>): {
       disk_mb: Math.trunc(diskMb),
       gpu: 0,
     },
-    network: { policy: networkPolicy, allowlist: [], allow: networkPolicy === "allow" },
+    network: { policy: networkPolicy, allowlist: [...SUITE_AGENT_ALLOWLIST] },
     agent_env: {},
     lifecycle: {},
     verifier: {
@@ -705,7 +765,7 @@ export function inspectEvalPackage(files: Map<string, Buffer>): {
     tags: [primaryCapability, language].filter((entry): entry is string => Boolean(entry)),
     profile: "bugfix",
     agentCategory: "coding",
-    categoryName: "simple",
+    categoryName: suiteCategory ?? "simple",
   };
 
   const validation: EvalPackageValidation = {
@@ -715,7 +775,7 @@ export function inspectEvalPackage(files: Map<string, Buffer>): {
     warnings,
     taskId,
     taskVersion,
-    category: "simple",
+    category: suiteCategory ?? "simple",
     language: language ?? null,
     verifierCheckIds: [],
     requirementIds: [],

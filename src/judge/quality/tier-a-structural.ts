@@ -29,18 +29,18 @@
 
 import { parse as parseYaml, parseAllDocuments } from 'yaml';
 
-import type {
-  EvalJudgeReport,
-  Ref,
-  RefKind,
-  ReportCategory,
-  TierResult,
-  Violation,
-} from './types.js';
 import {
+  AGENT_SUBSYSTEM_VALUES,
+  type EvalJudgeReport,
+  type Ref,
+  type RefKind,
+  type ReportCategory,
+  type TierResult,
+  type Violation,
   CLOSED_BY_VALUES,
   COMPETENCE_VALUES,
   CONFIDENCE_VALUES,
+  FIX_TYPE_VALUES,
   IMPACT_VALUES,
   IMPROVEMENT_CATEGORY_VALUES,
   RECONCILIATION_VALUES,
@@ -48,6 +48,8 @@ import {
   VERDICT_INTEGRITY_VALUES,
   WHY_UNRESOLVED_VALUES,
 } from './types.js';
+import { FINDING_SIGNATURES, isKnownSignature } from '../validity/signatures.js';
+import { gotValue } from '../tools/themis-tools-extension.js';
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -280,13 +282,34 @@ const VALIDITY_CHILD_KEYS = Object.freeze([
 /** Nested required/known key sets, keyed by the parent field name. */
 const VERDICT_CHILD_KEYS = Object.freeze(['approach', 'integrity', 'competence', 'reconciliation']);
 const STRENGTH_CHILD_KEYS = Object.freeze(['observation', 'ref']);
-const IMPROVEMENT_CHILD_KEYS = Object.freeze([
+/**
+ * `extra` is an open mapping, deliberately.
+ *
+ * The frozen six keys are what every consumer can rely on. But minos sometimes
+ * files a field the template never named (`pattern`, `root_cause`,
+ * `affected_component`), and that is real signal about the agent under test, so
+ * the assembler keeps it here rather than dropping it. Contract-checking stops
+ * at the boundary: `extra` must be a mapping, and its contents are free.
+ */
+const IMPROVEMENT_REQUIRED_KEYS = Object.freeze([
   'issue',
   'evidence',
   'recommendation',
   'category',
   'impact',
   'confidence',
+]);
+/**
+ * `subsystem`, `fix_type`, and `signature` are host-derived, so they are allowed
+ * but not required: an `evalJudge.yaml` written before they existed still
+ * passes. When present they must be exact enum members, same as `category`.
+ */
+const IMPROVEMENT_CHILD_KEYS = Object.freeze([
+  ...IMPROVEMENT_REQUIRED_KEYS,
+  'subsystem',
+  'fix_type',
+  'signature',
+  'extra',
 ]);
 /** Keys every evidence entry MUST carry. `kind` is optional (defaults archive). */
 const EVIDENCE_REQUIRED_KEYS = Object.freeze(['report', 'ref']);
@@ -471,7 +494,7 @@ export function checkRequiredKeys(report: unknown): Violation[] {
       );
       return;
     }
-    for (const key of IMPROVEMENT_CHILD_KEYS) {
+    for (const key of IMPROVEMENT_REQUIRED_KEYS) {
       if (!(key in item)) {
         violations.push(
           violation(
@@ -637,7 +660,7 @@ export function checkNoInventedKeys(report: unknown): Violation[] {
         violations.push(
           violation(
             'a-enums-exact',
-            `improvements[${i}].evidence[${j}].kind must be one of {${EVIDENCE_KINDS.join(', ')}} (got ${JSON.stringify(kind)})`,
+            `improvements[${i}].evidence[${j}].kind must be one of {${EVIDENCE_KINDS.join(', ')}} (got ${gotValue(kind)})`,
             `improvements[${i}].evidence[${j}].kind`,
           ),
         );
@@ -658,7 +681,7 @@ function inEnum(value: unknown, members: readonly string[], path: string, label:
   if (typeof value !== 'string' || !members.includes(value)) {
     return violation(
       'a-enums-exact',
-      `${path} must be one of {${members.join(', ')}} (got ${JSON.stringify(value)})`,
+      `${path} must be one of {${members.join(', ')}} (got ${gotValue(value)})`,
       path,
     );
   }
@@ -669,7 +692,7 @@ function mustBeInt(value: unknown, path: string, min: number): Violation | undef
   if (typeof value !== 'number' || !Number.isInteger(value) || value < min) {
     return violation(
       'a-enums-exact',
-      `${path} must be an integer >= ${min} (got ${JSON.stringify(value)})`,
+      `${path} must be an integer >= ${min} (got ${gotValue(value)})`,
       path,
     );
   }
@@ -740,7 +763,7 @@ export function checkEnumsExact(report: unknown): Violation[] {
       violations.push(
         violation(
           'a-enums-exact',
-          `verdict.competence must be one of {${COMPETENCE_VALUES.join(', ')}} (got ${JSON.stringify(competenceValue)})`,
+          `verdict.competence must be one of {${COMPETENCE_VALUES.join(', ')}} (got ${gotValue(competenceValue)})`,
           'verdict.competence',
         ),
       );
@@ -775,6 +798,25 @@ export function checkEnumsExact(report: unknown): Violation[] {
     if (impact !== undefined) violations.push(impact);
     const confidence = inEnum(item.confidence, CONFIDENCE_VALUES, `improvements[${i}].confidence`, 'confidence');
     if (confidence !== undefined) violations.push(confidence);
+    // Host-derived and optional, so an older report is still valid. Present,
+    // they carry the same exactness as every other enum in the contract.
+    if (item.subsystem !== undefined) {
+      const subsystem = inEnum(item.subsystem, AGENT_SUBSYSTEM_VALUES, `improvements[${i}].subsystem`, 'subsystem');
+      if (subsystem !== undefined) violations.push(subsystem);
+    }
+    if (item.fix_type !== undefined) {
+      const fixType = inEnum(item.fix_type, FIX_TYPE_VALUES, `improvements[${i}].fix_type`, 'fix_type');
+      if (fixType !== undefined) violations.push(fixType);
+    }
+    if (item.signature !== undefined && !isKnownSignature(item.signature)) {
+      violations.push(
+        violation(
+          'a-enums-exact',
+          `improvements[${i}].signature must be one of {${FINDING_SIGNATURES.join(', ')}} (got ${gotValue(item.signature)})`,
+          `improvements[${i}].signature`,
+        ),
+      );
+    }
     if (typeof item.issue !== 'string') {
       violations.push(
         violation('a-enums-exact', `improvements[${i}].issue must be a string`, `improvements[${i}].issue`),
@@ -959,23 +1001,42 @@ export function checkRefShapes(report: unknown): Violation[] {
 /* a-no-placeholder-residue                                            */
 /* ------------------------------------------------------------------ */
 
-// A template placeholder is an angle-bracketed token: `<int>`, `<string>`,
-// `<ref>`, `<ANGLE_BRACKETS>`, `<the question assigned>`. The `[^>\s]` guard
-// means prose comparisons like `a < b` (space after `<`) are not flagged.
-const PLACEHOLDER_RE = /<[^>\s][^>]*>/;
+// A template placeholder is an angle-bracketed token standing on its own:
+// `<int>`, `<string>`, `<ref>`, `<ANGLE_BRACKETS>`, `<the question assigned>`.
+// The `[^>\s]` guard means prose comparisons like `a < b` (space after `<`) are
+// not flagged. The boundary guards mean a bracket glued into a larger token is
+// not flagged either: a report legitimately quoting a shell metavariable in a
+// path or command (`sh <dir>/-name`, observed live) is evidence text, not an
+// unfilled slot, because `>` is followed by `/` rather than a word boundary.
+const PLACEHOLDER_RE = /(?:^|[\s([{"'=:,])<[^>\s][^>]*>(?=$|[\s)\]}"'.,;:!?])/;
 // Degenerate empty angle-bracket pair.
 const EMPTY_ANGLE_RE = /<>/;
-// Bare unfinished-work tokens left when a field is skipped. Word-boundary
-// anchored so ordinary prose ("do not", "not available as a primary finding")
-// is not flagged — only the token standing alone as a placeholder. Without
-// this, `TODO`/`N/A`/`TBD`/`FIXME` sail through while only the angle-bracket
-// form is caught (confirmed adversarial escape).
-const BARE_PLACEHOLDER_RE = /\b(?:TODO|FIXME|TBD|N\/A|WIP)\b/;
+// Bare unfinished-work tokens left when a field is skipped. Without this,
+// `TODO`/`N/A`/`TBD`/`FIXME` sail through while only the angle-bracket form is
+// caught (confirmed adversarial escape).
+//
+// Anchored to the START of the field, because that is what residue actually
+// looks like: the whole value is the token, optionally followed by a colon,
+// dash, or short excuse ("N/A - see above", "TODO: confirm exact assertion",
+// "N/A this is an improvement item"). Matching the token anywhere in the field
+// flagged real authored prose instead: a live report was rejected for the
+// sentence "treat an edge-case review produced during planning as a TODO list,
+// not an audit", which is a filled field discussing a TODO list, not residue.
+// A mid-sentence mention cannot mean the field was never authored, since the
+// surrounding sentence is the authoring.
+const BARE_PLACEHOLDER_RE = /^\s*(?:TODO|FIXME|TBD|N\/A|WIP)\b/i;
 
 /** No field may contain placeholder residue (angle-bracket OR bare token). */
 export function checkPlaceholderResidue(report: unknown): Violation[] {
   const violations: Violation[] = [];
   for (const { path, value } of collectStringLeaves(report)) {
+    // `extra` is an open mapping whose contents are free by contract (see
+    // IMPROVEMENT_CHILD_KEYS). A key nobody required cannot be residue: "N/A"
+    // under `extra` is minos answering a question the contract never asked, and
+    // failing the whole report for it contradicts the open-mapping promise.
+    // Observed live: `extra.what_the_agent_did_well: "N/A this is an
+    // improvement item"` sank an otherwise complete judgement.
+    if (/(?:^|\.)extra\./.test(path)) continue;
     // An email address quoted in angle brackets (`Eval Setup <eval@…>`) is
     // evidence text, not a template placeholder. Strip email-shaped pairs
     // before testing so a legitimately quoted seed-commit author does not
@@ -1061,7 +1122,10 @@ export function checkFieldEcho(report: unknown): Violation[] {
 /** Contract field order for each report shape. */
 const VERDICT_KEYS = Object.freeze(['approach', 'integrity', 'competence', 'reconciliation']);
 const STRENGTH_KEYS = Object.freeze(['observation', 'ref']);
-const IMPROVEMENT_KEYS = Object.freeze(['issue', 'evidence', 'recommendation', 'category', 'impact', 'confidence']);
+const IMPROVEMENT_KEYS = Object.freeze([
+  'issue', 'evidence', 'recommendation', 'category', 'impact', 'confidence',
+  'subsystem', 'fix_type', 'signature', 'extra',
+]);
 const EVIDENCE_KEYS = Object.freeze(['report', 'ref']);
 const INTEGRITY_SUMMARY_KEYS = Object.freeze(['verdict', 'findings']);
 const FINDING_KEYS = Object.freeze(['finding', 'ref', 'round']);

@@ -40,6 +40,7 @@ import {
   resolveEventsPath,
 } from "../runner/run-layout.js";
 import { Router, readJsonBody, sendJson, type RequestContext } from "./router.js";
+import { NETWORK_POLICIES, isNetworkPolicy } from "../runner/project-config.js";
 import {
   badRequest,
   conflict,
@@ -52,12 +53,16 @@ import { registerQueueRoutes } from "./queue-routes.js";
 import { registerAdapterRoutes } from "./adapter-routes.js";
 import { loadStoredModelConfig, registerSettingsRoutes } from "./settings-routes.js";
 import { parseStoredModelConfig } from "../config/model-config.js";
+import { loadSecretsIntoEnv } from "../config/secret-vault.js";
+import { loadPromptAsset, PROMPT_ASSET_IDS } from "../judge/pi/runtime.js";
 import { registerArchiveRoutes } from "./archive-routes.js";
 import { registerJudgeRoutes } from "./judge-routes.js";
 import { Phase1Service } from "../judge/phase1-service.js";
-import { registerPipelineRoutes } from "./pipeline-routes.js";
+import { registerPipelineRoutes, startProjectPipelines } from "./pipeline-routes.js";
 import { registerSandboxRoutes } from "./sandbox-routes.js";
+import { projectReadiness } from "./readiness.js";
 import { registerGitHubRoutes } from "./github-routes.js";
+import { registerEvalStoreRoutes } from "./eval-store-routes.js";
 import {
   createLiveQueueContainersMap,
   startQueueContainer,
@@ -152,6 +157,13 @@ export interface CreateServerOptions {
    * live repo state never depends on the network.
    */
   githubClient?: GitHubClient;
+  /**
+   * Milliseconds between background pipeline ticks. Omit to leave the pipeline
+   * driven only by explicit POST /advance calls, which is what tests want.
+   * `npm run serve` sets it so a started run moves through eval -> Phase 1 ->
+   * Phase 2 without anyone poking the API.
+   */
+  pipelineTickerMs?: number;
 }
 
 export interface ApiServer {
@@ -184,7 +196,100 @@ function parseProjectModelConfig(raw: unknown): Record<string, unknown> | null {
   return Object.keys(parsed).length > 0 ? (parsed as Record<string, unknown>) : null;
 }
 
-function projectJson(p: Project) {
+/** Project copies of the Phase 1 / Phase 2 prompts. Null clears them back to the built-in drafts. */
+function parsePromptConfig(raw: unknown): Record<string, string> | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw badRequest("prompt_config must be an object of { filename: markdown }");
+  }
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!(PROMPT_ASSET_IDS as readonly string[]).includes(key)) {
+      throw badRequest(`unknown prompt "${key}"`);
+    }
+    if (value === null || value === "") continue;
+    if (typeof value !== "string") {
+      throw badRequest(`prompt_config.${key} must be a string`);
+    }
+    out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/** How long shutdown waits for queue workers to seal their in-flight eval. */
+const SHUTDOWN_DRAIN_MS = 30_000;
+
+const PROMPT_META: Record<string, { title: string; blurb: string }> = {
+  "themis-orchestrator.md": {
+    title: "Courtroom lead",
+    blurb: "Runs the per-eval courtroom. Dispatches the others. Does not invent a verdict.",
+  },
+  "kratos.md": {
+    title: "How it worked",
+    blurb: "Reads the trace: tools, turns, process. Establishes facts. Never issues a verdict.",
+  },
+  "logos.md": {
+    title: "What the files show",
+    blurb: "Reads diffs and artifacts. Establishes facts. Never issues a verdict.",
+  },
+  "minos.md": {
+    title: "The verdict",
+    blurb: "Rules at the end of a round from the assembled case. Does not investigate.",
+  },
+  "remedy.md": {
+    title: "What to change",
+    blurb: "After the verdict, turns confirmed findings into a fix plan. Does not re-judge. A real PI subagent, same as the others.",
+  },
+  "clerk.md": {
+    title: "Case clerk",
+    blurb: "Packs the archive into the brief the courtroom reads. No verdict.",
+  },
+  "phase2-orchestrator.md": {
+    title: "Campaign lead",
+    blurb: "Runs the across-evals pass. Dispatches investigator, researcher, designer, reviewer.",
+  },
+  "phase2-investigator.md": {
+    title: "Patterns",
+    blurb: "Finds what repeats across the judged evals.",
+  },
+  "phase2-researcher.md": {
+    title: "Outside the eval",
+    blurb: "Looks up how those patterns are usually fixed. Does not re-diagnose.",
+  },
+  "phase2-designer.md": {
+    title: "The change",
+    blurb: "Turns research into a concrete change for the agent under test.",
+  },
+  "phase2-reviewer.md": {
+    title: "Sanity check",
+    blurb: "Reads the proposed change and says whether it actually addresses the findings.",
+  },
+};
+
+function promptTitle(id: string): string {
+  return PROMPT_META[id]?.title ?? id.replace(/\.md$/, "");
+}
+
+function promptBlurb(id: string): string {
+  return PROMPT_META[id]?.blurb ?? "";
+}
+
+/** A project's minimum enabled-eval count. Null clears it back to the default of 1. */
+function parseMinEvals(raw: unknown): number | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw badRequest("min_evals must be an integer of at least 1");
+  }
+  return n;
+}
+
+/** `resolvedAgentId` is the agent the project's queue will actually launch.
+ *  `default_agent_id` is only the project-level default and is usually null,
+ *  because the adapter is chosen on the queue. Serving that alone made the
+ *  project list print "—" for a project whose own detail page named the agent
+ *  right next to it. */
+function projectJson(p: Project, resolvedAgentId?: string | null) {
   return {
     id: p.id,
     name: p.name,
@@ -192,6 +297,7 @@ function projectJson(p: Project) {
     description: p.description,
     task_source: p.taskSource,
     default_agent_id: p.defaultAgentId,
+    resolved_agent_id: resolvedAgentId ?? p.defaultAgentId,
     default_model: p.defaultModel,
     default_provider: p.defaultProvider,
     workspace_image: p.workspaceImage,
@@ -199,12 +305,26 @@ function projectJson(p: Project) {
     adapter_overrides: p.adapterOverrides,
     network_policy: p.networkPolicy,
     retention_runs: p.retentionRuns,
+    min_evals: p.minEvals,
     sandbox: p.sandbox,
     model_config: p.modelConfig,
+    prompt_config: p.promptConfig,
     archived: p.archived,
     created_at: p.createdAt,
     updated_at: p.updatedAt,
   };
+}
+
+/** The agent a project actually runs: its own default when set, otherwise the
+ *  adapter named by its most recently updated queue (`listEvalQueues` sorts
+ *  newest first). Returns null when no queue has picked one yet. */
+function resolveProjectAgentId(queries: DbQueries, p: Project): string | null {
+  if (p.defaultAgentId) return p.defaultAgentId;
+  for (const q of queries.listEvalQueues(p.id)) {
+    const id = q.sharedAdapterId ?? q.builtinAdapterId ?? q.agentId;
+    if (id) return id;
+  }
+  return null;
 }
 
 function taskJson(t: Task, usedByQueues?: { id: string; name: string }[]) {
@@ -513,6 +633,13 @@ async function streamEvents(
     } catch {
       // ignore
     }
+    // Say the stream is over before ending it. Without this a browser
+    // EventSource treats the close as a dropped connection, reconnects, and
+    // replays the whole finished run again — the console feed showed every
+    // line twice.
+    if (!closed && !res.writableEnded && mode === "sse") {
+      res.write(`event: end\ndata: {"reason":"run-terminal"}\n\n`);
+    }
     if (!closed && !res.writableEnded) res.end();
     req.off("close", onClose);
     res.off("close", onClose);
@@ -621,7 +748,9 @@ function registerRoutes(router: Router): void {
       default_model?: string;
       default_provider?: string;
       network_policy?: string;
+      min_evals?: number;
       model_config?: unknown;
+      prompt_config?: unknown;
     }>(req);
 
     if (!body.name || !String(body.name).trim()) {
@@ -644,7 +773,9 @@ function registerRoutes(router: Router): void {
       defaultModel: body.default_model,
       defaultProvider: body.default_provider,
       networkPolicy: body.network_policy,
+      minEvals: parseMinEvals(body.min_evals),
       modelConfig: parseProjectModelConfig(body.model_config),
+      promptConfig: parsePromptConfig(body.prompt_config),
     });
     resolveProjectDir(app.dataDir, project.id);
     sendJson(res, 201, projectJson(project));
@@ -659,14 +790,14 @@ function registerRoutes(router: Router): void {
     const list = app.queries
       .listProjects({ includeArchived })
       .filter((p) => scope == null || scope.has(p.id))
-      .map(projectJson);
+      .map((p) => projectJson(p, resolveProjectAgentId(app.queries, p)));
     sendJson(res, 200, { projects: list });
   });
 
   router.get("/api/projects/:id", (_req, res, ctx) => {
     const app = appOf(ctx);
     const p = requireProject(app.queries, ctx.params.id!);
-    sendJson(res, 200, projectJson(p));
+    sendJson(res, 200, projectJson(p, resolveProjectAgentId(app.queries, p)));
   });
 
   router.patch("/api/projects/:id", async (req, res, ctx) => {
@@ -700,13 +831,55 @@ function registerRoutes(router: Router): void {
           : String(body.default_provider);
     }
     if ("network_policy" in body && typeof body.network_policy === "string") {
-      patch.networkPolicy = body.network_policy;
+      if (!isNetworkPolicy(body.network_policy)) {
+        throw badRequest(`network_policy must be one of ${NETWORK_POLICIES.join(", ")}`);
+      }
+      patch.networkPolicy = body.network_policy.trim().toLowerCase();
+    }
+    if ("min_evals" in body) {
+      patch.minEvals = parseMinEvals(body.min_evals);
     }
     if ("model_config" in body) {
       patch.modelConfig = parseProjectModelConfig(body.model_config);
     }
+    if ("prompt_config" in body) {
+      patch.promptConfig = parsePromptConfig(body.prompt_config);
+    }
     const updated = app.queries.updateProject(ctx.params.id!, patch);
     sendJson(res, 200, projectJson(updated));
+  });
+
+  /**
+   * Editable copies of the Phase 1 / Phase 2 prompts. `body` is what the
+   * courtroom will use: the project's saved text when present, otherwise the
+   * built-in draft. Saving PATCH prompt_config replaces that copy.
+   */
+  router.get("/api/projects/:id/prompts", async (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const p = requireProject(app.queries, ctx.params.id!);
+    const saved = p.promptConfig ?? {};
+    const prompts = [];
+    for (const id of PROMPT_ASSET_IDS) {
+      const builtin = await loadPromptAsset(id);
+      const projectText = typeof saved[id] === "string" ? saved[id] : null;
+      prompts.push({
+        id,
+        group: id.startsWith("phase2-") ? "phase2" : "phase1",
+        title: promptTitle(id),
+        blurb: promptBlurb(id),
+        body: projectText && projectText.trim() ? projectText : builtin,
+        source: projectText && projectText.trim() ? "project" : "builtin",
+        builtin,
+      });
+    }
+    sendJson(res, 200, { prompts });
+  });
+
+  /** Which setup steps this project still owes before runs, Phase 1, or Phase 2. */
+  router.get("/api/projects/:id/readiness", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const p = requireProject(app.queries, ctx.params.id!);
+    sendJson(res, 200, projectReadiness(app.queries, p.id));
   });
 
   router.delete("/api/projects/:id", (_req, res, ctx) => {
@@ -1274,14 +1447,24 @@ export function createServer(opts: CreateServerOptions): ApiServer {
   registerQueueRoutes(router);
   // Settings + password auth + project export (P9).
   registerSettingsRoutes(router);
-  // Install the operator's saved per-stage model config before any worker,
-  // judge, or Phase-2 path resolves a provider.
+  // Install the operator's saved credentials and per-stage model config before
+  // any worker, judge, or Phase-2 path resolves a provider. Keys land in this
+  // process's environment, so every stage resolves them by variable name.
+  loadSecretsIntoEnv(app.queries);
   loadStoredModelConfig(app.queries);
   registerArchiveRoutes(router);
-  registerJudgeRoutes(router);
-  registerPipelineRoutes(router, new Phase1Service(opts.dataDir));
+  // The registry handle lets Phase-1 publication update the eval's archive row
+  // when it reseals judge/ into it.
+  const phase1Service = new Phase1Service(opts.dataDir, undefined, app.queries);
+  registerJudgeRoutes(router, phase1Service);
+  registerPipelineRoutes(router, phase1Service);
+  const ticker =
+    opts.pipelineTickerMs !== undefined
+      ? startProjectPipelines(app, phase1Service, opts.pipelineTickerMs)
+      : null;
   registerSandboxRoutes(router);
   registerGitHubRoutes(router);
+  registerEvalStoreRoutes(router);
 
   const server = createHttpServer((req, res) => {
     void (async () => {
@@ -1333,9 +1516,21 @@ export function createServer(opts: CreateServerOptions): ApiServer {
       });
     },
     async close() {
-      for (const live of [...liveQueueContainers.values()]) {
+      ticker?.stop();
+      const draining = [...liveQueueContainers.values()];
+      for (const live of draining) {
         await live.stop().catch(() => undefined);
       }
+      // stop() ends the exec session, but the worker still has to seal the
+      // aborted run's evidence and give it a terminal status. Exiting before
+      // that leaves the run `running` with nothing left to finish it, so wait
+      // for the claim loop, with a ceiling so a wedged worker cannot block exit.
+      await Promise.race([
+        Promise.allSettled(draining.map((live) => live.done)),
+        new Promise((r) => setTimeout(r, SHUTDOWN_DRAIN_MS).unref?.()),
+      ]);
+      // Anything still unsealed after the drain window has no owner left.
+      opened.queries.recoverStaleQueueContainers({ olderThanMs: 0 });
       liveQueueContainers.clear();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));

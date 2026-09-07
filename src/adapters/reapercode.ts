@@ -16,6 +16,7 @@
 import type { CanonicalEvent, RunStatus, StopReason, Usage } from "../schema/events.js";
 import { linesFromStream, parseJsonlLine } from "../schema/jsonl.js";
 import type { Adapter, AdapterCommand, AgentStreams, RunContext } from "./types.js";
+import { evalCliProvider } from "./eval-cli.js";
 
 /** Live Reaper at main 541dce6+ emits session stream + slim conversation. */
 export const ADAPTER_STATUS = "live" as const;
@@ -864,7 +865,7 @@ export function buildReaperCommand(ctx: RunContext): AdapterCommand {
     "--workspace",
     "/workspace/task",
     "--provider",
-    ctx.provider,
+    evalCliProvider(ctx),
     "--model",
     ctx.model,
     // Required change ②A — trajectory JSONL on stdout.

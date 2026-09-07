@@ -35,8 +35,9 @@ export function portFlag(p: {
 
 /** Podman's `--network` value for a policy. */
 export function networkFlag(network: RunContainerSpec["network"]): string {
-  // `allowlist` gets a normal network here; egress filtering is enforced by
-  // NetworkCutoff at the firewall level, not by podman's network mode.
+  // `allowlist` needs a real interface to filter on, so it gets a normal
+  // network here. PodmanRuntime.start then installs the nftables ruleset in
+  // this container's netns (see network-allowlist.ts) before anything runs.
   return network === "offline" ? "none" : "bridge";
 }
 

@@ -28,7 +28,7 @@ cat <<JSON
   },
   "provider_config": {
     "credentialEnv": {
-      "nuralwatt": { "NURALWATT_API_KEY": "NEURALWATT_API_KEY" }
+      "nuralwatt": { "NURALWATT_API_KEY": "AGENTEVAL_MODEL_API_KEY" }
     }
   },
   "parser_kind": "reapercode-jsonl",

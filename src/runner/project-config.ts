@@ -27,6 +27,14 @@ export interface ProjectExecConfig {
 
 const NETWORK_MODES = new Set<NetworkMode>(["allow", "allowlist", "offline"]);
 
+/** Every accepted network_policy value, for API validation and error text. */
+export const NETWORK_POLICIES: readonly NetworkMode[] = ["allow", "allowlist", "offline"];
+
+/** True when a stored string is one of the three supported policies. */
+export function isNetworkPolicy(value: unknown): value is NetworkMode {
+  return typeof value === "string" && NETWORK_MODES.has(value.trim().toLowerCase() as NetworkMode);
+}
+
 /**
  * Coerce a stored network_policy string to a container network mode.
  * Unknown/absent values fall back to "allow" (the column default) rather than

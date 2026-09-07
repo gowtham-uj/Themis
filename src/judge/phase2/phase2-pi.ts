@@ -11,11 +11,11 @@ import {pipeline} from "node:stream/promises";
 import {createGzip} from "node:zlib";
 import {parseAllDocuments} from "yaml";
 import {
-  loadPromptAsset, runPiOrchestrator, writePiModelsJson, type PiConnection,
+  loadPromptAsset, PI_CHILD_RESUME_MANIFEST, PI_RESUME_POINTER, runPiOrchestrator, writePiModelsJson, type PiConnection,
 } from "../pi/runtime.js";
-import {coerceRecommendations, coerceReview} from "./analyst.js";
+import { copySanitizedPiTraceEntry, createReasoningContentStripper } from "../pi/sanitize-trace.js";
+import {coerceRecommendations, coerceReview, type Phase2Analyst} from "./analyst.js";
 import type {Phase2Board, Phase2BoardContext} from "./board.js";
-import type {Phase2Analyst} from "./analyst.js";
 import type {
   Phase2Case, Phase2Hypothesis, Phase2MemoryRecord, Phase2Pattern,
   Phase2PlatformFinding, Phase2Recommendation, Phase2ResearchNote, Phase2Review,
@@ -34,7 +34,10 @@ export async function writePhase2PiSubagentDefs(
   const agentsDir = join(agentDir, "agents");
   await mkdir(agentsDir, { recursive: true });
   const themisToolsExt = join(process.cwd(), "src", "judge", "tools", "themis-tools-extension.ts");
-  const modelSpec = `themis-proxy/${conn?.model ?? "deepseek-v4-flash"}`;
+  if (!conn?.model) {
+    throw new Error("Phase 2 subagent model is missing; set it on the project Models tab");
+  }
+  const modelSpec = `themis-proxy/${conn.model}`;
   await writeFile(join(agentDir, "settings.json"), `${JSON.stringify({
     subagents: {
       defaultModel: modelSpec,
@@ -119,6 +122,25 @@ async function loadYaml(workDir: string, name: string): Promise<Record<string, u
   }
 }
 
+/** Load a complete board record set from disk, or null when a role is still missing. */
+async function readFiledBoard(workDir: string): Promise<Phase2PiResult | null> {
+  const [hypDoc, resDoc, recDoc, revDoc] = await Promise.all([
+    loadYaml(workDir, "phase2-hypotheses.yaml"),
+    loadYaml(workDir, "phase2-research.yaml"),
+    loadYaml(workDir, "phase2-recommendations.yaml"),
+    loadYaml(workDir, "phase2-review.yaml"),
+  ]);
+  if ([hypDoc, resDoc, recDoc, revDoc].some((d) => Object.keys(d).length === 0)) return null;
+  const recommendations = coerceRecommendations(recDoc.recommendations ?? recDoc) as Phase2Recommendation[];
+  return {
+    hypotheses: (Array.isArray(hypDoc.hypotheses) ? hypDoc.hypotheses : []) as Phase2Hypothesis[],
+    research: (Array.isArray(resDoc.notes) ? resDoc.notes : []) as Phase2ResearchNote[],
+    recommendations,
+    review: coerceReview(revDoc, recommendations.map((r) => r.id)),
+    workDir,
+  };
+}
+
 /** Run the Phase-2 PI courtroom once and load filed YAML. */
 export async function runPhase2PiCampaign(input: {
   connection: PiConnection;
@@ -130,11 +152,17 @@ export async function runPhase2PiCampaign(input: {
   platformFaults: readonly string[];
   workDir?: string;
   timeoutMs?: number;
+  promptOverrides?: Record<string, string> | null;
 }): Promise<Phase2PiResult> {
   // Durable campaign traces live under data/platform/phase2/<campaignId>/ —
   // same idea as Phase-1 judge_traces/, campaign-level because Phase 2 is
   // cross-eval. Ephemeral mkdtemp is only a fallback.
   const workDir = input.workDir ?? join(process.cwd(), "data", "platform", "phase2", input.campaignId);
+  // A board that filed all four records before its process died has nothing left
+  // to say. Read what it committed instead of paying for a resume that would only
+  // re-read the same files and stop.
+  const already = await readFiledBoard(workDir);
+  if (already) return already;
   const agentDir = await mkdtemp(join(tmpdir(), "ae-p2-pi-agent-"));
   const campaignDir = join(workDir, "campaign");
   await mkdir(campaignDir, { recursive: true });
@@ -143,12 +171,13 @@ export async function runPhase2PiCampaign(input: {
   await writeFile(join(campaignDir, "patterns.json"), `${JSON.stringify(input.patterns, null, 2)}\n`);
   await writeFile(join(campaignDir, "views.json"), `${JSON.stringify(input.viewDirs, null, 2)}\n`);
 
+  const prompts = input.promptOverrides ?? null;
   const [orchestrator, investigator, researcher, designer, reviewer] = await Promise.all([
-    loadPromptAsset("phase2-orchestrator.md"),
-    loadPromptAsset("phase2-investigator.md"),
-    loadPromptAsset("phase2-researcher.md"),
-    loadPromptAsset("phase2-designer.md"),
-    loadPromptAsset("phase2-reviewer.md"),
+    loadPromptAsset("phase2-orchestrator.md", prompts),
+    loadPromptAsset("phase2-investigator.md", prompts),
+    loadPromptAsset("phase2-researcher.md", prompts),
+    loadPromptAsset("phase2-designer.md", prompts),
+    loadPromptAsset("phase2-reviewer.md", prompts),
   ]);
   await writePiModelsJson(agentDir, input.connection);
   await writePhase2PiSubagentDefs(agentDir, { investigator, researcher, designer, reviewer }, input.connection);
@@ -161,18 +190,35 @@ export async function runPhase2PiCampaign(input: {
   ].join("\n");
 
   let resumeSessionPath: string | undefined;
+  const sessionDir = join(workDir, "sessions");
   try {
-    const sessionDir = join(workDir, "sessions");
-    const jsonl = (await readdir(sessionDir)).filter((n) => n.endsWith(".jsonl")).sort();
-    if (jsonl.length) resumeSessionPath = join(sessionDir, jsonl[jsonl.length - 1]!);
-  } catch { /* fresh */ }
+    resumeSessionPath = (await readFile(join(sessionDir, PI_RESUME_POINTER), "utf8")).trim() || undefined;
+  } catch { /* no pause pointer */ }
+  if (!resumeSessionPath) {
+    try {
+      const jsonl = (await readdir(sessionDir)).filter((n) => n.endsWith(".jsonl") && !n.endsWith(".frozen.jsonl")).sort();
+      if (jsonl.length) resumeSessionPath = join(sessionDir, jsonl[jsonl.length - 1]!);
+    } catch { /* fresh */ }
+  }
+
+  let resumePrompt = "Paused. Continue this same session. Do not redo finished reports.";
+  if (resumeSessionPath) {
+    try {
+      const parsed = JSON.parse(await readFile(join(sessionDir, PI_CHILD_RESUME_MANIFEST), "utf8")) as {
+        children?: Array<{ runId?: string; index?: number; agent?: string }>;
+      };
+      const childLines = (parsed.children ?? []).filter((c) => c.runId).map((c) =>
+        `Resume interrupted ${c.agent ?? "subagent"} with subagent({ action: "resume", id: "${c.runId}", index: ${c.index ?? 0}, message: "Continue from the exact paused child session. Do not repeat completed work. Finish your assigned report." }).`,
+      );
+      if (childLines.length) resumePrompt += `\n${childLines.join("\n")}`;
+    } catch { /* no interrupted child */ }
+    resumePrompt += "\nAfter it returns, dispatch only the next unpaid role, then stop.";
+  }
 
   await runPiOrchestrator({
     connection: input.connection,
     systemPrompt: orchestrator,
-    userPrompt: resumeSessionPath
-      ? "RESUME the Phase-2 courtroom. Do not re-run investigator if phase2-hypotheses.yaml exists. If research is filed, dispatch designer (blocking, async:false). If recommendations are filed, dispatch reviewer. Then stop. Never poll status."
-      : userPrompt,
+    userPrompt: resumeSessionPath ? resumePrompt : userPrompt,
     agentDir,
     workDir,
     caseId: `phase2_${input.campaignId}`,
@@ -199,7 +245,8 @@ export async function runPhase2PiCampaign(input: {
 }
 
 /**
- * Copy PI orchestrator + subagent traces the same way Phase 1 seals judge_traces/.
+ * Copy PI orchestrator + subagent traces the same way Phase 1 seals
+ * phase1/judge_traces/; Phase 2 lands them under phase2/judge_traces/.
  * pi-stdout.jsonl is gzipped; sessions/ and subagents/ stay raw (resume source).
  */
 export async function copyPhase2Traces(srcWorkDir: string, destDir: string): Promise<void> {
@@ -212,10 +259,10 @@ export async function copyPhase2Traces(srcWorkDir: string, destDir: string): Pro
     const st = await stat(from).catch(() => null);
     if (!st) continue;
     if (name === "pi-stdout.jsonl") {
-      await pipeline(createReadStream(from), createGzip({ level: 6 }), createWriteStream(join(destDir, "pi-stdout.jsonl.gz")));
+      await pipeline(createReadStream(from), createReasoningContentStripper(), createGzip({ level: 6 }), createWriteStream(join(destDir, "pi-stdout.jsonl.gz")));
       continue;
     }
-    await cp(from, join(destDir, name), { recursive: true, force: true });
+    await copySanitizedPiTraceEntry(from, join(destDir, name));
   }
 }
 
@@ -223,7 +270,11 @@ export async function copyPhase2Traces(srcWorkDir: string, destDir: string): Pro
 export class PiPhase2Board implements Phase2Board {
   private cache: Phase2PiResult | null = null;
   private pending: Parameters<NonNullable<Phase2Board["bind"]>>[0] | null = null;
-  constructor(private connection: PiConnection, _designer?: Phase2Analyst) {}
+  constructor(
+    private connection: PiConnection,
+    _designer?: Phase2Analyst,
+    private promptOverrides: Record<string, string> | null = null,
+  ) {}
 
   bind(input: Parameters<NonNullable<Phase2Board["bind"]>>[0]): void {
     this.pending = input;
@@ -240,6 +291,7 @@ export class PiPhase2Board implements Phase2Board {
       patterns: this.pending.patterns,
       viewDirs: this.pending.viewDirs,
       platformFaults: [...this.pending.platformFaults],
+      promptOverrides: this.promptOverrides,
     });
     return this.cache;
   }

@@ -52,8 +52,25 @@ async function requestText(path: string): Promise<string> {
   return body
 }
 
+/** POST a file's raw bytes (archive import routes read the body directly). */
+async function requestUpload<T>(path: string, file: Blob): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: file,
+  })
+  let data: unknown = null
+  try { data = await res.json() } catch { /* empty */ }
+  if (!res.ok) {
+    const err = data as Partial<ApiError> | null
+    throw new HttpError(res.status, err?.detail ?? `HTTP ${res.status}`)
+  }
+  return data as T
+}
+
 export const api = {
   get: <T>(path: string) => request<T>('GET', path),
+  upload: <T>(path: string, file: Blob) => requestUpload<T>(path, file),
   text: (path: string) => requestText(path),
   post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
   patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body),

@@ -1,133 +1,115 @@
-import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMemo, useState } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, errText } from '../lib/api'
-import { Banner, Empty, Mono, PageHead, Panel, Spinner, StateBadge, Tabs } from '../components/ui'
-
-interface PhaseState {
-  sealed: 'base' | 'phase1' | 'phase2'
-  phase1: { trackId: string; resultVersionId: string; sealedAt: string } | null
-  phase2: { campaignId: string; state: string; memberCount: number; publishedAt: string | null } | null
-}
-
-interface ArchiveRow {
-  runId: string
-  projectName?: string | null
-  queueName?: string | null
-  taskName?: string | null
-  agent?: { id?: string; commit?: string | null; image?: string | null }
-  model?: string
-  status?: string
-  reward?: number | null
-  sealedAt?: string
-  phase?: PhaseState
-}
-
-// The layer actually sealed over the base evidence, plus what is still in
-// flight. A phase2 record that has not reached `published` means the campaign
-// wrote artifacts but the resealed view is not the archive of record yet.
-function sealLabel(phase: PhaseState | undefined): { text: string; cls: string; title: string } {
-  if (!phase || phase.sealed === 'base') {
-    const pending = phase?.phase2 && phase.phase2.state !== 'published'
-    return {
-      text: 'Base',
-      cls: 'chip',
-      title: pending ? `Base evidence only. Phase-2 publication is ${phase!.phase2!.state}.` : 'Base evidence only. Not judged.',
-    }
-  }
-  if (phase.sealed === 'phase1') {
-    const p2 = phase.phase2 ? ` Phase-2 publication is ${phase.phase2.state}.` : ''
-    return { text: 'Phase 1', cls: 'chip phase1', title: `Sealed with a judge/ view over the base.${p2}` }
-  }
-  return { text: 'Phase 2', cls: 'chip phase2', title: 'Resealed with a phase2/ view over the Phase-1 view.' }
-}
+import type { ArchiveRow } from '../lib/types'
+import { Banner, Empty, Mono, PageHead, Panel, Spinner, StateBadge } from '../components/ui'
 
 interface ArchiveList { archives: ArchiveRow[]; total?: number }
 
-// High-signal files in every sealed archive (base layout). Served via
-// /api/archives/:runId/files/<path>.
-const KNOWN_FILES = [
-  'eval_lifecycle_logs/events.jsonl',
-  'eval_lifecycle_logs/run.json',
-  'eval_lifecycle_logs/run-metrics.json',
-  'eval_lifecycle_logs/eval.json',
-  'diffs/diff.patch',
-  'raw_std/raw-stdout.log',
-  'raw_std/raw-stderr.log',
-]
+function runLabel(archive: ArchiveRow): string {
+  return archive.runName || (archive.runOrdinal != null ? `Run ${archive.runOrdinal}` : 'Unlinked run')
+}
+
+function layerLabel(archive: ArchiveRow): string {
+  if (archive.phase.sealed === 'phase2') return 'Phase 2'
+  if (archive.phase.sealed === 'phase1') return 'Phase 1'
+  return 'Base'
+}
 
 export default function Archives() {
+  const qc = useQueryClient()
+  const [params] = useSearchParams()
+  const pipelineRunId = params.get('pipeline_run_id')
   const [filter, setFilter] = useState('')
-  const [detailId, setDetailId] = useState<string | null>(null)
-  const [filePath, setFilePath] = useState<string | null>(null)
+  const path = pipelineRunId ? `/api/archives?pipeline_run_id=${encodeURIComponent(pipelineRunId)}` : '/api/archives'
+  const q = useQuery({ queryKey: ['archives', pipelineRunId], queryFn: () => api.get<ArchiveList>(path) })
 
-  const q = useQuery({ queryKey: ['archives'], queryFn: () => api.get<ArchiveList>('/api/archives') })
-
-  const file = useQuery({
-    queryKey: ['archive-file', detailId, filePath],
-    enabled: !!detailId && !!filePath,
-    queryFn: () => api.text(`/api/archives/${detailId}/files/${filePath}`),
-    retry: false,
+  const clearAll = useMutation({
+    mutationFn: () => api.del<{ deleted_rows: number; deleted_dirs: number }>('/api/archives'),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['archives'] }),
   })
 
-  const rows = (q.data?.archives ?? []).filter((a) => {
-    if (!filter) return true
-    const f = filter.toLowerCase()
-    return [a.taskName, a.agent?.id, a.model, a.runId, a.projectName].some((s) => String(s ?? '').toLowerCase().includes(f))
-  })
-
-  const detail = rows.find((r) => r.runId === detailId)
+  const rows = useMemo(() => {
+    const term = filter.trim().toLowerCase()
+    if (!term) return q.data?.archives ?? []
+    return (q.data?.archives ?? []).filter((archive) =>
+      [
+        archive.runName,
+        archive.runId,
+        archive.projectName,
+        archive.taskName,
+        archive.agent.name,
+        archive.agent.id,
+        archive.model,
+      ].some((value) => String(value ?? '').toLowerCase().includes(term)),
+    )
+  }, [filter, q.data?.archives])
 
   return (
     <>
       <PageHead
         title="Archives"
-        sub={`${q.data?.total ?? rows.length} sealed eval results`}
-        actions={<input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter by task, agent, model, run…" style={{ minWidth: 280 }} aria-label="Filter archives" />}
+        sub={pipelineRunId ? <span>Archives for run <Mono>{pipelineRunId}</Mono></span> : `${q.data?.total ?? rows.length} sealed eval results`}
+        actions={<>
+          {pipelineRunId && <Link to="/archives"><button>All archives</button></Link>}
+          <input
+            value={filter}
+            onChange={(event) => setFilter(event.target.value)}
+            placeholder="Search run, project, eval, agent…"
+            aria-label="Search archives"
+            className="archive-search"
+          />
+          {!pipelineRunId && (
+            <button
+              className="danger"
+              disabled={clearAll.isPending || rows.length === 0}
+              onClick={() => {
+                if (confirm('Delete every archive, its files, and its blobs? This cannot be undone.')) clearAll.mutate()
+              }}
+            >
+              {/* "Clear all" sat next to the search box and read as "clear the
+                  filter". It deletes every sealed archive and its blobs. */}
+              {clearAll.isPending ? 'Deleting…' : 'Delete all archives'}
+            </button>
+          )}
+        </>}
       />
+
       {q.isError && <Banner tone="danger">{errText(q.error)}</Banner>}
+      {clearAll.isError && <Banner tone="danger">{errText(clearAll.error)}</Banner>}
       {q.isLoading && <Spinner label="Loading archives…" />}
 
-      {!q.isLoading && rows.length === 0 && <Empty title={filter ? 'No archives match that filter' : 'No archives yet'}>{filter ? <button onClick={() => setFilter('')}>Clear filter</button> : undefined}</Empty>}
-
-      {rows.length > 0 && (
-        <Panel title="Sealed runs">
-          <table>
-            <thead><tr><th>Run</th><th>Task</th><th>Agent</th><th>Model</th><th>Status</th><th>Sealed at</th><th>Campaign</th><th>Reward</th><th>Date</th><th /></tr></thead>
-            <tbody>{rows.map((a) => {
-              const seal = sealLabel(a.phase)
-              return (
-              <tr key={a.runId}>
-                <td><Mono copy>{a.runId}</Mono></td>
-                <td style={{ color: 'var(--text)' }}>{a.taskName ?? '—'}</td>
-                <td><Mono>{a.agent?.id ?? '—'}</Mono></td>
-                <td><Mono>{a.model ?? '—'}</Mono></td>
-                <td><StateBadge state={a.status} /></td>
-                <td><span className={seal.cls} title={seal.title}>{seal.text}</span></td>
-                <td>{a.phase?.phase2
-                  ? <span title={`Publication ${a.phase.phase2.state}`}><Mono>{a.phase.phase2.campaignId}</Mono> <span className="hint">{a.phase.phase2.memberCount} evals</span></span>
-                  : '—'}</td>
-                <td className="num">{a.reward ?? '—'}</td>
-                <td><Mono>{a.sealedAt ? String(a.sealedAt).slice(0, 10) : '—'}</Mono></td>
-                <td><button onClick={() => { setDetailId(a.runId); setFilePath(null) }}>Files</button></td>
-              </tr>
-            )})}</tbody>
-          </table>
-        </Panel>
+      {!q.isLoading && rows.length === 0 && (
+        <Empty title={filter ? 'No archives match that search' : 'No archives yet'}>
+          {filter ? <button onClick={() => setFilter('')}>Clear search</button> : 'Archives appear after an eval seals its base evidence.'}
+        </Empty>
       )}
 
-      {detail && (
-        <Panel title={<span>Archive <Mono copy>{detail.runId}</Mono></span>}>
-          <div className="badge-row" style={{ marginBottom: 'var(--s3)' }}>
-            <span className={sealLabel(detail.phase).cls}>{sealLabel(detail.phase).text}</span>
-            {detail.phase?.phase1 && <span className="hint">judge track {detail.phase.phase1.trackId}, result {detail.phase.phase1.resultVersionId}</span>}
-            {detail.phase?.phase2 && <span className="hint">campaign {detail.phase.phase2.campaignId} over {detail.phase.phase2.memberCount} evals, publication {detail.phase.phase2.state}</span>}
-            {!detail.phase?.phase1 && !detail.phase?.phase2 && <span className="hint">base evidence only, no judgement sealed over it</span>}
+      {rows.length > 0 && (
+        <Panel title={`Sealed evals (${rows.length})`}>
+          <div className="archive-list" role="list">
+            {rows.map((archive) => (
+              <Link className="archive-list-row" to={`/archives/${archive.runId}`} key={archive.runId} role="listitem">
+                <div className="archive-primary">
+                  <strong>{archive.taskName || 'Unnamed eval'}</strong>
+                  <span>{runLabel(archive)} · {archive.projectName || archive.projectId}</span>
+                </div>
+                <div className="archive-agent">
+                  <span>{archive.agent.name || archive.agent.id || 'Unknown agent'}</span>
+                  <Mono>{archive.model || 'default model'}</Mono>
+                </div>
+                <span className={`chip ${archive.phase.sealed === 'phase2' ? 'phase2' : archive.phase.sealed === 'phase1' ? 'phase1' : ''}`}>
+                  {layerLabel(archive)}
+                </span>
+                {archive.reward == null
+                  ? <StateBadge state={archive.status} />
+                  : <span className={`chip ${archive.reward === 1 ? 'pass' : 'fail'}`}>{archive.reward === 1 ? 'Passed' : 'Failed'}</span>}
+                <time dateTime={archive.archivedAt}>{new Date(archive.archivedAt).toLocaleString()}</time>
+                <span className="archive-open" aria-hidden="true">Open</span>
+              </Link>
+            ))}
           </div>
-          <Tabs tabs={KNOWN_FILES.map((f) => f.split('/').pop()!)} active={filePath ? filePath.split('/').pop()! : KNOWN_FILES[0]!.split('/').pop()!}
-            onChange={(name) => setFilePath(KNOWN_FILES.find((f) => f.endsWith(name))!)} />
-          {file.isLoading && <Spinner label="Reading file…" />}
-          {file.isError && <Banner tone="danger">Cannot read that file: {errText(file.error)}</Banner>}
-          {file.data !== undefined && <pre className="code" style={{ maxHeight: 480 }}>{file.data}</pre>}
         </Panel>
       )}
     </>

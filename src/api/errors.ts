@@ -4,6 +4,7 @@
  * Spec: plan/api.md — errors are `{ type, title, status, detail }`.
  */
 
+import { randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 
 /** RFC-7807 problem detail payload. */
@@ -118,15 +119,29 @@ export function handleError(res: ServerResponse, err: unknown): void {
     return;
   }
   // Log the real error server-side; never echo internal details (paths, SQL,
-  // stack traces, secrets) to clients on a 500.
+  // stack traces, secrets) to clients on a 500. The client still gets enough to
+  // act on: an error id that matches the log line, plus the error's class and
+  // system code, neither of which carries a path or a secret.
+  const errorId = randomUUID();
   // eslint-disable-next-line no-console
   console.error(
-    "[api] unhandled error:",
+    `[api] unhandled error ${errorId}:`,
     err instanceof Error ? (err.stack ?? err.message) : String(err),
   );
+  const code = err && typeof err === "object" && "code" in err
+    ? String((err as { code: unknown }).code)
+    : undefined;
   apiError(res, 500, {
     title: "Internal Server Error",
-    detail: "Internal Server Error",
+    detail:
+      `The server failed while handling this request (error ${errorId}` +
+      `${code ? `, ${code}` : ""}). ` +
+      `Search the API log for that id to see the full cause.`,
     type: "https://agenteval.dev/errors/internal",
+    extensions: {
+      error_id: errorId,
+      ...(code ? { code } : {}),
+      ...(err instanceof Error ? { error_class: err.name } : {}),
+    },
   });
 }

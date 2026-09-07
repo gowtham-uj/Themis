@@ -42,19 +42,20 @@ import {
 import { buildEvalContext, organizeArchiveLayout, restructureSuiteArchive, sealEvalArchive } from "./eval-archive.js";
 import { ingestSealedArchive } from "../storage/archive-ingest.js";
 import { createLocalArtifactStore } from "../storage/local-artifact-store.js";
+import { HARNESS_CREDENTIAL_NAMES } from "../adapters/credential-contract.js";
 import { classifyRunFailure } from "./run-failure.js";
 import { analyzeEvidenceIntegrity } from "./evidence-integrity.js";
 import { deriveRunMetrics, RUN_METRICS_SCHEMA_VERSION } from "./metrics.js";
 import { buildEvalAgentImage } from "./package-image.js";
 import { runCanonicalPackageVerifier } from "./package-verifier.js";
 import { resolveAdapterOverrides, resolveNetworkMode } from "./project-config.js";
-import { resolveRuntime } from "./runtime.js";
-import type {
-  ContainerExecHandle,
-  ContainerExecResult,
-  ContainerExecSpec,
-  ContainerHandle,
-  ContainerRuntime,
+import {
+  resolveRuntime,
+  type ContainerExecHandle,
+  type ContainerExecResult,
+  type ContainerExecSpec,
+  type ContainerHandle,
+  type ContainerRuntime,
 } from "./runtime.js";
 import { deriveRunStatus } from "./status.js";
 import { commitWorkspaceBaseline } from "./workspace.js";
@@ -323,12 +324,17 @@ export async function startQueueContainer(
   const image = builtEvalImage.image;
   const seedResolved = resolveAdapterOverrides(project, seedOverrides);
   const configuredNetwork = resolveNetworkMode(seedResolved?.network ?? queue.networkPolicy);
-  if (configuredNetwork !== seedPackageRuntime.network) {
+  // Suite packages keep the agent on `allowlist` so it can reach the model
+  // provider while its egress still runs through the nftables filter. task.toml
+  // `internet = disabled` only offlines the verifier. A stricter project/queue
+  // policy is ignored for suite evals rather than failing the start, because an
+  // agent that cannot call the provider cannot run the eval at all.
+  if (!seedPackageRuntime.suite && configuredNetwork !== seedPackageRuntime.network) {
     throw new Error(
       `queue ${queue.id} network policy ${configuredNetwork} does not match eval package policy ${seedPackageRuntime.network}`,
     );
   }
-  const containerNetwork = seedPackageRuntime.network;
+  const containerNetwork = seedPackageRuntime.suite ? seedPackageRuntime.network : configuredNetwork;
   const containerNetworkAllowlist = seedPackageRuntime.networkAllowlist;
   const containerPorts = queue.ports.length > 0 ? queue.ports : (seedResolved?.ports ?? []);
   const generationSignature: GenerationContainerSignature = {
@@ -368,7 +374,9 @@ export async function startQueueContainer(
         );
       }
     }
-    const itemNetwork = resolveNetworkMode(resolved?.network ?? queue.networkPolicy);
+    const itemNetwork = itemPackageRuntime.suite
+      ? itemPackageRuntime.network
+      : resolveNetworkMode(resolved?.network ?? queue.networkPolicy);
     if (itemNetwork !== containerNetwork || itemPackageRuntime.network !== containerNetwork) {
       throw new Error(
         `queue ${queue.id} resolves incompatible queue/package network policies; one persistent queue requires one policy`,
@@ -577,6 +585,9 @@ export async function startQueueContainer(
     async pause() {
       if (live.finished) throw new Error(`queue ${queue.id} is stopped`);
       await handle.pause();
+      // The frozen container cannot make progress, so stop charging the
+      // in-flight agent command for the time it spends paused.
+      currentExec?.holdTimeout?.();
       live.paused = true;
       queries.updateQueueContainer(containerRow.id, { state: "paused" });
       queries.updateEvalQueue(queue.id, { status: "paused" });
@@ -584,13 +595,10 @@ export async function startQueueContainer(
     async resume() {
       if (live.finished) throw new Error(`queue ${queue.id} is stopped`);
       await handle.resume();
+      currentExec?.releaseTimeout?.();
       live.paused = false;
-      queries.updateQueueContainer(containerRow.id, {
-        state: live.currentRunId ? "running" : "running",
-      });
-      queries.updateEvalQueue(queue.id, {
-        status: live.currentRunId ? "running" : "running",
-      });
+      queries.updateQueueContainer(containerRow.id, { state: "running" });
+      queries.updateEvalQueue(queue.id, { status: "running" });
     },
     async abortCurrentRun() {
       if (live.finished) return;
@@ -1024,7 +1032,12 @@ export async function validateItemAgainstGenerationSignature(input: {
     }
   }
   const resolved = resolveAdapterOverrides(project, mergeOverrides(queue.adapterOverrides, overrides));
-  const itemNetwork = resolveNetworkMode(resolved?.network ?? queue.networkPolicy);
+  // A suite package's own policy wins over the queue's, exactly as it does when
+  // the generation container starts. Reading the queue column here instead
+  // would reject at resume every item the start path had already accepted.
+  const itemNetwork = runtimeConfig.suite
+    ? runtimeConfig.network
+    : resolveNetworkMode(resolved?.network ?? queue.networkPolicy);
   if (itemNetwork !== signature.network || runtimeConfig.network !== signature.network) {
     return "network policy does not match the active generation container";
   }
@@ -1575,6 +1588,10 @@ async function executeEval(input: {
       projectId: queue.projectId,
       schemaVersion: metrics.schemaVersion,
       execution: metrics as unknown as Record<string, unknown>,
+      // The verifier's 0/1 is the only authoritative pass/fail, and until now it
+      // lived only in verifier.json inside the archive. The catalog needs it to
+      // tell a passed eval from a failed one without opening the archive.
+      outcome: officialReward === null ? null : { officialReward },
     });
     const integrity = await analyzeEvidenceIntegrity({
       runId: run.id,
@@ -1849,19 +1866,7 @@ function collectApiKeys(
   env: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
   const keys: Record<string, string> = {};
-  for (const name of [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "OPENAI_API_KEY",
-    "OPENAI_BASE_URL",
-    "OPENAI_CODEX_ACCESS_TOKEN",
-    "MINIMAX_API_KEY",
-    "NEURALWATT_API_KEY",
-    "NURALWATT_API_KEY",
-    "NURALWATT_BASE_URL",
-    "ANTHROPIC_BASE_URL",
-    "DEEPSEEK_API_KEY",
-  ]) {
+  for (const name of HARNESS_CREDENTIAL_NAMES) {
     const value = env[name];
     if (value) keys[name] = value;
   }
@@ -1873,13 +1878,6 @@ function collectApiKeys(
   }
   if (!keys.ANTHROPIC_API_KEY && keys.ANTHROPIC_AUTH_TOKEN) {
     keys.ANTHROPIC_API_KEY = keys.ANTHROPIC_AUTH_TOKEN;
-  }
-  // The reaper CLI registers NeuroWatt under the provider id `nuralwatt`
-  // (one U) and reads its key from NURALWATT_API_KEY. Authors/operators
-  // commonly export NEURALWATT_API_KEY (two U's); mirror it under the spelling
-  // the agent expects so the connection check and real runs find the key.
-  if (!keys.NURALWATT_API_KEY && keys.NEURALWATT_API_KEY) {
-    keys.NURALWATT_API_KEY = keys.NEURALWATT_API_KEY;
   }
   applyEvalStageConfig(keys, projectModelConfig, env);
   return keys;
@@ -1909,6 +1907,8 @@ function applyEvalStageConfig(
   } catch {
     return;
   }
+  // Built-in CLIs pick --provider from this, not from a leftover queue pin.
+  keys.AGENTEVAL_EVAL_API_TYPE = cfg.apiType;
   if (cfg.apiType === "anthropic") {
     keys.ANTHROPIC_BASE_URL = cfg.baseUrl;
     keys.ANTHROPIC_API_KEY = cfg.apiKey;

@@ -28,8 +28,8 @@ describe("canonical eval packages", () => {
         destination,
       });
       expect(result.validation.valid).toBe(true);
-      expect(result.validation.category).toBe("simple");
-      expect(result.taskSpec.categoryName).toBe("simple");
+      expect(result.validation.category).toBe("simple_atomic");
+      expect(result.taskSpec.categoryName).toBe("simple_atomic");
       expect(result.taskSpec.agentCategory).toBe("coding");
       expect(result.packageDigest).toMatch(/^[a-f0-9]{64}$/);
       await verifyMaterializedEvalPackage({
@@ -176,6 +176,12 @@ describe("canonical eval packages", () => {
       expect(setup).toContain("/workspace/.agenteval/environment/setup.sh");
       expect(setup).toContain("cp -a /workspace/.agenteval/seed_repo/. /workspace/task/");
       expect(setup).toContain("chown -R 10001:10001 /workspace/task");
+      // Author setup.sh runs first. The platform seed is a fallback for scripts
+      // that only mkdir, and must not pre-fill /workspace/task for a script that
+      // seeds itself and refuses a non-empty target.
+      expect(setup.indexOf("/workspace/.agenteval/environment/setup.sh")).toBeLessThan(
+        setup.indexOf("cp -a /workspace/.agenteval/seed_repo/. /workspace/task/"),
+      );
       const cleanup = await readFile(join(workspace, ".agenteval/lifecycle-cleanup.sh"), "utf8");
       // Baked python: no apt-get purge, but the author's cleanup body still runs.
       expect(cleanup).not.toContain("apt-get purge");

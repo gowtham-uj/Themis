@@ -25,6 +25,7 @@ import { loadGatewayConfig } from "../gateway/config.js";
 import { loadCheckpoint } from "../graph/checkpoint.js";
 import { runPhase1 } from "../graph/graph.js";
 import { pauseJudgeQueue } from "../ingest/pause.js";
+import { piConnectionFor, type PiConnection } from "../pi/runtime.js";
 import { publishJudgeArchiveView } from "../results/publish-view.js";
 
 export interface ClaimWorkerOptions {
@@ -35,8 +36,6 @@ export interface ClaimWorkerOptions {
   node4TimeoutMs?: number;
   /** Stable per-case working-store root (checkpoints + PI sessions). */
   workRoot?: string;
-  /** Durable resealed archive-view root. */
-  viewsRoot?: string;
   /** Production PostgreSQL handle. When set, ALL durable work-control and
    *  publication writes go through it (no SQLite dual-write). */
   themis?: ThemisDb;
@@ -64,7 +63,7 @@ export class JudgeClaimWorker {
       ? {
           baseUrl: "",
           apiKey: "",
-          model: "deepseek-v4-flash",
+          model: "",
           reasoningEffort: "low",
           maxTokensFloor: 2048,
           timeoutMs: 300_000,
@@ -74,6 +73,27 @@ export class JudgeClaimWorker {
 
   /** Resolved gateway config (baseUrl/apiKey/model/effort) for the PI court. */
   private readonly gatewayConfig: import("../gateway/config.js").GatewayConfig;
+
+  /**
+   * PI courtroom connection for this worker.
+   *
+   * Resolved through the same helper every other PI call site uses, so the
+   * courtroom cannot land on a different endpoint, model, or wire format than
+   * the nodes that fed it. Falls back to the gateway config only when the
+   * stage will not resolve, which is the injected-gateway test path.
+   */
+  private piConnection(): PiConnection {
+    try {
+      return piConnectionFor("phase1", process.env, this.opts.projectModelConfig ?? null);
+    } catch {
+      return {
+        baseUrl: this.gatewayConfig.baseUrl,
+        apiKey: this.gatewayConfig.apiKey,
+        model: this.gatewayConfig.model,
+        reasoningEffort: this.gatewayConfig.reasoningEffort,
+      };
+    }
+  }
 
   close(): void {
     // The ThemisDb owns its pool and closes it via its own lifecycle; the
@@ -89,7 +109,8 @@ export class JudgeClaimWorker {
     jobId: string;
     runId: string;
     resultVersionId: string;
-    viewDir: string;
+    /** The eval's own archive, resealed with judge/ layered in. */
+    archiveDir: string;
   } | null> {
     const claimed = await this.jobs.claimNext(input.judgeQueueId, input.claim);
     if (!claimed) return null;
@@ -114,9 +135,7 @@ export class JudgeClaimWorker {
     // lost the resume source when another worker claimed the case.
     const dataRoot = dirname(this.opts.themisDbPath);
     const workDir = join(this.opts.workRoot ?? join(dataRoot, "judge_work"), claimed.job.id);
-    const viewDir = join(this.opts.viewsRoot ?? join(dataRoot, "judge_views"), runId);
     await mkdir(workDir, { recursive: true });
-    await mkdir(viewDir, { recursive: true });
 
     // Keep the lease alive while model/subagent work runs. No DB transaction is
     // held across calls; each heartbeat is a fenced single update. Without this,
@@ -171,10 +190,7 @@ export class JudgeClaimWorker {
         gateway: this.gateway,
         attemptId: claimed.attempt.id,
           pi: {
-            baseUrl: this.gatewayConfig.baseUrl,
-            apiKey: this.gatewayConfig.apiKey,
-            model: this.gatewayConfig.model,
-            reasoningEffort: this.gatewayConfig.reasoningEffort,
+            ...this.piConnection(),
             timeoutMs: this.opts.node4TimeoutMs ?? 900_000,
           },
         });
@@ -267,9 +283,10 @@ export class JudgeClaimWorker {
         baseArchiveDir: archiveDir,
         // The mediated tools write under THEMIS_JUDGE_DIR = workDir/node4.
         judgeDir: join(workDir, "node4", "judge"),
-        viewDir,
-        // PI orchestrator + subagent session logs -> judge_traces/
+        // PI orchestrator + subagent session logs -> phase1/judge_traces/
         traceDir: join(workDir, "node4"),
+        // node0..node3 deterministic artifacts + checkpoints -> phase1/
+        workDir,
       });
 
       let stored: { id: string; trackId: string };
@@ -277,7 +294,7 @@ export class JudgeClaimWorker {
         // Production publication (design §8/§9): one transaction writes the
         // verified result version and advances the current pointer with a
         // compare-and-swap predicate on base hash + expected current pointer.
-        const reportPath = join(viewDir, "judge", "evalJudge.yaml");
+        const reportPath = join(archiveDir, "judge", "evalJudge.yaml");
         let reportByteLength = 0;
         try {
           reportByteLength = (await stat(reportPath)).size;
@@ -350,7 +367,7 @@ export class JudgeClaimWorker {
           runId,
           trackId: sqliteStored.trackId,
           resultVersionId: sqliteStored.id,
-          archiveViewPath: sqliteStored.archiveViewPath ?? viewDir,
+          archiveViewPath: sqliteStored.archiveViewPath ?? archiveDir,
           baseManifestSha256: claimed.job.baseManifestSha256,
           expectedResultVersionId:
             claimed.job.publicationPolicy.expectedCurrentResultVersionId,
@@ -379,7 +396,7 @@ export class JudgeClaimWorker {
         jobId: claimed.job.id,
         runId,
         resultVersionId: stored.id,
-        viewDir,
+        archiveDir,
       };
     } catch (err) {
       // Publication failures are recoverable sealing failures. Keep the full

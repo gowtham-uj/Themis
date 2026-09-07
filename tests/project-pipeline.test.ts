@@ -2,7 +2,7 @@
 import Database from "better-sqlite3";
 import {describe,expect,it} from "vitest";
 import {createSqlitePhase2Db} from "../src/db/phase2/sqlite-store.ts";
-import {advanceProjectPipeline,type ProjectPipelineServices} from "../src/pipeline/project-pipeline.ts";
+import {advanceProjectPipeline,retryFailedEval,retryFailedPhase1,type ProjectPipelineServices} from "../src/pipeline/project-pipeline.ts";
 
 describe("project pipeline coordinator",()=>{
  it("runs evals sequentially, Phase1 per eval, Phase2 once, and finalizes both views",async()=>{
@@ -67,6 +67,180 @@ describe("project pipeline coordinator",()=>{
   const services:ProjectPipelineServices={async startEvalQueue(){return{started:true}},async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:`a-${item.evalId}`}},async startPhase1(){return{operationId:"p1"}},async getPhase1Status(){return{state:"published",resultVersionId:"rv",archiveViewId:"v"}},async runPhase2(){return{developerPackSha256:"a".repeat(64),developerPackZip:"/p2/developer-improvement-pack.zip",artifactDir:"/p2"}},async publishFinalView(){return{finalArchiveViewId:"fv",manifestSha256:"b".repeat(64)}}};
   let r;for(let i=0;i<10;i++){r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.waitingFor==="phase2_trigger")break}expect(r?.waitingFor).toBe("phase2_trigger");
   const done=await advanceProjectPipeline({db,services,generationId:g.id,trigger:"phase2"});expect(done.generation.state).toBe("completed");
+  // The pack digest must reach the campaign row, not just the record payload:
+  // a published campaign with a null digest is indistinguishable from one whose
+  // pack was never assembled.
+  const campaign=await db.phase2.getCampaignByGeneration(g.id);
+  expect(campaign?.developerPackSha256).toBe("a".repeat(64));
+  await db.close();
+ });
+ it("resumes a generation whose Phase2 board died mid-campaign",async()=>{
+  // A server restart kills the board process while the generation already says
+  // phase2_running and the campaign says analyzing. Nothing outside this tick
+  // owns the rest of the sequence, so re-entering must finish it.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p4",evalQueueId:"eq4",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  const item=await db.pipeline.addItem({generationId:g.id,evalId:"e",ordinal:1});
+  await db.pipeline.updateItem(item.id,"eval_pending",{state:"phase1_published",runId:"run-e",baseArchiveId:"a",phase1ResultVersionId:"rv",phase1ArchiveViewId:"v"});
+  const campaign=await db.phase2.createCampaign({projectId:"p4",pipelineGenerationId:g.id,sutFingerprint:"f",ontologyVersion:"phase2-v1",membershipSha256:"m",configJson:"{}"});
+  await db.phase2.addMember({campaignId:campaign.id,pipelineItemId:item.id,runId:"run-e",phase1ResultVersionId:"rv",phase1ArchiveViewId:"v",validForAgentLearning:true,ordinal:1});
+  const frozen=(await db.phase2.transitionCampaign(campaign.id,"draft",campaign.fencingToken,"frozen"))!;
+  await db.phase2.transitionCampaign(frozen.id,"frozen",frozen.fencingToken,"analyzing");
+  const gen=(await db.pipeline.getGeneration(g.id))!;
+  await db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"phase2_running");
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(){return{state:"completed",runId:"run-e",archiveId:"a"}},
+   async startPhase1(){return{operationId:"p1"}},
+   async getPhase1Status(){return{state:"published",resultVersionId:"rv",archiveViewId:"v"}},
+   async runPhase2(){return{developerPackSha256:"a".repeat(64),developerPackZip:"/p4/developer-improvement-pack.zip",artifactDir:"/p4"}},
+   async publishFinalView(){return{finalArchiveViewId:"fv",manifestSha256:"b".repeat(64)}},
+  };
+  const r=await advanceProjectPipeline({db,services,generationId:g.id});
+  expect(r.generation.state).toBe("completed");
+  expect((await db.phase2.getCampaignByGeneration(g.id))?.state).toBe("published");
+  expect((await db.pipeline.getItem(item.id))?.state).toBe("final_view_published");
+  const pubs=(await db.phase2.listPublications(campaign.id,{cursor:null,limit:10})).items;
+  expect(pubs.map(p=>p.state)).toEqual(["published"]);
+  await db.close();
+ });
+
+ it("revives Phase1 items that exhausted their automatic retries, and leaves eval failures alone",async()=>{
+  // Exhausting the bounded retries is not the same as losing the work: the
+  // courtroom's judge/ tree and PI session are still on disk. One live
+  // generation had five terminal `failed` items holding complete rulings that
+  // nothing could pick back up.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p4",evalQueueId:"eq4",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  const judged=await db.pipeline.addItem({generationId:g.id,evalId:"e1",ordinal:1});
+  const neverRan=await db.pipeline.addItem({generationId:g.id,evalId:"e2",ordinal:2});
+  await db.pipeline.updateItem(judged.id,"eval_pending",{state:"failed",errorKind:"phase1",errorDetail:"Tier A structural validation",retryCount:2});
+  // An eval that never sealed an archive has nothing for the courtroom to read.
+  await db.pipeline.updateItem(neverRan.id,"eval_pending",{state:"failed",errorKind:"eval",errorDetail:"the API process stopped"});
+
+  const r=await retryFailedPhase1({db,generationId:g.id});
+  expect(r.revived).toEqual([judged.id]);
+
+  const a=await db.pipeline.getItem(judged.id);
+  expect(a?.state).toBe("phase1_pending");
+  expect(a?.retryCount).toBe(0);
+  expect(a?.errorDetail).toBeFalsy();
+  expect((await db.pipeline.getItem(neverRan.id))?.state).toBe("failed");
+  await db.close();
+ });
+
+ it("retries one eval failure in the same generation and clears its stale run",async()=>{
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p5",evalQueueId:"eq5",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  const failed=await db.pipeline.addItem({generationId:g.id,evalId:"e1",ordinal:1});
+  const published=await db.pipeline.addItem({generationId:g.id,evalId:"e2",ordinal:2});
+  await db.pipeline.updateItem(failed.id,"eval_pending",{
+   state:"failed",runId:"failed-run",errorKind:"eval",errorDetail:"worker stopped",retryCount:1,
+  });
+  await db.pipeline.updateItem(published.id,"eval_pending",{
+   state:"phase1_published",runId:"good-run",baseArchiveId:"archive",phase1ResultVersionId:"rv",phase1ArchiveViewId:"view",
+  });
+  const gen=(await db.pipeline.getGeneration(g.id))!;
+  await db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"failed");
+
+  const r=await retryFailedEval({db,generationId:g.id,itemId:failed.id});
+
+  expect(r.revived).toEqual([failed.id]);
+  const retried=await db.pipeline.getItem(failed.id);
+  expect(retried).toMatchObject({state:"eval_pending",runId:null,errorKind:null,errorDetail:null,retryCount:0});
+  expect((await db.pipeline.getItem(published.id))?.state).toBe("phase1_published");
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("eval_running");
+  const events=(await db.pipeline.listEvents(g.id,{cursor:null,limit:10})).items;
+  expect(events.at(-1)?.eventType).toBe("eval.operator_retry");
+  expect(JSON.parse(events.at(-1)?.payloadJson??"{}")).toMatchObject({priorRunId:"failed-run",priorError:"worker stopped"});
+  await db.close();
+ });
+
+ it("runs Phase2 on the published subset when a sibling Phase1 case fails",async()=>{
+  // Observed live: 8 of 10 evals published Phase 1, 2 exhausted their judge
+  // retries, and the whole generation went terminal `failed`. Eight complete
+  // judgements were then unreachable and Phase 2 never ran. A failed sibling is
+  // a finding, not a reason to discard the rest of the run.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  await db.pipeline.addItem({generationId:g.id,evalId:"ok",ordinal:1});
+  await db.pipeline.addItem({generationId:g.id,evalId:"bad",ordinal:2});
+  let members=-1;
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:`arch-${item.evalId}`}},
+   async startPhase1(){return{operationId:"op"}},
+   async getPhase1Status(runId){return runId==="run-bad"
+    ?{state:"failed",error:"Tier A structural validation"}
+    :{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`}},
+   async runPhase2(campaign,ms){members=ms.length;return{developerPackSha256:"ab".repeat(32),developerPackZip:"/p/pack.zip",artifactDir:`/p/${campaign.id}`}},
+   async publishFinalView({member}){return{finalArchiveViewId:`final-${member.runId}`,manifestSha256:"cd".repeat(32)}},
+  };
+  for(let i=0;i<25;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed")break;}
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
+  expect(members).toBe(1);
+  const items=(await db.pipeline.listItems(g.id,{cursor:null,limit:10})).items;
+  expect(items.find(x=>x.evalId==="ok")?.state).toBe("final_view_published");
+  // The failed sibling keeps its error and stays revivable.
+  const bad=items.find(x=>x.evalId==="bad");
+  expect(bad?.state).toBe("failed");
+  expect(bad?.errorKind).toBe("phase1");
+  await db.close();
+ });
+
+ it("fails a generation only when no eval produced a Phase1 result",async()=>{
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  await db.pipeline.addItem({generationId:g.id,evalId:"e1",ordinal:1});
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:"a"}},
+   async startPhase1(){return{operationId:"op"}},
+   async getPhase1Status(){return{state:"failed",error:"judge exhausted"}},
+   async runPhase2(){throw new Error("Phase2 must not run with zero members")},
+   async publishFinalView(){throw new Error("no final view without Phase2")},
+  };
+  for(let i=0;i<25;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(["completed","failed"].includes(r.generation.state))break;}
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("failed");
+  await db.close();
+ });
+
+ it("parks Phase2 in waiting_retry after its attempt budget, then reopens on an operator trigger",async()=>{
+  // A board that throws on every attempt was retried by the 3s ticker forever,
+  // and every retry is real model spend. The budget is counted from durable
+  // events so a restart does not reset it.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  await db.pipeline.addItem({generationId:g.id,evalId:"e1",ordinal:1});
+  let boardCalls=0,boardFails=true;
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:"a"}},
+   async startPhase1(){return{operationId:"op"}},
+   async getPhase1Status(runId){return{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`}},
+   async runPhase2(campaign){boardCalls++;if(boardFails)throw new Error("board ran out of context");return{developerPackSha256:"ab".repeat(32),developerPackZip:"/p/pack.zip",artifactDir:`/p/${campaign.id}`}},
+   async publishFinalView({member}){return{finalArchiveViewId:`final-${member.runId}`,manifestSha256:"cd".repeat(32)}},
+  };
+  for(let i=0;i<20;i++){
+   const r=await advanceProjectPipeline({db,services,generationId:g.id}).catch(()=>null);
+   if(r?.generation.state==="waiting_retry")break;
+  }
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("waiting_retry");
+  expect(boardCalls).toBe(3);
+  // The ticker's own trigger must not reopen it.
+  await advanceProjectPipeline({db,services,generationId:g.id});
+  expect(boardCalls).toBe(3);
+  // An explicit operator trigger does, and clears the exhausted budget.
+  boardFails=false;
+  for(let i=0;i<20;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id,trigger:"phase2"});if(r.generation.state==="completed")break;}
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
+  expect(boardCalls).toBe(4);
   await db.close();
  });
 });

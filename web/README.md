@@ -1,32 +1,56 @@
-# React + TypeScript + Vite
+# Themis console
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The console is a React client for the Themis HTTP API. It does not keep its own backend state.
 
-Currently, two official plugins are available:
+## Run locally
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Start the API from the repository root:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm run serve -- --port 8080 --data-dir ./data
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Then start Vite:
+
+```bash
+cd web
+npm ci
+npm run dev -- --host 0.0.0.0
+```
+
+The Vite development server proxies `/api` to `http://127.0.0.1:8080`.
+
+## Production build
+
+```bash
+npm ci
+npm run lint
+npm run build
+npm run preview -- --host 0.0.0.0
+```
+
+`dist/` contains the static bundle. Deploy it behind the same origin as the API, or configure the reverse proxy so `/api` reaches the Themis server.
+
+## Main routes
+
+| Route | Purpose |
+|---|---|
+| `/projects` | Projects and recent run state. |
+| `/projects/:id` | Project overview and run history. |
+| `/projects/:id/settings` | Agent, model stages, Serper variable, and judge prompts. |
+| `/projects/:id/evals` | Project eval packages. |
+| `/projects/:id/queue` | Queue blueprint and stage automation. |
+| `/projects/:id/runs/:generationId` | Live run panel across eval execution, Phase 1, and Phase 2. |
+| `/eval-store` | Reusable canonical eval packages. |
+| `/archives` | Archive catalog. |
+| `/archives/:runId` | Collapsible archive tree and file viewer. |
+| `/models` | Deployment-wide model defaults. |
+
+## Checks
+
+```bash
+npm run lint
+npm run build
+```
+
+Console changes should also be checked with keyboard navigation and at narrow and wide viewport sizes. Include screenshots from real API data in pull requests.

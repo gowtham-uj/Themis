@@ -49,7 +49,7 @@ cat <<JSON
   "provider_config": {
     "credentialEnv": {
       "anthropic": { "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL": "ANTHROPIC_BASE_URL" },
-      "nuralwatt": { "NURALWATT_API_KEY": "NEURALWATT_API_KEY" },
+      "nuralwatt": { "NURALWATT_API_KEY": "AGENTEVAL_MODEL_API_KEY" },
       "default": { "OPENAI_API_KEY": "OPENAI_API_KEY" }
     }
   },

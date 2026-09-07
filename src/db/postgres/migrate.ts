@@ -537,6 +537,13 @@ const MIGRATIONS: readonly { id: number; name: string; statements: readonly stri
       `CREATE UNIQUE INDEX IF NOT EXISTS uq_project_pipeline_eval_queue ON project_pipeline_queues(eval_queue_id)`,
     ],
   },
+  {
+    id: 15,
+    name: "nameable pipeline runs",
+    statements: [
+      `ALTER TABLE project_pipeline_generations ADD COLUMN IF NOT EXISTS name TEXT`,
+    ],
+  },
 ];
 
 /** Create the bookkeeping table itself (outside the steps, first). */

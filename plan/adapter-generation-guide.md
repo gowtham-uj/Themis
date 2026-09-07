@@ -121,7 +121,7 @@ Supported script entrypoints:
   "provider_config": {
     "credentialEnv": {
       "nuralwatt": {
-        "OPENAI_API_KEY": "NEURALWATT_API_KEY",
+        "OPENAI_API_KEY": "AGENTEVAL_MODEL_API_KEY",
         "OPENAI_BASE_URL": "NURALWATT_BASE_URL"
       }
     }
@@ -210,7 +210,7 @@ eval commands; they are not baked into the image.
 {
   "credentialEnv": {
     "nuralwatt": {
-      "OPENAI_API_KEY": "NEURALWATT_API_KEY",
+      "OPENAI_API_KEY": "AGENTEVAL_MODEL_API_KEY",
       "OPENAI_BASE_URL": "NURALWATT_BASE_URL"
     },
     "anthropic": {

@@ -7,6 +7,7 @@
 import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { loadGatewayConfig } from "../src/judge/gateway/config.ts";
@@ -25,9 +26,10 @@ describe.skipIf(!LIVE)("Node 4 — PI courtroom (real)", () => {
       // Use a REAL sealed archive from the earlier dev-flow E2E — actual
       // verifier output, diff, and session content, so the investigators have
       // real evidence to examine (an empty archive is what starved the prior run).
+      const repoRoot = fileURLToPath(new URL("..", import.meta.url));
       const archiveDir =
         process.env.THEMIS_ARCHIVE_DIR ??
-        "/work/agenteval/data/archives/7b70d315-036d-4c14-a1a4-006fc2949c63";
+        join(repoRoot, "data", "archives", "7b70d315-036d-4c14-a1a4-006fc2949c63");
       const workDir = await mkdtemp(join(tmpdir(), "ae-pi-work-"));
       const gateway = new ModelGateway(loadGatewayConfig());
 

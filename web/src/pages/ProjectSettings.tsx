@@ -2,14 +2,14 @@ import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, errText } from '../lib/api'
-import type { Adapter, EvalQueue, PipelineQueue, Project, QueueItem } from '../lib/types'
-import { Banner, Empty, Field, Mono, PageHead, Panel, Spinner, StateBadge, Tabs } from '../components/ui'
+import type { Project } from '../lib/types'
+import { Banner, Field, PageHead, Panel, Spinner, Tabs } from '../components/ui'
+import { PromptEditor } from '../components/PromptEditor'
+import { AdapterPanel } from './Adapters'
 import {
-  StageFields, HealthBanner, useStageHealth, draftToPatch,
+  StageFields, HealthBanner, useStageHealth, useStoredSecrets, draftToPatch,
   EMPTY_DRAFT, STAGES, STAGE_COPY, type Stage, type StageDraft, type StageView,
 } from '../components/model-stage'
-
-interface QueueRow { queue: EvalQueue; items: QueueItem[]; container: { id?: string } | null }
 
 /** Read a saved override back into an editable draft; blanks mean "inherit". */
 function draftFromSaved(saved: Record<string, unknown> | undefined): StageDraft {
@@ -19,303 +19,120 @@ function draftFromSaved(saved: Record<string, unknown> | undefined): StageDraft 
     apiType: saved.apiType === 'anthropic' ? 'anthropic' : 'openai',
     baseUrl: s('baseUrl'),
     apiKeyEnv: s('apiKeyEnv'),
+    webSearchApiKeyEnv: s('webSearchApiKeyEnv'),
     model: s('model'),
     reasoningEffort: s('reasoningEffort'),
     timeoutMs: s('timeoutMs'),
   }
 }
 
-/** Parse an optional JSON object textarea. Blank means clear the field. */
-function parseJsonField(text: string, label: string): Record<string, unknown> | null {
-  const t = text.trim()
-  if (!t) return null
-  const parsed = JSON.parse(t) as unknown
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`${label} must be a JSON object`)
-  }
-  return parsed as Record<string, unknown>
+interface PromptRow {
+  id: string
+  group: 'phase1' | 'phase2'
+  title: string
+  blurb?: string
+  body: string
+  source: 'project' | 'builtin'
+  builtin: string
 }
 
-/**
- * Everything one eval queue owns: adapter selection, provider and model,
- * network policy, ports, sandbox, and adapter overrides. The backend refuses
- * these edits while the queue's container runs, so the form disables itself in
- * that case instead of letting a save fail with a conflict.
- */
-function QueueCard({
-  projectId, row, builtins, shared,
-}: {
-  projectId: string
-  row: QueueRow
-  builtins: string[]
-  shared: Adapter[]
-}) {
+function PromptsPanel({ projectId }: { projectId: string }) {
   const qc = useQueryClient()
-  const { queue, items } = row
-  const live = Boolean(row.container)
-  const [err, setErr] = useState<string | null>(null)
-  const [form, setForm] = useState({
-    name: '', description: '', model: '', provider: '', networkPolicy: 'allow',
-    adapterKind: 'builtin' as 'builtin' | 'shared',
-    builtinAdapterId: '', sharedAdapterId: '', agentCommit: '',
-    ports: '', sandbox: '', adapterOverrides: '',
+  const [selected, setSelected] = useState<string | null>(null)
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const list = useQuery({
+    queryKey: ['prompts', projectId],
+    queryFn: () => api.get<{ prompts: PromptRow[] }>(`/api/projects/${projectId}/prompts`),
   })
 
   useEffect(() => {
-    setForm({
-      name: queue.name ?? '',
-      description: queue.description ?? '',
-      model: queue.model ?? '',
-      provider: queue.provider ?? '',
-      networkPolicy: queue.networkPolicy ?? 'allow',
-      adapterKind: queue.sharedAdapterId ? 'shared' : 'builtin',
-      builtinAdapterId: queue.builtinAdapterId ?? '',
-      sharedAdapterId: queue.sharedAdapterId ?? '',
-      agentCommit: queue.agentCommit ?? '',
-      ports: queue.ports?.length ? JSON.stringify(queue.ports) : '',
-      sandbox: queue.sandbox ? JSON.stringify(queue.sandbox, null, 2) : '',
-      adapterOverrides: queue.adapterOverrides ? JSON.stringify(queue.adapterOverrides, null, 2) : '',
-    })
-  }, [queue])
+    if (!list.data?.prompts) return
+    const next: Record<string, string> = {}
+    for (const p of list.data.prompts) next[p.id] = p.body
+    setDrafts(next)
+    setSelected((cur) => cur ?? list.data!.prompts[0]?.id ?? null)
+  }, [list.data])
 
   const save = useMutation({
-    mutationFn: (body: Record<string, unknown>) => api.patch(`/api/projects/${projectId}/queues/${queue.id}`, body),
-    onSuccess: () => { setErr(null); void qc.invalidateQueries({ queryKey: ['queues', projectId] }) },
-    onError: (e) => setErr(errText(e)),
+    mutationFn: (prompt_config: Record<string, string> | null) =>
+      api.patch(`/api/projects/${projectId}`, { prompt_config }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['prompts', projectId] }),
   })
 
-  // Start is a PUT, stop is a DELETE, and pause/resume/abort ride one PATCH.
-  const control = useMutation({
-    mutationFn: (action: 'start' | 'stop' | 'pause' | 'resume' | 'abort') => {
-      const url = `/api/projects/${projectId}/queues/${queue.id}/container`
-      if (action === 'start') return api.put(url, {})
-      if (action === 'stop') return api.del(url)
-      return api.patch(url, { action })
-    },
-    onSuccess: () => { setErr(null); void qc.invalidateQueries({ queryKey: ['queues', projectId] }) },
-    onError: (e) => setErr(errText(e)),
-  })
+  const prompts = list.data?.prompts ?? []
+  const current = prompts.find((p) => p.id === selected)
+  const draft = current ? (drafts[current.id] ?? current.body) : ''
+  const dirty = prompts.some((p) => (drafts[p.id] ?? p.body) !== p.body)
 
-  function submit() {
-    let body: Record<string, unknown>
-    try {
-      body = {
-        name: form.name.trim(),
-        description: form.description.trim() || null,
-        model: form.model.trim(),
-        provider: form.provider.trim(),
-        network_policy: form.networkPolicy,
-        sandbox: parseJsonField(form.sandbox, 'Sandbox'),
-        adapter_overrides: parseJsonField(form.adapterOverrides, 'Adapter overrides'),
-        ports: form.ports.trim() ? JSON.parse(form.ports) : [],
-      }
-      if (form.adapterKind === 'shared' && form.sharedAdapterId) {
-        body.shared_adapter_id = form.sharedAdapterId
-      } else if (form.adapterKind === 'builtin' && form.builtinAdapterId) {
-        body.builtin_adapter_id = form.builtinAdapterId
-      }
-      if (form.agentCommit.trim()) body.agent_commit = form.agentCommit.trim()
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e))
-      return
+  function saveAll() {
+    const body: Record<string, string> = {}
+    for (const p of prompts) {
+      const text = drafts[p.id] ?? p.body
+      if (text !== p.builtin) body[p.id] = text
     }
-    save.mutate(body)
+    save.mutate(Object.keys(body).length > 0 ? body : null)
   }
 
-  const set = (k: keyof typeof form, v: string) => setForm({ ...form, [k]: v })
+  const phase1 = prompts.filter((p) => p.group === 'phase1')
+  const phase2 = prompts.filter((p) => p.group === 'phase2')
 
   return (
     <Panel
-      title={<span>{queue.name} <Mono copy>{queue.id}</Mono></span>}
+      title="Prompts"
       actions={<>
-        <StateBadge state={queue.status} />
-        {live ? (
-          <>
-            <button onClick={() => control.mutate('pause')}>Pause</button>
-            <button onClick={() => control.mutate('resume')}>Resume</button>
-            <button onClick={() => control.mutate('abort')}>Abort run</button>
-            <button className="danger" onClick={() => control.mutate('stop')}>Stop container</button>
-          </>
-        ) : (
-          <button onClick={() => control.mutate('start')}>Start container</button>
+        {current && (
+          <button
+            disabled={!current || (drafts[current.id] ?? current.body) === current.builtin || save.isPending}
+            onClick={() => setDrafts({ ...drafts, [current.id]: current.builtin })}
+          >
+            Reset this prompt
+          </button>
         )}
-        <button className="primary" onClick={submit} disabled={live || save.isPending}>
-          {save.isPending ? 'Saving…' : 'Save queue'}
+        <button className="primary" onClick={saveAll} disabled={!dirty || save.isPending}>
+          {save.isPending ? 'Saving…' : 'Save'}
         </button>
       </>}
     >
-      {err && <Banner tone="danger">{err}</Banner>}
-      {live && (
-        <Banner tone="warn">
-          A container is running for this queue. Stop it before changing execution settings.
-        </Banner>
+      {save.isError && <Banner tone="danger">{errText(save.error)}</Banner>}
+      {list.isError && <Banner tone="danger">{errText(list.error)}</Banner>}
+      {list.isLoading && <Spinner label="Loading prompts…" />}
+      <div style={{ color: 'var(--text-dim)', fontSize: 13, marginBottom: 'var(--s3)' }}>
+        These are the PI subagent prompts the courtroom actually loads. Edit the text, then Save once.
+        A pause/resume rereads whatever is saved here.
+      </div>
+      {prompts.length > 0 && (
+        <div className="prompt-layout">
+          <nav className="prompt-nav">
+            <div className="group">Phase 1</div>
+            {phase1.map((p) => (
+              <button key={p.id} className={p.id === selected ? 'active' : ''} onClick={() => setSelected(p.id)}>
+                {p.title}
+                <span className="src">{(drafts[p.id] ?? p.body) !== p.builtin ? 'edited' : 'built-in'}</span>
+              </button>
+            ))}
+            <div className="group">Phase 2</div>
+            {phase2.map((p) => (
+              <button key={p.id} className={p.id === selected ? 'active' : ''} onClick={() => setSelected(p.id)}>
+                {p.title}
+                <span className="src">{(drafts[p.id] ?? p.body) !== p.builtin ? 'edited' : 'built-in'}</span>
+              </button>
+            ))}
+          </nav>
+          {current && (
+            <div>
+              {current.blurb && (
+                <p style={{ color: 'var(--text-dim)', fontSize: 13, margin: '0 0 var(--s3)' }}>{current.blurb}</p>
+              )}
+              <PromptEditor
+                value={draft}
+                onChange={(next) => setDrafts({ ...drafts, [current.id]: next })}
+                onSave={saveAll}
+                disabled={save.isPending}
+              />
+            </div>
+          )}
+        </div>
       )}
-
-      <div className="form-grid">
-        <Field label="Name"><input value={form.name} disabled={live} onChange={(e) => set('name', e.target.value)} /></Field>
-        <Field label="Description">
-          <input value={form.description} disabled={live} onChange={(e) => set('description', e.target.value)} placeholder="What this queue runs" />
-        </Field>
-        <Field label="Adapter source" hint="A queue points at a built-in adapter or a shared one, never both">
-          <select value={form.adapterKind} disabled={live} onChange={(e) => set('adapterKind', e.target.value)}>
-            <option value="builtin">Built-in</option>
-            <option value="shared">Shared adapter</option>
-          </select>
-        </Field>
-        {form.adapterKind === 'builtin' ? (
-          <Field label="Built-in adapter">
-            <select value={form.builtinAdapterId} disabled={live} onChange={(e) => set('builtinAdapterId', e.target.value)}>
-              <option value="">keep current</option>
-              {builtins.map((b) => <option key={b} value={b}>{b}</option>)}
-            </select>
-          </Field>
-        ) : (
-          <Field label="Shared adapter">
-            <select value={form.sharedAdapterId} disabled={live} onChange={(e) => set('sharedAdapterId', e.target.value)}>
-              <option value="">keep current</option>
-              {shared.map((a) => <option key={a.id} value={a.id}>{a.agentId ?? a.agent_id ?? a.name ?? a.id}</option>)}
-            </select>
-          </Field>
-        )}
-        <Field label="Provider"><input value={form.provider} disabled={live} onChange={(e) => set('provider', e.target.value)} placeholder="openai-compatible" /></Field>
-        <Field label="Model" hint="What the agent under test runs on">
-          <input value={form.model} disabled={live} onChange={(e) => set('model', e.target.value)} placeholder="deepseek-v4-flash" />
-        </Field>
-        <Field label="Network policy">
-          <select value={form.networkPolicy} disabled={live} onChange={(e) => set('networkPolicy', e.target.value)}>
-            <option value="allow">allow</option>
-            <option value="offline">offline</option>
-            <option value="allowlist">allowlist</option>
-          </select>
-        </Field>
-        <Field label="Agent commit" hint="Full SHA, source-built adapters only">
-          <input value={form.agentCommit} disabled={live} onChange={(e) => set('agentCommit', e.target.value)} placeholder="leave blank to keep" />
-        </Field>
-        <Field label="Ports" hint='JSON array, for example [{"container":3000,"host":3000}]'>
-          <input value={form.ports} disabled={live} onChange={(e) => set('ports', e.target.value)} placeholder="[]" />
-        </Field>
-      </div>
-
-      <div className="form-grid" style={{ marginTop: 'var(--s3)' }}>
-        <Field label="Sandbox" hint="JSON object, blank clears it">
-          <textarea rows={4} value={form.sandbox} disabled={live} onChange={(e) => set('sandbox', e.target.value)} />
-        </Field>
-        <Field label="Adapter overrides" hint="JSON object, blank clears it">
-          <textarea rows={4} value={form.adapterOverrides} disabled={live} onChange={(e) => set('adapterOverrides', e.target.value)} />
-        </Field>
-      </div>
-
-      <div className="badge-row" style={{ marginTop: 'var(--s3)' }}>
-        <span className="chip">agent: <Mono>{queue.agentId ?? '—'}</Mono></span>
-        <span className="chip">revision: <Mono>{String(queue.revision ?? '—')}</Mono></span>
-        <span className="chip">{items.length} evals queued</span>
-        <Link to={`/projects/${projectId}/queue`}><button>Manage evals</button></Link>
-      </div>
-    </Panel>
-  )
-}
-
-/** Phase automation for the project's one pipeline queue, plus manual advance. */
-function PipelinePanel({ projectId, evalQueues }: { projectId: string; evalQueues: EvalQueue[] }) {
-  const qc = useQueryClient()
-  const [err, setErr] = useState<string | null>(null)
-  const [linkTo, setLinkTo] = useState('')
-
-  const p = useQuery({
-    queryKey: ['pipeline', projectId],
-    queryFn: () => api.get<{ queue: PipelineQueue | null; generation: { id: string; state?: string; ordinal?: number } | null }>(`/api/projects/${projectId}/pipeline`),
-  })
-  const invalidate = () => void qc.invalidateQueries({ queryKey: ['pipeline', projectId] })
-
-  const create = useMutation({
-    mutationFn: () => api.post(`/api/projects/${projectId}/pipeline`, { eval_queue_id: linkTo, auto_phase2: true }),
-    onSuccess: () => { setErr(null); invalidate() },
-    onError: (e) => setErr(errText(e)),
-  })
-  const patch = useMutation({
-    mutationFn: (body: Record<string, unknown>) => api.patch(`/api/projects/${projectId}/pipeline`, body),
-    onSuccess: () => { setErr(null); invalidate() },
-    onError: (e) => setErr(errText(e)),
-  })
-  const newGeneration = useMutation({
-    mutationFn: () => api.post(`/api/projects/${projectId}/pipeline/generation`, {}),
-    onSuccess: () => { setErr(null); invalidate() },
-    onError: (e) => setErr(errText(e)),
-  })
-  const advance = useMutation({
-    mutationFn: (generationId: string) => api.post(`/api/projects/${projectId}/pipeline/generation/${generationId}/advance`, { trigger: 'auto' }),
-    onSuccess: () => { setErr(null); invalidate() },
-    onError: (e) => setErr(errText(e)),
-  })
-
-  if (p.isLoading) return <Panel title="Pipeline phases"><Spinner label="Loading pipeline…" /></Panel>
-
-  const queue = p.data?.queue ?? null
-  const gen = p.data?.generation ?? null
-
-  if (!queue) {
-    return (
-      <Panel title="Pipeline phases">
-        {err && <Banner tone="danger">{err}</Banner>}
-        <div style={{ color: 'var(--text-dim)', fontSize: 12, marginBottom: 'var(--s3)' }}>
-          One pipeline queue per project drives eval execution, then Phase 1 on each sealed eval, then Phase 2
-          across the whole generation. Link it to an eval queue to turn that chain on.
-        </div>
-        <div className="form-grid">
-          <Field label="Eval queue to drive">
-            <select value={linkTo} onChange={(e) => setLinkTo(e.target.value)}>
-              <option value="">select a queue</option>
-              {evalQueues.map((q) => <option key={q.id} value={q.id}>{q.name}</option>)}
-            </select>
-          </Field>
-        </div>
-        <button className="primary" style={{ marginTop: 'var(--s3)' }} disabled={!linkTo || create.isPending} onClick={() => create.mutate()}>
-          {create.isPending ? 'Creating…' : 'Create pipeline'}
-        </button>
-      </Panel>
-    )
-  }
-
-  const toggle = (k: 'auto_eval' | 'auto_phase1' | 'auto_phase2', v: boolean) => patch.mutate({ [k]: v })
-
-  return (
-    <Panel
-      title="Pipeline phases"
-      actions={<>
-        <StateBadge state={queue.status} />
-        <button onClick={() => patch.mutate({ status: queue.status === 'paused' ? 'running' : 'paused' })}>
-          {queue.status === 'paused' ? 'Resume' : 'Pause'}
-        </button>
-        <button onClick={() => newGeneration.mutate()} disabled={newGeneration.isPending}>New generation</button>
-        {gen && <button className="primary" onClick={() => advance.mutate(gen.id)} disabled={advance.isPending}>Advance</button>}
-      </>}
-    >
-      {err && <Banner tone="danger">{err}</Banner>}
-      <div className="form-grid">
-        <Field label="Run evals automatically" hint="Start the eval queue container when a generation opens">
-          <select value={String(queue.autoEval ?? true)} onChange={(e) => toggle('auto_eval', e.target.value === 'true')}>
-            <option value="true">on</option><option value="false">off</option>
-          </select>
-        </Field>
-        <Field label="Run Phase 1 automatically" hint="Judge each eval as soon as its archive seals">
-          <select value={String(queue.autoPhase1 ?? true)} onChange={(e) => toggle('auto_phase1', e.target.value === 'true')}>
-            <option value="true">on</option><option value="false">off</option>
-          </select>
-        </Field>
-        <Field label="Run Phase 2 automatically" hint="Start the campaign once every Phase 1 result publishes">
-          <select value={String(queue.autoPhase2 ?? true)} onChange={(e) => toggle('auto_phase2', e.target.value === 'true')}>
-            <option value="true">on</option><option value="false">off</option>
-          </select>
-        </Field>
-      </div>
-      <div className="badge-row" style={{ marginTop: 'var(--s3)' }}>
-        <span className="chip">pipeline: <Mono>{queue.id}</Mono></span>
-        <span className="chip">eval queue: <Mono>{queue.evalQueueId ?? '—'}</Mono></span>
-        <span className="chip">revision: <Mono>{String(queue.revision)}</Mono></span>
-        {gen
-          ? <><span className="chip">generation {gen.ordinal ?? ''} <Mono>{gen.id}</Mono></span><StateBadge state={gen.state} /></>
-          : <span className="chip">no generation yet</span>}
-      </div>
     </Panel>
   )
 }
@@ -323,17 +140,15 @@ function PipelinePanel({ projectId, evalQueues }: { projectId: string; evalQueue
 export default function ProjectSettings() {
   const { id } = useParams()
   const qc = useQueryClient()
-  const [section, setSection] = useState('Project')
+  const [section, setSection] = useState('Agent & adapter')
   const [stage, setStage] = useState<Stage>('eval')
   const [drafts, setDrafts] = useState<Record<Stage, StageDraft>>({ eval: EMPTY_DRAFT, phase1: EMPTY_DRAFT, phase2: EMPTY_DRAFT })
-  const [general, setGeneral] = useState({ name: '', description: '', defaultModel: '', defaultProvider: '', networkPolicy: 'allow', taskSource: 'ui-builder' })
+  const [general, setGeneral] = useState({ name: '', description: '', defaultModel: '', defaultProvider: '', networkPolicy: 'allow', minEvals: '1' })
   const { health, run } = useStageHealth()
+  const secrets = useStoredSecrets()
 
   const p = useQuery({ queryKey: ['project', id], queryFn: () => api.get<Project & { task_source?: { kind?: string } }>(`/api/projects/${id}`) })
   const globals = useQuery({ queryKey: ['model-config'], queryFn: () => api.get<{ stages: StageView[] }>('/api/settings/models') })
-  const queues = useQuery({ queryKey: ['queues', id], queryFn: () => api.get<{ queues: QueueRow[] }>(`/api/projects/${id}/queues`) })
-  const builtins = useQuery({ queryKey: ['builtin-adapters'], queryFn: () => api.get<{ adapters: string[] }>('/api/adapters/builtin') })
-  const shared = useQuery({ queryKey: ['shared-adapters'], queryFn: () => api.get<{ adapters: Adapter[] }>('/api/adapters/store') })
 
   useEffect(() => {
     if (!p.data) return
@@ -345,7 +160,7 @@ export default function ProjectSettings() {
       defaultModel: p.data.default_model ?? '',
       defaultProvider: p.data.default_provider ?? '',
       networkPolicy: p.data.network_policy ?? 'allow',
-      taskSource: p.data.task_source?.kind ?? 'ui-builder',
+      minEvals: String(p.data.min_evals ?? 1),
     })
   }, [p.data])
 
@@ -358,10 +173,8 @@ export default function ProjectSettings() {
     save.mutate({
       name: general.name.trim(),
       description: general.description.trim() || null,
-      default_model: general.defaultModel.trim() || null,
-      default_provider: general.defaultProvider.trim() || null,
       network_policy: general.networkPolicy,
-      task_source: { kind: general.taskSource },
+      min_evals: Number(general.minEvals) || 1,
     })
   }
 
@@ -371,23 +184,25 @@ export default function ProjectSettings() {
       const patch = draftToPatch(drafts[s], false)
       if (patch) body[s] = { ...patch, apiType: drafts[s].apiType }
     }
-    save.mutate({ model_config: Object.keys(body).length > 0 ? body : null })
+    save.mutate({
+      model_config: Object.keys(body).length > 0 ? body : null,
+      default_model: general.defaultModel.trim() || null,
+      default_provider: general.defaultProvider.trim() || null,
+    })
   }
 
   const overrides = STAGES.filter((s) => draftToPatch(drafts[s], false) !== null)
   const h = health[stage]
-  const rows = queues.data?.queues ?? []
 
   return (
     <>
       <PageHead
         title={p.data ? `${p.data.name} settings` : 'Project settings'}
-        sub="Every project and queue setting, including the phase providers, lives on this page."
+        sub="The agent, the three model jobs, and the courtroom prompts. The queue is a separate page."
         actions={<>
           <Link to={`/projects/${id}`}><button>Overview</button></Link>
-          <Link to={`/projects/${id}/adapters`}><button>Adapters</button></Link>
           <Link to={`/projects/${id}/evals`}><button>Evals</button></Link>
-          <Link to={`/projects/${id}/queue`}><button>Queue runs</button></Link>
+          <Link to={`/projects/${id}/queue`}><button>Queue</button></Link>
         </>}
       />
 
@@ -396,53 +211,53 @@ export default function ProjectSettings() {
       {save.isError && <Banner tone="danger">{errText(save.error)}</Banner>}
 
       <Tabs
-        tabs={['Project', 'Model providers', 'Pipeline phases', `Queues (${rows.length})`]}
+        tabs={['Agent & adapter', 'Models', 'Prompts']}
         active={section}
         onChange={setSection}
       />
 
-      {section === 'Project' && (
+      {section === 'Agent & adapter' && (<>
         <Panel
-          title="General"
+          title="The agent"
           actions={<button className="primary" onClick={saveGeneral} disabled={save.isPending || !general.name.trim()}>{save.isPending ? 'Saving…' : 'Save'}</button>}
         >
+          <p style={{ color: 'var(--text-dim)', fontSize: 13, marginTop: 0 }}>
+            One project tests one agent. The adapter page is how we launch it. Every model and provider setting, for the agent and for both judge passes, is on the Models tab.
+          </p>
           <div className="form-grid">
             <Field label="Name">
               <input value={general.name} onChange={(e) => setGeneral({ ...general, name: e.target.value })} />
             </Field>
-            <Field label="Description">
-              <input value={general.description} onChange={(e) => setGeneral({ ...general, description: e.target.value })} placeholder="What this project evaluates" />
+            <Field label="What you are testing">
+              <input value={general.description} onChange={(e) => setGeneral({ ...general, description: e.target.value })} placeholder="A coding agent, a CLI, …" />
             </Field>
-            <Field label="Default model" hint="Pinned on new queues; each queue can override it">
-              <input value={general.defaultModel} onChange={(e) => setGeneral({ ...general, defaultModel: e.target.value })} placeholder="deepseek-v4-flash" />
-            </Field>
-            <Field label="Default provider">
-              <input value={general.defaultProvider} onChange={(e) => setGeneral({ ...general, defaultProvider: e.target.value })} placeholder="openai-compatible" />
-            </Field>
-            <Field label="Network policy" hint="What the agent container may reach">
+            <Field
+              label="Network"
+              hint={
+                general.networkPolicy === 'allowlist'
+                  ? 'Every packet is filtered against the eval package’s allowlist. Suite evals ship one entry covering the whole address space, so egress is open today but goes through the filter.'
+                  : general.networkPolicy === 'offline'
+                    ? 'Cuts the agent off the network. The model provider becomes unreachable. Leave allowlist unless you mean that.'
+                    : 'Skips the filter entirely. Suite evals use allowlist instead, so this only affects non-suite packages.'
+              }
+            >
               <select value={general.networkPolicy} onChange={(e) => setGeneral({ ...general, networkPolicy: e.target.value })}>
-                <option value="allow">allow</option>
-                <option value="offline">offline</option>
-                <option value="allowlist">allowlist</option>
+                <option value="allowlist">allowlist (filtered egress)</option>
+                <option value="allow">allow (unfiltered egress)</option>
+                <option value="offline">offline (no network)</option>
               </select>
             </Field>
-            <Field label="Eval source" hint="Where this project's evals come from">
-              <select value={general.taskSource} onChange={(e) => setGeneral({ ...general, taskSource: e.target.value })}>
-                <option value="ui-builder">ui-builder</option>
-                <option value="github">github</option>
-                <option value="upload">upload</option>
-              </select>
+            <Field label="Minimum evals" hint="How many evals must be on the queue before a start is allowed">
+              <input type="number" min={1} step={1} value={general.minEvals} onChange={(e) => setGeneral({ ...general, minEvals: e.target.value })} />
             </Field>
-          </div>
-          <div className="badge-row" style={{ marginTop: 'var(--s3)' }}>
-            <span className="chip">id: <Mono copy>{id ?? ''}</Mono></span>
           </div>
         </Panel>
-      )}
+        {id && <AdapterPanel projectId={id} />}
+      </>)}
 
-      {section === 'Model providers' && (
+      {section === 'Models' && (
         <Panel
-          title="Model providers"
+          title="Models"
           actions={<>
             <button onClick={() => void run(stage, draftToPatch(drafts[stage], true))} disabled={h === 'running'}>
               {h === 'running' ? 'Checking…' : 'Health check'}
@@ -450,11 +265,11 @@ export default function ProjectSettings() {
             <button className="primary" onClick={saveModels} disabled={save.isPending}>{save.isPending ? 'Saving…' : 'Save'}</button>
           </>}
         >
-          <div style={{ color: 'var(--text-dim)', fontSize: 12, marginBottom: 'var(--s3)' }}>
-            Each stage reaches its own endpoint. Blank fields inherit the global setting shown as the placeholder.
+          <div style={{ color: 'var(--text-dim)', fontSize: 13, marginBottom: 'var(--s3)' }}>
+            Three jobs, three endpoints. Blank fields use the global Models page. A value you type here wins for this project only.
             {overrides.length === 0
-              ? ' This project inherits every stage.'
-              : ` This project overrides ${overrides.map((s) => STAGE_COPY[s].short).join(', ')}.`}
+              ? ' This project currently uses the globals for all three.'
+              : ` This project sets its own ${overrides.map((s) => STAGE_COPY[s].short).join(', ')}.`}
           </div>
           <Tabs
             tabs={STAGES.map((s) => STAGE_COPY[s].short)}
@@ -466,33 +281,39 @@ export default function ProjectSettings() {
             stage={stage}
             draft={drafts[stage]}
             inherited={globals.data?.stages.find((x) => x.stage === stage)}
+            secrets={secrets}
             onChange={(next) => setDrafts((prev) => ({ ...prev, [stage]: next }))}
           />
+          {secrets.put.isError && <Banner tone="danger">{errText(secrets.put.error)}</Banner>}
+          {secrets.del.isError && <Banner tone="danger">{errText(secrets.del.error)}</Banner>}
+          {stage === 'eval' && (
+            <>
+              <div style={{ color: 'var(--text-dim)', fontSize: 12, margin: 'var(--s4) 0 var(--s3)' }}>
+                What the agent CLI is told on its own command line. Leave both blank and it follows the API type and model above.
+              </div>
+              <div className="form-grid">
+                <Field label="Provider flag" hint="We speak two wire formats. Blank follows the API type above.">
+                  <select value={general.defaultProvider} onChange={(e) => setGeneral({ ...general, defaultProvider: e.target.value })}>
+                    <option value="">follow API type ({drafts.eval.apiType})</option>
+                    <option value="openai">openai</option>
+                    <option value="anthropic">anthropic</option>
+                  </select>
+                </Field>
+                <Field label="Model flag" hint="Any model id the endpoint serves. Blank uses the model above.">
+                  <input
+                    value={general.defaultModel}
+                    onChange={(e) => setGeneral({ ...general, defaultModel: e.target.value })}
+                    placeholder={drafts.eval.model || globals.data?.stages.find((x) => x.stage === 'eval')?.model || 'model id'}
+                  />
+                </Field>
+              </div>
+            </>
+          )}
           {h && h !== 'running' && <div style={{ marginTop: 'var(--s3)' }}><HealthBanner result={h} /></div>}
         </Panel>
       )}
 
-      {section === 'Pipeline phases' && id && (
-        <PipelinePanel projectId={id} evalQueues={rows.map((r) => r.queue)} />
-      )}
-
-      {section.startsWith('Queues') && (
-        <>
-          {queues.isLoading && <Spinner label="Loading queues…" />}
-          {rows.length === 0 && !queues.isLoading && (
-            <Empty title="No queues yet"><Link to={`/projects/${id}/queue`}><button className="primary">Create a queue</button></Link></Empty>
-          )}
-          {id && rows.map((row) => (
-            <QueueCard
-              key={row.queue.id}
-              projectId={id}
-              row={row}
-              builtins={builtins.data?.adapters ?? []}
-              shared={shared.data?.adapters ?? []}
-            />
-          ))}
-        </>
-      )}
+      {section === 'Prompts' && id && <PromptsPanel projectId={id} />}
     </>
   )
 }

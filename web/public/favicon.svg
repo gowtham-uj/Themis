@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Themis">
+  <title>Themis</title>
+  <rect width="32" height="32" rx="7" fill="#0b0e12"/>
+  <!-- Balance scale: the judgement mark. Strokes stay >=2px so the shape holds
+       at a 16px tab icon instead of collapsing into a smudge. -->
+  <g stroke="#4aa3ff" stroke-width="2.2" stroke-linecap="round" fill="none">
+    <path d="M16 7.5v17"/>
+    <path d="M7 11h18"/>
+    <path d="M11.5 25.5h9"/>
+  </g>
+  <!-- Pans, drawn as filled arcs so they read as mass at small sizes. -->
+  <path d="M3.5 11 L7 18 L10.5 11 Z" fill="#4aa3ff"/>
+  <path d="M21.5 11 L25 18 L28.5 11 Z" fill="#4aa3ff"/>
+  <circle cx="16" cy="7" r="2.4" fill="#e6edf3"/>
+</svg>

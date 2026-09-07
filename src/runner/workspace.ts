@@ -10,7 +10,7 @@
 import { access, mkdir } from "node:fs/promises";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { WorkspaceSpec } from "../adapters/types.js";
@@ -130,12 +130,23 @@ async function assertEmptyOrMissing(dir: string): Promise<void> {
   }
 }
 
+/**
+ * True only when `dir` is itself a repo root.
+ *
+ * `git rev-parse --git-dir` walks up to the nearest ancestor repo, so a
+ * workspace nested under a checkout (the platform's own tree during local runs)
+ * would answer yes and every baseline commit and post-run diff would then land
+ * in that ancestor repo instead of the workspace. Compare the resolved toplevel
+ * against the directory itself so nesting is never mistaken for ownership.
+ */
 async function isGitRepo(dir: string): Promise<boolean> {
   try {
-    await execFileAsync("git", ["-C", dir, "rev-parse", "--git-dir"], {
-      env: process.env,
-    });
-    return true;
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", dir, "rev-parse", "--show-toplevel"],
+      { env: process.env },
+    );
+    return resolve(stdout.trim()) === resolve(dir);
   } catch {
     return false;
   }

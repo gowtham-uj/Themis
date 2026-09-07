@@ -58,6 +58,8 @@ export interface StoredStageConfig {
   apiType?: ModelApiType;
   baseUrl?: string;
   apiKeyEnv?: string;
+  /** Variable holding the Serper key used by Phase 1/2 web research. */
+  webSearchApiKeyEnv?: string;
   model?: string;
   reasoningEffort?: string;
   timeoutMs?: number;
@@ -70,7 +72,7 @@ export class ModelConfigError extends Error {
   constructor(
     message: string,
     readonly stage: ModelStage,
-    readonly field: "baseUrl" | "apiKey" | "apiType",
+    readonly field: "baseUrl" | "apiKey" | "apiType" | "model",
   ) {
     super(message);
     this.name = "ModelConfigError";
@@ -83,7 +85,6 @@ const ENV_PREFIX: Record<ModelStage, string> = {
   phase2: "AGENTEVAL_PHASE2",
 };
 
-const DEFAULT_MODEL = "deepseek-v4-flash";
 const DEFAULT_EFFORT = "max";
 const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_TOKENS_FLOOR = 2048;
@@ -168,7 +169,10 @@ export function resolveModelConfig(
   ).replace(/\/+$/, "");
   if (!baseUrl) {
     throw new ModelConfigError(
-      `no base URL for the ${stage} model. Set ${p}_BASE_URL or configure it in the console.`,
+      // "configure it in the console" was the whole instruction a reader got
+      // while already looking at this stage's Base URL field in the console.
+      // Name the field, and name the alternative that does not need this page.
+      `The ${stage} stage has no base URL. Fill in Base URL below, or set ${p}_BASE_URL before starting the server.`,
       stage,
       "baseUrl",
     );
@@ -199,18 +203,20 @@ export function resolveModelConfig(
     );
   }
 
+  const model =
+    stored.model ||
+    env[`${p}_MODEL`] ||
+    env.AGENTEVAL_DEFAULT_MODEL ||
+    env.THEMIS_MODEL ||
+    "";
+
   return {
     stage,
     apiType,
     baseUrl,
     apiKey,
     apiKeyEnv,
-    model:
-      stored.model ||
-      env[`${p}_MODEL`] ||
-      env.AGENTEVAL_DEFAULT_MODEL ||
-      env.THEMIS_MODEL ||
-      DEFAULT_MODEL,
+    model,
     reasoningEffort:
       stored.reasoningEffort ||
       env[`${p}_REASONING_EFFORT`] ||
@@ -235,18 +241,35 @@ export interface ModelStageView {
   /** Variable the key comes from, or null when nothing resolved. */
   apiKeyEnv: string | null;
   apiKeyPresent: boolean;
+  webSearchApiKeyEnv: string | null;
+  webSearchApiKeyPresent: boolean;
   /** Env var names this stage reads, so the console can show the setup. */
   envVars: {
     apiType: string;
     baseUrl: string;
     apiKey: string;
     apiKeyEnv: string;
+    webSearchApiKeyEnv: string;
     model: string;
     reasoningEffort: string;
     timeoutMs: string;
   };
   /** Why the stage cannot reach a model, when it cannot. */
   error: string | null;
+}
+
+/** Resolve the optional Serper credential for one judge stage without storing it. */
+export function resolveWebSearchCredential(
+  stage: ModelStage,
+  opts: { env?: NodeJS.ProcessEnv; stored?: StoredModelConfig } = {},
+): { apiKey: string; apiKeyEnv: string } | null {
+  const env = opts.env ?? process.env;
+  const stored = (opts.stored ?? storedConfig)[stage] ?? {};
+  const named = stored.webSearchApiKeyEnv || env[`${ENV_PREFIX[stage]}_WEB_SEARCH_API_KEY_ENV`];
+  if (named && env[named]) return { apiKey: env[named]!, apiKeyEnv: named };
+  if (env.SERPER_API_KEY) return { apiKey: env.SERPER_API_KEY, apiKeyEnv: "SERPER_API_KEY" };
+  if (env.SERPER_SEARCH_API_KEY) return { apiKey: env.SERPER_SEARCH_API_KEY, apiKeyEnv: "SERPER_SEARCH_API_KEY" };
+  return null;
 }
 
 /** Describe one stage for the console. Never includes the key itself. */
@@ -262,12 +285,14 @@ export function viewModelConfig(
     baseUrl: `${p}_BASE_URL`,
     apiKey: `${p}_API_KEY`,
     apiKeyEnv: `${p}_API_KEY_ENV`,
+    webSearchApiKeyEnv: `${p}_WEB_SEARCH_API_KEY_ENV`,
     model: `${p}_MODEL`,
     reasoningEffort: `${p}_REASONING_EFFORT`,
     timeoutMs: `${p}_TIMEOUT_MS`,
   };
   try {
     const cfg = resolveModelConfig(stage, opts);
+    const web = resolveWebSearchCredential(stage, opts);
     return {
       stage,
       apiType: cfg.apiType,
@@ -277,6 +302,8 @@ export function viewModelConfig(
       timeoutMs: cfg.timeoutMs,
       apiKeyEnv: cfg.apiKeyEnv || null,
       apiKeyPresent: true,
+      webSearchApiKeyEnv: web?.apiKeyEnv ?? stored.webSearchApiKeyEnv ?? null,
+      webSearchApiKeyPresent: web !== null,
       envVars,
       error: null,
     };
@@ -287,15 +314,18 @@ export function viewModelConfig(
     } catch {
       // An unparseable type is already the reported error.
     }
+    const web = resolveWebSearchCredential(stage, opts);
     return {
       stage,
       apiType,
       baseUrl: (stored.baseUrl || env[envVars.baseUrl] || firstEnv(env, LEGACY_BASE_URL_ENVS[apiType])?.value || "").replace(/\/+$/, ""),
-      model: stored.model || env[envVars.model] || env.AGENTEVAL_DEFAULT_MODEL || DEFAULT_MODEL,
+      model: stored.model || env[envVars.model] || env.AGENTEVAL_DEFAULT_MODEL || env.THEMIS_MODEL || "",
       reasoningEffort: stored.reasoningEffort || env[envVars.reasoningEffort] || DEFAULT_EFFORT,
       timeoutMs: positiveInt(stored.timeoutMs ?? env[envVars.timeoutMs], DEFAULT_TIMEOUT_MS),
       apiKeyEnv: stored.apiKeyEnv || env[envVars.apiKeyEnv] || null,
       apiKeyPresent: false,
+      webSearchApiKeyEnv: web?.apiKeyEnv ?? stored.webSearchApiKeyEnv ?? env[envVars.webSearchApiKeyEnv] ?? null,
+      webSearchApiKeyPresent: web !== null,
       envVars,
       error: err instanceof Error ? err.message : String(err),
     };
@@ -359,11 +389,15 @@ export function parseStoredStageConfig(body: unknown, stage: ModelStage): Stored
     const f = parseApiType(String(b.apiType), stage);
     if (f) out.apiType = f;
   }
-  for (const field of ["baseUrl", "apiKeyEnv", "model", "reasoningEffort"] as const) {
+  for (const field of ["baseUrl", "apiKeyEnv", "webSearchApiKeyEnv", "model", "reasoningEffort"] as const) {
     const v = b[field];
     if (v === undefined || v === null) continue;
     const s = String(v).trim();
-    if (s) out[field] = field === "baseUrl" ? s.replace(/\/+$/, "") : s;
+    if (!s) continue;
+    if ((field === "apiKeyEnv" || field === "webSearchApiKeyEnv") && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(s)) {
+      throw new ModelConfigError(`${field} must be an environment variable name, not a key value`, stage, "apiKey");
+    }
+    out[field] = field === "baseUrl" ? s.replace(/\/+$/, "") : s;
   }
   if (b.timeoutMs !== undefined && b.timeoutMs !== null && b.timeoutMs !== "") {
     out.timeoutMs = positiveInt(b.timeoutMs as string | number, DEFAULT_TIMEOUT_MS);

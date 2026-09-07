@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { useParams } from 'react-router-dom'
 import { api, errText } from '../lib/api'
 import { Banner, Mono, PageHead, Panel, Spinner, StateBadge, Tabs } from '../components/ui'
@@ -57,13 +57,27 @@ export default function RunDetail() {
   }, [id, eventsOpen])
 
   const r = run.data
+  const pauseJudge = useMutation({
+    mutationFn: () => api.post(`/api/projects/${r!.project_id}/runs/${id}/phase1/pause`),
+  })
+  const resumeJudge = useMutation({
+    mutationFn: () => api.post(`/api/judge/runs/${id}/phase1`),
+  })
+  const judgeMsg = pauseJudge.isError ? errText(pauseJudge.error) : resumeJudge.isError ? errText(resumeJudge.error) : pauseJudge.isSuccess ? 'Judge paused' : resumeJudge.isSuccess ? 'Judge resume accepted' : null
 
   return (
     <>
       <PageHead
         title={<span>Run <Mono copy>{id}</Mono></span>}
         sub={r ? `${r.agent_id ?? 'agent'} · ${r.model ?? '—'} · ${r.task_id ?? ''}` : undefined}
+        actions={r?.project_id ? (
+          <div className="badge-row">
+            <button onClick={() => pauseJudge.mutate()} disabled={pauseJudge.isPending}>Pause judge</button>
+            <button onClick={() => resumeJudge.mutate()} disabled={resumeJudge.isPending}>Resume judge</button>
+          </div>
+        ) : undefined}
       />
+      {judgeMsg && <Banner tone={pauseJudge.isError || resumeJudge.isError ? 'danger' : 'ok'}>{judgeMsg}</Banner>}
       {run.isError && <Banner tone="danger">{errText(run.error)}</Banner>}
 
       {run.isLoading && <Spinner label="Loading run…" />}

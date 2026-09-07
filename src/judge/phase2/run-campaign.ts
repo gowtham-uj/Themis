@@ -174,6 +174,19 @@ function derivePlatformFindings(cases: readonly Phase2Case[]): Phase2PlatformFin
       fixSuggestion: "Fix environment/setup.sh so seed_repo is copied into /workspace/task before the agent starts. Re-run after the seed lands.",
     });
   }
+  const setupFail = cases.filter((c) => c.platformFault.kind === "setup_failure");
+  if (setupFail.length > 0) {
+    out.push({
+      id: "PF-SETUP_FAILURE",
+      severity: "blocker",
+      kind: "setup_failure",
+      runIds: setupFail.map((c) => c.runId),
+      finding: `setup.sh failed in ${setupFail.length} eval(s), so the workspace was never seeded and the agent could not perform the task as specified.`,
+      evidence: setupFail.map((c) => `run ${c.runId}: ${c.platformFault.detail}`),
+      fixOwner: "eval package author / platform setup",
+      fixSuggestion: "Fix environment/setup.sh so it exits 0 and copies seed_repo into /workspace/task before the agent starts. Re-run after the seed lands.",
+    });
+  }
   const notAttributable = cases.filter((c) => !c.rewardAttributable && c.platformFault.kind === "none");
   if (notAttributable.length > 0) {
     out.push({
@@ -343,7 +356,7 @@ export async function runPhase2Campaign(x: RunPhase2Input): Promise<Phase2PackRe
   const platformTraces = join(process.cwd(), "data", "platform", "phase2", x.campaignId);
   try {
     const { copyPhase2Traces } = await import("./phase2-pi.js");
-    await copyPhase2Traces(platformTraces, join(x.outputDir, "traces"));
+    await copyPhase2Traces(platformTraces, join(x.outputDir, "judge_traces"));
   } catch { /* traces optional if this campaign did not use PI */ }
   return {
     artifactDir: x.outputDir,

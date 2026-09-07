@@ -80,9 +80,6 @@ export async function classifyEvalValidity(archiveDir: string): Promise<EvalVali
   const setup = await readJson(join(archiveDir, "eval_lifecycle_logs", "setup-manifest.json"));
   const run = await readJson(join(archiveDir, "eval_lifecycle_logs", "run.json"));
   const verifier = await readJson(join(archiveDir, "verifier_res", "verifier-result.json"));
-  const evalJson = await readJson(join(archiveDir, "eval_lifecycle_logs", "eval.json"));
-  const workspaceSource = String(((evalJson?.workspace ?? {}) as Record<string, unknown>).source ?? "");
-  const emptyWorkspace = workspaceSource === "empty";
   const verifierFailed = verifierCrashed(verifier);
 
   const toolCallCount = num(metrics?.toolCallCount ?? metrics?.tool_calls) ?? 0;
@@ -126,7 +123,10 @@ export async function classifyEvalValidity(archiveDir: string): Promise<EvalVali
   // infrastructure artifact: the reward must NOT be attributed to the agent,
   // and the failure routes to platform patterns, while the agent's process
   // behavior remains valid material for agent patterns.
-  if (verifierFailed || emptyWorkspace) {
+  // A failed setup means the agent ran against an unseeded workspace, so its
+  // reward measures the harness, not the agent. `eval.json` workspace.source is
+  // NOT that signal: it is the constant "empty" on every package-sourced eval.
+  if (verifierFailed || setupFailed) {
     return {
       valid_for_agent_learning: true,
       execution_status: "agent_ran",

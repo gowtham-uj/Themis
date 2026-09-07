@@ -17,23 +17,29 @@
  *   task_id, agent_id, limit, offset
  */
 
-import { constants as fsConstants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { constants as fsConstants, createWriteStream } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rm } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { relative, resolve, sep } from "node:path";
-import { getRequestAuth } from "./auth.js";
+import { tmpdir } from "node:os";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { getRequestAuth, requireAdminRequest } from "./auth.js";
 import {
   BASE_PHASE_STATE,
-  readArchivePhaseStates,
+  readArchiveCatalogMetadata,
   type ArchivePhaseState,
+  type ArchivePipelineRun,
 } from "./archive-phase-state.js";
+import { create as createTar } from "tar";
 import { HttpError, notFound } from "./errors.js";
 import { sendJson, type RequestContext, type Router } from "./router.js";
 import type { QueryStore, EvalArchive } from "../db/queries.js";
+import type { EvalArchiveFile, EvalArchiveManifest } from "../runner/eval-archive.js";
 import { createLocalArtifactStore } from "../storage/local-artifact-store.js";
 import { blobKey } from "../storage/content-address.js";
 import { normalizeArchivePath, parseManifest } from "../storage/archive-service.js";
 import {
+  archivesRoot,
   archiveStoreDir,
   assertSafeRunId,
   listArchiveIndex,
@@ -46,11 +52,17 @@ export interface ArchiveEntry {
   queueId: string;
   queueName: string | null;
   batchId: string;
+  /** Eval execution id. */
   runId: string;
+  /** Project-level start that owns this eval execution. */
+  pipelineRunId: string | null;
+  runName: string | null;
+  runOrdinal: number | null;
   taskId: string;
   taskName: string | null;
   agent: {
     id: string | null;
+    name: string | null;
     commit: string | null;
     image: string | null;
     imageId: string | null;
@@ -75,6 +87,8 @@ export interface ArchiveEntry {
   manifestKey: string | null;
   /** Internal compatibility materialization; never serialized to API clients. */
   storagePath: string;
+  /** Server storage root; never serialized to API clients. */
+  dataDir: string;
 }
 
 interface AppCtxLike {
@@ -97,8 +111,8 @@ function assertArchiveScope(req: IncomingMessage, app: AppCtxLike, projectId: st
   }
 }
 
-function archiveJson(entry: ArchiveEntry): Omit<ArchiveEntry, "storagePath" | "manifestKey"> {
-  const { storagePath: _storagePath, manifestKey: _manifestKey, ...publicEntry } = entry;
+function archiveJson(entry: ArchiveEntry): Omit<ArchiveEntry, "storagePath" | "manifestKey" | "dataDir"> {
+  const { storagePath: _storagePath, manifestKey: _manifestKey, dataDir: _dataDir, ...publicEntry } = entry;
   return publicEntry;
 }
 
@@ -106,7 +120,9 @@ function entryFromRecord(
   dataDir: string,
   record: ArchiveIndexRecord,
   phases: Map<string, ArchivePhaseState>,
+  pipelineRuns: Map<string, ArchivePipelineRun>,
 ): ArchiveEntry {
+  const pipelineRun = pipelineRuns.get(record.runId);
   return {
     projectId: record.projectId,
     projectName: record.projectName,
@@ -114,10 +130,14 @@ function entryFromRecord(
     queueName: record.queueName,
     batchId: record.batchId,
     runId: record.runId,
+    pipelineRunId: pipelineRun?.generationId ?? null,
+    runName: pipelineRun?.name ?? null,
+    runOrdinal: pipelineRun?.ordinal ?? null,
     taskId: record.taskId,
     taskName: record.taskName,
     agent: {
       id: record.agentId,
+      name: record.agentId,
       commit: record.agentCommit,
       image: record.agentImage,
       imageId: record.agentImageId,
@@ -134,7 +154,17 @@ function entryFromRecord(
     phase: phases.get(record.runId) ?? BASE_PHASE_STATE,
     manifestKey: null,
     storagePath: archiveStoreDir(dataDir, record.dir || record.runId),
+    dataDir,
   };
+}
+
+/**
+ * The verifier's authoritative 0/1 for one run, read from the metrics outcome.
+ * Returns null for runs finalized before the outcome was persisted.
+ */
+function officialRewardOf(queries: QueryStore, runId: string): number | null {
+  const outcome = queries.getEvalMetrics(runId)?.outcome as { officialReward?: unknown } | null | undefined;
+  return typeof outcome?.officialReward === "number" ? outcome.officialReward : null;
 }
 
 /** DB-backed catalog row — no archives/index.json scan. */
@@ -143,8 +173,10 @@ function entryFromArchive(
   queries: QueryStore,
   archive: EvalArchive,
   phases: Map<string, ArchivePhaseState>,
+  pipelineRuns: Map<string, ArchivePipelineRun>,
 ): ArchiveEntry {
   const run = queries.getRun(archive.runId);
+  const pipelineRun = pipelineRuns.get(archive.runId);
   const project = queries.getProject(archive.projectId);
   const queue = archive.queueId ? queries.getEvalQueue(archive.queueId) : null;
   const task = run ? queries.getTask(run.taskId) : null;
@@ -155,27 +187,35 @@ function entryFromArchive(
     queueName: queue?.name ?? null,
     batchId: archive.batchId,
     runId: archive.runId,
+    pipelineRunId: pipelineRun?.generationId ?? null,
+    runName: pipelineRun?.name ?? null,
+    runOrdinal: pipelineRun?.ordinal ?? null,
     taskId: run?.taskId ?? "",
     taskName: task?.name ?? null,
     agent: {
       id: run?.agentId ?? null,
+      name: run?.agentId ? queries.getAgent(run.agentId)?.displayName ?? run.agentId : null,
       commit: run?.agentCommit ?? null,
       image: run?.agentImage ?? null,
       imageId: null,
-      version: run?.agentCommit?.slice(0, 12) ?? null,
-      buildId: null,
+      version: run?.agentVersion ?? run?.agentCommit?.slice(0, 12) ?? null,
+      buildId: run?.buildId ?? null,
     },
     queueRevision: null,
     model: run?.model ?? "",
     provider: run?.provider ?? "",
     status: String(run?.status ?? "unknown"),
-    reward: null,
+    // The verifier's official 0/1, stored on the metrics outcome at finalization.
+    // An eval can finish with status "completed" and still have failed its checks.
+    reward: officialRewardOf(queries, archive.runId),
     sealedAt: archive.sealedAt,
     archivedAt: archive.archivedAt ?? archive.sealedAt,
     phase: phases.get(archive.runId) ?? BASE_PHASE_STATE,
     manifestKey: archive.manifestKey,
-    // Compatibility materialization path while file reads cut over to CAS.
-    storagePath: archiveStoreDir(dataDir, archive.runId),
+    // The project archive is the one mutable-by-reseal directory. CAS remains a
+    // fallback for imported archives whose local tree is no longer present.
+    storagePath: join(dataDir, "projects", archive.projectId, "evals", archive.runId),
+    dataDir,
   };
 }
 
@@ -187,12 +227,14 @@ export async function listArchiveEntries(
   projectIdFilter?: string,
   queries?: QueryStore,
 ): Promise<ArchiveEntry[]> {
-  // One read per listing, not one per row.
-  const phases = readArchivePhaseStates(dataDir);
+  // One Themis read per listing, not one query per archive row.
+  const metadata = readArchiveCatalogMetadata(dataDir);
   if (queries) {
     const archives = queries.listEvalArchives(projectIdFilter ? { projectId: projectIdFilter } : {});
     if (archives.length > 0) {
-      return archives.map((archive) => entryFromArchive(dataDir, queries, archive, phases));
+      return archives.map((archive) =>
+        entryFromArchive(dataDir, queries, archive, metadata.phases, metadata.pipelineRuns),
+      );
     }
     // Migration compatibility for legacy archives not yet backfilled into
     // eval_archives. New seals always write the DB row + canonical manifest, so
@@ -200,7 +242,9 @@ export async function listArchiveEntries(
   }
   // Migration-only compatibility for callers/data with no DB catalog row.
   const records = await listArchiveIndex(dataDir);
-  const entries = records.map((record) => entryFromRecord(dataDir, record, phases));
+  const entries = records.map((record) =>
+    entryFromRecord(dataDir, record, metadata.phases, metadata.pipelineRuns),
+  );
   return projectIdFilter ? entries.filter((entry) => entry.projectId === projectIdFilter) : entries;
 }
 
@@ -258,11 +302,23 @@ export function filterArchiveEntries(entries: ArchiveEntry[], params: Record<str
   const runId = get("run_id") ?? get("runId");
   if (runId) filtered = filtered.filter((e) => e.runId === runId || e.runId.includes(runId));
 
+  const pipelineRunId = get("pipeline_run_id") ?? get("pipelineRunId");
+  if (pipelineRunId) filtered = filtered.filter((e) => e.pipelineRunId === pipelineRunId);
+
+  const runName = get("run_name") ?? get("runName");
+  if (runName) filtered = filtered.filter((e) => e.runName?.toLowerCase().includes(runName.toLowerCase()));
+
+  const projectName = get("project_name") ?? get("projectName");
+  if (projectName) filtered = filtered.filter((e) => e.projectName?.toLowerCase().includes(projectName.toLowerCase()));
+
   const taskId = get("task_id") ?? get("taskId");
   if (taskId) filtered = filtered.filter((e) => e.taskId === taskId || e.taskId.includes(taskId));
 
   const agentId = get("agent_id") ?? get("agentId");
   if (agentId) filtered = filtered.filter((e) => e.agent.id === agentId);
+
+  const agentName = get("agent_name") ?? get("agentName");
+  if (agentName) filtered = filtered.filter((e) => e.agent.name?.toLowerCase().includes(agentName.toLowerCase()));
 
   const status = get("status");
   if (status) filtered = filtered.filter((e) => e.status.toLowerCase() === status.toLowerCase());
@@ -349,11 +405,72 @@ async function findArchive(
   const archive = queries.getEvalArchive(runId);
   if (archive) {
     if (projectId && archive.projectId !== projectId) return null;
-    return entryFromArchive(dataDir, queries, archive, readArchivePhaseStates(dataDir));
+    const metadata = readArchiveCatalogMetadata(dataDir);
+    return entryFromArchive(dataDir, queries, archive, metadata.phases, metadata.pipelineRuns);
   }
   // Legacy row not backfilled yet — bounded lookup in the compatibility index.
   const legacy = await listArchiveEntries(dataDir, projectId);
   return legacy.find((entry) => entry.runId === runId) ?? null;
+}
+
+async function readArchiveContents(entry: ArchiveEntry): Promise<{
+  files: EvalArchiveFile[];
+  layers: string[];
+  sealedAt: string | null;
+  resealedAt: string | null;
+  totalBytes: number;
+}> {
+  const manifestPath = join(entry.storagePath, "eval_lifecycle_logs", "archive.json");
+  try {
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as EvalArchiveManifest;
+    if (manifest.runId !== entry.runId || !Array.isArray(manifest.files)) throw new Error("invalid archive manifest");
+    return {
+      files: manifest.files,
+      layers: Array.isArray(manifest.layers) ? manifest.layers : [],
+      sealedAt: manifest.sealedAt ?? entry.sealedAt,
+      resealedAt: manifest.resealedAt ?? null,
+      totalBytes: Number(manifest.totalBytes ?? 0),
+    };
+  } catch {
+    // Imported archives may have CAS bytes only. Their manifest has the same
+    // useful path/hash/size tuples but no reseal metadata.
+    if (entry.manifestKey) {
+      const store = createLocalArtifactStore(resolve(entry.dataDir, "artifacts"));
+      const parsed = parseManifest(
+        (await readObject(store, entry.manifestKey, 16 * 1024 * 1024)).toString("utf8"),
+      );
+      if (parsed.ok) {
+        return {
+          files: parsed.manifest.entries.map((file) => ({
+            path: file.path,
+            kind: file.kind,
+            bytes: file.bytes,
+            sha256: file.sha256 ?? "",
+            ...(file.symlinkTarget !== null ? { target: file.symlinkTarget } : {}),
+          })),
+          layers: [],
+          sealedAt: entry.sealedAt,
+          resealedAt: null,
+          totalBytes: parsed.manifest.entries.reduce((sum, file) => sum + file.bytes, 0),
+        };
+      }
+    }
+    throw notFound(`archive manifest is unreadable: ${entry.runId}`);
+  }
+}
+
+/** Restore write permission across a sealed tree so it can be removed. */
+async function unharden(path: string): Promise<void> {
+  const stat = await lstat(path).catch(() => null);
+  if (!stat || stat.isSymbolicLink()) return;
+  if (stat.isDirectory()) {
+    await chmod(path, 0o755).catch(() => undefined);
+    for (const name of await readdir(path).catch(() => [] as string[])) {
+      await unharden(join(path, name));
+    }
+    return;
+  }
+  await chmod(path, 0o644).catch(() => undefined);
 }
 
 function requestedFilePath(params: Record<string, string | undefined>): string {
@@ -364,16 +481,93 @@ function requestedFilePath(params: Record<string, string | undefined>): string {
 }
 
 async function sendArchiveFile(res: ServerResponse, entry: ArchiveEntry, requested: string): Promise<void> {
-  if (entry.manifestKey) {
-    await serveCanonicalArchiveFile(res, entry, requested);
-    return;
-  }
   const filePath = resolve(entry.storagePath, requested);
   const rel = relative(resolve(entry.storagePath), filePath);
   if (!requested || rel.startsWith(`..${sep}`) || rel === ".." || rel.startsWith(sep)) {
     throw notFound(`archive file not found: ${requested}`);
   }
-  await serveArchiveFile(res, filePath, requested);
+
+  // Prefer the eval's own archive directory. Phase 1 and Phase 2 reseal this
+  // tree in place, while the generation-1 CAS manifest describes only the base.
+  try {
+    await serveArchiveFile(res, filePath, requested);
+    return;
+  } catch (err) {
+    if (!(err instanceof HttpError) || err.status !== 404) throw err;
+  }
+
+  // Imported or migrated archives may have only their canonical CAS objects.
+  if (entry.manifestKey) {
+    try {
+      await serveCanonicalArchiveFile(res, entry, requested);
+      return;
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 404) throw err;
+    }
+  }
+  throw notFound(`archive file not found: ${requested}`);
+}
+
+/** Read one artifact-store object fully into memory, with a hard size cap. */
+async function readObject(store: ReturnType<typeof createLocalArtifactStore>, key: string, capBytes: number): Promise<Buffer> {
+  const read = await store.get(key);
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of read.stream) {
+    const b = Buffer.from(chunk);
+    size += b.length;
+    if (size > capBytes) throw new Error(`object ${key} exceeds ${capBytes} bytes`);
+    chunks.push(b);
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Stream one whole archive as a gzipped tar.
+ *
+ * Canonical archives are content-addressed, so there is no directory to pack.
+ * Rebuild the tree from the manifest into a scratch directory, tar it, and
+ * delete it. Legacy archives that still have a browsable copy are packed in
+ * place.
+ */
+async function sendArchiveDownload(res: ServerResponse, entry: ArchiveEntry): Promise<void> {
+  let root = resolve(entry.storagePath);
+  let scratch: string | null = null;
+  const local = await lstat(root).catch(() => null);
+
+  if (!local?.isDirectory()) {
+    if (!entry.manifestKey) throw notFound(`archive files not found: ${entry.runId}`);
+    const store = createLocalArtifactStore(resolve(entry.dataDir, "artifacts"));
+    const parsed = parseManifest((await readObject(store, entry.manifestKey, 16 * 1024 * 1024)).toString("utf8"));
+    if (!parsed.ok) throw notFound(`archive manifest is unreadable: ${entry.runId}`);
+    scratch = await mkdtemp(join(tmpdir(), `ae-dl-${entry.runId}-`));
+    root = scratch;
+    for (const file of parsed.manifest.entries) {
+      if (file.kind !== "file") continue;
+      const target = join(scratch, file.path);
+      await mkdir(dirname(target), { recursive: true });
+      const read = await store.get(blobKey(file.sha256));
+      await pipeline(read.stream, createWriteStream(target));
+    }
+  }
+
+  try {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/gzip");
+    res.setHeader("Content-Disposition", `attachment; filename="archive-${entry.runId}.tar.gz"`);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    const stream = createTar({ gzip: true, cwd: root, portable: true, follow: false }, ["."]);
+    await new Promise<void>((resolveStream, reject) => {
+      stream.on("error", reject);
+      stream.on("end", resolveStream);
+      res.on("close", () => {
+        if (!stream.destroyed) stream.destroy();
+      });
+      stream.pipe(res);
+    });
+  } finally {
+    if (scratch) await rm(scratch, { recursive: true, force: true });
+  }
 }
 
 const FILE_SUFFIXES = [
@@ -434,6 +628,66 @@ export function registerArchiveRoutes(router: Router): void {
     if (!entry) throw notFound(`eval archive not found: ${runId}`);
     assertArchiveScope(req, app, entry.projectId);
     sendJson(res, 200, { archive: archiveJson(entry) });
+  });
+
+  /** GET /api/archives/:runId/contents — the actual resealed file inventory. */
+  router.get("/api/archives/:runId/contents", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const runId = ctx.params.runId!;
+    const entry = await findArchive(app.dataDir, app.queries, runId);
+    if (!entry) throw notFound(`eval archive not found: ${runId}`);
+    assertArchiveScope(req, app, entry.projectId);
+    sendJson(res, 200, { archive: archiveJson(entry), ...(await readArchiveContents(entry)) });
+  });
+
+  /** GET /api/archives/:runId/file?path=... — one file at any nesting depth. */
+  router.get("/api/archives/:runId/file", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const runId = ctx.params.runId!;
+    const entry = await findArchive(app.dataDir, app.queries, runId);
+    if (!entry) throw notFound(`eval archive not found: ${runId}`);
+    assertArchiveScope(req, app, entry.projectId);
+    await sendArchiveFile(res, entry, ctx.query?.path ?? "");
+  });
+
+  /** GET /api/archives/:runId/download — the whole sealed archive as one tar.gz. */
+  router.get("/api/archives/:runId/download", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const runId = ctx.params.runId!;
+    const entry = await findArchive(app.dataDir, app.queries, runId);
+    if (!entry) throw notFound(`eval archive not found: ${runId}`);
+    assertArchiveScope(req, app, entry.projectId);
+    await sendArchiveDownload(res, entry);
+  });
+
+  /**
+   * DELETE /api/archives — remove every archive: catalog rows, the browsable
+   * copies, and the content-addressed blobs and manifests behind them.
+   */
+  router.delete("/api/archives", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireAdminRequest(req, app.queries, app.authEnabled);
+    const rows = app.queries.deleteAllEvalArchives();
+    const root = archivesRoot(app.dataDir);
+    let dirs = 0;
+    for (const name of await readdir(root).catch(() => [] as string[])) {
+      await rm(resolve(root, name), { recursive: true, force: true });
+      dirs += 1;
+    }
+    // The per-project evals tree is where an archive actually lives. It is
+    // sealed read-only, so restore write permission before removing it.
+    const projectsRoot = resolve(app.dataDir, "projects");
+    for (const projectId of await readdir(projectsRoot).catch(() => [] as string[])) {
+      const evalsRoot = join(projectsRoot, projectId, "evals");
+      for (const name of await readdir(evalsRoot).catch(() => [] as string[])) {
+        const target = join(evalsRoot, name);
+        await unharden(target);
+        await rm(target, { recursive: true, force: true });
+        dirs += 1;
+      }
+    }
+    await rm(resolve(app.dataDir, "artifacts"), { recursive: true, force: true });
+    sendJson(res, 200, { deleted_rows: rows, deleted_dirs: dirs });
   });
 
   for (const suffix of FILE_SUFFIXES) {
@@ -503,8 +757,7 @@ async function serveCanonicalArchiveFile(
   const normalized = normalizeArchivePath(requested);
   if (!normalized) throw notFound(`archive file not found: ${requested}`);
 
-  const dataDir = resolve(entry.storagePath, "..", "..");
-  const store = createLocalArtifactStore(resolve(dataDir, "artifacts"));
+  const store = createLocalArtifactStore(resolve(entry.dataDir, "artifacts"));
   try {
     const manifestRead = await store.get(entry.manifestKey!);
     const chunks: Buffer[] = [];

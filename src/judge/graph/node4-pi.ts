@@ -9,12 +9,14 @@
  * The connection object is the same saved proxy the eval runner uses.
  */
 
-import { mkdtemp, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   loadPromptAsset,
+  PI_CHILD_RESUME_MANIFEST,
+  PI_RESUME_POINTER,
   runPiOrchestrator,
   writePiSubagentDefs,
   type PiConnection,
@@ -24,6 +26,44 @@ import { judgeMode, type JudgeMode } from "../config/mode.js";
 import { saveCheckpoint } from "./checkpoint.js";
 import type { Phase1GraphState } from "./state.js";
 
+/**
+ * Quote the exact quality-gate violations from the previous attempt.
+ *
+ * The retry used to say "read quality-report.json and repair the failing rule",
+ * but no mediated tool exposes that file, so the orchestrator was told to fix a
+ * violation it could not see. Live cases then burned both retries and failed on
+ * one wrong enum value or one invented key. The rules are short, so inline
+ * them.
+ */
+async function priorViolations(node4Dir: string): Promise<string> {
+  const generic =
+    "If evalJudge.yaml already exists, repair only its failing rules. Do not redo investigators or unrelated rulings.";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(
+      await readFile(join(node4Dir, "judge", "quality-report.json"), "utf8"),
+    );
+  } catch {
+    return generic;
+  }
+  const tierA = (parsed as { tiers?: { A?: { violations?: unknown } } })?.tiers?.A?.violations;
+  if (!Array.isArray(tierA) || tierA.length === 0) return generic;
+
+  const lines = tierA
+    .slice(0, 20)
+    .map((v) => {
+      const { rule, message } = v as { rule?: unknown; message?: unknown };
+      return `- [${String(rule ?? "tier-a")}] ${String(message ?? "")}`;
+    })
+    .join("\n");
+  return [
+    "judge/evalJudge.yaml exists but failed structural validation. Rewrite ONLY the",
+    "fields named below, using write_to_yaml_template. Every value must come from a",
+    "committed report; do not invent findings and do not redo investigators.",
+    lines,
+  ].join("\n");
+}
+
 export interface PiNode4Options {
   connection: PiConnection;
   /** Max pi wall-clock. */
@@ -31,6 +71,8 @@ export interface PiNode4Options {
   /** Judge run mode: dev surfaces platform findings; prod keeps the agent
    *  report strictly agent-only. Defaults to the process `THEMIS_MODE`. */
   mode?: JudgeMode;
+  /** Project prompt overrides keyed by filename (`kratos.md`, …). */
+  promptOverrides?: Record<string, string> | null;
 }
 
 /** Run Node 4 through the real PI orchestrator + subagents. */
@@ -42,12 +84,13 @@ export async function runNode4Pi(
   const workDir = join(state.workDir, "node4");
   const mode = opts.mode ?? judgeMode();
 
+  const prompts = opts.promptOverrides ?? null;
   const [orchestrator, kratos, logos, minosBase, remedy] = await Promise.all([
-    loadPromptAsset("themis-orchestrator.md"),
-    loadPromptAsset("kratos.md"),
-    loadPromptAsset("logos.md"),
-    loadPromptAsset("minos.md"),
-    loadPromptAsset("remedy.md"),
+    loadPromptAsset("themis-orchestrator.md", prompts),
+    loadPromptAsset("kratos.md", prompts),
+    loadPromptAsset("logos.md", prompts),
+    loadPromptAsset("minos.md", prompts),
+    loadPromptAsset("remedy.md", prompts),
   ]);
   // The minos prompt already carries the PROD rule (platform findings → channel,
   // never into the report). In dev mode, relax it so platform findings may also
@@ -145,28 +188,46 @@ export async function runNode4Pi(
   // and committed reports remain in the same workDir as well.
   let resumeSessionPath: string | undefined;
   try {
-    const allSessions = (await readdir(sessionDir))
-      .filter((name) => name.endsWith(".jsonl"))
-      .sort();
-    const stableSuffix = `_ae-${state.caseId.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 80)}.jsonl`;
-    // Prefer the exact stable case id. If a case was imported from an earlier
-    // runner whose job id changed, there is still only one orchestrator session
-    // in this per-case workDir — resume the latest one rather than discard it.
-    const exact = allSessions.filter((name) => name.endsWith(stableSuffix));
-    const latest = exact.at(-1) ?? allSessions.at(-1);
-    if (latest) resumeSessionPath = join(sessionDir, latest);
+    const pointer = (await readFile(join(sessionDir, PI_RESUME_POINTER), "utf8")).trim();
+    if (pointer) resumeSessionPath = pointer;
   } catch {
-    // No prior session: this is a fresh case.
+    /* no pause pointer */
+  }
+  if (!resumeSessionPath) {
+    try {
+      const allSessions = (await readdir(sessionDir))
+        .filter((name) => name.endsWith(".jsonl") && !name.endsWith(".frozen.jsonl"))
+        .sort();
+      const stableSuffix = `_ae-${state.caseId.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 80)}.jsonl`;
+      const exact = allSessions.filter((name) => name.endsWith(stableSuffix));
+      const latest = exact.at(-1) ?? allSessions.at(-1);
+      if (latest) resumeSessionPath = join(sessionDir, latest);
+    } catch {
+      // No prior session: this is a fresh case.
+    }
   }
 
+  let childResume = "";
+  if (resumeSessionPath) {
+    try {
+      const parsed = JSON.parse(
+        await readFile(join(sessionDir, PI_CHILD_RESUME_MANIFEST), "utf8"),
+      ) as { children?: Array<{ runId?: string; index?: number; agent?: string }> };
+      const targets = (parsed.children ?? []).filter((c) => c.runId);
+      if (targets.length) {
+        childResume = targets.map((c) =>
+          `Resume interrupted ${c.agent ?? "subagent"} with subagent({ action: "resume", id: "${c.runId}", index: ${c.index ?? 0}, message: "Continue from the exact paused child session. Do not repeat completed evidence reads. Finish your assigned report." }).`,
+        ).join("\n");
+      }
+    } catch { /* no interrupted child */ }
+  }
   const resumePrompt = resumeSessionPath
     ? [
-        "RESUME THE PAUSED COURTROOM FROM YOUR EXISTING SESSION.",
-        "Do not repeat completed investigations. Inspect the existing judge/",
-        "reports and continue from the last unfinished child/ruling/assembly.",
-        "If minos has not ruled, dispatch minos; if minos ruled, assemble",
-        "evalJudge.yaml. Do not end until the final artifact is written.",
-      ].join("\n")
+        "Paused. Continue this same session. Do not redo finished reports.",
+        childResume,
+        await priorViolations(workDir),
+        "Otherwise, after the unfinished child returns, dispatch only the next unpaid role, then write evalJudge.yaml.",
+      ].filter(Boolean).join("\n")
     : userPrompt;
 
   const result = await runPiOrchestrator({
@@ -179,7 +240,7 @@ export async function runNode4Pi(
     archiveDir: state.archiveDir,
     sessionDir,
     resumeSessionPath,
-    timeoutMs: opts.timeoutMs ?? 900_000,
+    timeoutMs: opts.timeoutMs ?? 2_700_000,
   });
 
   const next: Phase1GraphState = {
@@ -196,17 +257,3 @@ export async function runNode4Pi(
   return { state: next, result };
 }
 
-/** Build the PiConnection from the saved connection object. */
-export function piConnectionFromSaved(conn: {
-  baseUrl: string;
-  apiKey: string;
-  model?: string;
-  reasoningEffort?: string;
-}): PiConnection {
-  return {
-    baseUrl: conn.baseUrl,
-    apiKey: conn.apiKey,
-    model: conn.model ?? "deepseek-v4-flash",
-    reasoningEffort: conn.reasoningEffort ?? "max",
-  };
-}

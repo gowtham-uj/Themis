@@ -49,10 +49,14 @@ export const projects = sqliteTable("projects", {
   networkPolicy: text("network_policy").default("allow"),
   /** Keep last N runs per task; null = unlimited. */
   retentionRuns: integer("retention_runs"),
+  /** Enabled evals required before this project may start runs. Null = 1. */
+  minEvals: integer("min_evals"),
   /** Per-project sandbox controls (capabilities, mounts, devices, ports…). */
   sandboxJson: text("sandbox_json"),
   /** Per-stage model provider overrides; falls through to the global config. */
   modelConfigJson: text("model_config_json"),
+  /** Per-project prompt overrides keyed by filename; missing keys use the built-in draft. */
+  promptConfigJson: text("prompt_config_json"),
   archived: integer("archived").notNull().default(0),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
@@ -274,6 +278,36 @@ export const tasks = sqliteTable(
   (t) => [unique("tasks_project_external_id").on(t.projectId, t.externalId)],
 );
 
+/**
+ * Shared eval packages. Projects copy from here into their own store.
+ * The global row stays; deleting a project copy does not delete this.
+ */
+export const evalStore = sqliteTable("eval_store", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  prompt: text("prompt").notNull(),
+  workspaceSource: text("workspace_source").notNull(),
+  workspaceRepo: text("workspace_repo"),
+  workspaceRef: text("workspace_ref"),
+  rubricJson: text("rubric_json").notNull(),
+  version: integer("version").notNull().default(1),
+  rubricVersion: integer("rubric_version").notNull().default(1),
+  agentCategory: text("agent_category").notNull().default("coding"),
+  categoryName: text("category_name"),
+  profile: text("profile"),
+  referenceSolution: text("reference_solution"),
+  checksJson: text("checks_json"),
+  envJson: text("env_json"),
+  tags: text("tags"),
+  packagePath: text("package_path"),
+  packageDigest: text("package_digest"),
+  packageManifestJson: text("package_manifest_json"),
+  packageValidationJson: text("package_validation_json"),
+  archived: integer("archived").notNull().default(0),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
 export const evalQueueItems = sqliteTable(
   "eval_queue_items",
   {
@@ -412,6 +446,10 @@ export const runs = sqliteTable("runs", {
   agentCommit: text("agent_commit"),
   /** registry|built */
   agentImageSource: text("agent_image_source"),
+  /** adapter_builds row this run executed, when the adapter was source-built. */
+  buildId: text("build_id"),
+  /** Human-readable agent version reported by that build. */
+  agentVersion: text("agent_version"),
   /** Per-run adapter overrides as submitted (image, env, params, tools). */
   adapterOverridesJson: text("adapter_overrides_json"),
   /** Repo this run evaluates, overriding the task's workspace repo. */
@@ -595,6 +633,7 @@ export const schema = {
   watcherRules,
   watcherEvents,
   tasks,
+  evalStore,
   evalQueueItems,
   runBatches,
   queueContainers,

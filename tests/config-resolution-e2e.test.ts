@@ -20,7 +20,11 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   mergeStoredModelConfig,
@@ -33,8 +37,11 @@ import { loadGatewayConfig } from "../src/judge/gateway/config.ts";
 import { ModelGateway } from "../src/judge/gateway/client.ts";
 import { piConnectionFor } from "../src/judge/pi/runtime.ts";
 import { collectAgentEnvForTest } from "../src/runner/queue-worker.ts";
+import { buildPiCommand } from "../src/adapters/pi.ts";
+import { buildReaperCommand } from "../src/adapters/reapercode.ts";
+import { evalCliProvider } from "../src/adapters/eval-cli.ts";
+import type { RunContext } from "../src/adapters/types.ts";
 
-/** Synthetic stand-ins. Nothing here is a real endpoint or credential. */
 const GLOBAL_ENV = {
   AGENTEVAL_EVAL_BASE_URL: "https://global-eval.invalid/v1",
   AGENTEVAL_EVAL_API_KEY: "synthetic-global-eval-key",
@@ -95,6 +102,7 @@ describe("consumer 1: the eval agent container", () => {
     });
     expect(env.OPENAI_BASE_URL).toBe("https://project-eval.invalid/v1");
     expect(env.OPENAI_API_KEY).toBe("synthetic-global-eval-key");
+    expect(env.AGENTEVAL_EVAL_API_TYPE).toBe("openai");
   });
 
   it("uses the Anthropic variable pair when the stage is anthropic-compatible", () => {
@@ -105,6 +113,58 @@ describe("consumer 1: the eval agent container", () => {
     );
     expect(env.ANTHROPIC_BASE_URL).toBe("https://anthropic-style.invalid");
     expect(env.OPENAI_BASE_URL).not.toBe("https://anthropic-style.invalid");
+    expect(env.AGENTEVAL_EVAL_API_TYPE).toBe("anthropic");
+  });
+});
+
+describe("consumer 1b: built-in pi and reapercode follow the eval stage", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true });
+  });
+
+  function ctxFromEval(env: Record<string, string>, extra: Partial<RunContext> = {}): RunContext {
+    return {
+      runId: "cfg-eval-1",
+      project: { id: "proj-1" },
+      task: { prompt: "ping", workspace: { source: "empty" } },
+      model: "project-eval-model",
+      provider: "leftover-pin",
+      params: {},
+      workspaceDir: extra.workspaceDir ?? "/tmp/cfg-eval",
+      apiKeys: env,
+      ...extra,
+    };
+  }
+
+  it("stamps the eval api type so the CLI provider is not a leftover queue pin", () => {
+    setStoredModelConfig({});
+    const env = collectAgentEnvForTest(PROJECT_SETTINGS, GLOBAL_ENV);
+    expect(evalCliProvider(ctxFromEval(env))).toBe("openai");
+  });
+
+  it("pi --provider/--model and models.json use the eval stage, not a leftover pin", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cfg-pi-"));
+    dirs.push(root);
+    setStoredModelConfig({});
+    const env = collectAgentEnvForTest(PROJECT_SETTINGS, GLOBAL_ENV);
+    const { argv } = buildPiCommand(ctxFromEval(env, { workspaceDir: root }));
+    expect(argv[argv.indexOf("--provider") + 1]).toBe("openai");
+    expect(argv).toContain("project-eval-model");
+    const models = JSON.parse(await readFile(join(root, ".pi-agent", "models.json"), "utf8")) as {
+      providers: { openai: { baseUrl: string; models: Array<{ id: string }> } };
+    };
+    expect(models.providers.openai.baseUrl).toBe("https://project-eval.invalid/v1");
+    expect(models.providers.openai.models[0]!.id).toBe("project-eval-model");
+  });
+
+  it("reapercode --provider openai so the eval-stage URL is the one contacted", () => {
+    setStoredModelConfig({});
+    const env = collectAgentEnvForTest(PROJECT_SETTINGS, GLOBAL_ENV);
+    const { argv, env: cmdEnv } = buildReaperCommand(ctxFromEval(env));
+    expect(argv[argv.indexOf("--provider") + 1]).toBe("openai");
+    expect(argv).toContain("project-eval-model");
+    expect(cmdEnv.OPENAI_BASE_URL).toBe("https://project-eval.invalid/v1");
   });
 });
 
@@ -163,8 +223,18 @@ function loadSecretEnv(path: string): Record<string, string> {
   return out;
 }
 
-const SECRETS = loadSecretEnv("/work/agenteval/data/secrets/deepseek.env");
-const LIVE = Boolean(SECRETS.OPENAI_API_KEY && SECRETS.OPENAI_BASE_URL);
+// One provider for every live stage: NeuralWatt, read from .env.test by name.
+// The endpoint and model are the operator's configured pair; only the key is a
+// secret, so only the key comes from the file.
+const ENV_TEST_PATH = fileURLToPath(new URL("../.env.test", import.meta.url));
+const SECRETS = {
+  ...loadSecretEnv(ENV_TEST_PATH),
+  OPENAI_BASE_URL: "https://api.deepinfra.com/v1/openai",
+  AGENTEVAL_DEFAULT_MODEL: "zai-org/GLM-5.3-Flash",
+  OPENAI_API_KEY: process.env.AGENTEVAL_MODEL_API_KEY ?? "",
+};
+SECRETS.OPENAI_API_KEY ||= loadSecretEnv(ENV_TEST_PATH).AGENTEVAL_MODEL_API_KEY ?? "";
+const LIVE = Boolean(SECRETS.OPENAI_API_KEY);
 
 describe.runIf(LIVE)("live: the configured provider is the one contacted", () => {
   it("reaches the operator's endpoint through project config", async () => {
@@ -203,4 +273,44 @@ describe.runIf(LIVE)("live: the configured provider is the one contacted", () =>
     // eslint-disable-next-line no-console
     console.log(`[live] ${cfg.baseUrl} model=${cfg.model} -> ${outcome.slice(0, 120)}`);
   }, 120_000);
+
+  it("pi and reapercode commands target the project's eval endpoint and model", async () => {
+    const model = SECRETS.AGENTEVAL_DEFAULT_MODEL;
+    const stored = parseStoredModelConfig({
+      eval: { baseUrl: SECRETS.OPENAI_BASE_URL, model },
+    });
+    const env = collectAgentEnvForTest(stored, {
+      AGENTEVAL_EVAL_BASE_URL: "https://never-contacted.invalid/v1",
+      OPENAI_API_KEY: SECRETS.OPENAI_API_KEY,
+    } as NodeJS.ProcessEnv);
+    const expectedUrl = SECRETS.OPENAI_BASE_URL!.replace(/\/+$/, "");
+    expect(env.OPENAI_BASE_URL).toBe(expectedUrl);
+    expect(env.AGENTEVAL_EVAL_API_TYPE).toBe("openai");
+
+    const root = await mkdtemp(join(tmpdir(), "live-pi-dry-"));
+    const ctx: RunContext = {
+      runId: "live-dry",
+      project: { id: "p" },
+      task: { prompt: "ping", workspace: { source: "empty" } },
+      model,
+      provider: "leftover-pin",
+      params: {},
+      workspaceDir: root,
+      apiKeys: env,
+    };
+    const pi = buildPiCommand(ctx);
+    expect(pi.argv[pi.argv.indexOf("--provider")! + 1]).toBe("openai");
+    expect(pi.argv).toContain(model);
+    const models = JSON.parse(await readFile(join(root, ".pi-agent", "models.json"), "utf8")) as {
+      providers: { openai: { baseUrl: string } };
+    };
+    expect(models.providers.openai.baseUrl).toBe(expectedUrl);
+    expect(JSON.stringify(models)).not.toContain(SECRETS.OPENAI_API_KEY);
+
+    const reaper = buildReaperCommand(ctx);
+    expect(reaper.argv[reaper.argv.indexOf("--provider")! + 1]).toBe("openai");
+    expect(reaper.argv).toContain(model);
+    expect(reaper.env.OPENAI_BASE_URL).toBe(expectedUrl);
+    await rm(root, { recursive: true, force: true });
+  });
 });

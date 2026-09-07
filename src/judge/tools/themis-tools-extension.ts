@@ -35,6 +35,7 @@ import { Type } from "typebox";
 import { stringify as yamlStringify } from "yaml";
 
 import { FINDING_SIGNATURES, isKnownSignature } from "../validity/signatures.js";
+import { formatWebResults, webResearch } from "./web-research.js";
 
 // ---------------------------------------------------------------------------
 // Scoped path resolution (code-enforced containment)
@@ -144,11 +145,22 @@ const ENUMS = {
 export const REF_RE =
   /^(tool_call:.+|diff:[^#]+#\d+|file:[^#]+#L\d+-L\d+|verifier:\d+|report:(kratos|logos|minos)#round\d+|scratchpad:[A-Za-z0-9._-]+|web:https?:\/\/.+|trace:[^\s:]+:seq:\d+|artifact:[^#\s]+#\/\S+|source:[^#\s]+#symbol=\S+|metric:\S+)$/;
 
+/** How a rejected value is quoted back to the agent that wrote it.
+ *  `JSON.stringify(undefined)` is the JS value `undefined`, so interpolating it
+ *  printed the bare word: a MISSING key and a key literally holding the string
+ *  "undefined" produced the same message, and neither told the agent which
+ *  mistake it made. Name the absence instead. */
+export function gotValue(v: unknown): string {
+  if (v === undefined) return "no value — the key is missing";
+  if (v === null) return "null";
+  return JSON.stringify(v);
+}
+
 /** Reject a ref that is not a single well-formed frozen-grammar ref. */
 export function badRef(v: unknown, where: string): string | null {
   if (v === null || v === undefined || v === "") return null;
   if (typeof v !== "string" || !REF_RE.test(v)) {
-    return `${where} is not a well-formed ref (got ${JSON.stringify(v)}; expected tool_call:<id> | diff:<file>#<hunk> | file:<path>#L<a>-L<b> | verifier:<line> | report:<cat>#round<n> | scratchpad:<agent_id> | web:<url> | trace:<runId>:seq:<n> | artifact:<path>#/<json-pointer> | source:<path>#symbol=<name> | metric:<name>)`;
+    return `${where} is not a well-formed ref (got ${gotValue(v)}; expected tool_call:<id> | diff:<file>#<hunk> | file:<path>#L<a>-L<b> | verifier:<line> | report:<cat>#round<n> | scratchpad:<agent_id> | web:<url> | trace:<runId>:seq:<n> | artifact:<path>#/<json-pointer> | source:<path>#symbol=<name> | metric:<name>)`;
   }
   return null;
 }
@@ -173,7 +185,7 @@ export function validateInvestigatorReport(fields: Record<string, unknown>): str
     }
     const label = f.label;
     if (typeof label !== "string" || !(FINDING_LABELS as readonly string[]).includes(label)) {
-      return `findings[${i}].label must be one of {${FINDING_LABELS.join(", ")}} (got ${JSON.stringify(label)})`;
+      return `findings[${i}].label must be one of {${FINDING_LABELS.join(", ")}} (got ${gotValue(label)})`;
     }
     const r = badRef(f.ref, `findings[${i}].ref`);
     if (r) return r;
@@ -208,7 +220,7 @@ export function validateEvalJudge(fields: Record<string, unknown>): string | nul
       : verdict[k];
     if (v === undefined || v === null) continue;
     if (!(allowed as readonly string[]).includes(String(v))) {
-      return `${k} must be one of {${(allowed as readonly string[]).join(", ")}} (got ${JSON.stringify(v)})`;
+      return `${k} must be one of {${(allowed as readonly string[]).join(", ")}} (got ${gotValue(v)})`;
     }
   }
   // `null` competence is legal ONLY on a non-attributable run (the agent never
@@ -244,7 +256,7 @@ export function validateEvalJudge(fields: Record<string, unknown>): string | nul
       const it = imps[i] as Record<string, unknown> | undefined;
       if (!it || typeof it !== "object") return `improvements[${i}] must be a mapping`;
       if (it.category !== undefined && !CATEGORY.includes(String(it.category)))
-        return `improvements[${i}].category must be one of {${CATEGORY.join(", ")}} (got ${JSON.stringify(it.category)})`;
+        return `improvements[${i}].category must be one of {${CATEGORY.join(", ")}} (got ${gotValue(it.category)})`;
       if (it.impact !== undefined && !IMPACT.includes(String(it.impact)))
         return `improvements[${i}].impact must be one of {${IMPACT.join(", ")}}`;
       if (it.confidence !== undefined && !CONF.includes(String(it.confidence)))
@@ -279,7 +291,7 @@ export function validateEvalJudge(fields: Record<string, unknown>): string | nul
     for (let i = 0; i < (is.findings as unknown[]).length; i += 1) {
       const f = (is.findings as unknown[])[i] as Record<string, unknown> | undefined;
       if (f && f.round !== undefined && typeof f.round !== "number")
-        return `integrity_summary.findings[${i}].round must be an integer (got ${JSON.stringify(f.round)})`;
+        return `integrity_summary.findings[${i}].round must be an integer (got ${gotValue(f.round)})`;
       if (f) {
         const rf = badRef(f.ref, `integrity_summary.findings[${i}].ref`);
         if (rf) return rf;
@@ -303,7 +315,7 @@ export function validateDeveloperBrief(fields: Record<string, unknown>): string 
   if (typeof fields.case_id !== "string" || fields.case_id.length === 0) return "case_id must be a string";
   if (typeof fields.run_id !== "string" || fields.run_id.length === 0) return "run_id must be a string";
   const mode = fields.mode;
-  if (mode !== "prod" && mode !== "dev") return `mode must be prod|dev (got ${JSON.stringify(mode)})`;
+  if (mode !== "prod" && mode !== "dev") return `mode must be prod|dev (got ${gotValue(mode)})`;
   // Findings carry the Phase-2 registry signature (controlled vocabulary).
   const findings = fields.findings;
   if (Array.isArray(findings)) {
@@ -312,7 +324,7 @@ export function validateDeveloperBrief(fields: Record<string, unknown>): string 
       if (!f || typeof f !== "object") return `findings[${i}] must be a mapping`;
       if (typeof f.id !== "string" || f.id.length === 0) return `findings[${i}].id must be a string`;
       if (f.signature !== undefined && f.signature !== null && !isKnownSignature(f.signature)) {
-        return `findings[${i}].signature must be one of {${FINDING_SIGNATURES.join(", ")}} (got ${JSON.stringify(f.signature)})`;
+        return `findings[${i}].signature must be one of {${FINDING_SIGNATURES.join(", ")}} (got ${gotValue(f.signature)})`;
       }
       if (f.owner !== undefined && typeof f.owner !== "string") return `findings[${i}].owner must be a string`;
       if (f.refs !== undefined && !Array.isArray(f.refs)) return `findings[${i}].refs must be a list`;
@@ -327,8 +339,8 @@ export function validateDeveloperBrief(fields: Record<string, unknown>): string 
     const r = recs[i] as Record<string, unknown> | undefined;
     if (!r || typeof r !== "object") return `recommendations[${i}] must be a mapping`;
     if (typeof r.id !== "string" || r.id.length === 0) return `recommendations[${i}].id must be a string`;
-    if (!CLASSES.includes(String(r.class))) return `recommendations[${i}].class must be one of {${CLASSES.join(", ")}} (got ${JSON.stringify(r.class)})`;
-    if (!PRIORITIES.includes(String(r.priority))) return `recommendations[${i}].priority must be one of {${PRIORITIES.join(", ")}} (got ${JSON.stringify(r.priority)})`;
+    if (!CLASSES.includes(String(r.class))) return `recommendations[${i}].class must be one of {${CLASSES.join(", ")}} (got ${gotValue(r.class)})`;
+    if (!PRIORITIES.includes(String(r.priority))) return `recommendations[${i}].priority must be one of {${PRIORITIES.join(", ")}} (got ${gotValue(r.priority)})`;
     if (r.evidence_level !== undefined && !LEVELS.includes(String(r.evidence_level))) return `recommendations[${i}].evidence_level must be one of {${LEVELS.join(", ")}}`;
     if (r.confidence !== undefined && !LEVELS.includes(String(r.confidence))) return `recommendations[${i}].confidence must be one of {${LEVELS.join(", ")}}`;
     if (typeof r.target_subsystem !== "string" || r.target_subsystem.length === 0)
@@ -359,9 +371,22 @@ export function validateDeveloperBrief(fields: Record<string, unknown>): string 
   return null;
 }
 
-/** Canonical, tool-owned YAML serialization (nested structures, LF, block scalars). */
+/**
+ * Canonical, tool-owned YAML serialization.
+ *
+ * `BLOCK_LITERAL` used to force every scalar into a block, so a court record
+ * rendered `id: |-\n  F1` and `priority: |-\n  P1`. That tripled the line count
+ * of a developer brief and buried the prose an agent developer actually reads.
+ * `PLAIN` lets the emitter pick per value: short strings stay inline, multi-line
+ * prose still becomes a block, and anything ambiguous is quoted. Round trips are
+ * preserved either way; the emitter quotes what it must.
+ */
 export function serializeYaml(fields: Record<string, unknown>): string {
-  return yamlStringify(fields, { lineWidth: 0, defaultStringType: "BLOCK_LITERAL" });
+  return yamlStringify(fields, {
+    lineWidth: 0,
+    defaultStringType: "PLAIN",
+    defaultKeyType: "PLAIN",
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -471,15 +496,6 @@ export default function registerThemisTools(pi: ExtensionAPI): void {
   });
 
   // ---- read_evidence -----------------------------------------------------
-  const catalog = ((): string[] => {
-    // Read the evidence catalog written by Node 0 (evalContext.yaml lines).
-    try {
-      return [];
-    } catch {
-      return [];
-    }
-  })();
-
   pi.registerTool({
     name: "read_evidence",
     label: "Read evidence",
@@ -658,7 +674,7 @@ export default function registerThemisTools(pi: ExtensionAPI): void {
     name: "web_search",
     label: "Web search",
     description:
-      "Search the web for a technique or source. Refuses private/loopback/link-local targets. Web refs may back recommendations only, never findings about the agent.",
+      "Search the general web and arXiv for a technique or prior art. Ask in prose. Each result carries a ready-to-cite `web:<url>` ref; a recommendation with one earns fix_type: research_backed. Refuses private/loopback/link-local targets. Web refs may back recommendations only, never findings about the agent.",
     parameters: schema({ query: Type.String() }),
     async execute(_id, params) {
       try {
@@ -668,39 +684,12 @@ export default function registerThemisTools(pi: ExtensionAPI): void {
         // the guardrail is the point: no arbitrary URL, no private ranges.
         const endpoint = process.env.THEMIS_WEB_SEARCH_ENDPOINT;
         if (!endpoint) {
-          // Provider-native search via the same OpenAI-compatible proxy PI uses.
-          const base = (process.env.THEMIS_PROXY_BASE_URL || "").replace(/\/+$/, "");
-          const key = process.env.THEMIS_PROXY_API_KEY || "";
-          const model = process.env.THEMIS_PROXY_MODEL || "deepseek-v4-flash";
-          if (!base || !key) return err("web search: no THEMIS_WEB_SEARCH_ENDPOINT and no THEMIS_PROXY_*");
-          const res = await fetch(`${base}/chat/completions`, {
-            method: "POST",
-            headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-            body: JSON.stringify({
-              model,
-              messages: [
-                { role: "system", content: "Use web search. Return a concise brief with source URLs." },
-                { role: "user", content: q },
-              ],
-              // This proxy's Chat Completions schema requires tools[].type=function
-              // (a bare type:"web_search" is rejected before the query is sent —
-              // observed live: researcher 9/9 DENIED). The provider still executes
-              // the named web_search tool.
-              tools: [{
-                type: "function",
-                function: {
-                  name: "web_search",
-                  description: "Search the web",
-                  parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
-                },
-              }],
-              tool_choice: "auto",
-              max_tokens: 4096,
-            }),
-            signal: AbortSignal.timeout(60_000),
-          });
-          const raw = await res.text();
-          return ok(raw.slice(0, 64 * 1024));
+          // Keyless backends that work from this host. The old path asked the
+          // eval provider to run the search through an OpenAI-compatible tools
+          // array; DeepInfra answers `finish_reason: tool_calls` and executes
+          // nothing, so every court that tried got a body with no URLs in it.
+          const results = await webResearch(q);
+          return ok(formatWebResults(q, results));
         }
         const url = new URL(endpoint);
         if (["http:", "https:"].indexOf(url.protocol) < 0) return err("search endpoint must be http(s)");

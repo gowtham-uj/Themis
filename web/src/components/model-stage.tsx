@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, errText } from '../lib/api'
 import { Banner, Mono } from './ui'
 
@@ -16,7 +17,9 @@ export interface StageView {
   timeoutMs: number
   apiKeyEnv: string | null
   apiKeyPresent: boolean
-  envVars: Record<'apiType' | 'baseUrl' | 'apiKey' | 'apiKeyEnv' | 'model' | 'reasoningEffort' | 'timeoutMs', string>
+  webSearchApiKeyEnv: string | null
+  webSearchApiKeyPresent: boolean
+  envVars: Record<'apiType' | 'baseUrl' | 'apiKey' | 'apiKeyEnv' | 'webSearchApiKeyEnv' | 'model' | 'reasoningEffort' | 'timeoutMs', string>
   error: string | null
 }
 
@@ -37,29 +40,30 @@ export interface StageDraft {
   apiType: ApiType
   baseUrl: string
   apiKeyEnv: string
+  webSearchApiKeyEnv: string
   model: string
   reasoningEffort: string
   timeoutMs: string
 }
 
-export const EMPTY_DRAFT: StageDraft = { apiType: 'openai', baseUrl: '', apiKeyEnv: '', model: '', reasoningEffort: '', timeoutMs: '' }
+export const EMPTY_DRAFT: StageDraft = { apiType: 'openai', baseUrl: '', apiKeyEnv: '', webSearchApiKeyEnv: '', model: '', reasoningEffort: '', timeoutMs: '' }
 
 /** What each stage drives, so the operator knows which endpoint costs what. */
 export const STAGE_COPY: Record<Stage, { title: string; short: string; sub: string }> = {
   eval: {
-    title: 'Eval execution',
-    short: 'Eval',
-    sub: 'The model the agent under test runs against. This one is billed on every eval.',
+    title: 'The agent',
+    short: 'Agent',
+    sub: 'The model your agent talks to while it works each eval.',
   },
   phase1: {
-    title: 'Phase 1',
-    short: 'Phase 1',
-    sub: 'Per-eval courtroom: nodes 0 to 4, plus kratos, logos, minos, and remedy.',
+    title: 'Per-eval judge',
+    short: 'Judge',
+    sub: 'After each eval finishes, the courtroom reads that archive and writes a verdict.',
   },
   phase2: {
-    title: 'Phase 2',
-    short: 'Phase 2',
-    sub: 'Cross-eval campaign board: investigator, researcher, designer, reviewer.',
+    title: 'Across evals',
+    short: 'Across',
+    sub: 'Once every selected eval has a verdict, look for patterns and a fix plan. Needs the judge.',
   },
 }
 
@@ -68,6 +72,7 @@ export function draftFromView(v: StageView): StageDraft {
     apiType: v.apiType,
     baseUrl: v.baseUrl,
     apiKeyEnv: v.apiKeyEnv ?? '',
+    webSearchApiKeyEnv: v.webSearchApiKeyEnv ?? '',
     model: v.model,
     reasoningEffort: v.reasoningEffort,
     timeoutMs: String(v.timeoutMs),
@@ -80,10 +85,111 @@ export function draftToPatch(d: StageDraft, includeType: boolean): Record<string
   if (includeType) out.apiType = d.apiType
   if (d.baseUrl.trim()) out.baseUrl = d.baseUrl.trim()
   if (d.apiKeyEnv.trim()) out.apiKeyEnv = d.apiKeyEnv.trim()
+  if (d.webSearchApiKeyEnv.trim()) out.webSearchApiKeyEnv = d.webSearchApiKeyEnv.trim()
   if (d.model.trim()) out.model = d.model.trim()
   if (d.reasoningEffort.trim()) out.reasoningEffort = d.reasoningEffort.trim()
   if (d.timeoutMs.trim()) out.timeoutMs = d.timeoutMs.trim()
   return Object.keys(out).length > 0 ? out : null
+}
+
+export interface StoredSecret { name: string; updatedAt: string }
+
+/** Names and write times of the keys the server holds. Never values. */
+export function useStoredSecrets() {
+  const qc = useQueryClient()
+  const list = useQuery({
+    queryKey: ['secrets'],
+    queryFn: () => api.get<{ secrets: StoredSecret[] }>('/api/settings/secrets'),
+  })
+  const invalidate = () => {
+    void qc.invalidateQueries({ queryKey: ['secrets'] })
+    void qc.invalidateQueries({ queryKey: ['model-config'] })
+    void qc.invalidateQueries({ queryKey: ['projects'] })
+  }
+  const put = useMutation({
+    mutationFn: (v: { name: string; value: string }) =>
+      api.put(`/api/settings/secrets/${encodeURIComponent(v.name)}`, { value: v.value }),
+    onSuccess: invalidate,
+  })
+  const del = useMutation({
+    mutationFn: (name: string) => api.del(`/api/settings/secrets/${encodeURIComponent(name)}`),
+    onSuccess: invalidate,
+  })
+  const names = new Set((list.data?.secrets ?? []).map((s) => s.name))
+  return { secrets: list.data?.secrets ?? [], has: (n: string) => names.has(n), put, del }
+}
+
+/**
+ * Paste a key value for one environment variable name.
+ *
+ * The value goes to the server encrypted at rest and is decrypted back into the
+ * server's environment, so every queue, adapter, and judge stage resolves it by
+ * the same variable name it already reads. Masked by default; the eye reveals
+ * what was typed before saving.
+ */
+export function SecretValueField({
+  envName,
+  stored,
+  onSave,
+  onClear,
+  busy,
+  disabled,
+}: {
+  envName: string
+  stored: boolean
+  onSave: (value: string) => void
+  onClear: () => void
+  busy?: boolean
+  disabled?: boolean
+}) {
+  const [value, setValue] = useState('')
+  const [shown, setShown] = useState(false)
+  const ready = Boolean(envName.trim()) && !disabled
+  return (
+    <div className="field">
+      <label htmlFor={`${envName || 'key'}-value`}>Key value</label>
+      <div className="input-row">
+        <input
+          id={`${envName || 'key'}-value`}
+          type={shown ? 'text' : 'password'}
+          value={value}
+          autoComplete="off"
+          spellCheck={false}
+          disabled={!ready || busy}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder={stored ? 'a key is saved for this variable' : 'paste the key to save it'}
+        />
+        <button
+          type="button"
+          className="icon-button"
+          aria-label={shown ? 'Hide key value' : 'Show key value'}
+          aria-pressed={shown}
+          title={shown ? 'Hide' : 'Show'}
+          disabled={!value}
+          onClick={() => setShown((s) => !s)}
+        >
+          {shown ? '🙈' : '👁'}
+        </button>
+        <button
+          type="button"
+          disabled={!ready || !value.trim() || busy}
+          onClick={() => { onSave(value.trim()); setValue(''); setShown(false) }}
+        >
+          {busy ? 'Saving…' : 'Save key'}
+        </button>
+        {stored && (
+          <button type="button" className="danger" disabled={busy} onClick={onClear}>Clear</button>
+        )}
+      </div>
+      <span className="hint">
+        {!envName.trim()
+          ? 'Name the variable above first.'
+          : stored
+            ? <>saved and loaded into <Mono>{envName}</Mono> on every start. Saving again replaces it.</>
+            : <>stored encrypted, then loaded into <Mono>{envName}</Mono> on every start. Leave blank if the server already exports it.</>}
+      </span>
+    </div>
+  )
 }
 
 /**
@@ -97,15 +203,22 @@ export function StageFields({
   onChange,
   inherited,
   disabled,
+  secrets,
 }: {
   stage: Stage
   draft: StageDraft
   onChange: (next: StageDraft) => void
   inherited?: StageView
   disabled?: boolean
+  secrets?: ReturnType<typeof useStoredSecrets>
 }) {
   const set = (k: keyof StageDraft, v: string) => onChange({ ...draft, [k]: v })
   const env = inherited?.envVars
+  // Fall back to the stage's own variable name so a stage that has never been
+  // configured can still take a pasted key: the field shows that name as its
+  // placeholder, so an empty target here would read as a dead control.
+  const keyName = draft.apiKeyEnv.trim() || inherited?.apiKeyEnv || env?.apiKey || ''
+  const webKeyName = draft.webSearchApiKeyEnv.trim() || inherited?.webSearchApiKeyEnv || 'SERPER_SEARCH_API_KEY'
   return (
     <div className="form-grid">
       <div className="field">
@@ -140,10 +253,49 @@ export function StageFields({
           {inherited?.apiKeyPresent ? (
             <>key found in <Mono>{inherited.apiKeyEnv}</Mono></>
           ) : (
-            <>name the environment variable holding the key. The value is never saved.</>
+            <>name the environment variable holding the key.</>
           )}
         </span>
       </div>
+      {secrets && (
+        <SecretValueField
+          envName={keyName}
+          stored={secrets.has(keyName)}
+          busy={secrets.put.isPending || secrets.del.isPending}
+          disabled={disabled}
+          onSave={(value) => secrets.put.mutate({ name: keyName, value })}
+          onClear={() => secrets.del.mutate(keyName)}
+        />
+      )}
+      {stage !== 'eval' && (
+        <div className="field">
+          <label htmlFor={`${stage}-web-keyenv`}>Serper key variable</label>
+          <input
+            id={`${stage}-web-keyenv`}
+            value={draft.webSearchApiKeyEnv}
+            disabled={disabled}
+            onChange={(e) => set('webSearchApiKeyEnv', e.target.value)}
+            placeholder={inherited?.webSearchApiKeyEnv ?? 'SERPER_SEARCH_API_KEY'}
+          />
+          <span className="hint">
+            {inherited?.webSearchApiKeyPresent ? (
+              <>key found in <Mono>{inherited.webSearchApiKeyEnv}</Mono></>
+            ) : (
+              <>Serper covers the general web; arXiv runs alongside it.</>
+            )}
+          </span>
+        </div>
+      )}
+      {secrets && stage !== 'eval' && (
+        <SecretValueField
+          envName={webKeyName}
+          stored={secrets.has(webKeyName)}
+          busy={secrets.put.isPending || secrets.del.isPending}
+          disabled={disabled}
+          onSave={(value) => secrets.put.mutate({ name: webKeyName, value })}
+          onClear={() => secrets.del.mutate(webKeyName)}
+        />
+      )}
       <div className="field">
         <label htmlFor={`${stage}-model`}>Model</label>
         <input
@@ -151,7 +303,7 @@ export function StageFields({
           value={draft.model}
           disabled={disabled}
           onChange={(e) => set('model', e.target.value)}
-          placeholder={inherited?.model || 'deepseek-v4-flash'}
+          placeholder={inherited?.model || 'model id the endpoint serves'}
         />
         <span className="hint">{env?.model ?? ''}</span>
       </div>

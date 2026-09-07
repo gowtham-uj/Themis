@@ -26,7 +26,10 @@ export interface PipelineQueueRow {
   createdAt: Phase2Timestamp; updatedAt: Phase2Timestamp;
 }
 export interface PipelineGenerationRow {
-  id: string; queueId: string; ordinal: number; state: PipelineGenerationState;
+  id: string; queueId: string; ordinal: number;
+  /** Operator-chosen run name. Null falls back to "Run <ordinal>" in the UI. */
+  name: string | null;
+  state: PipelineGenerationState;
   fencingToken: number; configJson: string; createdAt: Phase2Timestamp;
   updatedAt: Phase2Timestamp; completedAt: Phase2Timestamp | null;
 }
@@ -79,7 +82,7 @@ export interface CreatePipelineQueueInput {
 export interface PipelineQueuePatch {
   status?: PipelineQueueStatus; name?: string; autoEval?: boolean; autoPhase1?: boolean; autoPhase2?: boolean;
 }
-export interface CreatePipelineGenerationInput { queueId: string; configJson: string }
+export interface CreatePipelineGenerationInput { queueId: string; configJson: string; name?: string | null }
 export interface AddPipelineItemInput { generationId: string; evalId: string; ordinal: number }
 export interface PipelineItemPatch {
   state?: PipelineItemState; runId?: string | null; baseArchiveId?: string | null;
@@ -104,6 +107,9 @@ export interface PipelineRepository {
   createGeneration(input: CreatePipelineGenerationInput): Promise<PipelineGenerationRow>;
   getGeneration(id: string): Promise<PipelineGenerationRow | null>;
   getCurrentGeneration(queueId: string): Promise<PipelineGenerationRow | null>;
+  /** Every run of one pipeline queue, newest first. */
+  listGenerations(queueId: string, req: Phase2PageRequest): Promise<Phase2Page<PipelineGenerationRow>>;
+  renameGeneration(id: string, name: string | null): Promise<PipelineGenerationRow | null>;
   transitionGeneration(id: string, expectedState: PipelineGenerationState, expectedToken: number, next: PipelineGenerationState): Promise<PipelineGenerationRow | null>;
   addItem(input: AddPipelineItemInput): Promise<PipelineItemRow>;
   getItem(id: string): Promise<PipelineItemRow | null>;
@@ -118,6 +124,11 @@ export interface Phase2Repository {
   getCampaign(id: string): Promise<Phase2CampaignRow | null>;
   getCampaignByGeneration(generationId: string): Promise<Phase2CampaignRow | null>;
   transitionCampaign(id: string, expectedState: Phase2CampaignState, expectedToken: number, next: Phase2CampaignState): Promise<Phase2CampaignRow | null>;
+  /** Record the digest of the developer pack this campaign produced. The column
+   *  existed from the first migration but nothing ever wrote it, so every
+   *  published campaign read back with a null pack digest and a client could not
+   *  tell a real pack from a missing one. */
+  setCampaignDeveloperPackSha256(id: string, sha256: string): Promise<Phase2CampaignRow | null>;
   addMember(input: AddPhase2MemberInput): Promise<Phase2CampaignMemberRow>;
   listMembers(campaignId: string, req: Phase2PageRequest): Promise<Phase2Page<Phase2CampaignMemberRow>>;
   upsertRecord(input: CreatePhase2RecordInput): Promise<{record: Phase2RecordRow; created: boolean}>;

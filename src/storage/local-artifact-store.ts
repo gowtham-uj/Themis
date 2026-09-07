@@ -21,18 +21,18 @@ import { dirname, join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-import type {
-  ArtifactDeleteOutcome,
-  ArtifactHead,
-  ArtifactPut,
-  ArtifactPutResult,
-  ArtifactRangeRead,
-  ArtifactRead,
-  ArtifactStore,
-  ByteRange,
-  DeleteGuard,
+import {
+  ArtifactStoreError,
+  type ArtifactDeleteOutcome,
+  type ArtifactHead,
+  type ArtifactPut,
+  type ArtifactPutResult,
+  type ArtifactRangeRead,
+  type ArtifactRead,
+  type ArtifactStore,
+  type ByteRange,
+  type DeleteGuard,
 } from "./artifact-store.js";
-import { ArtifactStoreError } from "./artifact-store.js";
 import { blobKey, normalizeSha256, streamSha256 } from "./content-address.js";
 
 /** Sidecar metadata persisted beside every stored object. */

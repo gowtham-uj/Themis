@@ -3,7 +3,7 @@
  *
  * This is the complete, frozen registry of every Tier A, Tier B and
  * deterministic Tier D rule from section 3 ("five-tier gate") of
- * /work/agenteval/plan/themis-phase1-implementation.md.
+ * plan/themis-phase1-implementation.md.
  *
  * It carries NO checking logic — this list IS the spec that the
  * implementers of the harness must satisfy. Each entry is

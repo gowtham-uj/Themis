@@ -334,9 +334,10 @@ describe("validateItemAgainstGenerationSignature", () => {
   function signature(over: Partial<GenerationContainerSignature> = {}): GenerationContainerSignature {
     return {
       image: "agenteval/suite-base:abc",
-      // Suite canonical packages always resolve to container network `allow`.
-      network: "allow",
-      networkAllowlist: null,
+      // Suite canonical packages always resolve to container network
+      // `allowlist`, carrying the one entry from SUITE_AGENT_ALLOWLIST.
+      network: "allowlist",
+      networkAllowlist: ["0.0.0.0/0"],
       cpus: 2,
       memoryMiB: 2048,
       ports: "[]",
@@ -454,13 +455,16 @@ describe("validateItemAgainstGenerationSignature", () => {
       base,
       "PATCH",
       `/api/projects/${projectId}/queues/${queueId}/items/${itemId}`,
-      { overrides: { network: "allow" } },
+      { overrides: { ports: [] } },
     );
     expect(ok.status).toBe(200);
-    expect(api.queries.getEvalQueueItem(itemId)!.overrides).toEqual({ network: "allow" });
+    expect(api.queries.getEvalQueueItem(itemId)!.overrides).toEqual({ ports: [] });
 
-    // A live generation pins network `allow`; changing overrides.network to a
-    // non-matching policy must be rejected with 409 (same gate as item POST).
+    // A live generation pins an empty port set; adding a published port changes
+    // the container the item needs, so the PATCH must be rejected with 409 (the
+    // same gate as item POST). Network is not the dimension under test: a suite
+    // package's own policy wins over any queue or item override, so an
+    // overrides.network edit cannot break the signature.
     api.liveQueueContainers.set(queueId, {
       queueId,
       finished: false,
@@ -471,12 +475,12 @@ describe("validateItemAgainstGenerationSignature", () => {
       base,
       "PATCH",
       `/api/projects/${projectId}/queues/${queueId}/items/${itemId}`,
-      { overrides: { network: "offline" } },
+      { overrides: { ports: [8080] } },
     );
     expect(bad.status).toBe(409);
     expect(String((bad.json as { detail?: unknown }).detail ?? "")).toMatch(/cannot run in the active queue generation/i);
     // Overrides are left at their last accepted value after rejection.
-    expect(api.queries.getEvalQueueItem(itemId)!.overrides).toEqual({ network: "allow" });
+    expect(api.queries.getEvalQueueItem(itemId)!.overrides).toEqual({ ports: [] });
   });
 });
 

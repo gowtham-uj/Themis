@@ -39,9 +39,14 @@ function improvementRefs(x: Record<string, unknown>): string[] {
 function platformFault(viewDir: string): Promise<{ kind: "verifier_crash" | "verifier_timeout" | "setup_failure" | "empty_workspace" | "none"; exitCode: number | null; detail: string }> {
   return (async () => {
     const vr = await json(join(viewDir, "verifier_res", "verifier-result.json"));
-    const evalJson = await json(join(viewDir, "eval_lifecycle_logs", "eval.json"));
-    const workspace = (evalJson?.workspace ?? {}) as Record<string, unknown>;
-    const emptyWorkspace = String(workspace.source ?? "") === "empty";
+    // `eval.json` workspace.source is "empty" for EVERY package-sourced eval
+    // (src/evals/package.ts stamps it as a constant meaning "no external repo
+    // to clone"). Seeds ship inside the package and setup.sh copies them into
+    // /workspace/task, so the only honest signal that seeding failed is the
+    // setup manifest.
+    const setup = await json(join(viewDir, "eval_lifecycle_logs", "setup-manifest.json"));
+    const setupExit = setup ? n(setup.exit_code) : null;
+    const setupFailed = setup?.setup_status === "failed" || (setupExit !== null && setupExit !== 0);
     const exit = vr ? n(vr.exitCode) : null;
     const checks = Array.isArray(vr?.checks) ? vr!.checks as Record<string, unknown>[] : [];
     const allError = checks.length > 0 && checks.every((c) => c.status === "error");
@@ -52,8 +57,12 @@ function platformFault(viewDir: string): Promise<{ kind: "verifier_crash" | "ver
     if (vr && exit !== null && exit !== 0 && (allError || emptyOut)) {
       return { kind: "verifier_crash", exitCode: exit, detail: s((checks[0] as Record<string, unknown> | undefined)?.detail) };
     }
-    if (emptyWorkspace) {
-      return { kind: "empty_workspace", exitCode: exit, detail: "eval.json workspace.source is empty; seed files never landed" };
+    if (setupFailed) {
+      return {
+        kind: "setup_failure",
+        exitCode: exit,
+        detail: `setup-manifest.json reports setup_status=${String(setup?.setup_status ?? "unknown")} exit_code=${String(setupExit)}; the workspace was never seeded`,
+      };
     }
     return { kind: "none", exitCode: exit, detail: "" };
   })();
@@ -76,15 +85,12 @@ export async function loadPhase2Case(viewDir: string): Promise<Phase2Case> {
   // Trust the Phase-1 stamp when present, but a deterministically-detected
   // verifier crash outranks a stale `failure_owner: none` from an old view.
   const stampedOwner = s(validity.failure_owner) || "none";
-  const emptyWorkspace =
-    String(((evalJson?.workspace ?? {}) as Record<string, unknown>).source ?? "") === "empty" ||
-    fault.kind === "empty_workspace";
+  const emptyWorkspace = fault.kind === "empty_workspace";
   const harnessFault =
     fault.kind === "verifier_crash" ||
     fault.kind === "verifier_timeout" ||
     fault.kind === "empty_workspace" ||
-    fault.kind === "setup_failure" ||
-    emptyWorkspace;
+    fault.kind === "setup_failure";
   const rewardAttributable = harnessFault ? false : validity.official_reward_attributable_to_agent !== false;
   const failureOwner: FailureOwner = harnessFault ? "eval_harness" : (stampedOwner as FailureOwner);
 

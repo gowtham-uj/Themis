@@ -3,6 +3,7 @@
  * Requires a real ModelGateway — no offline fake rulings.
  */
 
+import type { ModelApiType } from "../../config/model-config.js";
 import { MemoryDocumentLedger } from "../documents/ledger.js";
 import { GatewayError, type ModelGateway } from "../gateway/client.js";
 import { loadCheckpoint } from "./checkpoint.js";
@@ -27,10 +28,16 @@ export async function runPhase1(input: {
   pi?: {
     baseUrl: string;
     apiKey: string;
-    model?: string;
-    reasoningEffort?: string;
+    model: string;
+    reasoningEffort: string;
     timeoutMs?: number;
+    /** Wire format of the endpoint. Omitting it wrote the wrong provider kind
+     *  into pi's models.json, so an Anthropic-compatible stage was called as
+     *  OpenAI Chat Completions. */
+    apiType?: ModelApiType;
   };
+  /** Project prompt overrides keyed by filename. Missing keys use the built-in draft. */
+  promptOverrides?: Record<string, string> | null;
 }): Promise<Phase1GraphState> {
   const ledger = input.ledger ?? new MemoryDocumentLedger();
   // Crash-resume: every node persists a checkpoint after it completes. A worker
@@ -41,21 +48,23 @@ export async function runPhase1(input: {
   let state = await resumePhase1Graph(input);
   if (input.pi) {
     // Real PI courtroom: themis-orchestrator spawns kratos/logos/minos subagents.
-    // If a node4 checkpoint exists, runNode4Pi already returned once (and its
-    // session + committed reports persist); skip re-dispatching and continue to
-    // verbatim assembly + quality gate below.
+    // A node4 checkpoint without evalJudge means the court was killed mid-round
+    // (timeout/pause). Skip only when the verdict actually exists; otherwise
+    // --continue the same PI session.
     const node4Cp = await loadCheckpoint(input.workDir, "node4");
-    if (!node4Cp) {
+    if (!node4Cp?.paths.evalJudgePath) {
       const { state: piState, result } = await runNode4Pi(
         { ...state, round: 1 },
         {
           connection: {
             baseUrl: input.pi.baseUrl,
             apiKey: input.pi.apiKey,
-            model: input.pi.model ?? "deepseek-v4-flash",
-            reasoningEffort: input.pi.reasoningEffort ?? "max",
+            model: input.pi.model,
+            reasoningEffort: input.pi.reasoningEffort,
+            ...(input.pi.apiType ? { apiType: input.pi.apiType } : {}),
           },
           timeoutMs: input.pi.timeoutMs,
+          promptOverrides: input.promptOverrides,
         },
       );
       state = piState;

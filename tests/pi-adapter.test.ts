@@ -151,6 +151,49 @@ describe("piAdapter surface", () => {
       "https://proxy.example.test",
     );
   });
+
+  it("writes an openai-compatible provider under openai, listing the configured model", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-agent-openai-"));
+    const dir = ensurePiAgentDir(join(root, "agent"), {
+      openaiBaseUrl: "https://project-eval.example/v1",
+      provider: "openai",
+      model: "deepseek-v4-flash",
+    });
+    const models = JSON.parse(
+      await readFile(join(dir, "models.json"), "utf8"),
+    ) as {
+      providers: {
+        openai: {
+          baseUrl: string;
+          api: string;
+          apiKey: string;
+          models: Array<{ id: string }>;
+        };
+      };
+    };
+    expect(models.providers.openai.baseUrl).toBe("https://project-eval.example/v1");
+    expect(models.providers.openai.api).toBe("openai-completions");
+    expect(models.providers.openai.apiKey).toBe("${OPENAI_API_KEY}");
+    expect(models.providers.openai.models[0]!.id).toBe("deepseek-v4-flash");
+  });
+
+  it("passes --provider openai when the eval stage is openai-compatible", () => {
+    const root = "/tmp/pi-eval-cli";
+    const { argv } = buildPiCommand(
+      makeCtx({
+        workspaceDir: root,
+        provider: "leftover-pin",
+        model: "deepseek-v4-flash",
+        apiKeys: {
+          AGENTEVAL_EVAL_API_TYPE: "openai",
+          OPENAI_BASE_URL: "https://project-eval.example/v1",
+          OPENAI_API_KEY: "synthetic-eval-key",
+        },
+      }),
+    );
+    expect(argv[argv.indexOf("--provider") + 1]).toBe("openai");
+    expect(argv).toContain("deepseek-v4-flash");
+  });
 });
 
 describe("derivePiStatus", () => {

@@ -129,7 +129,7 @@ export class ModelGateway {
     // tens of thousands of tokens before any content, so a small cap starves the
     // answer (WP-6: reasoning budget is a correctness issue, not a tuning knob).
     // The PI path (models.json) proves 32768 is enough for `max` on
-    // deepseek-v4-flash; 8192 still starved Node 0's 60KB summarize input
+    // a high-reasoning model; 8192 still starved Node 0's 60KB summarize input
     // (observed live: finish_reason=length with empty content).
     const effortFloor = effort === "max" ? 32768 : this.config.maxTokensFloor;
     const maxTokens = Math.max(req.maxTokens ?? effortFloor, effortFloor);

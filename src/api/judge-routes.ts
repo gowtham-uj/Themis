@@ -9,14 +9,10 @@ import { join } from "node:path";
 import type { QueryStore } from "../db/queries.js";
 
 import { migrate as migrateThemis } from "../db/sqlite/migrate.js";
-import { advanceCurrentPointer } from "../db/sqlite/pointers.js";
-import { getResultVersion, listResultVersionsByRun, upsertResultVersion } from "../db/sqlite/results.js";
-import { ModelGateway } from "../judge/gateway/client.js";
+import { getResultVersion, listResultVersionsByRun } from "../db/sqlite/results.js";
 import { loadGatewayConfig } from "../judge/gateway/config.js";
-import { runPhase1 } from "../judge/graph/graph.js";
-import { piConnectionFor } from "../judge/pi/runtime.js";
-import { projectStoredModelConfig } from "../config/model-config.js";
-import { publishJudgeArchiveView } from "../judge/results/publish-view.js";
+import { Phase1Service } from "../judge/phase1-service.js";
+import { projectStoredModelConfig, viewModelConfig } from "../config/model-config.js";
 import { archiveStoreDir, readArchiveStoreManifest } from "../runner/archive-store.js";
 import {
   judgeQueueStatus,
@@ -31,6 +27,7 @@ import {
   submitStandaloneArchives,
 } from "../judge/ingest/store.js";
 import { badRequest, notFound } from "./errors.js";
+import { blockingReason, projectReadiness } from "./readiness.js";
 import { readJsonBody, sendJson, type Router } from "./router.js";
 
 type App = { dataDir: string; queries: QueryStore };
@@ -45,14 +42,8 @@ function appOf(ctx: { app: unknown }): App {
   return ctx.app as App;
 }
 
-/** In-flight phase1 runs keyed by runId: resolved with the result once done. */
-const phase1InFlight = new Map<
-  string,
-  Promise<{ result_version?: unknown; current_pointer?: unknown; paused?: boolean; run_id?: string; reason?: string }>
->();
-
 /** Register judge health + Phase-1 execution routes. */
-export function registerJudgeRoutes(router: Router): void {
+export function registerJudgeRoutes(router: Router, phase1: Phase1Service): void {
   router.get("/api/judge/health", (_req, res) => {
     let configured = false;
     try {
@@ -64,8 +55,8 @@ export function registerJudgeRoutes(router: Router): void {
     sendJson(res, 200, {
       ok: true,
       gateway_configured: configured,
-      model: process.env.AGENTEVAL_DEFAULT_MODEL || "deepseek-v4-flash",
-      reasoning_effort: process.env.THEMIS_REASONING_EFFORT || "max",
+      model: viewModelConfig("phase1").model || null,
+      reasoning_effort: viewModelConfig("phase1").reasoningEffort,
     });
   });
 
@@ -223,6 +214,32 @@ export function registerJudgeRoutes(router: Router): void {
     }
   });
 
+  /**
+   * The judge queue linked to this project's eval queue, plus job counts.
+   * `queue` is null when the project has not linked one yet.
+   */
+  router.get("/api/projects/:id/judge-queue", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const project = app.queries.getProject(ctx.params.id!);
+    if (!project) throw notFound(`project not found: ${ctx.params.id}`);
+    const evalQueue = app.queries.listEvalQueues(project.id)[0];
+    if (!evalQueue) {
+      sendJson(res, 200, { queue: null, status: null, eval_queue_id: null });
+      return;
+    }
+    const db = openThemisDb(app.dataDir);
+    try {
+      const queue = getLinkedJudgeQueue(db, evalQueue.id);
+      sendJson(res, 200, {
+        queue,
+        eval_queue_id: evalQueue.id,
+        status: queue ? judgeQueueStatus(db, queue.id) : null,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
   /** Inspect a linked queue's buffered archive count. */
   router.get("/api/judge/queues/:queueId/pending", (_req, res, ctx) => {
     const app = appOf(ctx);
@@ -241,6 +258,12 @@ export function registerJudgeRoutes(router: Router): void {
       () => ({}) as { work_dir?: string; track_id?: string },
     )) as { work_dir?: string; track_id?: string };
     const archiveRow = app.queries.getEvalArchive(runId);
+    // Adapter setup and eval selection gate Phase 1 too. Checking here names
+    // the skipped step instead of failing later inside a judge node.
+    if (archiveRow) {
+      const blocked = blockingReason(projectReadiness(app.queries, archiveRow.projectId), "phase1");
+      if (blocked) throw badRequest(blocked);
+    }
     const canonicalDir = archiveRow
       ? join(app.dataDir, "projects", archiveRow.projectId, "evals", runId)
       : null;
@@ -265,117 +288,25 @@ export function registerJudgeRoutes(router: Router): void {
     }
     if (!ready) throw notFound(`sealed archive not found for run ${runId}`);
 
-    // Node 0-3 call the gateway directly, so it needs the same project
-    // overrides the PI court below gets. Resolving it from env alone made the
-    // console's per-project Phase-1 settings apply to only half the pipeline.
     const projectModelConfig = archiveRow
       ? projectStoredModelConfig(app.queries.getProject(archiveRow.projectId)?.modelConfig)
       : null;
-    let gateway: ModelGateway;
-    try {
-      gateway = ModelGateway.fromEnv(process.env, undefined, "phase1", projectModelConfig);
-    } catch (err) {
-      throw badRequest(err instanceof Error ? err.message : String(err));
-    }
-
-    // Stable per-run work/session path. Re-posting after a quota/rate-limit
-    // pause resumes the exact PI session via --continue; it never starts the
-    // courtroom from scratch. Callers may still supply an explicit work_dir.
-    const workDir =
-      typeof body.work_dir === "string" && body.work_dir.length > 0
-        ? body.work_dir
-        : join(app.dataDir, "judge_work", runId);
-    const viewDir = join(app.dataDir, "judge_views", runId);
-    const { mkdir: ensureDir } = await import("node:fs/promises");
-    await ensureDir(workDir, { recursive: true });
-    await ensureDir(viewDir, { recursive: true });
-
-    // Phase-1 is a minutes-long model pipeline. Return 202 immediately and run
-    // in the background — holding an HTTP response open across model calls is
-    // exactly the pattern the design forbids (and trips client header timeouts).
-    let existing = phase1InFlight.get(runId);
-    if (!existing) {
-      const task = (async () => {
-        let state;
-        try {
-          state = await runPhase1({
-            caseId: `case_${runId}`,
-            runId,
-            archiveDir,
-            workDir,
-            gateway,
-            attemptId: `att_${runId}_${Date.now()}`,
-            // Real PI courtroom on the Phase-1 stage config, with this
-            // project's own overrides layered above the global one.
-            pi: piConnectionFor("phase1", process.env, projectModelConfig),
-          });
-        } catch (err) {
-          // A provider throttle must NOT be surfaced as a crash: pause any
-          // linked judge queue without consuming a retry, so a later resume
-          // continues from the committed checkpoint.
-          const { ProviderThrottledError } = await import("../judge/gateway/client.js");
-          if (err instanceof ProviderThrottledError) {
-            const { pauseJudgeQueue } = await import("../judge/ingest/pause.js");
-            const { getLinkedJudgeQueue } = await import("../judge/ingest/store.js");
-            const db = openThemisDb(app.dataDir);
-            try {
-              const q = getLinkedJudgeQueue(db, runId) ?? db
-                .prepare(`SELECT id FROM judge_queues WHERE project_id = (SELECT project_id FROM judge_jobs WHERE run_id = ? LIMIT 1) LIMIT 1`)
-                .get(runId) as { id: string } | undefined;
-              if (q) {
-                pauseJudgeQueue(db, q.id, {
-                  kind: err.throttleKind === "quota" ? "provider_quota" : "provider_rate_limit",
-                  reason: err.message,
-                });
-              }
-            } finally {
-              db.close();
-            }
-            return { paused: true, run_id: runId, reason: err.message };
-          }
-          throw err;
-        }
-
-        const published = await publishJudgeArchiveView({
-          runId,
-          trackId: body.track_id || "default",
-          baseArchiveDir: archiveDir,
-          // The mediated tools write under THEMIS_JUDGE_DIR = workDir/node4,
-          // so the court records live at node4/judge.
-          judgeDir: join(workDir, "node4", "judge"),
-          viewDir,
-          // PI orchestrator + subagent session logs -> judge_traces/
-          traceDir: join(workDir, "node4"),
-        });
-
-        const db = openThemisDb(app.dataDir);
-        try {
-          const stored = upsertResultVersion(db, published.result);
-          const pointer = advanceCurrentPointer(db, {
-            runId,
-            trackId: stored.trackId,
-            resultVersionId: stored.id,
-            archiveViewPath: stored.archiveViewPath ?? viewDir,
-            baseManifestSha256: stored.reportSha256,
-            expectedResultVersionId: null,
-          });
-          return { result_version: stored, current_pointer: pointer };
-        } finally {
-          db.close();
-        }
-      })().finally(() => {
-        phase1InFlight.delete(runId);
-      });
-      existing = task;
-      phase1InFlight.set(runId, existing);
-    }
-    sendJson(res, 202, { accepted: true, run_id: runId });
+    const started = await phase1.start({
+      runId,
+      archiveDir,
+      trackId: body.track_id,
+      projectModelConfig,
+    });
+    sendJson(res, 202, { accepted: true, run_id: runId, operation_id: started.operationId });
   });
 
   /** Poll Phase-1 completion: 200 when a result exists, 202 while still running. */
   router.post("/api/judge/runs/:runId/phase1/pause", async (_req, res, ctx) => {
     const app = appOf(ctx);
     const runId = ctx.params.runId!;
+    // Same reason as the project-scoped pause: an unknown run must be a 404, not a
+    // 200 that reads like the judge was already stopped.
+    if (!app.queries.getRun(runId)) throw notFound("run not found");
     const { pausePiWorkDir } = await import("../judge/pi/runtime.js");
     const primary = join(app.dataDir, "judge_work", `case_${runId}`, "node4");
     let out = await pausePiWorkDir(primary);
@@ -385,11 +316,12 @@ export function registerJudgeRoutes(router: Router): void {
 
   /** Resume is POST /api/judge/runs/:runId/phase1 — it --continues the PI session. */
 
-  router.get("/api/judge/runs/:runId/phase1", (_req, res, ctx) => {
+  router.get("/api/judge/runs/:runId/phase1", async (_req, res, ctx) => {
     const app = appOf(ctx);
     const runId = ctx.params.runId!;
     // Always answer immediately. Long-running work must never hold the socket.
-    if (phase1InFlight.has(runId)) {
+    const st = await phase1.status(runId);
+    if (st.state === "running") {
       sendJson(res, 202, { accepted: true, run_id: runId, status: "running" });
       return;
     }

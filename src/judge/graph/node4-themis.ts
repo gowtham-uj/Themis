@@ -153,7 +153,11 @@ export async function runNode4Round(
   opts: { gateway: ModelGateway; attemptId: string; ledger?: MemoryDocumentLedger },
 ): Promise<Phase1GraphState> {
   const round = Math.max(1, state.round || 1);
-  const judgeDir = join(state.workDir, "judge");
+  // Every other Phase-1 reader (quality gate, publish-view, run activity, stage
+  // progress) resolves the court record under `node4/judge`, which is where the
+  // PI courtroom writes. The gateway loop has to write to the same place or its
+  // records are invisible and the seal refuses for lack of a court record.
+  const judgeDir = join(state.workDir, "node4", "judge");
   await mkdir(judgeDir, { recursive: true });
   const clerk = await readFile(state.paths.clerkReportPath!, "utf8");
 

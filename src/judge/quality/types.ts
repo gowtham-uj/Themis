@@ -62,6 +62,45 @@ export type Impact = (typeof IMPACT_VALUES)[number];
 export const CONFIDENCE_VALUES = Object.freeze(['high', 'medium', 'low'] as const);
 export type Confidence = (typeof CONFIDENCE_VALUES)[number];
 
+/**
+ * Where in the agent a recommendation actually lands.
+ *
+ * `category` says what kind of problem it is. It does not say what a developer
+ * on PI or ReaperCode would open to fix it, which is the first thing they need.
+ * These are the parts of a coding agent that a report can point at, and they are
+ * the same parts across agents: every one of them has a prompt, a tool layer, a
+ * way of holding context, and a way of checking its own work.
+ */
+export const AGENT_SUBSYSTEM_VALUES = Object.freeze([
+  'system_prompt',
+  'tool_definition',
+  'tool_result_handling',
+  'context_management',
+  'planning',
+  'code_search',
+  'file_editing',
+  'verification',
+  'subagent_orchestration',
+  'model_config',
+  'harness',
+  'unknown',
+] as const);
+export type AgentSubsystem = (typeof AGENT_SUBSYSTEM_VALUES)[number];
+
+/**
+ * How much is known about whether the fix works.
+ *
+ * Same three words Phase 2 uses for its recommendation classes, so a Phase 1
+ * improvement and a Phase 2 campaign recommendation sort into one list.
+ * `research_backed` requires a `web:` ref in the improvement's evidence.
+ */
+export const FIX_TYPE_VALUES = Object.freeze([
+  'direct_fix',
+  'research_backed',
+  'experimental',
+] as const);
+export type FixType = (typeof FIX_TYPE_VALUES)[number];
+
 export const CLOSED_BY_VALUES = Object.freeze([
   'no_new_tangents',
   'triage_exhausted',

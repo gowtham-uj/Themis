@@ -9,6 +9,7 @@ import {
   ModelConfigError,
   parseStoredStageConfig,
   resolveModelConfig,
+  resolveWebSearchCredential,
   viewModelConfig,
 } from "../src/config/model-config.js";
 import { checkModelHealth } from "../src/config/model-health.js";
@@ -87,6 +88,15 @@ describe("resolveModelConfig", () => {
       resolveModelConfig("eval", { env: { AGENTEVAL_EVAL_BASE_URL: "https://x.example" }, stored: {} }),
     ).toThrow(/no API key/);
   });
+
+  it("resolves a project-named Serper variable without storing its value", () => {
+    const env = { PROJECT_SEARCH_KEY: FAKE_KEY } as NodeJS.ProcessEnv;
+    const web = resolveWebSearchCredential("phase1", {
+      env,
+      stored: { phase1: { webSearchApiKeyEnv: "PROJECT_SEARCH_KEY" } },
+    });
+    expect(web).toEqual({ apiKey: FAKE_KEY, apiKeyEnv: "PROJECT_SEARCH_KEY" });
+  });
 });
 
 describe("viewModelConfig", () => {
@@ -117,14 +127,15 @@ describe("viewModelConfig", () => {
 describe("parseStoredStageConfig", () => {
   it("refuses to store a key value", () => {
     expect(() => parseStoredStageConfig({ apiKey: FAKE_KEY }, "phase1")).toThrow(/never stored/);
+    expect(() => parseStoredStageConfig({ webSearchApiKeyEnv: FAKE_KEY }, "phase1")).toThrow(/environment variable name/);
   });
 
   it("normalizes and drops blank fields", () => {
     const out = parseStoredStageConfig(
-      { baseUrl: "https://x.example///", model: "  m  ", reasoningEffort: "", apiType: "openai_compatible" },
+      { baseUrl: "https://x.example///", webSearchApiKeyEnv: " SEARCH_KEY ", model: "  m  ", reasoningEffort: "", apiType: "openai_compatible" },
       "eval",
     );
-    expect(out).toEqual({ baseUrl: "https://x.example", model: "m", apiType: "openai" });
+    expect(out).toEqual({ baseUrl: "https://x.example", webSearchApiKeyEnv: "SEARCH_KEY", model: "m", apiType: "openai" });
   });
 });
 

@@ -39,6 +39,7 @@ import {
   runs,
   settings,
   tasks,
+  evalStore,
   users,
   watcherEvents,
   watcherRules,
@@ -63,11 +64,15 @@ export interface Project {
   adapterOverrides: Record<string, unknown> | null;
   networkPolicy: string;
   retentionRuns: number | null;
+  /** Enabled evals required before this project may start runs. Defaults to 1. */
+  minEvals: number;
   /** Retention policy for generated run outputs. */
   /** Per-project sandbox controls; null when the project configures none. */
   sandbox: Record<string, unknown> | null;
   /** Per-stage model provider overrides; null when the project sets none. */
   modelConfig: Record<string, unknown> | null;
+  /** Prompt overrides keyed by filename; null when the project uses every built-in draft. */
+  promptConfig: Record<string, string> | null;
   archived: boolean;
   createdAt: string;
   updatedAt: string;
@@ -86,8 +91,10 @@ export interface CreateProjectInput {
   adapterOverrides?: Record<string, unknown>;
   networkPolicy?: string;
   retentionRuns?: number | null;
+  minEvals?: number | null;
   sandbox?: Record<string, unknown> | null;
   modelConfig?: Record<string, unknown> | null;
+  promptConfig?: Record<string, string> | null;
   id?: string;
 }
 
@@ -103,8 +110,10 @@ export interface UpdateProjectInput {
   adapterOverrides?: Record<string, unknown> | null;
   networkPolicy?: string;
   retentionRuns?: number | null;
+  minEvals?: number | null;
   sandbox?: Record<string, unknown> | null;
   modelConfig?: Record<string, unknown> | null;
+  promptConfig?: Record<string, string> | null;
 }
 
 export interface Task {
@@ -135,6 +144,40 @@ export interface Task {
   archived: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Shared eval package. Projects copy from this store; the original stays. */
+export interface StoreEval {
+  id: string;
+  name: string;
+  prompt: string;
+  workspace: WorkspaceSpec;
+  rubric: Rubric;
+  version: number;
+  rubricVersion: number;
+  agentCategory: AgentCategory;
+  categoryName: string | null;
+  profile: TaskProfile | null;
+  referenceSolution: string | null;
+  checks: unknown[] | null;
+  env: Record<string, unknown> | null;
+  tags: string[] | null;
+  packagePath: string | null;
+  packageDigest: string | null;
+  packageManifest: Record<string, unknown> | null;
+  packageValidation: Record<string, unknown> | null;
+  archived: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateStoreEvalInput {
+  id?: string;
+  spec: TaskSpec;
+  packagePath?: string | null;
+  packageDigest?: string | null;
+  packageManifest?: Record<string, unknown> | null;
+  packageValidation?: Record<string, unknown> | null;
 }
 
 export interface UpdateTaskInput {
@@ -363,6 +406,10 @@ export interface Run {
   agentImage: string | null;
   agentCommit: string | null;
   agentImageSource: string | null;
+  /** adapter_builds row this run executed; null for registry/npm images. */
+  buildId: string | null;
+  /** Agent version that build reported; null when the build declared none. */
+  agentVersion: string | null;
   /** Per-run adapter overrides as submitted; null when the run set none. */
   adapterOverrides: Record<string, unknown> | null;
   workspaceRepo: string | null;
@@ -407,6 +454,8 @@ export interface CreateRunInput {
   agentImage?: string;
   agentCommit?: string;
   agentImageSource?: string;
+  buildId?: string | null;
+  agentVersion?: string | null;
   adapterOverrides?: Record<string, unknown> | null;
   /** Repo this run evaluates, overriding the task workspace repo. */
   workspaceRepo?: string | null;
@@ -981,6 +1030,11 @@ export interface QueryStore {
   updateTask(id: string, patch: UpdateTaskInput): Task;
   archiveTask(id: string): Task;
 
+  createStoreEval(input: CreateStoreEvalInput): StoreEval;
+  getStoreEval(id: string): StoreEval | null;
+  listStoreEvals(opts?: { includeArchived?: boolean }): StoreEval[];
+  archiveStoreEval(id: string): StoreEval;
+
   registerAgent(input: RegisterAgentInput): Agent;
   getAgent(id: string): Agent | null;
   listAgents(): Agent[];
@@ -1160,6 +1214,8 @@ export interface QueryStore {
   storeEvalArchive(input: StoreEvalArchiveInput): EvalArchive;
   getEvalArchive(runId: string): EvalArchive | null;
   listEvalArchives(filter: { projectId?: string; queueId?: string; batchId?: string }): EvalArchive[];
+  /** Drop every archive catalog row. Bytes on disk are removed by the caller. */
+  deleteAllEvalArchives(): number;
 
   // ---- API tokens (P8b-auth) ----
   /**
@@ -1335,8 +1391,10 @@ function mapProject(row: typeof projects.$inferSelect): Project {
     adapterOverrides: parseJson(row.adapterOverridesJson, null),
     networkPolicy: row.networkPolicy ?? "allow",
     retentionRuns: row.retentionRuns,
+    minEvals: row.minEvals ?? 1,
     sandbox: parseJson(row.sandboxJson, null),
     modelConfig: parseJson(row.modelConfigJson, null),
+    promptConfig: parseJson(row.promptConfigJson, null),
     archived: row.archived === 1,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -1371,6 +1429,37 @@ function mapTask(row: typeof tasks.$inferSelect): Task {
     env: parseJson(row.envJson, null),
     tags: parseJson(row.tags, null),
     sourceKind: row.sourceKind,
+    packagePath: row.packagePath ?? null,
+    packageDigest: row.packageDigest ?? null,
+    packageManifest: parseJson(row.packageManifestJson, null),
+    packageValidation: parseJson(row.packageValidationJson, null),
+    archived: row.archived === 1,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function mapStoreEval(row: typeof evalStore.$inferSelect): StoreEval {
+  const rubric = parseJson<Rubric>(row.rubricJson, {
+    criteria: [],
+    profile: "general",
+    version: row.rubricVersion,
+  });
+  return {
+    id: row.id,
+    name: row.name,
+    prompt: row.prompt,
+    workspace: workspaceFromRow(row.workspaceSource, row.workspaceRepo, row.workspaceRef),
+    rubric,
+    version: row.version ?? 1,
+    rubricVersion: row.rubricVersion,
+    agentCategory: (row.agentCategory ?? "coding") as AgentCategory,
+    categoryName: row.categoryName ?? null,
+    profile: (row.profile as TaskProfile | null) ?? null,
+    referenceSolution: row.referenceSolution,
+    checks: parseJson(row.checksJson, null),
+    env: parseJson(row.envJson, null),
+    tags: parseJson(row.tags, null),
     packagePath: row.packagePath ?? null,
     packageDigest: row.packageDigest ?? null,
     packageManifest: parseJson(row.packageManifestJson, null),
@@ -1513,6 +1602,8 @@ function mapRun(row: typeof runs.$inferSelect): Run {
     agentImage: row.agentImage,
     agentCommit: row.agentCommit,
     agentImageSource: row.agentImageSource,
+    buildId: row.buildId ?? null,
+    agentVersion: row.agentVersion ?? null,
     adapterOverrides: parseJson(row.adapterOverridesJson, null),
     workspaceRepo: row.workspaceRepo ?? null,
     workspaceRef: row.workspaceRef ?? null,
@@ -1757,8 +1848,10 @@ export class SqliteQueries implements QueryStore {
       adapterOverridesJson: stringifyJson(input.adapterOverrides ?? null),
       networkPolicy: input.networkPolicy ?? "allow",
       retentionRuns: input.retentionRuns ?? null,
+      minEvals: input.minEvals ?? null,
       sandboxJson: stringifyJson(input.sandbox ?? null),
       modelConfigJson: stringifyJson(input.modelConfig ?? null),
+      promptConfigJson: stringifyJson(input.promptConfig ?? null),
       archived: 0,
       createdAt: ts,
       updatedAt: ts,
@@ -1828,6 +1921,7 @@ export class SqliteQueries implements QueryStore {
           patch.retentionRuns !== undefined
             ? patch.retentionRuns
             : existing.retentionRuns,
+        minEvals: patch.minEvals !== undefined ? patch.minEvals : existing.minEvals,
         sandboxJson:
           patch.sandbox !== undefined
             ? stringifyJson(patch.sandbox)
@@ -1836,6 +1930,10 @@ export class SqliteQueries implements QueryStore {
           patch.modelConfig !== undefined
             ? stringifyJson(patch.modelConfig)
             : stringifyJson(existing.modelConfig),
+        promptConfigJson:
+          patch.promptConfig !== undefined
+            ? stringifyJson(patch.promptConfig)
+            : stringifyJson(existing.promptConfig),
         updatedAt: ts,
       })
       .where(eq(projects.id, id))
@@ -2021,6 +2119,63 @@ export class SqliteQueries implements QueryStore {
       .run();
     const row = this.getTask(id);
     if (!row) throw notFound("task", id);
+    return row;
+  }
+
+  createStoreEval(input: CreateStoreEvalInput): StoreEval {
+    const id = input.id ?? newId();
+    const ts = nowIso();
+    const spec = input.spec;
+    const ws = workspaceToCols(spec.workspace);
+    const checks = spec.checks ?? spec.rubric.checks ?? null;
+    this.db.insert(evalStore).values({
+      id,
+      name: spec.name,
+      prompt: spec.prompt,
+      workspaceSource: ws.workspaceSource,
+      workspaceRepo: ws.workspaceRepo,
+      workspaceRef: ws.workspaceRef,
+      rubricJson: JSON.stringify(spec.rubric),
+      version: 1,
+      rubricVersion: spec.rubric.version ?? 1,
+      agentCategory: spec.agentCategory ?? "coding",
+      categoryName: spec.categoryName?.trim() || null,
+      profile: spec.profile ?? spec.rubric.profile ?? null,
+      referenceSolution: spec.referenceSolution ?? null,
+      checksJson: stringifyJson(checks),
+      envJson: stringifyJson(spec.env ?? null),
+      tags: stringifyJson(spec.tags ?? null),
+      packagePath: input.packagePath ?? null,
+      packageDigest: input.packageDigest ?? null,
+      packageManifestJson: stringifyJson(input.packageManifest ?? null),
+      packageValidationJson: stringifyJson(input.packageValidation ?? null),
+      archived: 0,
+      createdAt: ts,
+      updatedAt: ts,
+    }).run();
+    const row = this.getStoreEval(id);
+    if (!row) throw new Error("failed to create store eval");
+    return row;
+  }
+
+  getStoreEval(id: string): StoreEval | null {
+    const row = this.db.select().from(evalStore).where(eq(evalStore.id, id)).get();
+    return row ? mapStoreEval(row) : null;
+  }
+
+  listStoreEvals(opts: { includeArchived?: boolean } = {}): StoreEval[] {
+    const rows = this.db.select().from(evalStore).all();
+    return rows
+      .filter((r) => opts.includeArchived || r.archived !== 1)
+      .map(mapStoreEval);
+  }
+
+  archiveStoreEval(id: string): StoreEval {
+    const existing = this.getStoreEval(id);
+    if (!existing) throw notFound("eval store entry", id);
+    this.db.update(evalStore).set({ archived: 1, updatedAt: nowIso() }).where(eq(evalStore.id, id)).run();
+    const row = this.getStoreEval(id);
+    if (!row) throw notFound("eval store entry", id);
     return row;
   }
 
@@ -2438,6 +2593,8 @@ export class SqliteQueries implements QueryStore {
         agentImage: input.agentImage ?? null,
         agentCommit: input.agentCommit ?? null,
         agentImageSource: input.agentImageSource ?? null,
+        buildId: input.buildId ?? null,
+        agentVersion: input.agentVersion ?? null,
         adapterOverridesJson: stringifyJson(input.adapterOverrides ?? null),
         workspaceRepo: input.workspaceRepo ?? null,
         workspaceRef: input.workspaceRef ?? null,
@@ -3161,7 +3318,14 @@ export class SqliteQueries implements QueryStore {
     const nowMs = Date.parse(opts.now ?? nowIso());
     const recovered: QueueContainer[] = [];
     for (const row of this.db.select().from(queueContainers).all().map(mapQueueContainerRow)) {
-      if (!isActiveContainerState(row)) continue;
+      if (!isActiveContainerState(row)) {
+        // The container is already terminal, but a run claimed inside it can
+        // still be queued/running when the process died between the container
+        // teardown and the run seal. Nothing will ever finish that run, so give
+        // it a terminal status instead of leaving it running forever.
+        this.failOrphanedRuns(row.batchId, opts.now);
+        continue;
+      }
       const startedMs = Date.parse(row.startedAt ?? row.createdAt);
       if (!Number.isFinite(startedMs) || nowMs - startedMs < olderThanMs) continue;
       const updated = this.updateQueueContainer(row.id, {
@@ -3180,18 +3344,28 @@ export class SqliteQueries implements QueryStore {
         this.updateEvalQueue(row.queueId, { status: "failed", activeBatchId: null });
       }
       // Any still-queued runs under the orphaned generation become failed.
-      for (const run of this.listRunsByBatch(row.batchId)) {
-        if (run.status === "queued" || run.status === "running") {
-          this.finalizeRun(run.id, {
-            status: "failed",
-            error: "queue generation recovered after process restart",
-            controlState: "done",
-          });
-        }
-      }
+      this.failOrphanedRuns(row.batchId, opts.now);
       recovered.push(updated);
     }
     return recovered;
+  }
+
+  /**
+   * Give a terminal status to runs left queued/running under a generation whose
+   * container is gone. Nothing in-process owns them any more, so without this
+   * they stay `running` in every API response and the console shows a run that
+   * can never finish.
+   */
+  private failOrphanedRuns(batchId: string, now?: string): void {
+    for (const run of this.listRunsByBatch(batchId)) {
+      if (run.status !== "queued" && run.status !== "running") continue;
+      this.finalizeRun(run.id, {
+        status: "failed",
+        error: "the API process stopped while this eval was running; it was not resumable",
+        controlState: "done",
+        ...(now ? { endedAt: now } : {}),
+      });
+    }
   }
 
   beginQueueGeneration(input: {
@@ -3361,6 +3535,8 @@ export class SqliteQueries implements QueryStore {
           agentImage: input.snapshot.agentImage,
           agentCommit: input.snapshot.agentCommit,
           agentImageSource: "built",
+          buildId: input.snapshot.buildId,
+          agentVersion: input.snapshot.agentVersion,
           adapterOverridesJson: stringifyJson(input.snapshot.adapterOverrides),
           trigger: "eval-queue",
           triggerRef: input.queueId,
@@ -3445,6 +3621,12 @@ export class SqliteQueries implements QueryStore {
         (!filter.queueId || a.queueId === filter.queueId) &&
         (!filter.batchId || a.batchId === filter.batchId))
       .sort((a, b) => b.sealedAt.localeCompare(a.sealedAt));
+  }
+
+  deleteAllEvalArchives(): number {
+    const count = this.db.select().from(evalArchives).all().length;
+    this.db.delete(evalArchives).run();
+    return count;
   }
 
   // ---- API tokens (P8b-auth) ----
@@ -3741,6 +3923,7 @@ export class MemoryQueries implements QueryStore {
   private adapterBuilds = new Map<string, AdapterBuild>();
   private batches = new Map<string, RunBatch>();
   private runs = new Map<string, Run>();
+  private storeEvals = new Map<string, StoreEval>();
   private watcherRules = new Map<string, WatcherRule>();
   private watcherEvents = new Map<string, WatcherEvent>();
   private evalQueues = new Map<string, EvalQueue>();
@@ -3759,8 +3942,8 @@ export class MemoryQueries implements QueryStore {
     // Built-in agents must exist for builtin_adapter_id queues (same invariant as
     // SqliteQueries seedBuiltinAgents). In-memory store seeds them eagerly.
     for (const agent of [
-      { id: "reapercode", displayName: "ReaperCode", defaultModel: "deepseek-v4-flash", defaultProvider: "nuralwatt" },
-      { id: "pi", displayName: "pi coding agent", defaultModel: "deepseek-v4-flash", defaultProvider: "nuralwatt" },
+      { id: "reapercode", displayName: "ReaperCode", defaultModel: "", defaultProvider: "" },
+      { id: "pi", displayName: "pi coding agent", defaultModel: "", defaultProvider: "" },
     ]) {
       this.agents.set(agent.id, agent);
     }
@@ -3786,8 +3969,10 @@ export class MemoryQueries implements QueryStore {
       adapterOverrides: input.adapterOverrides ?? null,
       networkPolicy: input.networkPolicy ?? "allow",
       retentionRuns: input.retentionRuns ?? null,
+      minEvals: input.minEvals ?? 1,
       sandbox: input.sandbox ?? null,
       modelConfig: input.modelConfig ?? null,
+      promptConfig: input.promptConfig ?? null,
       archived: false,
       createdAt: ts,
       updatedAt: ts,
@@ -3847,9 +4032,12 @@ export class MemoryQueries implements QueryStore {
         patch.retentionRuns !== undefined
           ? patch.retentionRuns
           : existing.retentionRuns,
+      minEvals: patch.minEvals ?? existing.minEvals,
       sandbox: patch.sandbox !== undefined ? patch.sandbox : existing.sandbox,
       modelConfig:
         patch.modelConfig !== undefined ? patch.modelConfig : existing.modelConfig,
+      promptConfig:
+        patch.promptConfig !== undefined ? patch.promptConfig : existing.promptConfig,
       updatedAt: nowIso(),
     };
     this.projects.set(id, next);
@@ -3988,6 +4176,55 @@ export class MemoryQueries implements QueryStore {
       updatedAt: nowIso(),
     };
     this.tasks.set(id, next);
+    return { ...next };
+  }
+
+  createStoreEval(input: CreateStoreEvalInput): StoreEval {
+    const ts = nowIso();
+    const spec = input.spec;
+    const row: StoreEval = {
+      id: input.id ?? newId(),
+      name: spec.name,
+      prompt: spec.prompt,
+      workspace: spec.workspace,
+      rubric: spec.rubric,
+      version: 1,
+      rubricVersion: spec.rubric.version ?? 1,
+      agentCategory: spec.agentCategory ?? "coding",
+      categoryName: spec.categoryName?.trim() || null,
+      profile: spec.profile ?? spec.rubric.profile ?? null,
+      referenceSolution: spec.referenceSolution ?? null,
+      checks: (spec.checks ?? spec.rubric.checks ?? null) as unknown[] | null,
+      env: (spec.env ?? null) as Record<string, unknown> | null,
+      tags: spec.tags ?? null,
+      packagePath: input.packagePath ?? null,
+      packageDigest: input.packageDigest ?? null,
+      packageManifest: input.packageManifest ? structuredClone(input.packageManifest) : null,
+      packageValidation: input.packageValidation ? structuredClone(input.packageValidation) : null,
+      archived: false,
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    this.storeEvals.set(row.id, row);
+    return { ...row };
+  }
+
+  getStoreEval(id: string): StoreEval | null {
+    const row = this.storeEvals.get(id);
+    return row ? { ...row } : null;
+  }
+
+  listStoreEvals(opts: { includeArchived?: boolean } = {}): StoreEval[] {
+    return [...this.storeEvals.values()]
+      .filter((r) => opts.includeArchived || !r.archived)
+      .map((r) => ({ ...r }));
+  }
+
+  archiveStoreEval(id: string): StoreEval {
+    const existing = this.storeEvals.get(id);
+    if (!existing) throw notFound("eval store entry", id);
+    const next = { ...existing, archived: true, updatedAt: nowIso() };
+    this.storeEvals.set(id, next);
     return { ...next };
   }
 
@@ -4326,6 +4563,8 @@ export class MemoryQueries implements QueryStore {
       agentImage: input.agentImage ?? null,
       agentCommit: input.agentCommit ?? null,
       agentImageSource: input.agentImageSource ?? null,
+      buildId: input.buildId ?? null,
+      agentVersion: input.agentVersion ?? null,
       adapterOverrides: input.adapterOverrides ?? null,
       workspaceRepo: input.workspaceRepo ?? null,
       workspaceRef: input.workspaceRef ?? null,
@@ -4896,7 +5135,12 @@ export class MemoryQueries implements QueryStore {
     const nowMs = Date.parse(opts.now ?? nowIso());
     const recovered: QueueContainer[] = [];
     for (const row of [...this.queueContainers.values()]) {
-      if (!isActiveContainerState(row)) continue;
+      if (!isActiveContainerState(row)) {
+        // See SqliteQueries: a terminal container can still own a run left
+        // queued/running by a process that died before the seal.
+        this.failOrphanedRuns(row.batchId, opts.now);
+        continue;
+      }
       const startedMs = Date.parse(row.startedAt ?? row.createdAt);
       if (!Number.isFinite(startedMs) || nowMs - startedMs < olderThanMs) continue;
       const updated = this.updateQueueContainer(row.id, {
@@ -4916,18 +5160,23 @@ export class MemoryQueries implements QueryStore {
       if (queue?.activeBatchId === row.batchId) {
         this.updateEvalQueue(row.queueId, { status: "failed", activeBatchId: null });
       }
-      for (const run of this.listRunsByBatch(row.batchId)) {
-        if (run.status === "queued" || run.status === "running") {
-          this.finalizeRun(run.id, {
-            status: "failed",
-            error: "queue generation recovered after process restart",
-            controlState: "done",
-          });
-        }
-      }
+      this.failOrphanedRuns(row.batchId, opts.now);
       recovered.push(updated);
     }
     return recovered;
+  }
+
+  /** See SqliteQueries.failOrphanedRuns. */
+  private failOrphanedRuns(batchId: string, now?: string): void {
+    for (const run of this.listRunsByBatch(batchId)) {
+      if (run.status !== "queued" && run.status !== "running") continue;
+      this.finalizeRun(run.id, {
+        status: "failed",
+        error: "the API process stopped while this eval was running; it was not resumable",
+        controlState: "done",
+        ...(now ? { endedAt: now } : {}),
+      });
+    }
   }
 
   beginQueueGeneration(input: {
@@ -5062,6 +5311,8 @@ export class MemoryQueries implements QueryStore {
       agentImage: input.snapshot.agentImage ?? undefined,
       agentCommit: input.snapshot.agentCommit ?? undefined,
       agentImageSource: "built",
+      buildId: input.snapshot.buildId ?? undefined,
+      agentVersion: input.snapshot.agentVersion ?? undefined,
       adapterOverrides: input.snapshot.adapterOverrides,
       trigger: "eval-queue",
       triggerRef: input.queueId,
@@ -5129,6 +5380,12 @@ export class MemoryQueries implements QueryStore {
       (!filter.queueId || a.queueId === filter.queueId) &&
       (!filter.batchId || a.batchId === filter.batchId))
       .sort((a, b) => b.sealedAt.localeCompare(a.sealedAt)).map((a) => ({ ...a }));
+  }
+
+  deleteAllEvalArchives(): number {
+    const count = this.evalArchives.size;
+    this.evalArchives.clear();
+    return count;
   }
 
   // ---- API tokens (P8b-auth) ----

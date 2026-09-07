@@ -15,7 +15,7 @@ import type {
 } from "../db/queries.js";
 import { listAdapters } from "../adapters/index.js";
 import { verifyEvalArchive } from "../runner/eval-archive.js";
-import { parsePorts } from "../runner/project-config.js";
+import { NETWORK_POLICIES, isNetworkPolicy, parsePorts } from "../runner/project-config.js";
 import {
   startQueueContainer,
   validateItemAgainstGenerationSignature,
@@ -32,6 +32,12 @@ import {
 import { isTerminalStatus } from "../runner/status.js";
 import { getRequestAuth, isLoopbackAddress, requireAdminRequest } from "./auth.js";
 import { badRequest, conflict, HttpError, notFound } from "./errors.js";
+import { blockingReason, projectReadiness } from "./readiness.js";
+import {
+  mergeStoredModelConfig,
+  projectStoredModelConfig,
+  viewModelConfig,
+} from "../config/model-config.js";
 import {
   readJsonBody,
   sendJson,
@@ -72,6 +78,23 @@ function requireProject(queries: DbQueries, id: string): Project {
   const project = queries.getProject(id);
   if (!project || project.archived) throw notFound(`project not found: ${id}`);
   return project;
+}
+
+/**
+ * Queue model/provider from the project's eval stage, used only when the
+ * request, project defaults, and adapter defaults all left them blank.
+ * Skips the fallback when the project has never configured an eval stage,
+ * so an empty project still fails with "configure the queue agent model".
+ */
+function evalStageQueueDefaults(project: Project): { model?: string; provider?: string } {
+  const stored = mergeStoredModelConfig(projectStoredModelConfig(project.modelConfig));
+  const evalStored = stored.eval;
+  if (!evalStored || Object.keys(evalStored).length === 0) return {};
+  const view = viewModelConfig("eval", { stored });
+  return {
+    model: evalStored.model || view.model,
+    provider: (evalStored.apiType ?? view.apiType) === "anthropic" ? "anthropic" : "openai",
+  };
 }
 
 function requireSharedAdapter(queries: DbQueries, projectId: string, adapterId: string) {
@@ -295,6 +318,9 @@ function queueView(app: QueueAppCtx, queue: EvalQueue): Record<string, unknown> 
     container: publicContainer(container),
     current_run_id: live?.currentRunId ?? null,
     current_queue_item_id: live?.currentQueueItemId ?? null,
+    /** True while this process owns the live handle. A DB row alone is not enough to pause. */
+    live: Boolean(live && !live.finished),
+    paused: Boolean(live?.paused) || container?.state === "paused",
     runs,
   };
 }
@@ -385,12 +411,15 @@ export function registerQueueRoutes(router: Router): void {
       );
     }
     const sharedAgent = sharedAdapter ? app.queries.getAgent(sharedAdapter.agentId) : null;
+    const evalDefaults = evalStageQueueDefaults(project);
     const model =
       body.model ?? project.defaultModel ?? sharedAgent?.defaultModel ??
-      (builtinAdapterId ? app.queries.getAgent(builtinAdapterId)?.defaultModel ?? undefined : undefined);
+      (builtinAdapterId ? app.queries.getAgent(builtinAdapterId)?.defaultModel ?? undefined : undefined) ??
+      evalDefaults.model;
     const provider =
       body.provider ?? project.defaultProvider ?? sharedAgent?.defaultProvider ??
-      (builtinAdapterId ? app.queries.getAgent(builtinAdapterId)?.defaultProvider ?? undefined : undefined);
+      (builtinAdapterId ? app.queries.getAgent(builtinAdapterId)?.defaultProvider ?? undefined : undefined) ??
+      evalDefaults.provider;
     if (!model || !provider) {
       throw badRequest("configure the queue agent model and provider first");
     }
@@ -409,7 +438,12 @@ export function registerQueueRoutes(router: Router): void {
     }
     if (body.sandbox !== undefined) input.sandbox = objectOrNull(body.sandbox, "sandbox");
     const networkPolicy = body.network_policy ?? body.networkPolicy;
-    if (networkPolicy !== undefined) input.networkPolicy = networkPolicy;
+    if (networkPolicy !== undefined) {
+      if (!isNetworkPolicy(networkPolicy)) {
+        throw badRequest(`network_policy must be one of ${NETWORK_POLICIES.join(", ")}`);
+      }
+      input.networkPolicy = String(networkPolicy).trim().toLowerCase();
+    }
     if (body.ports !== undefined) input.ports = parsePorts(body.ports) ?? [];
     const queue = app.queries.createEvalQueue(projectId, input);
     // Pin the queue to an agent commit (resolved to a full SHA) if requested.
@@ -436,6 +470,37 @@ export function registerQueueRoutes(router: Router): void {
     sendJson(res, 200, {
       queues: app.queries.listEvalQueues(projectId).map((queue) => queueView(app, queue)),
     });
+  });
+
+  /**
+   * The project's one queue. Created on first read if the project has none,
+   * using the project adapter or the pi built-in and the eval-stage model.
+   */
+  router.get("/api/projects/:id/queue", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    const project = requireProject(app.queries, ctx.params.id!);
+    const existing = app.queries.listEvalQueues(project.id)[0];
+    if (existing) {
+      sendJson(res, 200, queueView(app, existing));
+      return;
+    }
+    const configured = app.queries.listProjectAgentAdapters(project.id).find((a) => a.enabled);
+    const builtinAdapterId = configured ? null : "pi";
+    const evalDefaults = evalStageQueueDefaults(project);
+    const model = project.defaultModel ?? evalDefaults.model;
+    const provider = project.defaultProvider ?? evalDefaults.provider;
+    if (!model || !provider) {
+      throw badRequest("set the agent model on the project settings page before opening the queue");
+    }
+    const queue = app.queries.createEvalQueue(project.id, {
+      name: project.name,
+      agentId: configured?.agentId ?? "pi",
+      model,
+      provider,
+      builtinAdapterId,
+      sharedAdapterId: null,
+    });
+    sendJson(res, 200, queueView(app, queue));
   });
 
   router.get("/api/projects/:id/queues/:queueId", (_req, res, ctx) => {
@@ -515,7 +580,12 @@ export function registerQueueRoutes(router: Router): void {
     }
     if (body.sandbox !== undefined) patch.sandbox = objectOrNull(body.sandbox, "sandbox");
     const network = body.network_policy ?? body.networkPolicy;
-    if (typeof network === "string") patch.networkPolicy = network;
+    if (network !== undefined) {
+      if (!isNetworkPolicy(network)) {
+        throw badRequest(`network_policy must be one of ${NETWORK_POLICIES.join(", ")}`);
+      }
+      patch.networkPolicy = String(network).trim().toLowerCase();
+    }
     if (body.ports !== undefined) patch.ports = parsePorts(body.ports) ?? [];
     if (body.agent_commit !== undefined || body.agentCommit !== undefined ||
         body.agent_ref !== undefined || body.agentRef !== undefined) {
@@ -744,6 +814,11 @@ export function registerQueueRoutes(router: Router): void {
         // Starting a generation may build caller-supplied OCI definitions with
         // rootful Podman; keep it behind the privileged admin boundary.
         requireAdminRequest(req, app.queries, app.authEnabled);
+        // Adapter setup and eval selection are required steps. Checking them
+        // here names the missing step instead of failing later with a message
+        // about an image tag.
+        const blocked = blockingReason(projectReadiness(app.queries, queue.projectId), "run");
+        if (blocked) throw badRequest(blocked);
         const startOpts = { ...app.queueStartOpts };
         try {
           const live = await startQueueContainer(
@@ -767,6 +842,12 @@ export function registerQueueRoutes(router: Router): void {
           if (code === "ALREADY_ACTIVE") throw conflict(message);
           if (/no enabled evals|unavailable eval|multiple images|adapter .*not ready|configured agent|no agent_commit|reproducible commit/i.test(message)) {
             throw badRequest(message);
+          }
+          // Package integrity problems are about this project's data, not a
+          // server fault. Returning 409 with the real message lets the operator
+          // fix the eval instead of reading "Internal Server Error".
+          if (/eval package|package digest|manifest|non-canonical eval package/i.test(message)) {
+            throw conflict(message, "https://agenteval.dev/errors/eval-package");
           }
           throw err;
         }

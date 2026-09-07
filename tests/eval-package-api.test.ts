@@ -48,12 +48,12 @@ describe("canonical eval creation API", () => {
     });
     expect(response.status).toBe(201);
     const body = await response.json() as { id: string; category_name: string; package_digest: string };
-    expect(body.category_name).toBe("simple");
+    expect(body.category_name).toBe("simple_atomic");
     expect(body.package_digest).toMatch(/^[a-f0-9]{64}$/);
 
     const categories = await fetch(`${base}/api/projects/${project.id}/eval-categories`);
     expect(await categories.json()).toEqual({
-      categories: [{ name: "simple", eval_count: 1 }],
+      categories: [{ name: "simple_atomic", eval_count: 1 }],
     });
   });
 

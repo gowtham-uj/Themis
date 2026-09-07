@@ -42,71 +42,112 @@ export interface ArchivePhaseState {
   phase2: ArchivePhase2State | null;
 }
 
+/** The project-level start that owns one eval run. */
+export interface ArchivePipelineRun {
+  generationId: string;
+  ordinal: number;
+  name: string | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export interface ArchiveCatalogMetadata {
+  phases: Map<string, ArchivePhaseState>;
+  pipelineRuns: Map<string, ArchivePipelineRun>;
+}
+
 export const BASE_PHASE_STATE: ArchivePhaseState = { sealed: "base", phase1: null, phase2: null };
 
-/**
- * Read Phase-1 and Phase-2 sealing state for every judged run, keyed by run ID.
- * Returns an empty map when no Themis database exists yet.
- */
-export function readArchivePhaseStates(dataDir: string): Map<string, ArchivePhaseState> {
-  const states = new Map<string, ArchivePhaseState>();
+/** Read archive phase and project-run identity in one Themis database pass. */
+export function readArchiveCatalogMetadata(dataDir: string): ArchiveCatalogMetadata {
+  const phases = new Map<string, ArchivePhaseState>();
+  const pipelineRuns = new Map<string, ArchivePipelineRun>();
+  const empty = { phases, pipelineRuns };
   const dbPath = join(dataDir, "themis.sqlite");
-  if (!existsSync(dbPath)) return states;
+  if (!existsSync(dbPath)) return empty;
 
   let db: Database.Database;
   try {
     db = new Database(dbPath, { readonly: true, fileMustExist: true });
   } catch {
-    return states;
+    return empty;
   }
 
   try {
-    if (!hasTable(db, "judge_current_pointers")) return states;
-    const pointers = db
-      .prepare(`SELECT run_id, track_id, result_version_id, updated_at FROM judge_current_pointers`)
-      .all() as Record<string, unknown>[];
-    for (const row of pointers) {
-      states.set(String(row.run_id), {
-        sealed: "phase1",
-        phase1: {
-          trackId: String(row.track_id),
-          resultVersionId: String(row.result_version_id),
-          sealedAt: String(row.updated_at),
-        },
-        phase2: null,
-      });
+    if (hasTable(db, "project_pipeline_items") && hasTable(db, "project_pipeline_generations")) {
+      const rows = db
+        .prepare(
+          `SELECT i.run_id AS run_id, g.id AS generation_id, g.ordinal AS ordinal,
+                  g.name AS name, g.created_at AS created_at, g.completed_at AS completed_at
+             FROM project_pipeline_items i
+             JOIN project_pipeline_generations g ON g.id = i.generation_id
+            WHERE i.run_id IS NOT NULL`,
+        )
+        .all() as Record<string, unknown>[];
+      for (const row of rows) {
+        pipelineRuns.set(String(row.run_id), {
+          generationId: String(row.generation_id),
+          ordinal: Number(row.ordinal),
+          name: row.name === null ? null : String(row.name),
+          createdAt: String(row.created_at),
+          completedAt: row.completed_at === null ? null : String(row.completed_at),
+        });
+      }
     }
 
-    if (!hasTable(db, "phase2_artifact_publications")) return states;
-    const publications = db
-      .prepare(
-        `SELECT p.run_id AS run_id, p.campaign_id AS campaign_id, p.state AS state,
-                p.published_at AS published_at,
-                (SELECT COUNT(*) FROM phase2_campaign_members m
-                  WHERE m.campaign_id = p.campaign_id) AS member_count
-           FROM phase2_artifact_publications p`,
-      )
-      .all() as Record<string, unknown>[];
-    for (const row of publications) {
-      const runId = String(row.run_id);
-      const phase2: ArchivePhase2State = {
-        campaignId: String(row.campaign_id),
-        state: String(row.state),
-        memberCount: Number(row.member_count ?? 0),
-        publishedAt: row.published_at === null ? null : String(row.published_at),
-      };
-      const existing = states.get(runId);
-      states.set(runId, {
-        sealed: phase2.state === "published" ? "phase2" : existing?.sealed ?? "base",
-        phase1: existing?.phase1 ?? null,
-        phase2,
-      });
+    if (hasTable(db, "judge_current_pointers")) {
+      const pointers = db
+        .prepare(`SELECT run_id, track_id, result_version_id, updated_at FROM judge_current_pointers`)
+        .all() as Record<string, unknown>[];
+      for (const row of pointers) {
+        phases.set(String(row.run_id), {
+          sealed: "phase1",
+          phase1: {
+            trackId: String(row.track_id),
+            resultVersionId: String(row.result_version_id),
+            sealedAt: String(row.updated_at),
+          },
+          phase2: null,
+        });
+      }
+    }
+
+    if (hasTable(db, "phase2_artifact_publications")) {
+      const publications = db
+        .prepare(
+          `SELECT p.run_id AS run_id, p.campaign_id AS campaign_id, p.state AS state,
+                  p.published_at AS published_at,
+                  (SELECT COUNT(*) FROM phase2_campaign_members m
+                    WHERE m.campaign_id = p.campaign_id) AS member_count
+             FROM phase2_artifact_publications p`,
+        )
+        .all() as Record<string, unknown>[];
+      for (const row of publications) {
+        const runId = String(row.run_id);
+        const phase2: ArchivePhase2State = {
+          campaignId: String(row.campaign_id),
+          state: String(row.state),
+          memberCount: Number(row.member_count ?? 0),
+          publishedAt: row.published_at === null ? null : String(row.published_at),
+        };
+        const existing = phases.get(runId);
+        phases.set(runId, {
+          sealed: phase2.state === "published" ? "phase2" : existing?.sealed ?? "base",
+          phase1: existing?.phase1 ?? null,
+          phase2,
+        });
+      }
     }
   } finally {
     db.close();
   }
 
-  return states;
+  return empty;
+}
+
+/** Read only phase state for callers that do not need project-run identity. */
+export function readArchivePhaseStates(dataDir: string): Map<string, ArchivePhaseState> {
+  return readArchiveCatalogMetadata(dataDir).phases;
 }
 
 function hasTable(db: Database.Database, name: string): boolean {

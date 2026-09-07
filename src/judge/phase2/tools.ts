@@ -1,8 +1,7 @@
 /** Campaign-scoped tools for agentic Phase-2 roles. */
 import {readFile} from "node:fs/promises";
 import {join} from "node:path";
-import type {AgentToolResult} from "./agent-loop.js";
-import {fnTool} from "./agent-loop.js";
+import {fnTool, type AgentToolResult} from "./agent-loop.js";
 import type {Phase2Case, Phase2Hypothesis, Phase2Pattern} from "./types.js";
 
 const LIFECYCLE_ALLOW = new Set([

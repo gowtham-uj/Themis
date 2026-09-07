@@ -33,3 +33,33 @@ describe("run metrics — heredoc verification is not a mutation", () => {
     expect(metrics.mutationCount).toBe(1);
   });
 });
+
+describe("run metrics — tested-agent usage", () => {
+  it("counts model requests and splits input/output tokens from usage events", () => {
+    const metrics = deriveRunMetrics([
+      { v: 1, runId: "r", seq: 1, ts: "t", type: "usage", inputTokens: 100, outputTokens: 20 },
+      { v: 1, runId: "r", seq: 2, ts: "t", type: "usage", inputTokens: 50, outputTokens: 10, reasoningTokens: 5 },
+      { v: 1, runId: "r", seq: 3, ts: "t", type: "run.end", status: "completed", durationMs: 10 },
+    ] as never);
+    expect(metrics.measurements.model_requests?.value).toBe(2);
+    expect(metrics.measurements.input_tokens?.value).toBe(150);
+    expect(metrics.measurements.output_tokens?.value).toBe(30);
+    expect(metrics.measurements.tokens_used?.value).toBe(185);
+    expect(metrics.measurements.model_requests?.provenance).toBe("exact");
+  });
+
+  it("prefers run.end.usageTotal for token totals and still counts usage events as requests", () => {
+    const metrics = deriveRunMetrics([
+      { v: 1, runId: "r", seq: 1, ts: "t", type: "usage", inputTokens: 1, outputTokens: 1 },
+      { v: 1, runId: "r", seq: 2, ts: "t", type: "usage", inputTokens: 1, outputTokens: 1 },
+      {
+        v: 1, runId: "r", seq: 3, ts: "t", type: "run.end", status: "completed", durationMs: 10,
+        usageTotal: { inputTokens: 400, outputTokens: 80, reasoningTokens: 20, totalTokens: 500 },
+      },
+    ] as never);
+    expect(metrics.measurements.model_requests?.value).toBe(2);
+    expect(metrics.measurements.input_tokens?.value).toBe(400);
+    expect(metrics.measurements.output_tokens?.value).toBe(80);
+    expect(metrics.measurements.tokens_used?.value).toBe(500);
+  });
+});

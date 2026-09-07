@@ -1,7 +1,7 @@
 /** Build and run the hidden verifier in a container separate from the agent. */
 
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Task } from "../db/queries.js";
 import {
@@ -271,8 +271,6 @@ function inferSuiteCheckKind(name: string): string {
   return "test_suite";
 }
 
-import { cp } from "node:fs/promises";
-import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
 /** Build a package-root verifier context excluding solution/validation/seed_repo. */

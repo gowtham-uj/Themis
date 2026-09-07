@@ -4,19 +4,46 @@ export function Status({ tone, label }: { tone: 'ok' | 'warn' | 'danger' | 'viol
   return <span className={`status ${tone}`}><span className="dot" />{label}</span>
 }
 
+/**
+ * Backend state names are snake_case enums. A badge is read at a glance, so it
+ * shows the phrase a person would say instead of the wire value. States without
+ * an entry already read as English once underscores become spaces.
+ */
+const STATE_LABELS: Record<string, string> = {
+  eval_pending: 'waiting',
+  eval_running: 'agent working',
+  archive_sealed: 'sealed',
+  phase1_pending: 'judge queued',
+  phase1_running: 'judging',
+  phase1_published: 'judged',
+  phase2_attached: 'in across pass',
+  final_view_published: 'final view sealed',
+  dead_letter: 'gave up',
+  waiting_retry: 'retrying',
+}
+
 export function toneFor(state: string | undefined): { tone: 'ok' | 'warn' | 'danger' | 'violet' | 'info' | 'muted'; label: string } {
   const s = (state ?? '').toLowerCase()
-  if (['completed', 'published', 'done', 'pass', 'passed', 'success', 'final_view_published'].includes(s)) return { tone: 'ok', label: state! }
-  if (['running', 'analyzing', 'reviewing', 'finalizing', 'phase1_running', 'phase2_running', 'eval_running', 'sealing', 'leased'].includes(s)) return { tone: 'info', label: state! }
-  if (['failed', 'error', 'cancelled', 'dead_letter', 'invalid', 'blocked'].includes(s)) return { tone: 'danger', label: state! }
-  if (['waiting_retry', 'retry', 'partial', 'waiting'].includes(s) || s.includes('pending')) return { tone: 'warn', label: state! }
-  if (['phase1_published', 'phase2_attached', 'archive_sealed', 'judging'].includes(s)) return { tone: 'violet', label: state! }
-  return { tone: 'muted', label: state ?? 'unknown' }
+  const label = STATE_LABELS[s] ?? s.replace(/_/g, ' ')
+  if (['completed', 'published', 'done', 'pass', 'passed', 'success', 'final_view_published'].includes(s)) return { tone: 'ok', label }
+  if (['running', 'analyzing', 'reviewing', 'finalizing', 'phase1_running', 'phase2_running', 'eval_running', 'sealing', 'leased'].includes(s)) return { tone: 'info', label }
+  if (['failed', 'error', 'cancelled', 'dead_letter', 'invalid', 'blocked'].includes(s)) return { tone: 'danger', label }
+  if (['paused', 'waiting_retry', 'retry', 'partial', 'waiting'].includes(s) || s.includes('pending')) return { tone: 'warn', label }
+  if (['phase1_published', 'phase2_attached', 'archive_sealed', 'judging'].includes(s)) return { tone: 'violet', label }
+  return { tone: 'muted', label: state ? label : 'unknown' }
 }
 
 export function StateBadge({ state }: { state: string | undefined }) {
   const t = toneFor(state)
   return <Status tone={t.tone} label={t.label} />
+}
+
+/**
+ * An eval package's category is a snake_case identifier. Tables read better
+ * with the words spaced out, and nothing else keys off the displayed text.
+ */
+export function CategoryChip({ value }: { value: string | null | undefined }) {
+  return <span className="chip">{value ? value.replace(/_/g, ' ') : '—'}</span>
 }
 
 export function Mono({ children, copy }: { children: ReactNode; copy?: boolean }) {

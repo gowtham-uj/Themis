@@ -384,6 +384,41 @@ improvements:
     category: correctness | approach | process | integrity | efficiency | tooling
     impact: high | medium | low
     confidence: high | medium | low
+    subsystem: system_prompt | tool_definition | tool_result_handling |
+               context_management | planning | code_search | file_editing |
+               verification | subagent_orchestration | model_config | harness | unknown
+      # WHICH PART OF THE AGENT a developer opens to act on this. The first
+      # question anyone maintaining PI or ReaperCode asks, and `category` never
+      # answered it. Name it when you know it. Leave it out rather than guess:
+      # the host classifies your prose and writes `unknown` when nothing fits.
+    fix_type: direct_fix | research_backed | experimental
+      # How well established the fix is. `research_backed` requires a web ref in
+      # this improvement's `evidence` — the host will not accept the word
+      # without one. `experimental` is honest when you are proposing something
+      # the record cannot settle. Everything else is `direct_fix`.
+    signature: <one id from the finding vocabulary, e.g. VERIFICATION_GAP>
+      # The known pathology this instance belongs to, so the same problem across
+      # many evals groups into one row instead of many paraphrases. The host
+      # classifies your prose against the vocabulary and fills this in; name it
+      # yourself only when you are sure which one it is.
+    extra:
+      # OPTIONAL, and open. Anything you learned about this agent that the six
+      # keys above have no slot for goes here, under a key you choose. Use it —
+      # a field the template never anticipated is often the most useful thing in
+      # the report to the developer who maintains this agent.
+      #
+      # Examples of what belongs here:
+      #   pattern: <the recurring behavior this instance is one case of>
+      #   root_cause: <the underlying reason, when the record establishes one>
+      #   affected_component: <the part of the agent that would change>
+      #   trigger: <what conditions bring the behavior out>
+      #   generalizes: <where else this would show up>
+      #
+      # Two rules. Every value must be grounded in the record, exactly like the
+      # keys above; do not speculate here because the slot is free. And do not
+      # move a required field into `extra` — `category` still has to be one of
+      # the six words, even when your own word for it is better. If your word is
+      # better, put it in `extra` as well and say so.
     # `impact` is on the agent's future performance, not on this eval's reward.
     # Include an item only if the record supports it. An improvement you cannot
     # ground in a ref belongs in `open_questions`.

@@ -12,10 +12,8 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 
-import type { EvalPackageManifestFile } from "../evals/package.js";
-import { EVAL_PACKAGE_SCHEMA_VERSION } from "../evals/package.js";
-import type { ArtifactStore } from "./artifact-store.js";
-import { ArtifactStoreError } from "./artifact-store.js";
+import { EVAL_PACKAGE_SCHEMA_VERSION, type EvalPackageManifestFile } from "../evals/package.js";
+import { ArtifactStoreError, type ArtifactStore } from "./artifact-store.js";
 import { blobKey, normalizeSha256 } from "./content-address.js";
 
 /** One file submitted for package storage. */

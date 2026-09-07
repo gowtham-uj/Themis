@@ -7,8 +7,11 @@ dist/
 !.env.example
 .DS_Store
 coverage/
-# local eval data — never commit runs/archives
+# Local eval data and generated diagnostics. Never commit runs, archives, or probes.
 data/
+reports/
+.scratch-*/
+context.md
 .env.test
 .env
 .env.local

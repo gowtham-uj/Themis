@@ -21,14 +21,21 @@ import { join } from "node:path";
 import { stringify } from "yaml";
 
 import { classifyEvalValidity } from "../validity/classify.js";
+import { classifySignatures } from "../validity/signatures.js";
 import {
   arr,
   closedByOf,
   confidenceBasisOf,
   confidenceOf,
+  fixTypeOf,
+  improvementCategoryOf,
+  subsystemOf,
   integritySummaryOf,
+  integrityVerdictOf,
   narrativeOf,
   obj,
+  splitKnownKeys,
+  tierOf,
   openQuestionsOf,
   reportRefOf,
   rewardReconciliationOf,
@@ -87,6 +94,23 @@ async function readAgentId(archiveDir: string | undefined): Promise<string | nul
   }
 }
 
+/**
+ * The keys an improvement may carry at its top level (report-templates.md #4),
+ * plus `extra`, which holds anything minos filed beyond the frozen set.
+ */
+const IMPROVEMENT_KEYS: readonly string[] = [
+  "issue",
+  "evidence",
+  "recommendation",
+  "category",
+  "impact",
+  "confidence",
+  "subsystem",
+  "fix_type",
+  "signature",
+  "extra",
+];
+
 /** The strengths/improvements minos committed, aggregated across rounds. */
 function minosDeliverables(docs: Array<Record<string, unknown>>): {
   whatTheyDidWell: Array<Record<string, unknown>>;
@@ -125,8 +149,46 @@ function minosDeliverables(docs: Array<Record<string, unknown>>): {
           .map((ev) => obj(ev))
           .filter((ev): ev is Record<string, unknown> => ev !== null)
           .map((ev) => ({ report: reportRefOf(ev.report, round), ref: validRef(ev.ref) }));
-        improvements.push({ ...o, evidence });
+        // A `web:` ref means minos actually retrieved a source through
+        // web_search, so `research_backed` cannot be claimed without one.
+        const hasWebRef = evidence.some(
+          (ev) => ev.ref?.startsWith("web:") === true || ev.report?.startsWith("web:") === true,
+        );
+        // Prose is copied verbatim; only the structural fields are mapped onto
+        // the frozen enums. Minos writes the natural engineering word
+        // ("robustness", "performance"), and because this projection is
+        // deterministic, an off-enum value was previously unfixable by any
+        // retry. Whatever minos actually wrote is preserved under `extra`, along
+        // with any key the template never named, since a surprise field like
+        // `pattern` or `root_cause` is real signal about the agent under test.
+        const { extra } = splitKnownKeys(o, IMPROVEMENT_KEYS);
+        const category = improvementCategoryOf(o.category);
+        if (typeof o.category === "string" && o.category !== category) {
+          extra.category_as_written = o.category;
+        }
+        // Three fields the six frozen keys never answered, and a developer on
+        // PI or ReaperCode needs all three: which part of the agent to open,
+        // how well established the fix is, and which known pathology this is an
+        // instance of. All are derived here, from minos's own words where it
+        // named them and from its prose otherwise, so the vocabulary is stable
+        // across cases instead of depending on one model's word choice.
+        const prose = `${str(o.issue)}\n${str(o.recommendation ?? "")}`;
+        const signatures = classifySignatures(prose);
+        improvements.push({
+          issue: str(o.issue),
+          evidence,
+          recommendation: str(o.recommendation ?? o.issue),
+          category,
+          impact: tierOf(o.impact, "medium"),
+          confidence: tierOf(o.confidence, "medium"),
+          subsystem: subsystemOf(o.subsystem ?? o.affected_component, prose),
+          fix_type: fixTypeOf(o.fix_type ?? o.class, hasWebRef),
+          signature: signatures[0] ?? "UNCLASSIFIED",
+          ...(Object.keys(extra).length > 0 ? { extra } : {}),
+        });
       } else {
+        // A bare string improvement from an older minos shape still gets
+        // classified: the prose is all there is, and it is enough.
         improvements.push({
           issue,
           evidence: [],
@@ -134,6 +196,9 @@ function minosDeliverables(docs: Array<Record<string, unknown>>): {
           category: "process",
           impact: "medium",
           confidence: "high",
+          subsystem: subsystemOf(null, issue),
+          fix_type: "direct_fix",
+          signature: classifySignatures(issue)[0] ?? "UNCLASSIFIED",
         });
       }
     }

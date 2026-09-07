@@ -30,6 +30,7 @@ import {
   type StoredModelConfig,
 } from "../config/model-config.js";
 import { checkModelHealth } from "../config/model-health.js";
+import { deleteSecret, listSecrets, putSecret } from "../config/secret-vault.js";
 import {
   getRequestAuth,
   isPublicApiPath,
@@ -402,6 +403,43 @@ export function registerSettingsRoutes(router: Router): void {
     app.queries.setSetting(SETTINGS_KEYS.modelStages, stored);
     setStoredModelConfig(stored);
     sendJson(res, 200, { stages: MODEL_STAGES.map((s) => viewModelConfig(s)) });
+  });
+
+  // ---- Credential values ----
+  //
+  // The console can accept a key value directly instead of asking the operator
+  // to export it before starting the server. The value is encrypted at rest and
+  // decrypted into this process's environment, so every queue, adapter, and
+  // judge stage keeps resolving it by variable name exactly as before. Reads
+  // return names and write times only.
+
+  router.get("/api/settings/secrets", (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireAdmin(req, app.queries, app.authEnabled);
+    sendJson(res, 200, { secrets: listSecrets(app.queries) });
+  });
+
+  router.put("/api/settings/secrets/:name", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireAdmin(req, app.queries, app.authEnabled);
+    const name = ctx.params.name ?? "";
+    const body = await readJsonBody<{ value?: unknown }>(req);
+    const value = typeof body?.value === "string" ? body.value.trim() : "";
+    if (!value) throw badRequest("value is required");
+    try {
+      putSecret(app.queries, name, value);
+    } catch (err) {
+      throw badRequest(err instanceof Error ? err.message : String(err));
+    }
+    sendJson(res, 200, { secrets: listSecrets(app.queries) });
+  });
+
+  router.delete("/api/settings/secrets/:name", (req, res, ctx) => {
+    const app = appOf(ctx);
+    requireAdmin(req, app.queries, app.authEnabled);
+    const name = ctx.params.name ?? "";
+    if (!deleteSecret(app.queries, name)) throw notFound(`no stored value for "${name}"`);
+    sendJson(res, 200, { secrets: listSecrets(app.queries) });
   });
 
   // Real request against the configured endpoint. Config presence is not

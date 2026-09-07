@@ -1,155 +1,152 @@
 /**
- * WP-12 minimal archive-view publisher: base archive + judge/ tree → view dir.
- * Does not yet CAS current pointers in PostgreSQL (full WP-12); produces the
- * on-disk strict-superset view the plan requires.
+ * Phase-1 publication: seal the `judge/` tree back into the eval's own archive.
+ *
+ * An eval gets exactly one archive directory for its whole life. Phase 1 does
+ * not copy it anywhere; it stages its output, then reseals that one directory
+ * with `judge/` (the court record) and `phase1/` (how the judgement was
+ * produced: deterministic node0-node3 artifacts plus `phase1/judge_traces/`)
+ * added, every base path byte-identical.
  */
 
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { cp, mkdir, readdir, stat, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { cp, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 
+import type { DbQueries } from "../../db/queries.js";
+import { resealEvalArchive } from "../../runner/eval-archive.js";
+import { copySanitizedPiTraceEntry, createReasoningContentStripper } from "../pi/sanitize-trace.js";
 import type { JudgeResultVersion } from "./types.js";
 
-async function listFiles(root: string): Promise<string[]> {
-  const out: string[] = [];
-  async function walk(dir: string): Promise<void> {
-    for (const name of await readdir(dir)) {
-      const p = join(dir, name);
-      const s = await stat(p);
-      if (s.isDirectory()) await walk(p);
-      else if (s.isFile()) out.push(p);
+/** Deterministic Phase-1 node directories, sealed as the provenance of the ruling. */
+const NODE_DIRS = ["node0", "node1", "node2", "node3"];
+
+/**
+ * Stage the `phase1/` layer: the deterministic node0-node3 artifacts that fed
+ * the courtroom, plus `phase1/judge_traces/` holding orchestrator and subagent
+ * session logs. The court records themselves stay in `judge/`, so `judge` is
+ * skipped here. Returns the staging dir, or null when there is nothing to seal.
+ */
+async function stagePhase1(
+  workDir: string | undefined,
+  traceDir: string | undefined,
+  stagingRoot: string,
+): Promise<string | null> {
+  const dest = join(stagingRoot, "phase1");
+  await mkdir(dest, { recursive: true });
+  let staged = 0;
+
+  if (workDir) {
+    for (const node of NODE_DIRS) {
+      const src = join(workDir, node);
+      if (!(await readdir(src).catch(() => null))) continue;
+      await cp(src, join(dest, node), { recursive: true, force: true });
+      staged += 1;
+    }
+    const checkpoints = join(workDir, "checkpoints");
+    if (await readdir(checkpoints).catch(() => null)) {
+      await cp(checkpoints, join(dest, "checkpoints"), { recursive: true, force: true });
+      staged += 1;
     }
   }
-  await walk(root);
-  return out;
+
+  const names = traceDir ? await readdir(traceDir).catch(() => null) : null;
+  if (names) {
+    const traces = join(dest, "judge_traces");
+    await mkdir(traces, { recursive: true });
+    for (const name of names) {
+      if (name === "judge") continue;
+      if (name === "pi-stdout.jsonl") {
+        // Raw orchestrator event streams reach multiple GB. Session jsonl files
+        // are the resume source and stay raw; this examination-only firehose is
+        // compressed so the archive does not carry it verbatim.
+        await pipeline(
+          createReadStream(join(traceDir!, name)),
+          createReasoningContentStripper(),
+          createGzip({ level: 6 }),
+          createWriteStream(join(traces, "pi-stdout.jsonl.gz")),
+        );
+        staged += 1;
+        continue;
+      }
+      await copySanitizedPiTraceEntry(join(traceDir!, name), join(traces, name));
+      staged += 1;
+    }
+  }
+
+  return staged > 0 ? dest : null;
 }
 
-/** Hash one file with fixed-size stream buffers (supports multi-GB traces). */
-async function hashFile(path: string): Promise<{ sha256: string; bytes: number }> {
-  const hash = createHash("sha256");
-  let bytes = 0;
-  await new Promise<void>((resolve, reject) => {
-    const stream = createReadStream(path, { highWaterMark: 1024 * 1024 });
-    stream.on("data", (chunk: string | Buffer) => {
-      const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-      hash.update(buf);
-      bytes += buf.length;
-    });
-    stream.on("end", resolve);
-    stream.on("error", reject);
-  });
-  return { sha256: hash.digest("hex"), bytes };
-}
-
-/** Publish a judge view over an immutable base archive directory. */
+/** Reseal one eval's archive with its Phase-1 judgement layered in. */
 export async function publishJudgeArchiveView(input: {
   runId: string;
   trackId: string;
+  /** The eval's own sealed archive. Resealed in place, never copied. */
   baseArchiveDir: string;
   judgeDir: string;
-  viewDir: string;
   /**
-   * PI orchestrator + subagent session logs for this case. Sealed into the view
-   * under `judge_traces/` so the resealed archive carries the full provenance of
-   * how the judgement was reached, not just its conclusions.
+   * PI orchestrator and subagent session logs for this case, sealed under
+   * `phase1/judge_traces/` so the archive carries how the judgement was reached.
    */
   traceDir?: string;
+  /**
+   * The case work directory (`judge_work/case_<runId>`). Its deterministic
+   * node0-node3 outputs and checkpoints seal under `phase1/`, so the evidence
+   * the courtroom actually read is retained beside the ruling.
+   */
+  workDir?: string;
+  queries?: DbQueries | null;
 }): Promise<{ result: JudgeResultVersion; manifestPath: string }> {
-  await mkdir(input.viewDir, { recursive: true });
-  // Copy base (caller may pass an empty viewDir).
-  await cp(input.baseArchiveDir, input.viewDir, { recursive: true, force: true });
-  const judgeDest = join(input.viewDir, "judge");
-  await mkdir(judgeDest, { recursive: true });
+  // A partial judge/ is recoverable, not fatal: resealEvalArchive completes an
+  // already-sealed layer by adding only the files it lacks. What is worth
+  // refusing is a seal with no court record at all, which would spend the
+  // archive's one publication on the quality gate's own output.
+  // The PI courtroom writes YAML, the gateway loop writes JSON, and the log
+  // books are Markdown, so the record is identified by not being the gate's own
+  // output rather than by extension.
+  const judgeFiles = await readdir(input.judgeDir).catch(() => [] as string[]);
+  if (!judgeFiles.some((n) => n !== "quality-report.json" && !n.startsWith("."))) {
+    throw new Error(
+      `refusing to seal judge/ for run ${input.runId}: no court record in ${input.judgeDir}` +
+        ` (found ${judgeFiles.length ? judgeFiles.join(", ") : "nothing"}).` +
+        " A later retry can still complete this layer once the courtroom writes one.",
+    );
+  }
+
+  const stagingRoot = await mkdtemp(join(tmpdir(), "ae-reseal-"));
   try {
-    await cp(input.judgeDir, judgeDest, { recursive: true, force: true });
-  } catch {
-    // A case that produced no court records still reseals: the view carries the
-    // base plus whatever provenance exists, rather than failing the publish.
-  }
-
-  // judge_traces/: orchestrator + subagent session logs (pi stdout stream and
-  // per-child transcripts). Best-effort — a missing trace dir never blocks a
-  // publish, but when present it is sealed with the rest of the view.
-  if (input.traceDir) {
-    try {
-      const tracesDest = join(input.viewDir, "judge_traces");
-      await mkdir(tracesDest, { recursive: true });
-      // Copy only the trace artifacts — the orchestrator/subagent session
-      // streams and transcripts. The `judge` subdirectory is the same court
-      // records already sealed under view/judge/, so copying it here would
-      // duplicate the whole tree.
-      const { readdir } = await import("node:fs/promises");
-      const { join: j } = await import("node:path");
-      for (const name of await readdir(input.traceDir)) {
-        if (name === "judge") continue;
-        if (name === "pi-stdout.jsonl") {
-          // Raw orchestrator event streams can be multi-GB. Session jsonl files
-          // are the resume source and remain raw; compress this examination-only
-          // firehose while copying so the resealed view does not duplicate 3GB.
-          await pipeline(
-            createReadStream(j(input.traceDir, name)),
-            createGzip({ level: 6 }),
-            createWriteStream(j(tracesDest, "pi-stdout.jsonl.gz")),
-          );
-          continue;
-        }
-        await cp(j(input.traceDir, name), j(tracesDest, name), {
-          recursive: true,
-          force: true,
-        });
-      }
-    } catch {
-      // trace capture is provenance, not correctness
+    const layers: { name: string; sourceDir: string }[] = [
+      { name: "judge", sourceDir: input.judgeDir },
+    ];
+    if (input.traceDir || input.workDir) {
+      const phase1 = await stagePhase1(input.workDir, input.traceDir, stagingRoot);
+      if (phase1) layers.push({ name: "phase1", sourceDir: phase1 });
     }
-  }
 
-  const files = await listFiles(input.viewDir);
-  const entries = [];
-  for (const abs of files.sort()) {
-    const rel = relative(input.viewDir, abs).replace(/\\/g, "/");
-    if (rel === "view.manifest.json") continue;
-    const hashed = await hashFile(abs);
-    entries.push({
-      path: rel,
-      kind: "file" as const,
-      bytes: hashed.bytes,
-      sha256: hashed.sha256,
-      symlinkTarget: null,
+    const { manifest } = await resealEvalArchive({
+      runId: input.runId,
+      archiveDir: input.baseArchiveDir,
+      layers,
+      queries: input.queries ?? null,
     });
-  }
-  const report = entries.find((e) => e.path === "judge/evalJudge.yaml");
-  // The remediation deliverable is optional (the remedy agent may have had no
-  // confirmed findings to research), but when present it is sealed and surfaced
-  // alongside the report so Phase 2 has the developer-facing improvement pack.
-  const developerBrief = entries.find((e) => e.path === "judge/developer-brief.yaml");
-  const manifest = {
-    schemaVersion: 1,
-    kind: "themis-archive-view",
-    runId: input.runId,
-    files: entries,
-    totalBytes: entries.reduce((s, e) => s + e.bytes, 0),
-    resealedAt: new Date().toISOString(),
-    deliverables: {
-      evalJudge: report?.sha256 ?? null,
-      developerBrief: developerBrief?.sha256 ?? null,
-    },
-  };
-  const manifestPath = join(input.viewDir, "view.manifest.json");
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
-  const result: JudgeResultVersion = {
-    id: `jrv_${createHash("sha256").update(`${input.runId}:${report?.sha256 ?? ""}`).digest("hex").slice(0, 32)}`,
-    runId: input.runId,
-    trackId: input.trackId,
-    reportSha256: report?.sha256 ?? "",
-    reportPath: join(input.viewDir, "judge/evalJudge.yaml"),
-    archiveViewPath: input.viewDir,
-    publicationState: "published",
-    schemaVersion: 1,
-    createdAt: new Date().toISOString(),
-  };
-  return { result, manifestPath };
+    const report = manifest.files.find((f) => f.path === "judge/evalJudge.yaml");
+    const result: JudgeResultVersion = {
+      id: `jrv_${createHash("sha256").update(`${input.runId}:${report?.sha256 ?? ""}`).digest("hex").slice(0, 32)}`,
+      runId: input.runId,
+      trackId: input.trackId,
+      reportSha256: report?.sha256 ?? "",
+      reportPath: join(input.baseArchiveDir, "judge/evalJudge.yaml"),
+      archiveViewPath: input.baseArchiveDir,
+      publicationState: "published",
+      schemaVersion: 1,
+      createdAt: new Date().toISOString(),
+    };
+    return { result, manifestPath: join(input.baseArchiveDir, manifest.manifestRel) };
+  } finally {
+    await rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined);
+  }
 }

@@ -1,10 +1,10 @@
-# Authoring an agenteval eval (suite format)
+# Authoring a Themis eval (suite format)
 
-Agenteval accepts **one** eval format: a project-scoped, immutable eval package described with a flat
+Themis accepts **one** eval format: a project-scoped, immutable eval package described with a flat
 `task.toml`, an initial agent workspace (`seed_repo/`), a self-contained environment image, a separate
 hidden verifier, and validation material. This is the only accepted creation format for new evals.
 
-Each eval is created per-project through the API — one eval per package, or many evals from a packed
+Each eval is created per-project through the API, one eval per package, or many evals from a packed
 suite file. Eval rows are project-scoped and independent per project.
 
 ## Required tree (one eval)
@@ -39,7 +39,7 @@ The validator requires `instruction.md`, `task.toml`, `README.md`, `seed_repo/`,
 `environment/` scripts, `tests/{Dockerfile,test.sh,verifier.py}`, `solution/{solve.sh,reference.patch,
 reference_files/}`, and `validation/{expected.json,known_bad.patch,known_bad/}`.
 
-## task.toml — flat schema
+## task.toml, flat schema
 
 All keys are top-level scalars (no `[table]`). Example (python):
 
@@ -69,41 +69,32 @@ disk_mb`. `official_reward` must be `"binary"`; `internet` must be `allow|allowl
 The platform maps each eval to `category_name="simple"` and `agent_category="coding"` (per the accepted
 category contract) regardless of the suite's own `category` value.
 
-## environment/Dockerfile (required, but not built as the agent image)
+## environment/Dockerfile and the universal fat base
 
-The file `environment/Dockerfile` is still required for format compatibility (and must stay
-COPY-context-isolated, no `solution/`/`tests/`/`validation/` references), but the platform does **not**
-build it as the agent container image. Instead, all suite evals in a queue share **one platform-provided
-fat base image** (`debian:bookworm-slim` + build-essential + git + apt + sudo + non-root `agent` uid
-`10001`), overlaid once with the project's reaper adapter. Heterogeneous suite evals (python/node/gcc/
-bash/c) therefore run sequentially in a single persistent queue container.
+`environment/Dockerfile` remains required for package compatibility and verifier context validation. It must not copy or reference `solution/`, `tests/`, or `validation/`. The eval queue does not build one agent image per eval.
 
-The language toolchain is installed **at eval time** by the platform-synthesized `setup.sh` (below),
-derived from `task.toml`'s `language` field — `language` is the source of truth for the agent
-container's toolchain, not the Dockerfile.
+Every queue uses one platform fat base derived from `debian:bookworm-slim`. The image includes:
+
+- build-essential, git, apt, sudo, and common shell tools;
+- Node.js and npm;
+- Python, pip, and venv;
+- Go;
+- Rust and Cargo;
+- the non-root `agent` user with uid `10001`.
+
+The selected agent adapter is overlaid once. Python, Node, Go, Rust, C, C++, and shell evals can then run sequentially in the same persistent queue container without installing a language toolchain for each eval.
 
 ## environment/setup.sh and environment/cleanup.sh
 
-Each eval's `setup.sh` / `cleanup.sh` provision and tear down that eval's dependencies at eval time
-inside the shared container:
+The platform wraps each package lifecycle script:
 
-- The platform **synthesizes a wrapper** `lifecycle-setup.sh` that runs as `root`: it `apt-get install`s
-  the packages mapped from `language` (see map below), then runs the author's `environment/setup.sh`
-  body, then `chown`s `/workspace/task` to uid `10001` so the non-root agent can write it.
-- The author's `setup.sh` (argv[1]=target, default `/workspace/task`) runs with `cwd=/workspace/.agenteval`,
-  where the staged `seed_repo/` is available (it references `seed_repo` via `dirname $0/..`). It seeds
-  the target and `git init`s a baseline.
-- After the agent runs, the platform synthesizes `lifecycle-cleanup.sh` (restoring the trusted copy
-  defensively): it runs the author's `cleanup.sh` (deletes `/workspace/task`), then `apt-get purge` +
-  `autoremove` the toolchain — a best-effort restore between evals.
+- `lifecycle-setup.sh` runs as root, calls the package's `environment/setup.sh`, then gives uid `10001` ownership of `/workspace/task`.
+- The package setup receives the target path as `argv[1]`. It copies `seed_repo/` into that target and creates the baseline repository state.
+- The agent runs as the non-root user.
+- `lifecycle-cleanup.sh` calls the package's `environment/cleanup.sh` and verifies that the workspace is safe for the next eval.
+- Baked language toolchains are never purged between evals.
 
-Language → apt map: `python`→`[python3, python3-pip, python3-venv]`, `javascript`/`node`→`[nodejs, npm]`,
-`c`→`[gcc]`, `cpp`→`[g++]`, `bash`→ none (already present). Unknown languages install nothing (the eval
-runs only if the toolchain is already in the base).
-
-> One persistent container per queue: the setup/cleanup restore is best-effort. If a language's
-> packages leak shared libraries that a later eval happens to use, prefer moving that eval to a
-> homogeneous queue; but mixed simple-language suites are the intended shared-container case.
+The queue worker records setup, cleanup, and reset evidence. A cleanup or reset failure taints the persistent queue because the next eval can no longer trust the shared container state.
 
 ## Confidentiality boundary
 
@@ -112,9 +103,13 @@ runs only if the toolchain is already in the base).
   enter it.
 - The **hidden verifier** (`tests/`) runs in a separate offline container against the final
   `/workspace/task`; the agent never sees it.
-- The **agent container network is `allow`** so the real reaper agent can reach its model provider. The
-  suite's `internet=...` describes task/verifier network intent and is honored by the isolated verifier
-  (always offline), not by offlining the agent container.
+- The **agent container network is `allowlist`**. Every packet leaves through an nftables filter installed
+  in the container's own network namespace, with a default drop policy. There is one list and it is an
+  allowlist: nothing gets out unless an entry names it. Suite packages carry a single entry covering the
+  whole address space, so egress is open today, because the agent has to reach whatever model endpoint the
+  project points it at. Narrowing that is an edit to `SUITE_AGENT_ALLOWLIST` in `src/evals/package.ts`, not
+  a switch to a different enforcement path. The suite's `internet=...` describes task/verifier network
+  intent and is honored by the isolated verifier (always offline), not by offlining the agent container.
 
 ## The verifier contract
 

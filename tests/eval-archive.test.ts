@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MemoryQueries } from "../src/db/queries.ts";
 import {
   buildEvalContext,
+  resealEvalArchive,
   restructureSuiteArchive,
   sealEvalArchive,
   verifyEvalArchive,
@@ -225,5 +226,109 @@ describe("eval archive", () => {
 
     // verifyEvalArchive round-trips through the nested manifest location.
     expect(await verifyEvalArchive(sealed.archive)).toMatchObject({ ok: true, errors: [] });
+  });
+});
+
+describe("eval archive reseal", () => {
+  /** A sealed one-file archive plus a registry that owns its row. */
+  async function sealed(runId: string) {
+    const dataDir = await mkdtemp(join(tmpdir(), "agenteval-reseal-"));
+    dirs.push(dataDir);
+    const root = join(dataDir, "evals", runId);
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "evidence.txt"), "base bytes\n");
+    const queries = new MemoryQueries(dataDir);
+    await sealEvalArchive(queries, root, {
+      runId,
+      projectId: "proj_1",
+      queueId: null,
+      batchId: "batch_1",
+    });
+    return { root, queries, dataDir };
+  }
+
+  it("adds a layer in place, records provenance, and updates the archive row", async () => {
+    const { root, queries, dataDir } = await sealed("run_reseal_1");
+    const src = join(dataDir, "judge-src");
+    await mkdir(src, { recursive: true });
+    await writeFile(join(src, "evalJudge.yaml"), "verdict: principled\n");
+
+    const before = queries.getEvalArchive("run_reseal_1")!;
+    const { archive, manifest } = await resealEvalArchive({
+      runId: "run_reseal_1",
+      archiveDir: root,
+      layers: [{ name: "judge", sourceDir: src }],
+      queries,
+    });
+
+    expect(manifest.layers).toEqual(["judge"]);
+    expect(manifest.files.map((f) => f.path)).toContain("judge/evalJudge.yaml");
+    expect(manifest.files.map((f) => f.path)).toContain("evidence.txt");
+    expect(archive!.manifestSha256).not.toBe(before.manifestSha256);
+    expect(archive!.sizeBytes).toBeGreaterThan(0);
+    expect(archive!.sealedAt).toBe(before.sealedAt);
+    expect(await verifyEvalArchive(archive!)).toMatchObject({ ok: true, errors: [] });
+  });
+
+  it("rejects a second reseal of the same layer", async () => {
+    const { root, queries, dataDir } = await sealed("run_reseal_2");
+    const src = join(dataDir, "judge-src");
+    await mkdir(src, { recursive: true });
+    await writeFile(join(src, "evalJudge.yaml"), "verdict: principled\n");
+    const args = {
+      runId: "run_reseal_2",
+      archiveDir: root,
+      layers: [{ name: "judge", sourceDir: src }],
+      queries,
+    };
+    await resealEvalArchive(args);
+    await expect(resealEvalArchive(args)).rejects.toThrow(/already carries layer judge/);
+  });
+
+  it("aborts when a base path changed under the seal", async () => {
+    const { root, queries, dataDir } = await sealed("run_reseal_3");
+    const src = join(dataDir, "judge-src");
+    await mkdir(src, { recursive: true });
+    await writeFile(join(src, "evalJudge.yaml"), "verdict: principled\n");
+    const { chmod } = await import("node:fs/promises");
+    await chmod(root, 0o755);
+    await chmod(join(root, "evidence.txt"), 0o644);
+    await writeFile(join(root, "evidence.txt"), "tampered\n");
+
+    await expect(
+      resealEvalArchive({
+        runId: "run_reseal_3",
+        archiveDir: root,
+        layers: [{ name: "judge", sourceDir: src }],
+        queries,
+      }),
+    ).rejects.toThrow(/reseal changed a sealed path: evidence\.txt/);
+  });
+
+  it("skips a layer whose source is missing and fails when none exist", async () => {
+    const { root, queries, dataDir } = await sealed("run_reseal_4");
+    const src = join(dataDir, "judge-src");
+    await mkdir(src, { recursive: true });
+    await writeFile(join(src, "evalJudge.yaml"), "verdict: principled\n");
+
+    const { manifest } = await resealEvalArchive({
+      runId: "run_reseal_4",
+      archiveDir: root,
+      layers: [
+        { name: "judge", sourceDir: src },
+        { name: "phase1", sourceDir: join(dataDir, "absent") },
+      ],
+      queries,
+    });
+    expect(manifest.layers).toEqual(["judge"]);
+
+    await expect(
+      resealEvalArchive({
+        runId: "run_reseal_4",
+        archiveDir: root,
+        layers: [{ name: "phase2", sourceDir: join(dataDir, "absent") }],
+        queries,
+      }),
+    ).rejects.toThrow(/no reseal layer source exists/);
   });
 });

@@ -9,7 +9,7 @@
 - **WP-5** judge_queues/outbox/idempotency DDL + outbox helpers + **OutboxRelay**
 - **WP-6** ModelGateway + ledger + ReasoningStarvedError + json repair
 - **WP-7** Document ledger + evidence/scratchpad/petition tools
-- **WP-8/9** Node0–3 (live gateway path)
+- **WP-8/9** Nodes 0-3 (live gateway path)
 - **WP-10** Node4 + multi-round loop
 - **WP-11** Result versions (+ keyset list)
 - **WP-12** Publish view + CAS current pointers

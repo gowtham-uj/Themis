@@ -16,6 +16,14 @@ const execFileAsync = promisify(execFile);
 import { listAdapters } from "../adapters/index.js";
 import { runAdapterGenerator, GENERATOR_CONTRACT } from "../adapters/generator.js";
 import { createDeclarativeAdapter, renderTemplate } from "../adapters/declarative.js";
+import {
+  HARNESS_CREDENTIAL_NAMES,
+  credentialContractDoc,
+  stageManagedNames,
+  validateCredentialEnv,
+} from "../adapters/credential-contract.js";
+import { adapterDocs } from "../adapters/docs.js";
+import { projectStoredModelConfig, resolveModelConfig, type ModelStageConfig } from "../config/model-config.js";
 import type { EvidenceEntry, EvidenceRole, RunContext } from "../adapters/types.js";
 import type {
   CliAdapterEvidenceConfig,
@@ -23,6 +31,8 @@ import type {
   CliCommandTemplate,
   CreateProjectAgentAdapterInput,
   DbQueries,
+  Project,
+  AdapterBuild,
   ProjectAgentAdapter,
   UpdateProjectAgentAdapterInput,
 } from "../db/queries.js";
@@ -206,12 +216,74 @@ function evidenceEntry(value: unknown, name: string): EvidenceEntry {
   return entry;
 }
 
+/** One selectable agent version. Source-build rows come from adapter_builds. */
+export function versionJson(b: AdapterBuild): Record<string, unknown> {
+  return {
+    id: b.id,
+    adapter_id: b.adapterId,
+    commit: b.commitSha,
+    version: b.agentVersion ?? b.commitSha.slice(0, 12),
+    status: b.status,
+    image: b.image,
+    image_id: b.imageId,
+    error: b.error,
+    created_at: b.createdAt,
+    completed_at: b.completedAt,
+    builtin: false,
+  };
+}
+
+export function listVersionRows(
+  queries: DbQueries,
+  adapter: ProjectAgentAdapter,
+): Record<string, unknown>[] {
+  const builds = queries.listAdapterBuilds(adapter.id);
+  if (builds.length > 0) return builds.map(versionJson);
+  if (adapter.buildStatus === "ready") {
+    return [
+      {
+        id: adapter.id,
+        adapter_id: adapter.id,
+        commit: adapter.builtCommit,
+        version: adapter.builtCommit ? adapter.builtCommit.slice(0, 12) : "ready",
+        status: "ready",
+        image: adapter.image,
+        image_id: adapter.builtImageId,
+        error: null,
+        created_at: adapter.createdAt,
+        completed_at: adapter.lastBuiltAt,
+        builtin: false,
+      },
+    ];
+  }
+  return [];
+}
+
 function recordOrNull(value: unknown, name: string): Record<string, unknown> | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "object" || Array.isArray(value)) {
     throw badRequest(`${name} must be an object or null`);
   }
   return value as Record<string, unknown>;
+}
+
+/**
+ * Validate `provider_config` and reject a credentialEnv the platform cannot honor.
+ *
+ * A source name nothing supplies used to be a silent no-op: the variable was
+ * never set, the CLI ran unauthenticated, and the run failed much later with a
+ * generic "no model response". Rejecting it at write time is where the author
+ * can still act on it.
+ */
+function providerConfigOrNull(value: unknown, name: string): Record<string, unknown> | null {
+  const record = recordOrNull(value, name);
+  const problems = validateCredentialEnv(record);
+  if (problems.length > 0) {
+    throw badRequest(
+      `${name}.credentialEnv: ${problems.map((p) => p.message).join("; ")}`,
+    );
+  }
+  return record;
 }
 
 function parserKind(value: unknown): CliAdapterParserKind {
@@ -514,19 +586,16 @@ async function resolveRefCommit(repo: string, ref: string | null): Promise<strin
   }
 }
 
-/** Collect harness credentials available to the project for generator provisioning. */
+/**
+ * Collect harness credentials available to the project for generator provisioning.
+ *
+ * The name list is the shared contract, not a local copy. The copy that used to
+ * live here had drifted four names behind the runner, so a dry run reported
+ * variables as unavailable that a real run would have supplied.
+ */
 function collectHarnessCredentials(): Record<string, string> {
-  const names = [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "OPENAI_API_KEY",
-    "MINIMAX_API_KEY",
-    "NEURALWATT_API_KEY",
-    "NURALWATT_API_KEY",
-    "ANTHROPIC_BASE_URL",
-  ];
   const keys: Record<string, string> = {};
-  for (const name of names) {
+  for (const name of HARNESS_CREDENTIAL_NAMES) {
     const v = process.env[name];
     if (v) keys[name] = v;
   }
@@ -536,19 +605,40 @@ function collectHarnessCredentials(): Record<string, string> {
   return keys;
 }
 
-/** Build a synthetic RunContext for the validate/dry-run endpoint. */
-function sampleRunContext(adapter: ProjectAgentAdapter): RunContext {
+/**
+ * Build a synthetic RunContext for the validate/dry-run endpoint.
+ *
+ * The provider comes from the project, not a literal placeholder. With
+ * `sample-provider` hardcoded, credentialEnv lookup always fell through to the
+ * `default` bucket, so a per-provider bucket was never exercised by a dry run
+ * and an adapter could validate cleanly then start a real run with no key.
+ */
+function sampleRunContext(adapter: ProjectAgentAdapter, project: Project | null): RunContext {
   const apiKeys: Record<string, string> = {};
   for (const name of Object.keys(collectHarnessCredentials())) {
     apiKeys[name] = `<redacted:${name}>`;
   }
-  // Provider/model live on the project, not the adapter; use safe placeholders.
+  // The eval stage writes these at run time, so validate must show them too.
+  // A project with no eval stage configured yet is a normal state during
+  // adapter authoring, so fall back to the openai shape rather than refusing
+  // to dry-run.
+  let stage: ModelStageConfig | null = null;
+  try {
+    stage = resolveModelConfig("eval", {
+      stored: projectStoredModelConfig(project?.modelConfig) ?? undefined,
+    });
+  } catch {
+    stage = null;
+  }
+  for (const name of stageManagedNames(stage?.apiType ?? "openai")) {
+    apiKeys[name] = `<redacted:${name}>`;
+  }
   return {
     runId: "sample-run-id",
     project: { id: adapter.projectId },
     task: { prompt: "sample eval prompt", workspace: { source: "empty" } },
-    model: "sample-model",
-    provider: "sample-provider",
+    model: project?.defaultModel ?? stage?.model ?? "sample-model",
+    provider: project?.defaultProvider ?? "default",
     params: {},
     workspaceDir: "/workspace",
     apiKeys,
@@ -609,10 +699,10 @@ export function registerAdapterRoutes(router: Router): void {
       );
     }
     if (body.provider_config !== undefined || body.providerConfig !== undefined) {
-      input.providerConfig = recordOrNull(
+      input.providerConfig = providerConfigOrNull(
         body.provider_config ?? body.providerConfig,
         "provider_config",
-      );
+    );
     }
     const sourceRepo = body.source_repo ?? body.sourceRepo;
     if (sourceRepo === null || typeof sourceRepo === "string") input.sourceRepo = sourceRepo;
@@ -665,6 +755,49 @@ export function registerAdapterRoutes(router: Router): void {
     sendJson(res, 200, {
       adapter: requireAdapter(app.queries, ctx.params.id!, ctx.params.adapterId!),
     });
+  });
+
+  /**
+   * Every agent version this adapter can run. A queue generation starts against
+   * one of these builds; the id is what a caller pins as `build_id`.
+   */
+  router.get("/api/projects/:id/adapters/:adapterId/versions", (_req, res, ctx) => {
+    const app = appOf(ctx);
+    requireProject(app.queries, ctx.params.id!);
+    const adapter = requireAdapter(app.queries, ctx.params.id!, ctx.params.adapterId!);
+    sendJson(res, 200, { versions: listVersionRows(app.queries, adapter) });
+  });
+
+  /**
+   * Build one specific ref or commit without moving the adapter's own source_ref.
+   * Use it to make an older or newer agent version selectable alongside the
+   * current one.
+   */
+  router.post("/api/projects/:id/adapters/:adapterId/versions", async (req, res, ctx) => {
+    const app = appOf(ctx);
+    const projectId = ctx.params.id!;
+    requireProject(app.queries, projectId);
+    requireAdminRequest(req, app.queries, app.authEnabled);
+    const adapter = requireAdapter(app.queries, projectId, ctx.params.adapterId!);
+    if (adapter.installType === "npm") {
+      throw badRequest("npm adapters have no per-commit versions; use the adapter build endpoint");
+    }
+    if (!adapter.sourceRepo) throw badRequest("adapter source_repo is required to build a version");
+    if (!adapter.containerfile) throw badRequest("adapter containerfile is required before build");
+    const body = await readJsonBody<{ ref?: unknown; commit?: unknown }>(req);
+    const ref = body.commit ?? body.ref;
+    if (typeof ref !== "string" || ref.trim() === "") {
+      throw badRequest("ref (branch, tag, or full commit sha) is required");
+    }
+    const service: AdapterBuildService = {
+      queries: app.queries,
+      dataDir: app.dataDir,
+      runtime: resolveRuntime(),
+    };
+    const resolved = await resolveAgentCommit(service, adapter.sourceRepo, ref.trim());
+    if (!resolved) throw badRequest(`cannot resolve "${ref.trim()}" to a commit in ${adapter.sourceRepo}`);
+    const build = await ensureAdapterImageForCommit(service, adapter, resolved.sha);
+    sendJson(res, 200, { version: versionJson(build) });
   });
 
   router.patch("/api/projects/:id/adapters/:adapterId", async (req, res, ctx) => {
@@ -725,10 +858,10 @@ export function registerAdapterRoutes(router: Router): void {
       );
     }
     if (body.provider_config !== undefined || body.providerConfig !== undefined) {
-      patch.providerConfig = recordOrNull(
+      patch.providerConfig = providerConfigOrNull(
         body.provider_config ?? body.providerConfig,
         "provider_config",
-      );
+    );
     }
     const sourceRepo = body.source_repo ?? body.sourceRepo;
     if (sourceRepo === null || typeof sourceRepo === "string") patch.sourceRepo = sourceRepo;
@@ -910,10 +1043,10 @@ export function registerAdapterRoutes(router: Router): void {
         );
       }
       if (emitted.provider_config !== undefined || emitted.providerConfig !== undefined) {
-        input.providerConfig = recordOrNull(
+        input.providerConfig = providerConfigOrNull(
           emitted.provider_config ?? emitted.providerConfig,
           "provider_config",
-        );
+    );
       }
       const emittedRepo = emitted.source_repo ?? emitted.sourceRepo;
       if (emittedRepo !== undefined && emittedRepo !== null && (typeof emittedRepo !== "string" || !emittedRepo.trim())) {
@@ -977,6 +1110,11 @@ export function registerAdapterRoutes(router: Router): void {
     sendJson(res, 200, GENERATOR_CONTRACT);
   });
 
+  /** The adapter authoring guide, for anyone writing an adapter for their agent. */
+  router.get("/api/adapters/docs", (_req, res, _ctx) => {
+    sendJson(res, 200, adapterDocs());
+  });
+
   // --- Shared adapters: cross-project discovery ---
 
   /** Registered built-in adapter ids a queue may select. */
@@ -998,7 +1136,7 @@ export function registerAdapterRoutes(router: Router): void {
       const projectId = ctx.params.id!;
       requireProject(app.queries, projectId);
       const adapter = requireAdapter(app.queries, projectId, ctx.params.adapterId!);
-      const ctx2 = sampleRunContext(adapter);
+      const ctx2 = sampleRunContext(adapter, app.queries.getProject(projectId) ?? null);
       const decAdapter = createDeclarativeAdapter(adapter);
       const command = decAdapter.command(ctx2);
       const connectionCheck = decAdapter.connectionCheck(ctx2);

@@ -415,6 +415,31 @@ evaluation**; defects in the eval harness itself are not agent improvements, so
 record those in `open_questions` instead. Use the frozen `report:` and primary ref
 shapes described above in every `evidence` entry.
 
+`category`, `impact`, and `confidence` are closed enums. Write one of the listed
+words exactly, even when your own word fits better: "robustness" is not a category,
+"critical" is not an impact. The host maps a near miss onto the closest enum member
+rather than losing your ruling, but it should not have to guess.
+
+Three more fields carry the improvement from a judgement to something a developer
+can act on. `subsystem` names the part of the agent someone would open: its system
+prompt, a tool definition, how it handles tool results, context management, planning,
+code search, file editing, verification, subagent orchestration, model config, or the
+harness. `fix_type` says how well established the remedy is, and `research_backed`
+requires a `web:` ref in that improvement's evidence, so the word always means you
+retrieved a source. `signature` is the known pathology this instance belongs to, which
+is what makes the same problem across a hundred evals group into one row.
+
+All three are optional for you. The host derives each from your prose when you leave
+it out, which is better than a guess from you. Name one only when you are sure.
+
+Each improvement also has an optional `extra` mapping, and it is open: put anything
+you learned about this agent that the six fixed keys have no slot for under a key you
+choose. `pattern`, `root_cause`, `affected_component`, `trigger`, `generalizes` are
+useful starting points, and a key none of these anticipated is welcome. Ground every
+value in the record exactly as you would a required field; the slot being free is not
+licence to speculate. And when your own word for a category is sharper than the enum,
+use the enum in `category` and put yours in `extra` so the developer sees both.
+
 ## Recommendations must fix the observed PATTERN, not just the symptom
 
 A useful recommendation names the **pattern or behavior** this agent exhibited
@@ -496,8 +521,15 @@ narrative: <what happened and why, grounded in the record>
 what_the_agent_did_well: [ {observation, ref} ]
 improvements: [ {issue, evidence: [{report, ref}], recommendation,
   category: correctness|approach|process|integrity|efficiency|tooling,
-  impact: high|medium|low, confidence: high|medium|low} ]
-integrity_summary: { verdict, findings: [ {finding, ref, round: <int>} ] }
+  impact: high|medium|low, confidence: high|medium|low,
+  subsystem: system_prompt|tool_definition|tool_result_handling|context_management|
+    planning|code_search|file_editing|verification|subagent_orchestration|
+    model_config|harness|unknown,
+  fix_type: direct_fix|research_backed|experimental,
+  signature: <one finding-vocabulary id, e.g. VERIFICATION_GAP>,
+  extra: {<your own keys — optional, open, grounded>}} ]
+integrity_summary: { verdict: clean|suspicious|violation|contested|insufficient_evidence,
+  findings: [ {finding, ref, round: <int>} ] }
 reward_reconciliation: <does the reward follow from the process?>
 case_coverage: { tangents_total, tangents_resolved, tangents_open, closed_by, converged }
 open_questions: [ {question, why_unresolved, what_would_settle_it} ]

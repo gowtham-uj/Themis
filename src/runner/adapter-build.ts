@@ -24,8 +24,7 @@ import {
   parseRepoRef,
   type RepoRef,
 } from "../api/github.js";
-import type { ContainerRuntime } from "./runtime.js";
-import { resolveRuntime } from "./runtime.js";
+import { resolveRuntime, type ContainerRuntime } from "./runtime.js";
 import { prepareWorkspace } from "./workspace.js";
 
 /** Dependencies shared by every build/resolve path. */

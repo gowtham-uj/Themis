@@ -27,9 +27,13 @@ if (!authEnabled && !isLoopbackBind && process.env.AGENTEVAL_ALLOW_UNAUTH_NETWOR
   );
   process.exit(1);
 }
+// Drive each project's pipeline in the background. Without a ticker a started
+// run stays in eval_running until a caller POSTs /advance by hand.
+const pipelineTickerMs = Number(process.env.AGENTEVAL_PIPELINE_TICK_MS ?? "3000");
 const api = createServer({
   dataDir,
   authEnabled,
+  ...(pipelineTickerMs > 0 ? { pipelineTickerMs } : {}),
 });
 const bound = await api.listen(port, host);
 // eslint-disable-next-line no-console

@@ -1,172 +1,347 @@
-# agenteval API operator guide
+# Operating Themis through the API
 
-This guide covers the API-only workflow from an empty installation to queued eval execution and centrally
-queryable immutable results.
+This runbook covers the day-to-day API workflow after installation. For the first setup, start with [getting-started.md](./getting-started.md). For every route, use [api-reference.md](./api-reference.md).
 
-Assume `BASE=http://127.0.0.1:8080`. When authentication is enabled, send:
+Assume:
 
-```http
-Authorization: Bearer <token>
+```bash
+BASE=http://127.0.0.1:8080
 ```
 
-## 1. Create a project
+When authentication is enabled:
 
-```http
-POST /api/projects
-Content-Type: application/json
-
-{
-  "name": "ReaperCode eval suite",
-  "slug": "reapercode-evals",
-  "default_model": "deepseek-v4-flash",
-  "default_provider": "nuralwatt"
-}
+```bash
+AUTH=(-H "Authorization: Bearer $THEMIS_TOKEN")
 ```
 
-## 2. Create or select an adapter
+Add `"${AUTH[@]}"` to each curl command.
 
-Create a declarative project adapter with `POST /api/projects/<projectId>/adapters`, or generate one with
-`POST /api/projects/<projectId>/adapters/from-generator`. Validate and build it through the corresponding
-adapter endpoints. The adapter record retains its resolved source commit and built image provenance.
+## Check project readiness
 
-An adapter can be shared by setting its sharing field through the adapter API. Consumer queues must select
-that exact shared adapter-store row; sharing is never implicit.
-
-## 3. Import canonical eval packages
-
-```http
-POST /api/projects/<projectId>/evals
-Content-Type: application/json
-
-{"files":{"task.toml":"...","seed_repo/README.md":"...",...}}
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/readiness" | jq
 ```
 
-Or upload ZIP/TAR bytes:
+Readiness names the missing prerequisite instead of waiting for container start to fail. It checks the project adapter, eval membership, queue, commit or built-in adapter, and model configuration.
 
-```http
-POST /api/projects/<projectId>/evals:import-archive?format=zip
-Content-Type: application/octet-stream
+## Configure model stages safely
+
+Project model settings are stored in `model_config`. Secret values are not.
+
+```bash
+curl -fsS -X PATCH "$BASE/api/projects/$PROJECT_ID" \
+  -H 'content-type: application/json' \
+  -d '{
+    "model_config": {
+      "eval": {
+        "apiType": "openai",
+        "baseUrl": "https://provider.example/v1",
+        "apiKeyEnv": "EVAL_PROVIDER_KEY",
+        "model": "agent-model"
+      },
+      "phase1": {
+        "apiType": "openai",
+        "baseUrl": "https://provider.example/v1",
+        "apiKeyEnv": "JUDGE_PROVIDER_KEY",
+        "webSearchApiKeyEnv": "SERPER_SEARCH_API_KEY",
+        "model": "judge-model"
+      },
+      "phase2": {
+        "apiType": "openai",
+        "baseUrl": "https://provider.example/v1",
+        "apiKeyEnv": "JUDGE_PROVIDER_KEY",
+        "webSearchApiKeyEnv": "SERPER_SEARCH_API_KEY",
+        "model": "judge-model"
+      }
+    }
+  }' | jq
 ```
 
-The package validator rejects incomplete or unsafe packages atomically. Solution/tests/validation content
-is retained outside the agent container.
+The environment variables must exist in the API process. The server rejects a key value where a variable name belongs.
 
-The eval store is decoupled from queues: a queue item is a pointer to an eval id, and a run snapshots
-the eval at claim time. Evals list the queues that reference them (`used_by_queues`), and deletion is
-guarded — `DELETE /api/projects/<projectId>/evals/<evalId>` returns `409` while a live queue still
-references the eval. A cross-project listing is available at `GET /api/evals?project_id=...&category_name=...`
-and `GET /api/evals/<evalId>`.
+Probe a stage before spending on a run:
 
-## 4. Create a queue and add evals
-
-```http
-POST /api/projects/<projectId>/queues
-Content-Type: application/json
-
-{
-  "name": "DeepSeek queue",
-  "model": "deepseek-v4-flash",
-  "provider": "nuralwatt"
-}
+```bash
+curl -fsS -X POST "$BASE/api/settings/models/phase1/health" \
+  -H 'content-type: application/json' \
+  -d '{}' | jq
 ```
 
-Then add eval IDs:
+## Validate and build the adapter
 
-```http
-POST /api/projects/<projectId>/queues/<queueId>/items
-Content-Type: application/json
+List project adapters:
 
-{"eval_id":"<evalId>","repeats":1}
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/adapters" | jq
 ```
 
-## 5. Start and inspect the persistent queue container
+Validate one:
 
-```http
-PUT /api/projects/<projectId>/queues/<queueId>/container
-GET /api/projects/<projectId>/queues/<queueId>/container
-GET /api/projects/<projectId>/containers
+```bash
+curl -fsS -X POST "$BASE/api/projects/$PROJECT_ID/adapters/$ADAPTER_ID/validate" | jq
 ```
 
-One real Podman container is created for the active queue. Evals execute sequentially. Each eval runs its
-setup, the real agent, evidence extraction, separate verifier, cleanup, workspace reset, and archive seal.
+Build its selected commit:
 
-For privileged live inspection of an existing queue container:
-
-```http
-POST /api/projects/<projectId>/queues/<queueId>/container/exec
-Content-Type: application/json
-
-{"command":"ps aux","cwd":"/workspace","timeout_ms":30000}
+```bash
+curl -fsS -X POST "$BASE/api/projects/$PROJECT_ID/adapters/$ADAPTER_ID/build" \
+  -H 'content-type: application/json' \
+  -d '{"ref":"main"}' | jq
 ```
 
-## 6. Read run state and events
+A source-built queue must resolve to an exact commit before it starts. The queue generation snapshots the build ID, image ID, commit, and adapter version.
 
-```http
-GET /api/runs/<runId>
-GET /api/runs/<runId>/events
-GET /api/runs/<runId>/events?stream=ndjson
-GET /api/runs/<runId>/diff
-GET /api/evals/<runId>/metrics
-GET /api/evals/<runId>/archive
+## Import and inspect evals
+
+Import a suite:
+
+```bash
+curl -fsS -X POST \
+  "$BASE/api/projects/$PROJECT_ID/evals:import-archive?format=zip" \
+  -H 'content-type: application/zip' \
+  --data-binary @suite.zip | jq
 ```
 
-The verifier reward is authoritative. Provider quota, rate-limit, context-length, authentication, and model
-availability failures are classified explicitly in the run archive.
+List project evals and their queue references:
 
-## 7. Browse the central archive store
-
-Across all projects:
-
-```http
-GET /api/archives?agent_commit=<sha>&model=deepseek-v4-flash&reward=1
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/evals" | jq
 ```
 
-For one project:
+List categories:
 
-```http
-GET /api/projects/<projectId>/archives?queue_id=<queueId>&status=completed
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/eval-categories" | jq
 ```
 
-One archive, by run id:
+The import validator runs no-op, oracle, and known-bad checks before the package is ready. A known-bad case should pass public tests and fail the hidden contract.
 
-```http
-GET /api/archives/<runId>
-GET /api/archives/<runId>/files/retained/trace.jsonl
+## Prepare the queue blueprint
+
+Read the project's queue view:
+
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/queue" | jq
 ```
 
-The older project/commit paths still work as aliases:
+Add one eval:
 
-```http
-GET /api/archives/<projectId>/<agentCommit>
-GET /api/archives/<projectId>/<agentCommit>/<runId>
-GET /api/archives/<projectId>/<agentCommit>/<runId>/files/retained/trace.jsonl
+```bash
+curl -fsS -X POST "$BASE/api/projects/$PROJECT_ID/queues/$QUEUE_ID/items" \
+  -H 'content-type: application/json' \
+  -d '{"eval_id":"<eval-id>","repeats":1}' | jq
 ```
 
-Available list filters are `project_id`, `agent_id`, `agent_commit`, `queue_id`, `batch_id`, `run_id`,
-`task_id`, `task_name`, `model`, `provider`, `status`, `reward`, `limit`, and `offset`.
+Load a category:
 
-## 8. Control and stop queue execution
-
-Run pausing, resuming, and aborting are queue-container operations (there are no standalone run-level
-control routes). Pause/resume/abort act on the current run in the active queue container; abort seals
-partial evidence then lets the worker continue to the next claim.
-
-```http
-PATCH  /api/projects/<projectId>/queues/<queueId>/container
-       {"action":"pause"|"resume"|"abort"}
-DELETE /api/projects/<projectId>/queues/<queueId>/container
+```bash
+curl -fsS -X POST "$BASE/api/projects/$PROJECT_ID/queues/$QUEUE_ID/items:load-category" \
+  -H 'content-type: application/json' \
+  -d '{"category":"multi_file_engineering"}' | jq
 ```
 
-## 9. Export a project
+Patch order or enabled state:
 
-```http
-POST /api/projects/<projectId>/export
+```bash
+curl -fsS -X PATCH "$BASE/api/projects/$PROJECT_ID/queues/$QUEUE_ID/items/$ITEM_ID" \
+  -H 'content-type: application/json' \
+  -d '{"position":3,"enabled":true}' | jq
 ```
 
-Returns a portable JSON bundle of the project's rows and path manifest for backup or migration.
+## Start a named pipeline run
 
-## Removed interfaces
+The pipeline is the normal start path. It keeps eval execution, Phase 1, Phase 2, and final archive publication under one generation ID.
 
-The backend has no judge/judgement, queue-analysis, report, findings/regression/improvement, reusable-rubric,
-standalone run-artifact, or frontend interface. Historical evidence and generated outputs are accessed
-through immutable eval archives.
+Create or read the pipeline:
+
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/pipeline" | jq
+```
+
+Enable all automatic stages:
+
+```bash
+curl -fsS -X PATCH "$BASE/api/projects/$PROJECT_ID/pipeline" \
+  -H 'content-type: application/json' \
+  -d '{"auto_eval":true,"auto_phase1":true,"auto_phase2":true}' | jq
+```
+
+Create the run:
+
+```bash
+GENERATION_ID=$(curl -fsS -X POST "$BASE/api/projects/$PROJECT_ID/pipeline/generation" \
+  -H 'content-type: application/json' \
+  -d '{"name":"Ten-eval release run"}' | jq -r '.id')
+```
+
+The background ticker starts the queue and advances every stage. The explicit advance endpoint is useful for tests and manual control:
+
+```bash
+curl -fsS -X POST \
+  "$BASE/api/projects/$PROJECT_ID/pipeline/generation/$GENERATION_ID/advance" \
+  -H 'content-type: application/json' \
+  -d '{"trigger":"auto"}' | jq
+```
+
+## Watch the run
+
+Generation rows:
+
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/pipeline/generation/$GENERATION_ID" | jq
+```
+
+Stage progress:
+
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/pipeline/generation/$GENERATION_ID/progress" | jq
+```
+
+Human-facing activity:
+
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/pipeline/generation/$GENERATION_ID/activity?limit=300" | jq
+```
+
+Live agent events:
+
+```bash
+curl -N "$BASE/api/runs/$RUN_ID/events"
+```
+
+The run panel in the console combines these sources. It shows current eval progress, Phase 1 node state for each case, Phase 2 board state, and how many archives have been resealed.
+
+## Pause and resume without losing work
+
+Pause the active eval container:
+
+```bash
+curl -fsS -X PATCH "$BASE/api/projects/$PROJECT_ID/queues/$QUEUE_ID/container" \
+  -H 'content-type: application/json' \
+  -d '{"action":"pause"}' | jq
+```
+
+Resume it:
+
+```bash
+curl -fsS -X PATCH "$BASE/api/projects/$PROJECT_ID/queues/$QUEUE_ID/container" \
+  -H 'content-type: application/json' \
+  -d '{"action":"resume"}' | jq
+```
+
+Pause a Phase 1 case:
+
+```bash
+curl -fsS -X POST "$BASE/api/projects/$PROJECT_ID/runs/$RUN_ID/phase1/pause" | jq
+```
+
+Resume the same PI session:
+
+```bash
+curl -fsS -X POST "$BASE/api/judge/runs/$RUN_ID/phase1" | jq
+```
+
+Pause or resume Phase 2:
+
+```bash
+curl -fsS -X POST "$BASE/api/projects/$PROJECT_ID/pipeline/campaign/$CAMPAIGN_ID/pause" | jq
+curl -fsS -X POST "$BASE/api/projects/$PROJECT_ID/pipeline/campaign/$CAMPAIGN_ID/resume" | jq
+```
+
+PI session files and child-session manifests remain under the case work directory. Resume continues those sessions.
+
+## Retry typed failures
+
+For an eval-stage failure, retry the exact pipeline item:
+
+```bash
+curl -fsS -X POST \
+  "$BASE/api/projects/$PROJECT_ID/pipeline/generation/$GENERATION_ID/retry-eval" \
+  -H 'content-type: application/json' \
+  -d '{"item_id":"<pipeline-item-id>"}' | jq
+```
+
+The retry stays in the same pipeline generation. It creates one fresh agent run. The old failed run remains queryable.
+
+For Phase 1 cases that exhausted bounded automatic retries:
+
+```bash
+curl -fsS -X POST \
+  "$BASE/api/projects/$PROJECT_ID/pipeline/generation/$GENERATION_ID/retry-phase1" | jq
+```
+
+These cases resume their saved courtroom state.
+
+## Inspect the final artifacts
+
+List archives:
+
+```bash
+curl -fsS "$BASE/api/projects/$PROJECT_ID/archives" | jq
+```
+
+Inspect the current tree:
+
+```bash
+curl -fsS "$BASE/api/archives/$RUN_ID/contents" | jq
+```
+
+Read the Phase 1 report:
+
+```bash
+curl -fsS "$BASE/api/archives/$RUN_ID/file?path=judge/evalJudge.yaml"
+```
+
+Read Phase 2 outputs:
+
+```bash
+curl -fsS "$BASE/api/archives/$RUN_ID/file?path=phase2/developer-pack.yaml"
+curl -fsS "$BASE/api/archives/$RUN_ID/file?path=phase2/platform-report.yaml"
+```
+
+Download the campaign pack:
+
+```bash
+curl -fL "$BASE/api/projects/$PROJECT_ID/pipeline/campaign/$CAMPAIGN_ID/pack" \
+  -o developer-improvement-pack.zip
+```
+
+Download one full archive view:
+
+```bash
+curl -fL "$BASE/api/archives/$RUN_ID/download" -o "$RUN_ID.tar.gz"
+```
+
+## Stop a queue generation
+
+Stop the active queue container:
+
+```bash
+curl -fsS -X DELETE "$BASE/api/projects/$PROJECT_ID/queues/$QUEUE_ID/container" | jq
+```
+
+This stops the queue generation. It does not delete finished runs or archives.
+
+## Operational checks
+
+Before a release or deployment:
+
+```bash
+npm ci
+npm run typecheck
+npm run lint
+npm run build
+AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=0 npm test
+cd web && npm ci && npm run lint && npm run build
+```
+
+Also verify:
+
+- `/api/health` and `/api/judge/health` are healthy;
+- the API refuses unauthenticated non-loopback startup;
+- the three model health probes pass;
+- Podman can start and remove a queue container;
+- a real eval reaches a sealed base archive;
+- Phase 1 publishes `judge/evalJudge.yaml`;
+- Phase 2 publishes its pack and platform report;
+- archive downloads contain no changed base files.

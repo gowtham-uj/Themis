@@ -26,6 +26,7 @@ import type {
   AgentStreams,
   RunContext,
 } from "./types.js";
+import { evalCliProvider } from "./eval-cli.js";
 
 const DEFAULT_IMAGE = "agenteval/pi:latest";
 
@@ -743,7 +744,6 @@ export function resolvePiBin(): string {
     anchors.push(import.meta.url);
   }
   anchors.push(join(process.cwd(), "package.json"));
-  anchors.push("/work/agenteval/package.json");
 
   for (const anchor of anchors) {
     try {
@@ -758,53 +758,89 @@ export function resolvePiBin(): string {
     }
   }
 
-  // Filesystem fallbacks (symlink layout from file: install).
-  for (const root of [
-    join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent"),
-    "/work/agenteval/node_modules/@earendil-works/pi-coding-agent",
-  ]) {
-    const cliPath = join(root, "dist", "cli.js");
-    try {
-      // exists check without importing fs.promises
-      const require = createRequire(join(process.cwd(), "package.json"));
-      require("node:fs").accessSync(cliPath);
-      return cliPath;
-    } catch {
-      // continue
-    }
+  // Filesystem fallback for layouts whose exports map blocks resolution.
+  const cliPath = join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  try {
+    // exists check without importing fs.promises
+    const require = createRequire(join(process.cwd(), "package.json"));
+    require("node:fs").accessSync(cliPath);
+    return cliPath;
+  } catch {
+    return "pi";
   }
-
-  return "pi";
 }
 
 /** Default short system prompt for eval runs (avoids pi's long default). */
 export const DEFAULT_PI_SYSTEM_PROMPT =
   "You are a helpful coding agent. Use tools to complete the task. Be concise.";
 
+/** Options for the per-run pi agent dir (models.json). */
+export interface PiAgentDirOptions {
+  anthropicBaseUrl?: string;
+  openaiBaseUrl?: string;
+  /**
+   * CLI provider id to register the openai-compatible endpoint under.
+   * Comes from the eval stage's API type (`openai` / `anthropic`), not a
+   * leftover queue pin.
+   */
+  provider?: string;
+  /** Model id from the queue / eval stage. Listed so pi does not look it up in a builtin catalog. */
+  model?: string;
+}
+
 /**
- * Ensure a private agent dir with models.json that routes the anthropic
- * provider through ANTHROPIC_BASE_URL when set (self-hosted proxy / gateway).
- * Returns the absolute agent dir path (or undefined when no override needed
- * and no dir requested).
+ * Write a private agent dir with models.json that routes the eval-stage
+ * endpoint into pi.
+ *
+ * The openai-compatible provider is always registered as `openai` (or
+ * `options.provider` when that is already `openai`), matching `--provider`
+ * from {@link evalCliProvider}. The key is an env interpolation, never a
+ * literal, because this file lives in the workspace and is archived.
  */
 export function ensurePiAgentDir(
   agentDir: string,
-  options: { anthropicBaseUrl?: string } = {},
+  options: PiAgentDirOptions = {},
 ): string {
   const dir = resolve(agentDir);
   mkdirSync(dir, { recursive: true });
-  const baseUrl = options.anthropicBaseUrl ?? process.env.ANTHROPIC_BASE_URL;
-  if (baseUrl) {
-    const modelsPath = join(dir, "models.json");
-    const payload = {
-      providers: {
-        anthropic: {
-          baseUrl,
-        },
-      },
+  const anthropicBaseUrl = options.anthropicBaseUrl ?? process.env.ANTHROPIC_BASE_URL;
+  const openaiBaseUrl = options.openaiBaseUrl ?? process.env.OPENAI_BASE_URL;
+  if (!anthropicBaseUrl && !openaiBaseUrl) return dir;
+
+  const providers: Record<string, unknown> = {};
+  if (anthropicBaseUrl) {
+    providers.anthropic = {
+      baseUrl: anthropicBaseUrl,
+      api: "anthropic-messages",
+      apiKey: "${ANTHROPIC_API_KEY}",
+      authHeader: true,
     };
-    writeFileSync(modelsPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   }
+  if (openaiBaseUrl) {
+    providers.openai = {
+      baseUrl: openaiBaseUrl,
+      api: "openai-completions",
+      apiKey: "${OPENAI_API_KEY}",
+      authHeader: true,
+      compat: {
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: true,
+      },
+      ...(options.model
+        ? {
+            models: [
+              {
+                id: options.model,
+                reasoning: true,
+                contextWindow: 128_000,
+                maxTokens: 32_768,
+              },
+            ],
+          }
+        : {}),
+    };
+  }
+  writeFileSync(join(dir, "models.json"), `${JSON.stringify({ providers }, null, 2)}\n`, "utf8");
   return dir;
 }
 
@@ -853,7 +889,19 @@ export function buildPiEnv(
     env.ANTHROPIC_API_KEY = overrideKey;
   }
 
-  if (ctx.apiKeys.OPENAI_API_KEY) {
+  const overrideOpenaiUrl = ctx.overrides?.env?.OPENAI_BASE_URL;
+  const openaiBaseUrl =
+    (typeof overrideOpenaiUrl === "string" && overrideOpenaiUrl) ||
+    ctx.apiKeys.OPENAI_BASE_URL ||
+    env.OPENAI_BASE_URL ||
+    process.env.OPENAI_BASE_URL;
+  if (openaiBaseUrl) {
+    env.OPENAI_BASE_URL = openaiBaseUrl;
+  }
+  const overrideOpenaiKey = ctx.overrides?.env?.OPENAI_API_KEY;
+  if (typeof overrideOpenaiKey === "string" && overrideOpenaiKey) {
+    env.OPENAI_API_KEY = overrideOpenaiKey;
+  } else if (ctx.apiKeys.OPENAI_API_KEY) {
     env.OPENAI_API_KEY = ctx.apiKeys.OPENAI_API_KEY;
   }
 
@@ -861,7 +909,7 @@ export function buildPiEnv(
   env.PI_OFFLINE = env.PI_OFFLINE ?? "1";
 
   // Self-signed proxy certs (common in private gateways).
-  if (baseUrl && !env.NODE_TLS_REJECT_UNAUTHORIZED) {
+  if ((baseUrl || openaiBaseUrl) && !env.NODE_TLS_REJECT_UNAUTHORIZED) {
     env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
   }
 
@@ -901,7 +949,7 @@ export function buildPiCommand(
     "-p",
     ctx.task.prompt,
     "--provider",
-    ctx.provider,
+    evalCliProvider(ctx),
     "--model",
     ctx.model,
   );
@@ -940,18 +988,26 @@ export function buildPiCommand(
   // Avoid package-registry / version-check network at startup.
   argv.push("--offline");
 
-  // Prepare agent dir with baseUrl override when ANTHROPIC_BASE_URL is present.
-  const baseUrl =
+  // Route the eval-stage endpoint into pi. OpenAI-compatible URLs used to be
+  // ignored here, so the agent used pi's builtin openai catalog (wrong host,
+  // model missing from that catalog).
+  const anthropicBaseUrl =
     ctx.apiKeys.ANTHROPIC_BASE_URL ??
     ctx.overrides?.env?.ANTHROPIC_BASE_URL ??
     process.env.ANTHROPIC_BASE_URL;
+  const openaiBaseUrl =
+    ctx.apiKeys.OPENAI_BASE_URL ??
+    ctx.overrides?.env?.OPENAI_BASE_URL ??
+    process.env.OPENAI_BASE_URL;
   let agentDir = options.agentDir;
-  if (!agentDir && baseUrl) {
-    agentDir = ensurePiAgentDir(join(ctx.workspaceDir, ".pi-agent"), {
-      anthropicBaseUrl: baseUrl,
+  if (anthropicBaseUrl || openaiBaseUrl) {
+    const dir = agentDir ?? join(ctx.workspaceDir, ".pi-agent");
+    agentDir = ensurePiAgentDir(dir, {
+      anthropicBaseUrl,
+      openaiBaseUrl,
+      provider: evalCliProvider(ctx),
+      model: ctx.model,
     });
-  } else if (agentDir && baseUrl) {
-    ensurePiAgentDir(agentDir, { anthropicBaseUrl: baseUrl });
   }
 
   const env = buildPiEnv(ctx, { agentDir });
@@ -983,6 +1039,9 @@ export async function* runPi(
     ensurePiAgentDir(join(ctx.workspaceDir, ".pi-agent"), {
       anthropicBaseUrl:
         ctx.apiKeys.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL,
+      openaiBaseUrl: ctx.apiKeys.OPENAI_BASE_URL ?? process.env.OPENAI_BASE_URL,
+      provider: evalCliProvider(ctx),
+      model: ctx.model,
     });
 
   const { argv, env } = buildPiCommand(ctx, {

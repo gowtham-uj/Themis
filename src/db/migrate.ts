@@ -23,8 +23,8 @@ const BUILTIN_AGENTS: ReadonlyArray<{
   defaultModel: string;
   defaultProvider: string;
 }> = [
-  { id: "reapercode", displayName: "ReaperCode", defaultModel: "deepseek-v4-flash", defaultProvider: "nuralwatt" },
-  { id: "pi", displayName: "pi coding agent", defaultModel: "deepseek-v4-flash", defaultProvider: "nuralwatt" },
+  { id: "reapercode", displayName: "ReaperCode", defaultModel: "", defaultProvider: "" },
+  { id: "pi", displayName: "pi coding agent", defaultModel: "", defaultProvider: "" },
 ];
 
 /** Ensure built-in agents have rows so builtin_adapter_id queues satisfy FKs. */
@@ -180,6 +180,32 @@ const DDL: string[] = [
     UNIQUE (project_id, external_id)
   )`,
 
+  `CREATE TABLE IF NOT EXISTS eval_store (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    workspace_source TEXT NOT NULL,
+    workspace_repo TEXT,
+    workspace_ref TEXT,
+    rubric_json TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    rubric_version INTEGER NOT NULL DEFAULT 1,
+    agent_category TEXT NOT NULL DEFAULT 'coding',
+    category_name TEXT,
+    profile TEXT,
+    reference_solution TEXT,
+    checks_json TEXT,
+    env_json TEXT,
+    tags TEXT,
+    package_path TEXT,
+    package_digest TEXT,
+    package_manifest_json TEXT,
+    package_validation_json TEXT,
+    archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+
   `CREATE TABLE IF NOT EXISTS eval_queue_items (
     id TEXT PRIMARY KEY,
     queue_id TEXT NOT NULL REFERENCES eval_queues(id),
@@ -280,6 +306,8 @@ const DDL: string[] = [
     agent_image TEXT,
     agent_commit TEXT,
     agent_image_source TEXT,
+    build_id TEXT,
+    agent_version TEXT,
     trigger TEXT,
     trigger_ref TEXT,
     trigger_rule_id TEXT REFERENCES watcher_rules(id),
@@ -449,6 +477,10 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE projects ADD COLUMN sandbox_json TEXT",
     // Per-stage model provider overrides (eval, phase1, phase2).
     "ALTER TABLE projects ADD COLUMN model_config_json TEXT",
+    // Enabled evals a project must have before runs may start.
+    "ALTER TABLE projects ADD COLUMN min_evals INTEGER",
+    // Per-project prompt overrides for Phase 1 / Phase 2 agent drafts.
+    "ALTER TABLE projects ADD COLUMN prompt_config_json TEXT",
     // Per-run adapter overrides (image, env, params, tools) as submitted.
     "ALTER TABLE runs ADD COLUMN adapter_overrides_json TEXT",
     // Per-eval environment spec (greenfield/brownfield, image, setup script).
@@ -472,6 +504,9 @@ function ensureColumns(db: Database.Database): void {
     "ALTER TABLE runs ADD COLUMN eval_snapshot_json TEXT",
     // v9: immutable queue-item snapshot copied at claim time.
     "ALTER TABLE runs ADD COLUMN item_snapshot_json TEXT",
+    // Which adapter build (agent version) executed this run.
+    "ALTER TABLE runs ADD COLUMN build_id TEXT",
+    "ALTER TABLE runs ADD COLUMN agent_version TEXT",
     // Adapter generator + connection-check derivation.
     "ALTER TABLE project_agent_adapters ADD COLUMN connection_check_derived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE project_agent_adapters ADD COLUMN generator_script TEXT",

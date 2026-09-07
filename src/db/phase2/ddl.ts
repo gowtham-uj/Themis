@@ -9,7 +9,7 @@ export const PHASE2_SQLITE_DDL: readonly string[] = [
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 `CREATE TABLE IF NOT EXISTS project_pipeline_generations (
   id TEXT PRIMARY KEY, queue_id TEXT NOT NULL REFERENCES project_pipeline_queues(id),
-  ordinal INTEGER NOT NULL, state TEXT NOT NULL, fencing_token INTEGER NOT NULL DEFAULT 0,
+  ordinal INTEGER NOT NULL, name TEXT, state TEXT NOT NULL, fencing_token INTEGER NOT NULL DEFAULT 0,
   config_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   completed_at TEXT, UNIQUE(queue_id, ordinal))`,
 `CREATE UNIQUE INDEX IF NOT EXISTS uq_pipeline_active_generation

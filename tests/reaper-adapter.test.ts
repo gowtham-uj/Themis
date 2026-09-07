@@ -105,6 +105,35 @@ describe("reaperCodeAdapter surface", () => {
     expect(viaAdapter.argv).toEqual(argv);
   });
 
+  it("uses --provider openai when the eval stage is openai-compatible", () => {
+    const { argv, env } = buildReaperCommand(
+      makeCtx({
+        provider: "leftover-pin",
+        model: "deepseek-v4-flash",
+        apiKeys: {
+          AGENTEVAL_EVAL_API_TYPE: "openai",
+          OPENAI_BASE_URL: "https://project-eval.invalid/v1",
+          OPENAI_API_KEY: "synthetic-eval-key",
+        },
+      }),
+    );
+    expect(argv[argv.indexOf("--provider") + 1]).toBe("openai");
+    expect(argv).toContain("deepseek-v4-flash");
+    expect(env.OPENAI_BASE_URL).toBe("https://project-eval.invalid/v1");
+    expect(env.OPENAI_API_KEY).toBe("synthetic-eval-key");
+  });
+
+  it("keeps the queue pin when no eval stage overlay is present", () => {
+    const { argv } = buildReaperCommand(
+      makeCtx({
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        apiKeys: { ANTHROPIC_API_KEY: "sk-test-not-real" },
+      }),
+    );
+    expect(argv[argv.indexOf("--provider") + 1]).toBe("anthropic");
+  });
+
   it("declares a role-typed evidence manifest over the .reaper tree", () => {
     const spec = reaperCodeAdapter.evidence(ctx);
     expect(spec.manifest).toBeDefined();

@@ -242,10 +242,31 @@ describe('Tier A — structural validity', () => {
     expect(ruleIds(checkTierA(yaml).violations)).toContain('a-no-placeholder-residue');
   });
 
-  it('rejects bare TODO/N/A/TBD/FIXME placeholder residue (not only angle brackets)', () => {
-    // attack-a1 payload #4: the classic defense greps for `<...>` and misses
-    // these. Word-boundary tokens standing alone as unfilled residue must fire.
-    for (const residue of ['TODO: confirm exact assertion', 'N/A - see above', 'TBD', 'FIXME later']) {
+  it('does not flag an authored sentence that mentions TODO in prose (observed live)', () => {
+    // A live report was rejected for this recommendation. The field is fully
+    // authored; it discusses a TODO list. Residue means the field was never
+    // written, which a surrounding sentence disproves.
+    const report = goodReport();
+    report.improvements[0]!.recommendation =
+      'Treat an edge-case review produced during planning as a TODO list, not an audit: convert each identified divergence into a one-line executable check before declaring the contract met.';
+    const yaml = canonicalSerializeReport(report);
+    expect(ruleIds(checkTierA(yaml).violations)).not.toContain('a-no-placeholder-residue');
+  });
+
+  it('does not flag a not-applicable answer inside the open `extra` mapping', () => {
+    // `extra` is open by contract: its keys are ones nobody required. A key
+    // nobody asked for cannot be an unfilled slot. Observed live, this sank a
+    // complete judgement across every automatic retry.
+    const report = goodReport();
+    report.improvements[0]!.extra = { what_the_agent_did_well: 'N/A this is an improvement item' };
+    const yaml = canonicalSerializeReport(report);
+    expect(ruleIds(checkTierA(yaml).violations)).not.toContain('a-no-placeholder-residue');
+  });
+
+  it('still flags a field whose value STARTS with a placeholder token', () => {
+    // The adversarial escape stays closed: residue standing at the head of the
+    // field, with or without an excuse after it.
+    for (const residue of ['N/A this is an improvement item', 'TODO: confirm exact assertion', 'N/A - see above', 'TBD', 'FIXME later']) {
       const report = goodReport();
       report.narrative = residue;
       expect(
@@ -253,6 +274,14 @@ describe('Tier A — structural validity', () => {
         `expected a-no-placeholder-residue for ${JSON.stringify(residue)}`,
       ).toContain('a-no-placeholder-residue');
     }
+  });
+
+  it('does not flag a shell metavariable glued into a path (observed live)', () => {
+    const report = goodReport();
+    report.narrative =
+      'One fixture exercises sh <dir>/-name as a filename and one invokes sh -dashdir directly.';
+    const yaml = canonicalSerializeReport(report);
+    expect(ruleIds(checkTierA(yaml).violations)).not.toContain('a-no-placeholder-residue');
   });
 
   it('rejects a field that restates its own name (a-no-field-echo)', () => {

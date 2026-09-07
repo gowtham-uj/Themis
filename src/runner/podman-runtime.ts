@@ -30,6 +30,7 @@ import type {
   ResolvedPort,
   RunContainerSpec,
 } from "./runtime.js";
+import { installAllowlist } from "./network-allowlist.js";
 import { buildPodmanRunArgs } from "./podman-argv.js";
 import {
   defaultSandboxPolicy,
@@ -180,6 +181,10 @@ class PodmanExecHandle implements ContainerExecHandle {
   private timedOut = false;
   private settled = false;
   private timeoutTimer: NodeJS.Timeout | undefined;
+  /** Deadline the live timer is counting toward; null while held. */
+  private deadlineAt: number | null = null;
+  /** Milliseconds left when the timeout was held for a pause. */
+  private heldRemainingMs: number | null = null;
 
   constructor(child: ChildProcess, timeoutMs: number) {
     this.child = child;
@@ -207,13 +212,39 @@ class PodmanExecHandle implements ContainerExecHandle {
         );
       });
     });
-    if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
-      this.timeoutTimer = setTimeout(() => {
-        this.timedOut = true;
-        this.killGroup("SIGKILL");
-      }, timeoutMs);
-      this.timeoutTimer.unref?.();
-    }
+    this.arm(timeoutMs);
+  }
+
+  /** Start the kill timer for `ms` from now. A non-positive budget disarms it. */
+  private arm(ms: number): void {
+    if (!(ms > 0) || !Number.isFinite(ms)) return;
+    this.deadlineAt = Date.now() + ms;
+    this.timeoutTimer = setTimeout(() => {
+      this.timedOut = true;
+      this.killGroup("SIGKILL");
+    }, ms);
+    this.timeoutTimer.unref?.();
+  }
+
+  /**
+   * Stop the clock. The container is frozen, so counting this time against the
+   * agent's budget would kill an eval for work it was never allowed to do.
+   */
+  holdTimeout(): void {
+    if (this.settled || this.heldRemainingMs !== null) return;
+    if (this.timeoutTimer === undefined || this.deadlineAt === null) return;
+    clearTimeout(this.timeoutTimer);
+    this.timeoutTimer = undefined;
+    this.heldRemainingMs = Math.max(1, this.deadlineAt - Date.now());
+    this.deadlineAt = null;
+  }
+
+  /** Restart the clock with whatever budget was left when it was held. */
+  releaseTimeout(): void {
+    if (this.settled || this.heldRemainingMs === null) return;
+    const remaining = this.heldRemainingMs;
+    this.heldRemainingMs = null;
+    this.arm(remaining);
   }
 
   private killGroup(signal: NodeJS.Signals): void {
@@ -633,6 +664,47 @@ export class PodmanRuntime implements ContainerRuntime {
         if (ports.length === 0) {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
+      }
+    }
+
+    // `allowlist` was accepted and then ignored, so a package that named three
+    // reachable hosts got the same unrestricted egress as `allow`. Filtering
+    // runs inside this container's own netns, after it exists and before the
+    // agent is exec'd into it.
+    if (effectiveSpec.network === "allowlist") {
+      const pidRes = await runCli(
+        [...this.cmd(), "inspect", id, "--format", "{{.State.Pid}}"],
+        { timeoutMs: 30_000 },
+      );
+      const pid = Number(pidRes.stdout.trim());
+      const result =
+        pidRes.code === 0 && Number.isInteger(pid) && pid > 0
+          ? await installAllowlist({
+              pid,
+              entries: effectiveSpec.networkAllowlist ?? [],
+              sudo: this.prefix.length > 0,
+            })
+          : {
+              applied: false,
+              entries: [],
+              addresses: [],
+              error: `could not read container pid: ${pidRes.stderr.trim() || pidRes.stdout.trim()}`,
+            };
+      if (!result.applied) {
+        // Silently downgrading to unrestricted egress would defeat the point of
+        // asking for an allowlist, so an unenforceable policy stops the run.
+        await runCli([...this.cmd(), "rm", "-f", id], { timeoutMs: 30_000 });
+        throw new Error(
+          `network allowlist could not be enforced for this container: ${result.error}`,
+        );
+      }
+      const unresolved = result.entries.filter((e) => e.addresses.length === 0);
+      if (unresolved.length > 0) {
+        console.warn(
+          `[podman] allowlist entries did not resolve and are unreachable: ${unresolved
+            .map((e) => `${e.source} (${e.error})`)
+            .join(", ")}`,
+        );
       }
     }
 

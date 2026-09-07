@@ -47,7 +47,12 @@ export async function runNode1(
 
   const extractedMetricsPath = join(outDir, "extracted_metrics.yaml");
   const evalCasePath = join(outDir, "evalCase.yaml");
-  const extractedJson = JSON.stringify(value, null, 2);
+  const agentUsage = await loadAgentUsageMetrics(state.archiveDir);
+  const extracted = {
+    ...(value as Record<string, unknown>),
+    deterministic_agent_usage: agentUsage,
+  };
+  const extractedJson = JSON.stringify(extracted, null, 2);
   await writeFile(extractedMetricsPath, extractedJson + "\n");
   await writeFile(
     evalCasePath,
@@ -55,7 +60,7 @@ export async function runNode1(
       {
         case_id: state.caseId,
         run_id: state.runId,
-        extracted: value,
+        extracted,
       },
       null,
       2,
@@ -73,4 +78,48 @@ export async function runNode1(
   };
   await saveCheckpoint(next);
   return next;
+}
+
+/**
+ * Copy the tested agent's request/token counts out of the sealed archive.
+ * These are platform-owned run-metrics, not judge-model guesses.
+ */
+async function loadAgentUsageMetrics(archiveDir: string): Promise<Record<string, unknown>> {
+  const candidates = [
+    join(archiveDir, "eval_lifecycle_logs", "run-metrics.json"),
+    join(archiveDir, "run-metrics.json"),
+  ];
+  for (const path of candidates) {
+    try {
+      const raw = JSON.parse(await readFile(path, "utf8")) as {
+        measurements?: Record<string, { value?: unknown; unit?: string; provenance?: string; note?: string }>;
+      };
+      const m = raw.measurements ?? {};
+      const pick = (key: string) => {
+        const row = m[key];
+        if (!row) return null;
+        return {
+          value: row.value ?? null,
+          unit: row.unit ?? "",
+          provenance: row.provenance ?? "exact",
+          ...(row.note ? { note: row.note } : {}),
+          source: "run-metrics.json",
+        };
+      };
+      return {
+        model_requests: pick("model_requests"),
+        input_tokens: pick("input_tokens"),
+        output_tokens: pick("output_tokens"),
+        tokens_used: pick("tokens_used"),
+      };
+    } catch {
+      continue;
+    }
+  }
+  return {
+    model_requests: null,
+    input_tokens: null,
+    output_tokens: null,
+    tokens_used: null,
+  };
 }

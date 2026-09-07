@@ -1,9 +1,94 @@
-/** Publish one immutable Phase-2 strict-superset view over a Phase-1 view. */
-import {createHash} from "node:crypto";import {createReadStream} from "node:fs";import {cp,lstat,mkdir,readdir,stat,writeFile} from "node:fs/promises";import {join,relative} from "node:path";
-interface Entry{path:string;kind:"file"|"symlink";bytes:number;sha256:string;symlinkTarget:string|null}
-async function hash(path:string){const h=createHash("sha256");let bytes=0;await new Promise<void>((ok,no)=>{const s=createReadStream(path);s.on("data",c=>{const b=Buffer.isBuffer(c)?c:Buffer.from(c);h.update(b);bytes+=b.length});s.on("end",ok);s.on("error",no)});return{bytes,sha256:h.digest("hex")}}
-async function entries(root:string):Promise<Entry[]>{const out:Entry[]=[];async function walk(d:string){for(const e of await readdir(d,{withFileTypes:true})){const p=join(d,e.name),rel=relative(root,p).replace(/\\/g,"/");if(rel==="phase2-view.manifest.json")continue;if(e.isDirectory())await walk(p);else if(e.isSymbolicLink()){const {readlink}=await import("node:fs/promises");const t=await readlink(p);out.push({path:rel,kind:"symlink",bytes:Buffer.byteLength(t),sha256:createHash("sha256").update(t).digest("hex"),symlinkTarget:t})}else if(e.isFile()){const x=await hash(p);out.push({path:rel,kind:"file",bytes:x.bytes,sha256:x.sha256,symlinkTarget:null})}}}await walk(root);return out.sort((a,b)=>a.path.localeCompare(b.path))}
-function same(a:Entry,b:Entry){return a.path===b.path&&a.kind===b.kind&&a.bytes===b.bytes&&a.sha256===b.sha256&&a.symlinkTarget===b.symlinkTarget}
-export interface Phase2ViewResult{viewDir:string;manifestPath:string;manifestSha256:string;files:number;bytes:number}
-/** Copy Phase1 view, add phase2/, verify strict superset, and write manifest. */
-export async function publishPhase2ArchiveView(input:{runId:string;campaignId:string;phase1ViewDir:string;phase2ArtifactDir:string;viewDir:string}):Promise<Phase2ViewResult>{const existing=await readdir(input.viewDir).catch(()=>[]);if(existing.length)throw new Error(`Phase2 view destination is not empty: ${input.viewDir}`);const base=await entries(input.phase1ViewDir);if(base.some(e=>e.path==="phase2"||e.path.startsWith("phase2/")))throw new Error("Phase1 view already contains phase2/ paths");const required=["campaign.yaml","patterns.yaml","developer-pack.yaml","experiment-plans.yaml","manifest.json","executive-brief.yaml","hypotheses.yaml","developer-improvement-pack.zip"];for(const f of required){const s=await stat(join(input.phase2ArtifactDir,f)).catch(()=>null);if(!s?.isFile())throw new Error(`missing required Phase2 artifact: ${f}`)}await mkdir(input.viewDir,{recursive:true});await cp(input.phase1ViewDir,input.viewDir,{recursive:true,force:true});const p2=join(input.viewDir,"phase2");await mkdir(p2,{recursive:true});for(const f of await readdir(input.phase2ArtifactDir)){if(f==="developer-pack.json")continue;if(f.includes("/")||f==="."||f==="..")throw new Error(`invalid Phase2 artifact path: ${f}`);const src=join(input.phase2ArtifactDir,f),s=await lstat(src);if(s.isDirectory()&&f==="traces"){await cp(src,join(p2,"traces"),{recursive:true,force:false,errorOnExist:true});continue}if(!s.isFile())throw new Error(`unsupported Phase2 artifact kind: ${f}`);await cp(src,join(p2,f),{force:false,errorOnExist:true})}const final=await entries(input.viewDir),by=new Map(final.map(e=>[e.path,e]));for(const b of base){const f=by.get(b.path);if(!f||!same(b,f))throw new Error(`Phase1 tuple changed or missing: ${b.path}`)}const added=final.filter(e=>!base.some(b=>b.path===e.path));if(added.some(e=>!e.path.startsWith("phase2/")))throw new Error("final view added a non-phase2 path");const manifest={schemaVersion:1,kind:"themis-phase2-archive-view",runId:input.runId,campaignId:input.campaignId,parentPhase1ManifestSha256:createHash("sha256").update(JSON.stringify(base)).digest("hex"),files:final,totalBytes:final.reduce((n,e)=>n+e.bytes,0),createdAt:new Date().toISOString()};const body=`${JSON.stringify(manifest,null,2)}\n`,manifestPath=join(input.viewDir,"phase2-view.manifest.json");await writeFile(manifestPath,body);return{viewDir:input.viewDir,manifestPath,manifestSha256:createHash("sha256").update(body).digest("hex"),files:final.length,bytes:manifest.totalBytes}}
+/**
+ * Phase-2 publication: seal the campaign's `phase2/` tree back into each
+ * member eval's own archive. Like Phase 1, this reseals the one archive the
+ * eval already has rather than copying it into a third directory.
+ */
+
+import { createHash } from "node:crypto";
+import { cp, lstat, mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type { DbQueries } from "../../db/queries.js";
+import { resealEvalArchive } from "../../runner/eval-archive.js";
+
+const REQUIRED_ARTIFACTS = [
+  "campaign.yaml",
+  "patterns.yaml",
+  "developer-pack.yaml",
+  "experiment-plans.yaml",
+  "manifest.json",
+  "executive-brief.yaml",
+  "hypotheses.yaml",
+  "developer-improvement-pack.zip",
+];
+
+export interface Phase2ViewResult {
+  /** The eval's archive, now carrying phase2/. */
+  viewDir: string;
+  manifestPath: string;
+  manifestSha256: string;
+  files: number;
+  bytes: number;
+}
+
+/** Reseal one member eval's archive with the campaign's phase2/ layer added. */
+export async function publishPhase2ArchiveView(input: {
+  runId: string;
+  campaignId: string;
+  /** The eval's archive. Already carries judge/ from Phase 1. */
+  archiveDir: string;
+  phase2ArtifactDir: string;
+  queries?: DbQueries | null;
+}): Promise<Phase2ViewResult> {
+  for (const name of REQUIRED_ARTIFACTS) {
+    const s = await stat(join(input.phase2ArtifactDir, name)).catch(() => null);
+    if (!s?.isFile()) throw new Error(`missing required Phase2 artifact: ${name}`);
+  }
+
+  // Stage the layer so the archive is unsealed only once, with the exact tree
+  // that will be sealed. `developer-pack.json` is the analyst's working copy of
+  // developer-pack.yaml and is not part of the deliverable.
+  const stagingRoot = await mkdtemp(join(tmpdir(), "ae-p2-"));
+  const staged = join(stagingRoot, "phase2");
+  await mkdir(staged, { recursive: true });
+  try {
+    for (const name of await readdir(input.phase2ArtifactDir)) {
+      if (name === "developer-pack.json") continue;
+      if (name.includes("/") || name === "." || name === "..") {
+        throw new Error(`invalid Phase2 artifact path: ${name}`);
+      }
+      const src = join(input.phase2ArtifactDir, name);
+      const s = await lstat(src);
+      if (s.isDirectory()) {
+        // Phase-2 orchestrator/subagent traces mirror Phase 1's layout:
+        // phase2/judge_traces/ rather than a differently-named phase2/traces/.
+        if (name !== "judge_traces") throw new Error(`unsupported Phase2 artifact kind: ${name}`);
+        await cp(src, join(staged, name), { recursive: true, force: true });
+        continue;
+      }
+      if (!s.isFile()) throw new Error(`unsupported Phase2 artifact kind: ${name}`);
+      await cp(src, join(staged, name), { force: true });
+    }
+
+    const { manifest } = await resealEvalArchive({
+      runId: input.runId,
+      archiveDir: input.archiveDir,
+      layers: [{ name: "phase2", sourceDir: staged }],
+      queries: input.queries ?? null,
+    });
+
+    const manifestPath = join(input.archiveDir, manifest.manifestRel);
+    return {
+      viewDir: input.archiveDir,
+      manifestPath,
+      manifestSha256: createHash("sha256")
+        .update(`${JSON.stringify(manifest, null, 2)}\n`)
+        .digest("hex"),
+      files: manifest.files.length,
+      bytes: manifest.totalBytes,
+    };
+  } finally {
+    await rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined);
+  }
+}

@@ -10,18 +10,73 @@ import type { ModelGateway } from "../gateway/client.js";
 import { saveCheckpoint } from "./checkpoint.js";
 import type { Phase1GraphState } from "./state.js";
 
-async function listRelFiles(root: string): Promise<string[]> {
+/**
+ * Directory names that hold machine bookkeeping rather than evidence.
+ *
+ * A retained workspace carries the agent's whole task tree, so `.git/` object
+ * and hook files and the harness's own caches outnumber real source files by
+ * two orders of magnitude. Cataloging them buries the handful of paths the
+ * investigators need and spends the model's context on git plumbing.
+ */
+const CATALOG_NOISE_DIRS = new Set([
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".venv",
+  "venv",
+  ".gradle",
+  ".cargo",
+  ".npm",
+  ".cache",
+  "cache",
+]);
+
+/** True when a path segment marks a subtree the evidence catalog should skip. */
+function isNoiseDir(name: string): boolean {
+  return CATALOG_NOISE_DIRS.has(name);
+}
+
+/**
+ * List archive files worth cataloging, with counts of what was pruned.
+ *
+ * Pruning is reported rather than silent: a judge that sees "2 source files"
+ * must be able to tell a small diff from a truncated catalog.
+ */
+async function listRelFiles(root: string): Promise<{ files: string[]; skipped: number }> {
   const out: string[] = [];
+  let skipped = 0;
   async function walk(dir: string): Promise<void> {
     for (const name of await readdir(dir)) {
       const p = join(dir, name);
       const s = await stat(p);
-      if (s.isDirectory()) await walk(p);
-      else out.push(relative(root, p).replace(/\\/g, "/"));
+      if (s.isDirectory()) {
+        if (isNoiseDir(name)) {
+          skipped += await countFiles(p);
+          continue;
+        }
+        await walk(p);
+      } else out.push(relative(root, p).replace(/\\/g, "/"));
     }
   }
   await walk(root);
-  return out.sort();
+  return { files: out.sort(), skipped };
+}
+
+/** Count files under a pruned subtree so the catalog can say what it dropped. */
+async function countFiles(dir: string): Promise<number> {
+  let n = 0;
+  for (const name of await readdir(dir)) {
+    const p = join(dir, name);
+    const s = await stat(p);
+    if (s.isDirectory()) n += await countFiles(p);
+    else n += 1;
+  }
+  return n;
 }
 
 async function readSnippet(root: string, rel: string, max = 12_000): Promise<string> {
@@ -102,7 +157,7 @@ export async function runNode0(input: {
   gateway: ModelGateway;
   attemptId: string;
 }): Promise<Phase1GraphState> {
-  const files = await listRelFiles(input.archiveDir);
+  const { files, skipped } = await listRelFiles(input.archiveDir);
   const outDir = join(input.workDir, "node0");
   await mkdir(outDir, { recursive: true });
 
@@ -127,9 +182,17 @@ export async function runNode0(input: {
 
   const catalog = files.map((f) => `  - path: ${JSON.stringify(f)}`).join("\n");
   const evalContextPath = join(outDir, "evalContext.yaml");
+  const pruned =
+    skipped > 0
+      ? `skipped_files: ${skipped}\nskipped_reason: "version-control, dependency, and cache directories are not evidence"\n`
+      : "";
   await writeFile(
     evalContextPath,
-    `case_id: ${JSON.stringify(input.caseId)}\nrun_id: ${JSON.stringify(input.runId)}\nfiles:\n${catalog}\n`,
+    `case_id: ${JSON.stringify(input.caseId)}\n` +
+      `run_id: ${JSON.stringify(input.runId)}\n` +
+      `file_count: ${files.length}\n` +
+      pruned +
+      `files:\n${catalog}\n`,
   );
 
   const summary = await input.gateway.chat({

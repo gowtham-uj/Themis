@@ -10,7 +10,7 @@
 
 import { execFile } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -98,6 +98,19 @@ export async function captureDiff(
     GIT_CONFIG_KEY_0: "safe.directory",
     GIT_CONFIG_VALUE_0: "*",
   };
+  // `git add -A` walks up to the nearest ancestor repo. If the workspace is not
+  // its own repo root, that stages and diffs somebody else's checkout, which
+  // both loses the agent's real changes and writes into an unrelated repo.
+  const { stdout: toplevel } = await execFileAsync(
+    "git",
+    ["-C", workspaceDir, "rev-parse", "--show-toplevel"],
+    { env: gitEnv },
+  );
+  if (resolve(toplevel.trim()) !== resolve(workspaceDir)) {
+    throw new Error(
+      `diff capture refused: ${workspaceDir} is not a git repository root (nearest repo is ${toplevel.trim()})`,
+    );
+  }
   await execFileAsync("git", ["-C", workspaceDir, "add", "-A"], { env: gitEnv });
 
   const rawDiff = await gitDiffCached(

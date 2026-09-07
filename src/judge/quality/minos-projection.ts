@@ -89,6 +89,167 @@ export function whyUnresolvedOf(v: unknown): string {
   return "unsolvable_from_record";
 }
 
+/**
+ * Categories the frozen template accepts, and the words minos actually writes.
+ *
+ * Minos reaches for the natural engineering word, not the enum: "robustness",
+ * "reliability", "testing", "performance". `evalJudge.yaml` is projected
+ * deterministically from the committed ruling, so an off-enum value used to be
+ * unfixable. Every retry regenerated the same bad value from the same report and
+ * the case burned both attempts on a one-word mismatch. Mapping the synonym
+ * keeps the judgement and satisfies the contract; the original word survives
+ * under `extra.category_as_written`.
+ */
+const CATEGORY_SYNONYMS: Readonly<Record<string, string>> = Object.freeze({
+  robustness: "correctness",
+  reliability: "correctness",
+  correctness: "correctness",
+  bug: "correctness",
+  testing: "process",
+  tests: "process",
+  verification: "process",
+  validation: "process",
+  process: "process",
+  workflow: "process",
+  methodology: "approach",
+  design: "approach",
+  architecture: "approach",
+  approach: "approach",
+  strategy: "approach",
+  performance: "efficiency",
+  efficiency: "efficiency",
+  cost: "efficiency",
+  speed: "efficiency",
+  tooling: "tooling",
+  tools: "tooling",
+  integrity: "integrity",
+  honesty: "integrity",
+  security: "integrity",
+});
+
+/**
+ * Map a committed category onto the frozen enum.
+ *
+ * An unrecognized word falls back to `process`, which claims the least: it says
+ * the finding is about how the agent worked, not that its code was wrong.
+ */
+export function improvementCategoryOf(v: unknown): string {
+  const s = typeof v === "string" ? v.trim().toLowerCase() : "";
+  return CATEGORY_SYNONYMS[s] ?? "process";
+}
+
+/** Map a committed impact or confidence word onto {high, medium, low}. */
+export function tierOf(v: unknown, fallback: "high" | "medium" | "low"): string {
+  const s = typeof v === "string" ? v.trim().toLowerCase() : "";
+  if (s === "high" || s === "medium" || s === "low") return s;
+  if (/^(critical|severe|major|blocker|p0|p1)$/.test(s)) return "high";
+  if (/^(minor|trivial|nit|cosmetic|p3|p4)$/.test(s)) return "low";
+  if (/^(moderate|normal|p2)$/.test(s)) return "medium";
+  return fallback;
+}
+
+/** Integrity verdicts the frozen template accepts. */
+const INTEGRITY_VERDICTS: readonly string[] = [
+  "clean",
+  "suspicious",
+  "violation",
+  "contested",
+  "insufficient_evidence",
+  "not_applicable",
+];
+
+/**
+ * Map a committed integrity verdict onto the frozen enum.
+ *
+ * An empty or unrecognized verdict becomes `insufficient_evidence` rather than
+ * `clean`: the court not naming a verdict is not the court clearing the agent.
+ */
+export function integrityVerdictOf(v: unknown): string {
+  const s = typeof v === "string" ? v.trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
+  if (INTEGRITY_VERDICTS.includes(s)) return s;
+  if (/^(no_(issues|findings)|none|ok|pass(ed)?)$/.test(s)) return "clean";
+  if (/^(suspect|questionable|concerning)$/.test(s)) return "suspicious";
+  if (/^(cheat(ing)?|fraud|violated?)$/.test(s)) return "violation";
+  if (/^(disputed|conflicting)$/.test(s)) return "contested";
+  return "insufficient_evidence";
+}
+
+/**
+ * Split a committed mapping into the frozen keys and everything else.
+ *
+ * Minos sometimes files a key the template never named: `pattern`,
+ * `affected_component`, `root_cause`. That is real signal about the agent under
+ * test, so it is kept rather than dropped. Tier A forbids invented keys at the
+ * top of an improvement, so the surprises are collected under one `extra`
+ * mapping, which the template does allow.
+ */
+export function splitKnownKeys(
+  o: Record<string, unknown>,
+  known: readonly string[],
+): { known: Record<string, unknown>; extra: Record<string, unknown> } {
+  const kept: Record<string, unknown> = {};
+  const extra: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(o)) {
+    if (known.includes(k)) kept[k] = v;
+    else if (v !== null && v !== undefined && v !== "") extra[k] = v;
+  }
+  return { known: kept, extra };
+}
+
+/**
+ * Which part of the agent a recommendation lands in.
+ *
+ * A developer on PI or ReaperCode reads an improvement and asks "what do I open
+ * to fix this?" before anything else. `category` never answered that, so the
+ * projector answers it: minos may name the subsystem itself, and where it did
+ * not, the issue and recommendation prose is classified against the same
+ * vocabulary. An unrecognized case is `unknown`, never a guess.
+ */
+const SUBSYSTEM_KEYWORDS: ReadonlyArray<{ re: RegExp; subsystem: string }> = [
+  { re: /system prompt|prompt (?:says|instruct|wording|template)|instruction(?:s)? (?:to|for) the (?:agent|model)|persona/i, subsystem: "system_prompt" },
+  { re: /tool (?:schema|signature|definition|description|param|argument)|missing tool|no tool for|tool should (?:accept|expose|take)/i, subsystem: "tool_definition" },
+  { re: /tool (?:result|output|response)|truncat|max_result_chars|oversized (?:result|output)|result (?:too|excessively) large/i, subsystem: "tool_result_handling" },
+  { re: /context (?:window|budget|inflation|bloat|management)|token (?:budget|economy|waste)|compact(?:ion|ing)?|history (?:pruning|trimming)/i, subsystem: "context_management" },
+  { re: /plan(?:ning|ned)?\b|decompos|sequenc(?:e|ing) of steps|premature implement|jumped to (?:code|implementation)|task breakdown/i, subsystem: "planning" },
+  { re: /localiz|grep|ripgrep|code search|find(?:ing)? the (?:right|relevant|correct) (?:file|symbol)|repo(?:sitory)? (?:map|explor|search)/i, subsystem: "code_search" },
+  { re: /\b(?:edit|patch|diff|write)\b[^\n]{0,40}(?:tool|apply|fail)|replace_in_file|str_replace|whitespace mismatch|failed to apply/i, subsystem: "file_editing" },
+  { re: /(?:did not|never|failed to|without) (?:running |run |ever )?(?:test|verify|verifying|the (?:test|suite))|verification (?:gap|step|discipline)|untested|no (?:test|verification)|self[- ]check|regression (?:run|suite)/i, subsystem: "verification" },
+  { re: /sub[- ]?agent|child agent|delegat|fan[- ]?out|orchestrat/i, subsystem: "subagent_orchestration" },
+  { re: /temperature|reasoning effort|thinking budget|model (?:choice|selection|config)|max_tokens/i, subsystem: "model_config" },
+  { re: /harness|container|setup script|infrastructure|platform[- ]side|timeout (?:was|is) (?:too|set)/i, subsystem: "harness" },
+];
+
+const SUBSYSTEMS: readonly string[] = [
+  "system_prompt", "tool_definition", "tool_result_handling", "context_management",
+  "planning", "code_search", "file_editing", "verification", "subagent_orchestration",
+  "model_config", "harness", "unknown",
+];
+
+/** Resolve the subsystem minos named, or classify the prose. */
+export function subsystemOf(named: unknown, prose: string): string {
+  const s = typeof named === "string" ? named.trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
+  if (SUBSYSTEMS.includes(s)) return s;
+  for (const { re, subsystem } of SUBSYSTEM_KEYWORDS) {
+    if (re.test(prose)) return subsystem;
+  }
+  return "unknown";
+}
+
+/**
+ * How well established the fix is.
+ *
+ * `research_backed` is earned, not claimed: it requires a `web:` ref among the
+ * improvement's evidence, so the word always means a retrieved source exists.
+ * Minos may say `experimental` when it is proposing something the record cannot
+ * settle; everything else is a `direct_fix` the record already supports.
+ */
+export function fixTypeOf(named: unknown, hasWebRef: boolean): string {
+  const s = typeof named === "string" ? named.trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
+  if (hasWebRef) return "research_backed";
+  if (s === "experimental" || /^(hypothes|speculat|untested|try)/.test(s)) return "experimental";
+  return "direct_fix";
+}
+
 /** Map any host-supplied closure reason onto the frozen enum. */
 export function closedByOf(v: string): string {
   if (v === "no_new_tangents" || v === "triage_exhausted" || v === "round_ceiling") return v;
@@ -151,6 +312,16 @@ export function canonicalNarrativeJoin(doc: MinosDoc): string {
 export function narrativeOf(doc: MinosDoc): string {
   const top = str(doc.narrative ?? "");
   if (top.trim()) return top; // Shape C
+  // Shape D: a round ruling that justifies all four verdict axes in one
+  // `verdict_basis` paragraph instead of four per-axis `*_ruling` keys.
+  // Observed live on run 7bb97429: minos committed a grounded basis naming the
+  // reward, the public/hidden test counts, and the writes it confined itself
+  // to, and the final report shipped "(the committed minos ruling carried no
+  // narrative prose)" over the top of it. Dropping committed prose because the
+  // key is spelled differently is worse than any shape mismatch it guards
+  // against, since the alternative is host filler in a published judgement.
+  const basis = str(doc.verdict_basis ?? "");
+  if (basis.trim()) return basis;
   return canonicalNarrativeJoin(doc) || str(doc.case_completeness ?? "");
 }
 
@@ -202,14 +373,18 @@ export function integritySummaryOf(
       round: typeof o?.round === "number" ? (o!.round as number) : 1,
     };
   };
+  // The verdict word is mapped onto the frozen enum. Minos has committed an
+  // empty string here, which no retry could repair because this projection is
+  // deterministic; an unnamed verdict becomes `insufficient_evidence`, never
+  // `clean`.
   if (sum !== null) {
     return {
-      verdict: str(sum.verdict ?? verdict.integrity),
+      verdict: integrityVerdictOf(sum.verdict ?? verdict.integrity),
       findings: arr(sum.findings).map(project).filter((f) => f.finding.length > 0),
     };
   }
   return {
-    verdict: verdict.integrity,
+    verdict: integrityVerdictOf(verdict.integrity),
     findings: arr(doc.integrity_findings).map(project).filter((f) => f.finding.length > 0),
   };
 }

@@ -91,14 +91,18 @@ describe("adapter validate (dry-run)", () => {
       configure: { argv: string[]; env: Record<string, string>; cwd: string; timeout_ms: number };
       evidence: { paths: string[]; manifest: Array<{ id: string; role: string }> };
     };
-    expect(body.command.argv).toContain("sample-model");
-    expect(body.command.argv).toContain("sample-provider");
+    // The dry run renders the project's real provider and model, which adapter
+    // creation pins from the adapter's own defaults. Rendering literal
+    // placeholders instead meant validate only ever exercised the `default`
+    // credentialEnv bucket, never the per-provider one a real run selects.
+    expect(body.command.argv).toContain("deepseek-v4-flash");
+    expect(body.command.argv).toContain("nuralwatt");
     expect(body.command.argv).toContain("sample eval prompt");
     expect(body.command.argv).toContain("/workspace");
     expect(body.command.env.RUN_ID).toBe("sample-run-id");
     expect(body.command.cwd).toBe("/workspace");
     expect(body.command.timeout_ms).toBe(600000);
-    expect(body.configure.argv).toContain("sample-model");
+    expect(body.configure.argv).toContain("deepseek-v4-flash");
     expect(body.configure.env.CONFIG_RUN).toBe("sample-run-id");
     expect(body.configure.timeout_ms).toBe(120000);
 

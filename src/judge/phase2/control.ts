@@ -11,6 +11,16 @@ export function phase2PlatformDir(dataDir: string, campaignId: string): string {
 
 const inFlight = new Map<string, Promise<Phase2PiResult>>();
 
+/** The in-process map empties on API restart while the board's PI process keeps
+ *  running, and the reverse happens when that process dies under a live server.
+ *  The recorded pid is the durable truth, so check it too. */
+async function pidAlive(workDir: string): Promise<boolean> {
+  let pid: number;
+  try { pid = Number.parseInt(await readFile(join(workDir, "pi.pid"), "utf8"), 10); } catch { return false; }
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
 export interface Phase2PiStatus {
   campaignId: string;
   workDir: string;
@@ -60,7 +70,7 @@ export async function getPhase2PiStatus(dataDir: string, campaignId: string): Pr
     workDir,
     exists,
     resumable: session !== null,
-    running: inFlight.has(campaignId),
+    running: inFlight.has(campaignId) || await pidAlive(workDir),
     filed,
     subagents,
     session,
@@ -74,6 +84,7 @@ export async function resumePhase2Pi(input: {
   projectId: string;
   connection: PiConnection;
   platformFaults?: string[];
+  promptOverrides?: Record<string, string> | null;
 }): Promise<{ started: boolean; running: boolean }> {
   const workDir = phase2PlatformDir(input.dataDir, input.campaignId);
   if (inFlight.has(input.campaignId)) return { started: false, running: true };
@@ -96,6 +107,7 @@ export async function resumePhase2Pi(input: {
     viewDirs,
     platformFaults: input.platformFaults ?? [],
     workDir,
+    promptOverrides: input.promptOverrides ?? null,
   }).finally(() => { inFlight.delete(input.campaignId); });
   inFlight.set(input.campaignId, task);
   return { started: true, running: true };

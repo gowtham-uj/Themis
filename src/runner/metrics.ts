@@ -98,6 +98,10 @@ export function deriveRunMetrics(
   let previousSignature: string | null = null;
   let repeatedSignatureCount = 0;
   let totalTokens = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let reasoningTokens = 0;
+  let usageEventCount = 0;
   let sawRunUsageTotal = false;
   let lastMessage = "";
 
@@ -113,13 +117,22 @@ export function deriveRunMetrics(
       continue;
     }
     if (event.type === "usage") {
-      if (!sawRunUsageTotal) totalTokens += event.totalTokens ?? event.inputTokens + event.outputTokens;
+      usageEventCount += 1;
+      if (!sawRunUsageTotal) {
+        inputTokens += event.inputTokens;
+        outputTokens += event.outputTokens;
+        reasoningTokens += event.reasoningTokens ?? 0;
+        totalTokens += event.totalTokens ?? event.inputTokens + event.outputTokens + (event.reasoningTokens ?? 0);
+      }
       continue;
     }
     if (event.type === "run.end") {
       terminalStatus = event.status;
       wallClockMs = event.durationMs;
       if (event.usageTotal) {
+        inputTokens = event.usageTotal.inputTokens;
+        outputTokens = event.usageTotal.outputTokens;
+        reasoningTokens = event.usageTotal.reasoningTokens ?? 0;
         totalTokens = event.usageTotal.totalTokens ??
           event.usageTotal.inputTokens + event.usageTotal.outputTokens +
           (event.usageTotal.reasoningTokens ?? 0) +
@@ -227,7 +240,22 @@ export function deriveRunMetrics(
   const traceRange = (start: number | null, end: number | null): MetricRef[] =>
     start === null || end === null ? [] : [{ kind: "trace", runId, seqs: [start, end] }];
 
+  const sawUsage = usageEventCount > 0 || sawRunUsageTotal;
   const measurements: Record<string, MetricMeasurement> = {
+    model_requests: exact(
+      usageEventCount,
+      "requests",
+      traceRange(0, ordered.at(-1)?.seq ?? null),
+      usageEventCount === 0 && sawRunUsageTotal
+        ? "Only run.end.usageTotal was present; per-request usage events were missing."
+        : undefined,
+    ),
+    input_tokens: sawUsage
+      ? exact(inputTokens, "tokens", traceRange(0, ordered.at(-1)?.seq ?? null))
+      : unknown("tokens", "Canonical events had no usage records from the agent under test."),
+    output_tokens: sawUsage
+      ? exact(outputTokens, "tokens", traceRange(0, ordered.at(-1)?.seq ?? null))
+      : unknown("tokens", "Canonical events had no usage records from the agent under test."),
     tokens_used: exact(totalTokens, "tokens", traceRange(0, ordered.at(-1)?.seq ?? null)),
     cost_usd: options.totalCost == null
       ? unknown("usd", "Provider cost was not available on the finalized run.")
@@ -388,8 +416,13 @@ function patchStats(text: string | undefined): { bytes: number; added: number; r
   return { bytes: Buffer.byteLength(text), added, removed };
 }
 
-function exact(value: number | boolean, unit: string, refs: MetricRef[]): MetricMeasurement {
-  return { value, unit, provenance: "exact", refs };
+function exact(
+  value: number | boolean,
+  unit: string,
+  refs: MetricRef[],
+  note?: string,
+): MetricMeasurement {
+  return { value, unit, provenance: "exact", refs, ...(note ? { note } : {}) };
 }
 
 function derived(value: number | boolean, unit: string, refs: MetricRef[]): MetricMeasurement {

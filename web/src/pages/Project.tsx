@@ -1,9 +1,8 @@
 import { Link, useParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { api, errText } from '../lib/api'
-import type { Adapter, EvalQueue, EvalTask, Project } from '../lib/types'
-import { Banner, Empty, Mono, PageHead, Panel } from '../components/ui'
-import { STAGES, STAGE_COPY } from '../components/model-stage'
+import type { Adapter, EvalQueue, EvalTask, PipelineRunSummary, Project } from '../lib/types'
+import { Banner, CategoryChip, Empty, Mono, PageHead, Panel, StateBadge } from '../components/ui'
 
 export default function Project() {
   const { id } = useParams()
@@ -11,89 +10,121 @@ export default function Project() {
   const adapters = useQuery({ queryKey: ['adapters', id], queryFn: () => api.get<{ adapters: Adapter[] }>(`/api/projects/${id}/adapters`) })
   const evals = useQuery({ queryKey: ['evals', id], queryFn: () => api.get<{ evals: EvalTask[] }>(`/api/projects/${id}/evals`) })
   const queues = useQuery({ queryKey: ['queues', id], queryFn: () => api.get<{ queues: { queue: EvalQueue; items: unknown[] }[] }>(`/api/projects/${id}/queues`) })
+  const runs = useQuery({
+    queryKey: ['pipeline-runs', id],
+    queryFn: () => api.get<{ runs: PipelineRunSummary[]; total: number; active: number }>(`/api/projects/${id}/pipeline/runs`),
+    refetchInterval: (query) => query.state.data?.active ? 3000 : false,
+  })
+
+  const adapter = adapters.data?.adapters[0]
+  const queueRow = queues.data?.queues[0]
+  // The server resolves this the same way for every project, so prefer it over a
+  // client-side guess: the two used to disagree, and the projects list showed
+  // "—" for a project whose detail page named the agent.
+  const agentName = adapter?.name ?? adapter?.agent_id ?? adapter?.agentId ?? p.data?.resolved_agent_id ?? p.data?.default_agent_id ?? queueRow?.queue.builtinAdapterId ?? 'not set'
 
   return (
     <>
       <PageHead
         title={p.data?.name ?? 'Project'}
-        sub={id ? <Mono>{id}</Mono> : undefined}
+        sub={p.data?.description || 'One agent, one eval store, one queue.'}
         actions={<>
-          <Link to={`/projects/${id}/settings`}><button className="primary">Settings</button></Link>
-          <Link to={`/projects/${id}/adapters`}><button>Adapters</button></Link>
+          <Link to={`/projects/${id}/queue`}><button className="primary">Start a run</button></Link>
           <Link to={`/projects/${id}/evals`}><button>Evals</button></Link>
-          <Link to={`/projects/${id}/queue`}><button>Queue</button></Link>
-          <Link to={`/projects/${id}/live`}><button>Live</button></Link>
+          <Link to={`/projects/${id}/settings`}><button>Settings</button></Link>
         </>}
       />
 
       {p.isError && <Banner tone="danger">{errText(p.error)}</Banner>}
+      {runs.isError && <Banner tone="danger">Cannot load runs: {errText(runs.error)}</Banner>}
 
-      <Panel title="Summary" actions={<Link to={`/projects/${id}/settings`}><button>Edit settings</button></Link>}>
-        <div className="badge-row">
-          <span className="chip">model: <Mono>{p.data?.default_model ?? '—'}</Mono></span>
-          <span className="chip">provider: <Mono>{p.data?.default_provider ?? '—'}</Mono></span>
-          <span className="chip">network: <Mono>{p.data?.network_policy ?? 'allow'}</Mono></span>
-        </div>
-        <div className="badge-row" style={{ marginTop: 'var(--s2)' }}>
-          {STAGES.every((s) => !p.data?.model_config?.[s])
-            ? <span className="chip">providers: inherits global for every stage</span>
-            : STAGES.map((s) => (
-                <span key={s} className={`chip ${p.data?.model_config?.[s] ? (s === 'eval' ? 'accent' : s) : ''}`}>
-                  {STAGE_COPY[s].short}: {p.data?.model_config?.[s] ? String(p.data.model_config[s].model ?? 'overridden') : 'inherited'}
-                </span>
-              ))}
-        </div>
-      </Panel>
+      <div className="summary-strip" aria-label="Project run summary">
+        <div><span>Runs</span><strong>{runs.data?.total ?? 0}</strong></div>
+        <div><span>Active</span><strong>{runs.data?.active ?? 0}</strong></div>
+        <div><span>Evals in store</span><strong>{evals.data?.evals.length ?? 0}</strong></div>
+        <div><span>Queued</span><strong>{queueRow?.items.length ?? 0}</strong></div>
+      </div>
 
-      <Panel title={`Adapters (${adapters.data?.adapters.length ?? 0})`}>
-        {adapters.data?.adapters.length === 0 && <Empty title="No adapters"><Link to={`/projects/${id}/adapters`}><button>Create an adapter</button></Link></Empty>}
-        {adapters.data && adapters.data.adapters.length > 0 && (
-          <table>
-            <thead><tr><th>Agent</th><th>Install</th><th>Source</th><th>Provider / model</th><th>Image</th></tr></thead>
-            <tbody>{adapters.data.adapters.slice(0, 10).map((a, i) => (
-              <tr key={a.id ?? i}>
-                <td style={{ color: 'var(--text)', fontWeight: 600 }}>{a.agent_id ?? a.agentId ?? a.name}</td>
-                <td><Mono>{a.install_type ?? a.installType ?? '—'}</Mono></td>
-                <td><Mono>{a.sourceRepo ?? '—'}</Mono></td>
-                <td><Mono>{a.defaultProvider ?? '—'} / {a.default_model ?? a.defaultModel ?? '—'}</Mono></td>
-                <td><Mono copy>{a.image ?? '—'}</Mono></td>
-              </tr>
-            ))}</tbody>
-          </table>
+      <Panel title="Runs" actions={<Link to={`/projects/${id}/queue`}><button className="primary">New run</button></Link>}>
+        {runs.data?.runs.length === 0 && (
+          <Empty title="No runs yet">
+            A run is one independent copy of the queue blueprint. Name it when you start, then watch every eval and archive from its own panel.
+            <div style={{ marginTop: 'var(--s3)' }}><Link to={`/projects/${id}/queue`}><button className="primary">Set up the first run</button></Link></div>
+          </Empty>
+        )}
+        {runs.data && runs.data.runs.length > 0 && (
+          <div className="run-list">
+            {runs.data.runs.map((run) => {
+              const label = run.name || `Run ${run.ordinal ?? ''}`
+              return (
+                <Link className="run-list-row" to={`/projects/${id}/runs/${run.id}`} key={run.id}>
+                  <div className="run-list-main">
+                    <strong>{label}</strong>
+                    <span className="hint"><Mono>{run.id}</Mono></span>
+                  </div>
+                  <div className="run-list-progress">
+                    <span>{run.completedEvals} of {run.evals} evals advanced</span>
+                    <span>{run.archives} archive{run.archives === 1 ? '' : 's'}</span>
+                  </div>
+                  <StateBadge state={run.state} />
+                  <time dateTime={run.createdAt}>{run.createdAt ? new Date(run.createdAt).toLocaleString() : '—'}</time>
+                  <span className="run-list-open" aria-hidden="true">Open</span>
+                </Link>
+              )
+            })}
+          </div>
         )}
       </Panel>
 
-      <Panel title={`Evals (${evals.data?.evals.length ?? 0})`}>
-        {evals.data?.evals.length === 0 && <Empty title="No evals"><Link to={`/projects/${id}/evals`}><button>Import evals</button></Link></Empty>}
+      <Panel title="The agent">
+        <p style={{ color: 'var(--text)', marginTop: 0 }}>
+          {agentName}
+          {p.data?.default_model ? <> on <Mono>{p.data.default_model}</Mono></> : ' using the default model'}
+        </p>
+        <p style={{ color: 'var(--text-dim)', fontSize: 13 }}>
+          A project tests one agent. The adapter is how we launch it. Models for the agent, the judge, and the across-evals pass live in settings. Blank fields there use the global defaults.
+        </p>
+        <div className="badge-row">
+          <Link to={`/projects/${id}/settings`}><button>{adapter ? 'Adapter' : 'Set adapter'}</button></Link>
+          <Link to={`/projects/${id}/settings`}><button>Settings</button></Link>
+        </div>
+      </Panel>
+
+      <Panel title="Eval store" actions={<Link to={`/projects/${id}/evals`}><button>Manage</button></Link>}>
+        {evals.data?.evals.length === 0 && (
+          <Empty title="No evals yet">
+            Import packages into this project, then add them to the queue.
+            <div style={{ marginTop: 'var(--s3)' }}>
+              <Link to={`/projects/${id}/evals`}><button className="primary">Open evals</button></Link>
+            </div>
+          </Empty>
+        )}
         {evals.data && evals.data.evals.length > 0 && (
           <table>
-            <thead><tr><th>Name</th><th>Category</th><th>Id</th></tr></thead>
+            <thead><tr><th>Name</th><th>Category</th></tr></thead>
             <tbody>{evals.data.evals.slice(0, 10).map((t) => (
               <tr key={t.id}>
                 <td style={{ color: 'var(--text)' }}>{t.name}</td>
-                <td><span className="chip">{String(t.categoryName ?? '—')}</span></td>
-                <td><Mono copy>{t.id}</Mono></td>
+                <td><CategoryChip value={(t.category_name ?? t.categoryName) as string | null} /></td>
               </tr>
             ))}</tbody>
           </table>
         )}
       </Panel>
 
-      <Panel title={`Queues (${queues.data?.queues.length ?? 0})`}>
-        {queues.data?.queues.length === 0 && <Empty title="No queues"><Link to={`/projects/${id}/queue`}><button>Create a queue</button></Link></Empty>}
-        {queues.data && queues.data.queues.length > 0 && (
-          <table>
-            <thead><tr><th>Name</th><th>Agent</th><th>Model</th><th>Status</th><th>Items</th></tr></thead>
-            <tbody>{queues.data.queues.map(({ queue, items }) => (
-              <tr key={queue.id}>
-                <td style={{ color: 'var(--text)' }}>{queue.name}</td>
-                <td><Mono>{queue.agentId ?? queue.builtinAdapterId ?? '—'}</Mono></td>
-                <td><Mono>{queue.model ?? '—'}</Mono></td>
-                <td><Mono>{queue.status}</Mono></td>
-                <td className="num">{items.length}</td>
-              </tr>
-            ))}</tbody>
-          </table>
+      <Panel title="Queue" actions={<Link to={`/projects/${id}/queue`}><button className="primary">Open queue</button></Link>}>
+        {!queueRow && (
+          <Empty title="No queue yet">
+            The queue is the blueprint: which evals, and whether to run the agent, judge each eval, or look across them. Opening it creates it.
+          </Empty>
+        )}
+        {queueRow && (
+          <p style={{ color: 'var(--text-dim)', fontSize: 13, margin: 0 }}>
+            {queueRow.items.length} eval{queueRow.items.length === 1 ? '' : 's'} on the queue.
+            Agent <Mono>{queueRow.queue.agentId ?? queueRow.queue.builtinAdapterId}</Mono>,
+            model <Mono>{queueRow.queue.model ?? '—'}</Mono>.
+            A start is a run: one container, its own archives, a live view.
+          </p>
         )}
       </Panel>
     </>

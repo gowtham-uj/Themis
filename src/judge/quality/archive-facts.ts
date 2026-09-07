@@ -228,13 +228,34 @@ export async function collectArchiveFacts(input: {
   for (const rel of ["eval_lifecycle_logs/events.jsonl", "session/session.jsonl"]) {
     const text = await readIfSmall(join(input.archiveDir, rel), 16 * 1024 * 1024);
     if (!text) continue;
+    // A stream declares its own run identity once, in a leading header record,
+    // and most later records omit it. Attributing only the records that repeat
+    // `runId` would bury the rest in the anonymous bucket, so every ref to a
+    // real moment in that stream would read as unresolvable.
+    let streamRunId: string | undefined;
     for (const line of text.split("\n")) {
       const t = line.trim();
       if (!t) continue;
       try {
-        const o = JSON.parse(t) as { seq?: unknown; runId?: unknown };
+        const o = JSON.parse(t) as {
+          seq?: unknown;
+          runId?: unknown;
+          id?: unknown;
+          kind?: unknown;
+          metadata?: { runId?: unknown };
+        };
+        if (o.kind === "header") {
+          const declared =
+            typeof o.metadata?.runId === "string" && o.metadata.runId
+              ? o.metadata.runId
+              : typeof o.id === "string" && o.id
+                ? o.id
+                : undefined;
+          if (declared) streamRunId = declared;
+        }
         if (typeof o.seq !== "number") continue;
-        const runId = typeof o.runId === "string" && o.runId ? o.runId : "*";
+        const runId =
+          typeof o.runId === "string" && o.runId ? o.runId : (streamRunId ?? "*");
         if (!traceSeqs.has(runId)) traceSeqs.set(runId, new Set());
         traceSeqs.get(runId)!.add(o.seq);
       } catch {
@@ -248,7 +269,10 @@ export async function collectArchiveFacts(input: {
   // reformatting in a way `file:...#L12-L20` is not.
   const artifactPointers = new Map<string, Set<string>>();
   const metricNames = new Set<string>();
-  const jsonRels = relPaths.filter((p) => p.endsWith(".json"));
+  // A verifier writes its structured result to stdout, so the archive holds it
+  // under a `.log` name. Selecting on the extension alone would leave that
+  // artifact unaddressable, so any small text body that parses as JSON counts.
+  const jsonRels = relPaths.filter((p) => p.endsWith(".json") || p.endsWith(".log"));
   for (const rel of jsonRels) {
     const text = await readIfSmall(join(input.archiveDir, rel), 4 * 1024 * 1024);
     if (!text) continue;

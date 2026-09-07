@@ -35,7 +35,7 @@ const adapter = {
   },
   derive_connection_check: true,
   configure: null,
-  provider_config: {"credentialEnv":{"nuralwatt":{"OPENAI_API_KEY":"NEURALWATT_API_KEY"},"openai":{"OPENAI_API_KEY":"OPENAI_API_KEY"}}},
+  provider_config: {"credentialEnv":{"nuralwatt":{"OPENAI_API_KEY":"AGENTEVAL_MODEL_API_KEY"},"openai":{"OPENAI_API_KEY":"OPENAI_API_KEY"}}},
   parser_kind: "canonical-jsonl",
   parser_config: null,
   evidence: {

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { prepareWorkspace } from "../runner/workspace.js";
 import type { CreateProjectAgentAdapterInput } from "../db/queries.js";
+import { credentialContractDoc } from "./credential-contract.js";
 
 const GENERATOR_TIMEOUT_MS = 120_000;
 const MAX_GENERATOR_OUTPUT_BYTES = 1024 * 1024;
@@ -197,6 +198,12 @@ async function runScript(
  * Callers render this as JSON; authors use it to write a generator.
  */
 export const GENERATOR_CONTRACT = {
+  /**
+   * Which harness credential names exist and how to claim them. Adapter authors
+   * had no way to discover this short of reading the runner source, so a typo
+   * in a credentialEnv source name shipped and failed inside a container.
+   */
+  credentialContract: credentialContractDoc(),
   inputEnv: [
     "AGENTEVAL_PROJECT_ID",
     "AGENTEVAL_AGENT_ID",
