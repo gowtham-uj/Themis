@@ -129,6 +129,36 @@ describe("project pipeline coordinator",()=>{
   await db.close();
  });
 
+ it("clears the previous attempt's error when a retried item finally succeeds",async()=>{
+  // Observed live: an item whose first Phase 1 attempt failed Tier A validation
+  // published a perfectly good verdict on the retry, and still read
+  // "failed Tier A structural validation" afterwards. The retry path stamps
+  // errorKind/errorDetail and nothing removed them, so the UI showed a
+  // published item as broken. Success must erase the earlier failure.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p6",evalQueueId:"eq6",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  const item=await db.pipeline.addItem({generationId:g.id,evalId:"e",ordinal:1});
+  await db.pipeline.updateItem(item.id,"eval_pending",{state:"phase1_running",runId:"run-e",baseArchiveId:"a",
+   errorKind:"phase1",errorDetail:"Phase 1 evalJudge.yaml failed Tier A structural validation",retryCount:1});
+  const gen=(await db.pipeline.getGeneration(g.id))!;
+  await db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"phase1_running");
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(){return{state:"completed",runId:"run-e",archiveId:"a"}},
+   async startPhase1(){return{operationId:"p1"}},
+   async getPhase1Status(){return{state:"published",resultVersionId:"rv",archiveViewId:"v"}},
+   async runPhase2(){return{developerPackSha256:"c".repeat(64),developerPackZip:"/p6/pack.zip",artifactDir:"/p6"}},
+   async publishFinalView(){return{finalArchiveViewId:"fv",manifestSha256:"d".repeat(64)}},
+  };
+  await advanceProjectPipeline({db,services,generationId:g.id});
+  const done=await db.pipeline.getItem(item.id);
+  expect(done?.phase1ResultVersionId).toBe("rv");
+  expect(done?.errorKind).toBeNull();
+  expect(done?.errorDetail).toBeNull();
+  await db.close();
+ });
+
  it("revives Phase1 items that exhausted their automatic retries, and leaves eval failures alone",async()=>{
   // Exhausting the bounded retries is not the same as losing the work: the
   // courtroom's judge/ tree and PI session are still on disk. One live

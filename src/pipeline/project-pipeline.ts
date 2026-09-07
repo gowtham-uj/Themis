@@ -179,7 +179,9 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
    if(s.runId&&s.runId!==item.runId){await input.db.pipeline.updateItem(item.id,item.state,{runId:s.runId});if(item.state==="eval_pending"){await input.db.pipeline.updateItem(item.id,"eval_pending",{state:"eval_running"});}changed=true;}
    const fresh=(await input.db.pipeline.getItem(item.id))!;
    if(s.state==="completed"&&s.archiveId&&fresh.state==="eval_running"){
-    await input.db.pipeline.updateItem(fresh.id,"eval_running",{state:"archive_sealed",baseArchiveId:s.archiveId});
+    // Same reason as the Phase 1 publish below: a retried eval that then
+    // succeeds must not keep the earlier attempt's error.
+    await input.db.pipeline.updateItem(fresh.id,"eval_running",{state:"archive_sealed",baseArchiveId:s.archiveId,errorKind:null,errorDetail:null});
     await input.db.pipeline.appendEvent({generationId:gen.id,itemId:fresh.id,operationId:`archive.sealed:${fresh.id}:${s.archiveId}`,eventType:"archive.sealed",payloadJson:JSON.stringify({runId:s.runId,archiveId:s.archiveId})});changed=true;
    } else if(s.state==="failed"&&fresh.state!=="failed"){
     await input.db.pipeline.updateItem(fresh.id,fresh.state,{state:"failed",errorKind:"eval",errorDetail:s.error??"eval failed"});changed=true;
@@ -197,7 +199,12 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
   const s=await input.services.getPhase1Status(item.runId!);
   if(s.state==="published"){
    if(!s.resultVersionId||!s.archiveViewId)throw new Error(`published Phase1 ${item.runId} missing ids`);
-   await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"phase1_published",phase1ResultVersionId:s.resultVersionId,phase1ArchiveViewId:s.archiveViewId});
+   // Clear the error a previous attempt recorded. Phase 1 retries stamp
+   // errorKind/errorDetail on the way back to `phase1_pending`, and nothing
+   // used to remove them, so an item that failed once and then produced a
+   // perfectly good verdict stayed marked failed forever. Observed live: a
+   // published item still reading "failed Tier A structural validation".
+   await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"phase1_published",phase1ResultVersionId:s.resultVersionId,phase1ArchiveViewId:s.archiveViewId,errorKind:null,errorDetail:null});
    await input.db.pipeline.appendEvent({generationId:gen.id,itemId:item.id,operationId:`phase1.published:${item.id}:${s.resultVersionId}`,eventType:"phase1.result_published",payloadJson:JSON.stringify(s)});changed=true;
   }else if(s.state==="failed"){
    const n=item.retryCount+1;
