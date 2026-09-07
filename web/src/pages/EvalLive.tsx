@@ -276,6 +276,11 @@ function nowCopy(opts: {
   if (opts.genState === 'waiting_retry') {
     return 'The across-evals pass stopped after its retries ran out, usually a provider error. Every verdict is still published. Resume to run it again.'
   }
+  // The board process being gone is not the same as the pass being under way.
+  // Claiming it is looking across verdicts contradicts the card right below it.
+  if (p?.phase2.stalled) {
+    return 'The across-evals board stopped mid-pass. Its session is saved and every verdict is still published. Resume to pick up where it stopped.'
+  }
   if (opts.acrossRunning || opts.genState === 'phase2_running') return `Looking across ${p?.phase1.published ?? opts.total ?? 0} verdicts for patterns and a fix plan.`
   if (opts.genState === 'finalizing') return 'Sealing the across-evals view onto each archive.'
   if (p?.stage === 'phase1') {
@@ -411,8 +416,11 @@ export default function EvalLive() {
   // A parked board keeps its campaign in `analyzing` so resume continues the same
   // session, so `analyzing` alone does not mean the board is working. The
   // generation sitting in `paused` or `waiting_retry` is what says it stopped.
+  // `stalled` means the generation still says phase2_running but the board
+  // process is gone, so that state is not evidence of work either.
   const acrossGenState = gen.data?.generation.state ?? pipeline.data?.generation?.state
-  const acrossStopped = acrossGenState === 'paused' || acrossGenState === 'waiting_retry'
+  const acrossStopped =
+    acrossGenState === 'paused' || acrossGenState === 'waiting_retry' || Boolean(prog?.phase2.stalled)
   const acrossRunning =
     Boolean(prog?.phase2.running) ||
     Boolean(campaign.data?.pi?.running) ||
@@ -643,9 +651,13 @@ export default function EvalLive() {
   // contradicts the chip whenever the generation row trails the items.
   const genState = gen.data?.generation.state ?? pipeline.data?.generation?.state ?? null
   const TERMINAL = ['completed', 'failed', 'cancelled', 'paused']
+  // A stopped board must not read as running. Its own card explains what
+  // happened; the badge only has to stop claiming work is under way.
   const statusWord = runPaused || (active === 'judge' && judgePaused)
     ? 'paused'
-    : genState && TERMINAL.includes(genState)
+    : active === 'across' && acrossStopped
+      ? 'stopped'
+      : genState && TERMINAL.includes(genState)
       ? genState
       : genState
         ? 'running'

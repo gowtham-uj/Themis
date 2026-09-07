@@ -28,7 +28,7 @@ export function toneFor(state: string | undefined): { tone: 'ok' | 'warn' | 'dan
   if (['completed', 'published', 'done', 'pass', 'passed', 'success', 'final_view_published'].includes(s)) return { tone: 'ok', label }
   if (['running', 'analyzing', 'reviewing', 'finalizing', 'phase1_running', 'phase2_running', 'eval_running', 'sealing', 'leased'].includes(s)) return { tone: 'info', label }
   if (['failed', 'error', 'cancelled', 'dead_letter', 'invalid', 'blocked'].includes(s)) return { tone: 'danger', label }
-  if (['paused', 'waiting_retry', 'retry', 'partial', 'waiting'].includes(s) || s.includes('pending')) return { tone: 'warn', label }
+  if (['paused', 'stopped', 'waiting_retry', 'retry', 'partial', 'waiting'].includes(s) || s.includes('pending')) return { tone: 'warn', label }
   if (['phase1_published', 'phase2_attached', 'archive_sealed', 'judging'].includes(s)) return { tone: 'violet', label }
   return { tone: 'muted', label: state ? label : 'unknown' }
 }
