@@ -327,6 +327,24 @@ describe("full mapping: post-change trajectory fixture", () => {
 });
 
 describe("edge mappings", () => {
+  it("deduplicates Reaper's message and custom copies of one thought", () => {
+    const id = "thought-1";
+    const timestamp = 1788741101581;
+    const content = "Inspect the failing retry test.";
+    const events = parseReaperTrajectory(
+      [
+        { kind: "entry", type: "message", id, seq: 1, timestamp,
+          message: { role: "thinking", content, turn_index: 3 } },
+        { kind: "entry", type: "custom", customType: "thinking", id, seq: 2, timestamp,
+          data: { content, turn_index: 3 } },
+      ],
+      makeCtx(),
+    );
+    const thoughts = events.filter((entry) => entry.type === "thinking") as ThinkingEvent[];
+    expect(thoughts).toHaveLength(1);
+    expect(thoughts[0]).toMatchObject({ turn: 3, mode: "full", text: content });
+  });
+
   it("deduplicates an identical terminal assistant message", () => {
     const events = parseReaperTrajectory(
       [

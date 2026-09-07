@@ -8,7 +8,7 @@ import { ingestSealedArchive } from "../src/storage/archive-ingest.js";
 import { createLocalArtifactStore } from "../src/storage/local-artifact-store.js";
 import type { EvalArchiveManifest } from "../src/runner/eval-archive.js";
 
-const DATA = "/work/agenteval/data";
+const DATA = new URL("../data/", import.meta.url).pathname;
 const legacyRoot = join(DATA, "archives");
 const keep = (await readdir(legacyRoot, { withFileTypes: true }))
   .filter((e) => e.isDirectory())

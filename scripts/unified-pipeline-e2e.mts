@@ -12,7 +12,7 @@ async function api(method:string,path:string,body?:unknown){const r=await fetch(
 function ok(r:{status:number;body:any},ctx:string){if(r.status<200||r.status>=300)throw new Error(`${ctx} -> ${r.status}: ${JSON.stringify(r.body).slice(0,400)}`);return r.body}
 
 // Two deterministic canonical eval packages in the CURRENT platform schema.
-const {pipelineEvalOne,pipelineEvalTwo}=await import("/work/agenteval/tests/helpers/pipeline-evals.ts");
+const {pipelineEvalOne,pipelineEvalTwo}=await import("../tests/helpers/pipeline-evals.ts");
 
 const suffix=Date.now().toString(36);
 const projectName=`unified-e2e-${suffix}`;
@@ -21,7 +21,7 @@ const projectId=proj.id;
 console.log("project",projectId);
 
 // Two canonical complex evals via the import-archive route (tar.gz, single-file layout).
-const {decodePackageFiles}=await import("/work/agenteval/src/evals/package.js");
+const {decodePackageFiles}=await import("../src/evals/package.js");
 const {create:tarCreate}=await import("tar");
 async function importEval(pkg:any,label:string){const files=decodePackageFiles(pkg);const {mkdtemp}=await import("node:fs/promises");const {tmpdir}=await import("node:os");const {join}=await import("node:path");const {writeFile,readFile}=await import("node:fs/promises");const dir=await mkdtemp(join(tmpdir(),"pkg-import-"));const {mkdir}=await import("node:fs/promises");const {dirname}=await import("node:path");for(const [path,content] of files){const target=join(dir,path);await mkdir(dirname(target),{recursive:true});await writeFile(target,content)}const tgz=join(tmpdir(),`${label}.tar.gz`);await tarCreate({gzip:true,file:tgz,cwd:dir},["."]);const buf=await readFile(tgz);const r=await fetch(`${BASE}/api/projects/${projectId}/evals:import-archive?format=tar.gz`,{method:"POST",body:buf});const body=await r.json().catch(()=>({rawStatus:r.status}));if(r.status<200||r.status>=300)throw new Error(`${label} import -> ${r.status}: ${JSON.stringify(body).slice(0,400)}`);return body}
 const eval1=await importEval(pipelineEvalOne(),"eval1");

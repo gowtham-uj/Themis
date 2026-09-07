@@ -1,8 +1,7 @@
 # Themis Phase 1 — implementation plan
 
-Companion to the locked design in `/work/.reaper/claude/plans/fluffy-knitting-pinwheel.md`
-(design), `rosy-petting-boot.md` (locked semantics), the four prompt drafts, and
-`themis-report-templates.md` (report contract).
+Companion to the locked Phase 1 design, the courtroom semantics, the four prompt drafts, and
+`src/judge/prompts/report-templates.md` (report contract).
 
 This document does not restate the design. It divides it into buildable work packages, defines the
 gate each must pass, and specifies the judge-output quality harness that decides whether the system
@@ -224,11 +223,11 @@ source. The key is read from the environment only and never logged, echoed, or p
 | TLS | verifies clean (`ssl_verify_result=0`) | normal HTTPS; **no** TLS bypass, no `NODE_TLS_REJECT_UNAUTHORIZED` |
 | `GET /v1/models` | 200, 31 models | live model-ID validation at config load |
 | `deepseek-v4-flash` | present, works | default for all judge roles |
-| **Reasoning model** | `reasoning_tokens` + `reasoning_content` | see §Reasoning budget below |
+| **Reasoning model** | billed reasoning tokens plus private reasoning text | see §Reasoning budget below |
 | `response_format: json_schema` | **rejected** — "unavailable now" | cannot rely on strict schema mode |
 | `response_format: json_object` | works, parses | **this is the structured-output path** |
 | Tool calling | works, well-formed `tool_calls` | Node 4 mediated tools are viable |
-| Streaming (SSE) | works, `reasoning_content` streams first | progress/heartbeat during long calls |
+| Streaming (SSE) | works, private reasoning text streams first | progress/heartbeat during long calls |
 | Independent grader | `gemini-2.5-flash` responds | tier-D grader ≠ judge model, satisfied |
 
 **Reasoning budget — a correctness issue, not a tuning knob.** `max_tokens` is consumed by reasoning
@@ -241,9 +240,9 @@ WP-6 must therefore:
   `finish_reason: length` with empty content as a **distinct typed error** (`reasoning_starved`),
   never as an empty answer or a schema failure;
 - account `reasoning_tokens` separately in budget tracking — they are billed and invisible in content;
-- never persist `reasoning_content` into a report, scratchpad, or any model-facing document. It is
-  provider-internal scratch, is not evidence, and carries no ref. It may be recorded in the operation
-  ledger for cost/debug only, subject to the same redaction pass as any other captured text.
+- never persist provider-private reasoning text into a report, scratchpad, or model-facing document. It
+  is not evidence and carries no ref. The operation ledger may retain it for cost and debugging only,
+  subject to the same redaction pass as any other captured text.
 
 **Structured output ladder.** With `json_schema` unavailable, WP-6 layers: `json_object` mode +
 schema in the prompt → validate against the real schema locally → one repair attempt (the design's
@@ -515,7 +514,7 @@ Everything else — code, tests, research, fixtures — is delegated.
 
 Typecheck green; retained tests green; no unbounded `.all()`; no offset pagination on a high-cardinality
 table; no provider SDK or hardcoded endpoint/key outside WP-6; no raw credential path to a model
-context; no `reasoning_content` in any document; public functions carry a purpose comment.
+context; no provider-private reasoning text in any document; public functions carry a purpose comment.
 
 ---
 
@@ -550,6 +549,6 @@ context; no `reasoning_content` in any document; public functions carry a purpos
 3. **Credential handling — the supplied key is a live secret in chat.** It is used from the
    environment and appears in no file in this repository. Two standing consequences:
    - The router key must be rotated once Phase 1 work settles, since it was transmitted in plaintext.
-   - `/work/model_setup.md` separately contains a live-looking NeuralWatt key committed in plaintext.
-     That one should be rotated too, and both keys should move to environment variables or a secret
-     store. Rotation is an explicit operator action — never something this build performs on its own.
+   - Any provider credential previously shared in plaintext should be rotated and moved to an
+     environment variable or secret store. Rotation is an explicit operator action, never something
+     this build performs on its own.

@@ -10,10 +10,33 @@ import type {
   Phase2CampaignMemberRow, Phase2CampaignRow, Phase2Db, PipelineGenerationRow,
   PipelineItemRow, PipelineItemState,
 } from "../db/phase2/contracts.js";
+import {isPhase2BoardInterrupted} from "../judge/phase2/errors.js";
+import {isArchiveSealFailure} from "../runner/archive-status.js";
 
 export type PipelineTrigger="auto"|"eval"|"phase1"|"phase2"|"finalize";
 export interface EvalQueueStartResult{started:boolean}
 export interface EvalItemStatus{state:"running"|"completed"|"failed";runId?:string;archiveId?:string;error?:string}
+
+const EVAL_TERMINAL_STATES = new Set(["completed", "done", "failed", "aborted", "timeout"]);
+
+/** Map an eval run to pipeline state without treating agent failure as platform failure. */
+export function evalItemStatusFromRun(
+  run: {id:string;status:string;error?:string|null},
+  archiveId: string|null,
+): EvalItemStatus {
+  if (EVAL_TERMINAL_STATES.has(run.status)) {
+    if (archiveId) return {state:"completed",runId:run.id,archiveId};
+    if (isArchiveSealFailure(run.error)) {
+      return {state:"failed",runId:run.id,error:run.error ?? "archive seal failed"};
+    }
+    // finalizeRun is committed before the archive is sealed. Keep polling during
+    // that short window for every agent outcome, including timeout and failure.
+    return {state:"running",runId:run.id};
+  }
+  if (run.error) return {state:"failed",runId:run.id,error:run.error};
+  return {state:"running",runId:run.id};
+}
+
 export interface Phase1StartResult{operationId:string}
 /** `not_started` means no in-flight run AND no published result — i.e. the worker
  *  that owned this Phase-1 run was lost (crash/restart) and must be re-launched
@@ -260,6 +283,21 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
   }
   await transition("completed");items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];return{generation:gen,items,changed:true,waitingFor:null};
   }catch(err){
+   // A paused or otherwise interrupted board is NOT a failed attempt. Its frozen
+   // PI session and every filed record are on disk, so the generation parks in
+   // `paused` with the campaign still `analyzing`: resume continues that exact
+   // session, nothing publishes, and no attempt is consumed. Before this, the
+   // missing records read as an empty board and the campaign published an empty
+   // developer pack over already-sealed archives.
+   if(isPhase2BoardInterrupted(err)){
+    await input.db.pipeline.appendEvent({generationId:gen.id,itemId:null,
+     operationId:`phase2.paused:${gen.id}:${Date.now()}`,
+     eventType:"phase2.paused",
+     payloadJson:JSON.stringify({filed:err.filed,resumable:err.resumable,detail:err.message})});
+    if(String(gen.state)!=="paused")await transition("paused");
+    items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];
+    return{generation:gen,items,changed:true,waitingFor:"phase2_resume"};
+   }
    // The board failed. Record why, durably, so the bounded budget above decides
    // whether the next tick tries again. A thrown error out of a coordinator tick
    // is only a log line; this makes it a run-panel fact the operator can read.

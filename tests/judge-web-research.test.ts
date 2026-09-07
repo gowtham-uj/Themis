@@ -9,6 +9,7 @@
  * how their results merge, and the ref shape minos copies.
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { providerSearch } from "../src/judge/phase2/agent-loop.ts";
 import { formatWebResults, webResearch, type WebResult } from "../src/judge/tools/web-research.ts";
 
 const saved = {
@@ -101,6 +102,18 @@ describe("web research providers", () => {
 
     expect(seen.some((u) => u.includes("serper.dev"))).toBe(true);
     expect(results.some((r) => r.source === "serper")).toBe(true);
+  });
+
+  it("routes the Phase 2 agent loop through the configured search providers", async () => {
+    process.env.SERPER_API_KEY = "test-key-not-real";
+    process.env.THEMIS_WEB_SEARCH_PROVIDERS = "serper";
+    const seen = stubFetch({ "serper.dev": SERPER_BODY });
+
+    const text = await providerSearch("agent verification");
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("serper.dev");
+    expect(text).toContain("ref: web:https://example.invalid/harness");
   });
 
   it("keeps arXiv scholarly even when the override lists it first", async () => {

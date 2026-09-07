@@ -6,7 +6,7 @@
  * output. It carries NO checking logic — implementers satisfy these types.
  *
  * Field names, enum member sets, and the ref grammar follow
- * /work/.reaper/claude/plans/themis-report-templates.md exactly.
+ * `src/judge/prompts/report-templates.md` exactly.
  * Do not rename or invent fields.
  */
 

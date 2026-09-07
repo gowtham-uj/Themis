@@ -2,7 +2,7 @@
  * pi adapter — maps `pi --mode json` stdout JSONL → canonical events.
  *
  * No pi changes required. Mapping table: plan/event-schema.md § "Mapping: pi → canonical".
- * Reference: /work/_inspect/pi packages (AgentSessionEvent + SessionHeader).
+ * Reference: the Pi AgentSessionEvent and SessionHeader package types.
  *
  * Local runs (Dockerless): {@link runPi} spawns `pi --mode json -p` as a child process,
  * streams stdout JSONL, and yields a complete canonical stream including run.start/run.end.

@@ -51,7 +51,7 @@ export interface ReaperSessionStart extends ReaperEnvelope {
 
 /**
  * Expected post-change `thinking` kind (change ①).
- * Not present in current /work/_inspect/reaper/src/logging/schema.ts.
+ * Not present in the older ReaperCode trajectory schema.
  */
 export interface ReaperThinking extends ReaperEnvelope {
   kind: "thinking";
@@ -182,6 +182,8 @@ class ParseState {
   cumulativeUsage: Usage | undefined;
   sawRunEnd = false;
   lastFullMessage: { turn: number; text: string } | undefined;
+  /** Reaper can stream one logical thought as both a message and a custom entry. */
+  seenSourceEvents = new Set<string>();
 
   nextSeq(): number {
     this.seq += 1;
@@ -232,6 +234,14 @@ export function mapReaperEntry(
   const maxOut = options.maxToolOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT;
   const ts = asString(entry.timestamp) ?? new Date().toISOString();
   const kind = entry.kind;
+  // Current Reaper emits thinking twice with the same mutation id: once as a
+  // message and once as a custom entry. Both normalize to kind=thinking. Keep
+  // one canonical event while preserving distinct source kinds that share an id.
+  if (entry.event_id) {
+    const sourceKey = `${entry.event_id}\u0000${kind}`;
+    if (state.seenSourceEvents.has(sourceKey)) return [];
+    state.seenSourceEvents.add(sourceKey);
+  }
   const out: CanonicalEvent[] = [];
 
   const base = () => ({
@@ -365,7 +375,7 @@ export function mapReaperEntry(
 
     case "engine_turn_complete": {
       // Closes the already-open turn. Live `engine_turn_complete` carries no
-      // turn_index (see /work/_inspect/reaper schema.ts) — the turn was opened
+      // turn_index in older ReaperCode schemas — the turn was opened
       // by this turn's thinking/model_response/tool_call. Do NOT advance here:
       // advancing on the 2nd turn-end would bump turn 2→3. If no turn is open
       // yet (defensive), open turn 1. An explicit turn_index, if ever present,

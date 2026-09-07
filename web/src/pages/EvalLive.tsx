@@ -25,6 +25,11 @@ interface GenerationView {
   campaign: Campaign | null
 }
 
+interface JudgeQueueView {
+  queue: { id: string; status?: string; name?: string } | null
+  status: { status?: string | null; byState?: Record<string, number> } | null
+}
+
 interface CampaignView {
   campaign: Campaign
   pi?: { running?: boolean; resumable?: boolean; subagents?: { agent?: string; turns?: number | null; exitCode?: number | null }[]; filed?: string[] }
@@ -222,15 +227,21 @@ function pct(done: number, total: number): number {
 }
 
 /** Eval stage headline: counts first, because that is what the operator asked. */
-function evalStageLine(p: StageProgress | undefined, total: number): string {
+function evalStageLine(
+  p: StageProgress | undefined,
+  total: number,
+  activeEval: 'running' | 'paused' | null = null,
+): string {
   if (!p || p.evals.total === 0) return total === 0 ? 'This run has no evals.' : `${total} queued.`
   const e = p.evals
   if (e.done === e.total) return `All ${e.total} completed.`
-  // `left` counts everything not yet done, the running one included, so naming
-  // both "left" and "running" beside each other has to exclude the overlap.
+  // The queue can report its live container a poll before the pipeline item
+  // changes from pending to running. Count that current eval once so the panel
+  // never says all ten are waiting while its headline says one is working.
+  const activeCount = Math.max(e.running, activeEval ? 1 : 0)
   const parts = [`${e.done} of ${e.total} completed`]
-  if (e.running) parts.push(`${e.running} running`)
-  const waiting = Math.max(0, e.left - e.running)
+  if (activeCount) parts.push(`${activeCount} ${activeEval === 'paused' ? 'paused' : 'running'}`)
+  const waiting = Math.max(0, e.left - activeCount)
   if (waiting) parts.push(`${waiting} waiting`)
   if (e.failed) parts.push(`${e.failed} failed`)
   return parts.join(' · ')
@@ -263,7 +274,8 @@ function nowCopy(opts: {
   if (p?.stage === 'evals' || opts.live || opts.genState === 'eval_running') {
     if (p && p.evals.total > 0) {
       const n = p.evals.currentOrdinal != null ? ` · ${p.evals.currentOrdinal} of ${p.evals.total}` : ''
-      return `The agent is working on ${who}${n}. ${p.evals.done} completed, ${Math.max(0, p.evals.left - p.evals.running)} waiting.`
+      const activeCount = Math.max(p.evals.running, opts.live ? 1 : 0)
+      return `The agent is working on ${who}${n}. ${p.evals.done} completed, ${Math.max(0, p.evals.left - activeCount)} waiting.`
     }
     const n = opts.index != null && opts.total ? ` · ${opts.index} of ${opts.total}` : ''
     return `The agent is working on ${who}${n}.`
@@ -349,6 +361,13 @@ export default function EvalLive() {
     queryFn: () => api.get<CampaignView>(`/api/projects/${id}/pipeline/campaign/${campaignId}`),
     enabled: Boolean(campaignId),
     refetchInterval: 3000,
+  })
+
+  const judgeQ = useQuery({
+    queryKey: ['judge-queue', id],
+    queryFn: () => api.get<JudgeQueueView>(`/api/projects/${id}/judge-queue`),
+    refetchInterval: 4000,
+    retry: false,
   })
 
   const activity = useQuery({
@@ -479,16 +498,22 @@ export default function EvalLive() {
     mutationFn: async () => {
       const judging = items.filter((it) => it.state === 'phase1_running' && it.runId)
       await Promise.all(judging.map((it) => api.post(`/api/projects/${id}/runs/${it.runId}/phase1/pause`)))
-      if (judging.length === 0) throw new Error('nothing is judging yet')
+      // Pausing only the live case leaves the queue claiming the next one a
+      // second later, so the panel looks paused while judging carries on.
+      const jqid = judgeQ.data?.queue?.id
+      if (jqid) await api.post(`/api/judge/queues/${jqid}/pause`, { kind: 'manual' })
+      if (judging.length === 0 && !jqid) throw new Error('nothing is judging yet')
     },
     onSuccess: () => { invalidate(); setMsg({ tone: 'ok', text: 'Judge paused. Resume continues the PI session.' }) },
     onError: (e) => setMsg({ tone: 'danger', text: errText(e) }),
   })
   const resumeJudge = useMutation({
     mutationFn: async () => {
-      const targets = items.filter((it) => it.runId && (it.state === 'phase1_running' || it.state === 'phase1_pending'))
+      const jqid = judgeQ.data?.queue?.id
+      if (jqid) await api.post(`/api/judge/queues/${jqid}/resume`, {})
+      const targets = items.filter((it) => it.runId && (it.state === 'phase1_running' || it.state === 'phase1_pending' || it.state === 'paused'))
       await Promise.all(targets.map((it) => api.post(`/api/judge/runs/${it.runId}/phase1`)))
-      if (targets.length === 0) throw new Error('nothing to resume')
+      if (!jqid && targets.length === 0) throw new Error('nothing to resume')
     },
     onSuccess: () => { invalidate(); setMsg({ tone: 'ok', text: 'Judge resumed from its last checkpoint' }) },
     onError: (e) => setMsg({ tone: 'danger', text: errText(e) }),
@@ -570,6 +595,9 @@ export default function EvalLive() {
 
   const lastEvent = feed.at(-1)
   const lastLine = lastEvent ? eventLine(lastEvent) : null
+  // The judge queue is what actually gates claiming the next case, so its status
+  // — not the live case's own state — is what says the judge is paused.
+  const judgePaused = judgeQ.data?.status?.status === 'paused' || judgeQ.data?.queue?.status === 'paused'
   const busy = retryEval.isPending || control.isPending || pauseJudge.isPending || resumeJudge.isPending || pauseAcross.isPending || resumeAcross.isPending
   const runRows = runs.data?.runs ?? []
   const generationLabel = gen.data?.generation.name || `Run ${gen.data?.generation.ordinal ?? pipeline.data?.generation?.ordinal ?? ''}`
@@ -578,7 +606,7 @@ export default function EvalLive() {
   // contradicts the chip whenever the generation row trails the items.
   const genState = gen.data?.generation.state ?? pipeline.data?.generation?.state ?? null
   const TERMINAL = ['completed', 'failed', 'cancelled', 'paused']
-  const statusWord = runPaused
+  const statusWord = runPaused || (active === 'judge' && judgePaused)
     ? 'paused'
     : genState && TERMINAL.includes(genState)
       ? genState
@@ -640,10 +668,10 @@ export default function EvalLive() {
               <button onClick={() => control.mutate('abort')} disabled={busy}>Abort this eval</button>
             </>
           )}
-          {active === 'judge' && currentRunId && (
+          {active === 'judge' && (currentRunId || judgeQ.data?.queue) && (
             <>
-              <button onClick={() => pauseJudge.mutate()} disabled={busy}>Pause judge</button>
-              <button onClick={() => resumeJudge.mutate()} disabled={busy}>Resume judge</button>
+              <button onClick={() => pauseJudge.mutate()} disabled={judgePaused || busy}>Pause judge</button>
+              <button onClick={() => resumeJudge.mutate()} disabled={!judgePaused || busy}>Resume judge</button>
             </>
           )}
           {active === 'across' && campaignId && (
@@ -660,20 +688,20 @@ export default function EvalLive() {
           <div className="n">1 · Evals</div>
           <h3>Run the agent</h3>
           <div className="meter"><i style={{ width: `${pct(prog?.evals.done ?? evalCounts.sealed, prog?.evals.total ?? evalCounts.total)}%` }} /></div>
-          <p>{evalStageLine(prog, evalCounts.total)}</p>
+          <p>{evalStageLine(prog, evalCounts.total, runPaused ? 'paused' : runLive ? 'running' : null)}</p>
           {prog?.evals.currentOrdinal != null && (
             <p className="hint">On eval {prog.evals.currentOrdinal} of {prog.evals.total}</p>
           )}
         </div>
 
-        <div className={`phase-step${active === 'judge' ? ' active' : ''}${phase1Done ? ' done' : ''}`}>
+        <div className={`phase-step${active === 'judge' ? ' active' : ''}${phase1Done ? ' done' : ''}${judgePaused && !phase1Done ? ' paused' : ''}`}>
           <div className="n">2 · Phase 1</div>
           <h3>Judge each eval</h3>
           <div className="meter"><i style={{ width: `${pct(prog?.phase1.published ?? evalCounts.judged, prog?.phase1.total ?? evalCounts.total)}%` }} /></div>
           <p>
             {(prog?.phase1.total ?? evalCounts.total) === 0
               ? 'Waits for a sealed archive.'
-              : `${prog?.phase1.published ?? evalCounts.judged} of ${prog?.phase1.total ?? evalCounts.total} verdicts${(prog?.phase1.running ?? evalCounts.judging) ? ` · ${prog?.phase1.running ?? evalCounts.judging} in session` : ''}`}
+              : `${prog?.phase1.published ?? evalCounts.judged} of ${prog?.phase1.total ?? evalCounts.total} verdicts${judgePaused ? ' · paused, resume continues the session' : (prog?.phase1.running ?? evalCounts.judging) ? ` · ${prog?.phase1.running ?? evalCounts.judging} in session` : ''}`}
           </p>
           {prog && prog.phase1.cases.length > 0 && (
             <ul className="lines">

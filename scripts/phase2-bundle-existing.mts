@@ -4,7 +4,7 @@ import {join} from "node:path";
 import {bundleDeveloperPack} from "../src/judge/phase2/run-campaign.js";
 import {publishPhase2ArchiveView} from "../src/judge/results/publish-phase2-view.js";
 
-const DATA = "/work/agenteval/data";
+const DATA = new URL("../data/", import.meta.url).pathname;
 const SRC = "p2c_rerun_mtf8qamv";
 const CANONICAL = "p2c_ca54584b1d404080b9fd3eaf0e91e55a";
 const RUNS = [

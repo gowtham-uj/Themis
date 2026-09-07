@@ -13,7 +13,7 @@ Themis runs untrusted agent code. Its main boundaries are deliberate:
 - The evaluated agent runs in a Podman container.
 - Hidden tests, reference solutions, validation material, and verifier code never enter the agent container.
 - The verifier runs separately and owns the official reward.
-- Model and search credentials come from environment variables. The API and project settings store variable names, not secret values.
+- Model and search credentials reach workers through environment variables. Values entered in the console are stored with AES-256-GCM encryption and never returned by the API; project settings expose only variable names and presence.
 - The API binds to loopback by default. A non-loopback bind requires authentication or the explicit `AGENTEVAL_ALLOW_UNAUTH_NETWORK=1` acknowledgement.
 - The judge reads evidence through mediated tools. Web pages can support recommendations, but cannot establish facts about the evaluated agent.
 - Archive file paths are normalized and confined to their archive root.

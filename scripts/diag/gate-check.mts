@@ -8,13 +8,13 @@ import { collectResolvingRefs } from "../../src/judge/quality/tier-b-grounded.js
 import { parseEvalJudgeYaml } from "../../src/judge/quality/tier-a-structural.js";
 import type { EvalJudgeReport } from "../../src/judge/quality/types.js";
 
-const viewsRoot = "/work/agenteval/data/judge_views";
-const workRoot = "/work/agenteval/data/judge_work";
+const viewsRoot = new URL("../../data/judge_views/", import.meta.url).pathname;
+const workRoot = new URL("../../data/judge_work/", import.meta.url).pathname;
 const views = await readdir(viewsRoot);
 const jobs = await readdir(workRoot).catch(() => [] as string[]);
 
 const templateText = await readFile(
-  "/work/agenteval/src/judge/prompts/report-templates.md",
+  new URL("../../src/judge/prompts/report-templates.md", import.meta.url),
   "utf8",
 ).catch(() => "");
 

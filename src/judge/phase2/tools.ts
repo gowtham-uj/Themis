@@ -33,7 +33,7 @@ export const PHASE2_READ_TOOLS = [
 ];
 
 export const PHASE2_SEARCH_TOOLS = [
-  fnTool("web_search", "Search the web via the model provider's built-in search. Pass a query.", { query: { type: "string" } }, ["query"]),
+  fnTool("web_search", "Search the web through Themis's configured providers. Pass a query.", { query: { type: "string" } }, ["query"]),
 ];
 
 export function submitTool(name: string, description: string): ReturnType<typeof fnTool> {

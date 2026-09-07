@@ -326,6 +326,9 @@ async function evalActivity(
   const ctx = {evalName, evalId: item.evalId, runId: item.runId, stage: "evals" as const, node: null};
   const out: RunActivityEntry[] = [];
   const pending = new Map<string, string>();
+  // Older sealed traces may contain both Reaper representations of the same
+  // thought. Hide the duplicate in the operator feed without rewriting evidence.
+  const seenThoughts = new Set<string>();
 
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
@@ -358,11 +361,15 @@ async function evalActivity(
           text: `${what} failed.`});
         break;
       }
-      case "thinking":
+      case "thinking": {
         if (!ev.text?.trim()) break;
+        const thoughtKey = `${ev.ts}\u0000${ev.turn ?? ""}\u0000${ev.text}`;
+        if (seenThoughts.has(thoughtKey)) break;
+        seenThoughts.add(thoughtKey);
         out.push({...base, kind: "note", tone: "info", detail: firstSentence(ev.text, 600),
           text: firstSentence(ev.text, 150)});
         break;
+      }
       case "run.end": {
         const ok = ev.status === "completed";
         const secs = ev.durationMs ? Math.round(ev.durationMs / 1000) : null;

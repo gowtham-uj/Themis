@@ -4,9 +4,8 @@
  * Written FIRST, before any backend implementation exists, and frozen. This file
  * pins the CONTRACT SHAPE so an implementation cannot drift from it:
  *
- *  1. Every state enum has EXACTLY the members the design names
- *     (`/work/.reaper/claude/plans/fluffy-knitting-pinwheel.md` §3 and
- *     "Production architecture").
+ *  1. Every state enum has EXACTLY the members named in
+ *     `plan/themis-phase1-implementation.md` and the production architecture.
  *  2. The cursor wire codec round-trips, is stable, is opaque, and fails closed
  *     on malformed/tampered/wrong-version input.
  *  3. No contract method returns a non-Promise, and the manifest surface is

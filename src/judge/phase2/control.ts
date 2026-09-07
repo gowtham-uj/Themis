@@ -77,6 +77,23 @@ export async function getPhase2PiStatus(dataDir: string, campaignId: string): Pr
   };
 }
 
+/**
+ * Run the board for this campaign, or join the run already in flight.
+ *
+ * Resume starts the board detached so the HTTP call can answer immediately,
+ * and the pipeline ticker re-enters Phase 2 moments later. Without this
+ * registry both spawned a PI process against the same work dir, and the second
+ * one's orchestrator wrote over the first one's session. Every Phase-2 board
+ * launch goes through here.
+ */
+export function runOrJoinPhase2Pi(input: Parameters<typeof runPhase2PiCampaign>[0]): Promise<Phase2PiResult> {
+  const existing = inFlight.get(input.campaignId);
+  if (existing) return existing;
+  const task = runPhase2PiCampaign(input).finally(() => { inFlight.delete(input.campaignId); });
+  inFlight.set(input.campaignId, task);
+  return task;
+}
+
 /** Resume or continue the durable PI session for this campaign. */
 export async function resumePhase2Pi(input: {
   dataDir: string;
@@ -98,7 +115,10 @@ export async function resumePhase2Pi(input: {
   } catch {
     throw new Error("Phase 2 campaign snapshot missing — run Phase 2 once before resume");
   }
-  const task = runPhase2PiCampaign({
+  // An interrupted board rejects now (that is the point of the typed error), and
+  // this launch is detached from the HTTP response, so swallow it here. The
+  // pipeline's own call is what records the failure and parks the generation.
+  void runOrJoinPhase2Pi({
     connection: input.connection,
     campaignId: input.campaignId,
     projectId: input.projectId,
@@ -108,8 +128,7 @@ export async function resumePhase2Pi(input: {
     platformFaults: input.platformFaults ?? [],
     workDir,
     promptOverrides: input.promptOverrides ?? null,
-  }).finally(() => { inFlight.delete(input.campaignId); });
-  inFlight.set(input.campaignId, task);
+  }).catch(() => undefined);
   return { started: true, running: true };
 }
 

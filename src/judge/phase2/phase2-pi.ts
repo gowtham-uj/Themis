@@ -15,6 +15,7 @@ import {
 } from "../pi/runtime.js";
 import { copySanitizedPiTraceEntry, createReasoningContentStripper } from "../pi/sanitize-trace.js";
 import {coerceRecommendations, coerceReview, type Phase2Analyst} from "./analyst.js";
+import {Phase2BoardInterruptedError} from "./errors.js";
 import type {Phase2Board, Phase2BoardContext} from "./board.js";
 import type {
   Phase2Case, Phase2Hypothesis, Phase2MemoryRecord, Phase2Pattern,
@@ -233,15 +234,47 @@ export async function runPhase2PiCampaign(input: {
     },
   });
 
-  const hypDoc = await loadYaml(workDir, "phase2-hypotheses.yaml");
-  const resDoc = await loadYaml(workDir, "phase2-research.yaml");
-  const recDoc = await loadYaml(workDir, "phase2-recommendations.yaml");
-  const revDoc = await loadYaml(workDir, "phase2-review.yaml");
-  const hypotheses = (Array.isArray(hypDoc.hypotheses) ? hypDoc.hypotheses : []) as Phase2Hypothesis[];
-  const research = (Array.isArray(resDoc.notes) ? resDoc.notes : []) as Phase2ResearchNote[];
-  const recommendations = coerceRecommendations(recDoc.recommendations ?? recDoc) as Phase2Recommendation[];
-  const review = coerceReview(revDoc, recommendations.map((r) => r.id));
-  return { hypotheses, research, recommendations, review, workDir };
+  return resolveBoardOutcome(workDir);
+}
+
+/**
+ * Read what the board committed, or refuse when it stopped mid-filing.
+ *
+ * A complete record set is a finished board. Anything less means the process
+ * tree was SIGKILLed — a pause, an operator stop, or the wall clock — and the
+ * roles that had not filed yet lost their turn, not their work: the frozen
+ * session and every child transcript are still on disk. Reading the missing
+ * YAML as `[]` published an empty developer pack over ten sealed archives and
+ * left the recorded board unreachable behind the published-campaign guard.
+ */
+export async function resolveBoardOutcome(workDir: string): Promise<Phase2PiResult> {
+  const filed = await readFiledBoard(workDir);
+  if (filed) return filed;
+  const records = await filedRecords(workDir);
+  throw new Phase2BoardInterruptedError(
+    `Phase 2 board stopped before filing every record (filed: ${records.join(", ") || "nothing"})`,
+    records,
+    await hasResumePointer(workDir),
+  );
+}
+
+/** Board records committed to `judge/` so far, sorted. */
+async function filedRecords(workDir: string): Promise<string[]> {
+  try {
+    return (await readdir(join(workDir, "judge"))).filter((n) => n.endsWith(".yaml")).sort();
+  } catch {
+    return [];
+  }
+}
+
+/** True when a pause froze this run's session and left a resume pointer. */
+async function hasResumePointer(workDir: string): Promise<boolean> {
+  try {
+    const p = await readFile(join(workDir, "sessions", PI_RESUME_POINTER), "utf8");
+    return p.trim().length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -283,7 +316,8 @@ export class PiPhase2Board implements Phase2Board {
   private async ensure(): Promise<Phase2PiResult> {
     if (this.cache) return this.cache;
     if (!this.pending) throw new Error("PiPhase2Board.bind() was not called with campaign data");
-    this.cache = await runPhase2PiCampaign({
+    const {runOrJoinPhase2Pi} = await import("./control.js");
+    this.cache = await runOrJoinPhase2Pi({
       connection: this.connection,
       campaignId: this.pending.campaignId,
       projectId: this.pending.projectId,

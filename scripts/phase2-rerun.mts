@@ -11,7 +11,7 @@ import {PiPhase2Board} from "../src/judge/phase2/phase2-pi.js";
 import {runPhase2Campaign} from "../src/judge/phase2/run-campaign.js";
 import {publishPhase2ArchiveView} from "../src/judge/results/publish-phase2-view.js";
 
-const DATA = "/work/agenteval/data";
+const DATA = new URL("../data/", import.meta.url).pathname;
 const RUNS = [
   "603b94d5-87ac-43dc-8774-1ededa1fcf3a",
   "a46918ac-1054-4e7e-9490-35799f3c2370",

@@ -154,7 +154,7 @@ export class GatewayPhase2Board implements Phase2Board {
       },
       parseFinal: (content) => asArray(parseJson(content), "notes") as Phase2ResearchNote[],
       system: [
-        "You are the Phase-2 researcher. You are AGENTIC: use web_search (the model provider's built-in search) for each hypothesis.",
+        "You are the Phase-2 researcher. You are AGENTIC: use Themis's web_search tool for each hypothesis.",
         "Attach techniques only from search results you actually retrieved. Never invent URLs.",
         "If search returns DENIED or empty, techniques MUST be [].",
         "When done, call submit_research with {notes:[{hypothesisId,techniques:[{url,claim}],applicable,notes}]}.",

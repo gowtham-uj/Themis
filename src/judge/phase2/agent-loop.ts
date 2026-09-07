@@ -4,6 +4,7 @@
  * (campaign manager, pattern analyzer) do not use this.
  */
 import type {ChatMessage, ChatResult, ChatTool, ChatToolCall, ModelGateway} from "../gateway/client.js";
+import {formatWebResults, webResearch} from "../tools/web-research.js";
 
 export interface AgentToolResult {
   text: string;
@@ -60,7 +61,7 @@ export async function runPhase2AgentLoop<T>(input: AgentLoopInput<T>): Promise<T
       let out: AgentToolResult;
       try {
         if (tc.function.name === "web_search") {
-          out = { text: await providerSearch(input.gateway, input.attemptId, String(args.query ?? "")) };
+          out = { text: await providerSearch(String(args.query ?? "")) };
         } else {
           out = await input.execute(tc.function.name, args);
         }
@@ -88,33 +89,12 @@ function parseArgs(tc: ChatToolCall): Record<string, unknown> {
   }
 }
 
-/** Use the same model provider's built-in web search — never a side endpoint. */
-export async function providerSearch(gateway: ModelGateway, attemptId: string, query: string): Promise<string> {
+/** Search through Themis's fixed-host providers and return ready-to-cite web refs. */
+export async function providerSearch(query: string): Promise<string> {
   if (!query.trim()) return "DENIED: empty query";
-  const result = await gateway.chat({
-    attemptId,
-    node: "phase2",
-    metricOrRole: "provider_web_search",
-    messages: [
-      { role: "system", content: "Use web search. Return a concise brief of what you found, with source URLs. If search is unavailable, say so." },
-      { role: "user", content: query },
-    ],
-    tools: [{
-      type: "function",
-      function: {
-        name: "web_search",
-        description: "Search the web",
-        parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
-      },
-    }],
-    toolChoice: "auto",
-    maxTokens: 4096,
-  });
-  if (result.content.trim()) return result.content.slice(0, 16_000);
-  if (result.toolCalls.length) {
-    return `provider returned ${result.toolCalls.length} search tool call(s) without text; treat as no snippets`;
-  }
-  return "DENIED: provider web search returned empty content";
+  const results = await webResearch(query);
+  if (results.length === 0) return "DENIED: web search returned no sources";
+  return formatWebResults(query, results).slice(0, 16_000);
 }
 
 export function fnTool(name: string, description: string, properties: Record<string, unknown>, required: string[] = []): ChatTool {

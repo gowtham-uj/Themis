@@ -27,8 +27,8 @@ eval execution  →  sealed archive  →  PHASE 1 (per eval)  →  PHASE 2 (per 
 
 ### Phase 1: per-eval judgement
 
-A sealed archive goes through five nodes. The first four are mechanical, and they exist to bound what
-the expensive part has to read.
+A sealed archive goes through five nodes. Nodes 0 through 3 bind, extract, and condense the evidence
+so the courtroom receives a bounded case file.
 
 | Node | What it does |
 |---|---|
@@ -75,8 +75,8 @@ Five components, of which the first two are deterministic and model-free:
 
 Components 3 through 5 run as PI coding-agent subagents under a Phase-2 orchestrator: investigator,
 researcher, designer, reviewer, dispatched in that order, blocking. They reach evidence only through a
-mediated tool surface, and `web_search` uses the model provider's own search rather than a separate
-service.
+mediated tool surface. `web_search` uses Themis's configured providers: Serper for general search,
+a reader-backed fallback, and arXiv for scholarly results.
 
 The validity split in component 1 is the piece that took the longest to get right. A run where the
 harness broke before the agent started must never become "the agent performs poorly on undo/redo

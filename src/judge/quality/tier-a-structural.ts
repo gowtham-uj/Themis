@@ -17,7 +17,7 @@
  *                           re-serialize round trip
  *
  * The field/enum/ref grammar is the frozen contract in `./types.ts` and the
- * report template #4 in /work/.reaper/claude/plans/themis-report-templates.md.
+ * report template #4 in `src/judge/prompts/report-templates.md`.
  *
  * Parsing uses the `yaml` package (the repo's chosen YAML implementation;
  * added as a dependency in WP-0). The canonical serializer here is a WP-0

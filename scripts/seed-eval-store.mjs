@@ -4,7 +4,7 @@
  * already in the store, so re-running it is safe.
  *
  * Usage:
- *   node scripts/seed-eval-store.mjs --dir /work/peak-evals-backup --api http://127.0.0.1:8080
+ *   node scripts/seed-eval-store.mjs --dir ./peak-evals-backup --api http://127.0.0.1:8080
  */
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, relative } from "node:path";
@@ -14,7 +14,7 @@ function arg(name, fallback) {
   return i > -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 
-const dir = arg("dir", "/work/peak-evals-backup");
+const dir = arg("dir", "./peak-evals-backup");
 const api = arg("api", "http://127.0.0.1:8080").replace(/\/+$/, "");
 
 const TEXT = /\.(toml|md|json|sh|py|c|h|ts|js|go|rs|txt|patch|yaml|yml|cfg|mk)$|Makefile|Dockerfile/;

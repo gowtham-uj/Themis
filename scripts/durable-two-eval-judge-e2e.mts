@@ -19,7 +19,7 @@ import { JudgeClaimWorker } from "../src/judge/worker/claim-worker.js";
 const RUN_IDS = process.argv.slice(2);
 if (RUN_IDS.length !== 2) throw new Error("pass exactly two run ids");
 
-const ROOT = "/work/agenteval";
+const ROOT = new URL("../", import.meta.url).pathname;
 const DATA = join(ROOT, "data");
 const DB_PATH = join(DATA, "themis.sqlite");
 const ARCHIVES = join(DATA, "archives");

@@ -2,7 +2,30 @@
 import Database from "better-sqlite3";
 import {describe,expect,it} from "vitest";
 import {createSqlitePhase2Db} from "../src/db/phase2/sqlite-store.ts";
-import {advanceProjectPipeline,retryFailedEval,retryFailedPhase1,type ProjectPipelineServices} from "../src/pipeline/project-pipeline.ts";
+import {Phase2BoardInterruptedError} from "../src/judge/phase2/errors.ts";
+import {advanceProjectPipeline,evalItemStatusFromRun,retryFailedEval,retryFailedPhase1,type ProjectPipelineServices} from "../src/pipeline/project-pipeline.ts";
+
+describe("eval run pipeline mapping",()=>{
+ it.each(["completed","failed","aborted","timeout"])(
+  "advances a %s agent outcome when its evidence archive sealed",
+  (status)=>{
+   expect(evalItemStatusFromRun({id:"run-1",status,error:null},"run-1")).toEqual({
+    state:"completed",runId:"run-1",archiveId:"run-1",
+   });
+  },
+ );
+ it("keeps polling between run finalization and archive sealing",()=>{
+  expect(evalItemStatusFromRun({id:"run-1",status:"timeout",error:null},null)).toEqual({
+   state:"running",runId:"run-1",
+  });
+ });
+ it("fails explicitly when the platform could not seal the archive",()=>{
+  const error="archive seal failed: manifest write failed";
+  expect(evalItemStatusFromRun({id:"run-1",status:"failed",error},null)).toEqual({
+   state:"failed",runId:"run-1",error,
+  });
+ });
+});
 
 describe("project pipeline coordinator",()=>{
  it("runs evals sequentially, Phase1 per eval, Phase2 once, and finalizes both views",async()=>{
@@ -241,6 +264,58 @@ describe("project pipeline coordinator",()=>{
   for(let i=0;i<20;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id,trigger:"phase2"});if(r.generation.state==="completed")break;}
   expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
   expect(boardCalls).toBe(4);
+  await db.close();
+ });
+
+ it("parks the generation when a paused board stopped mid-filing, and never publishes it",async()=>{
+  // Pausing Phase 2 SIGKILLs the PI tree and freezes its session. Reading the
+  // unwritten YAML as an empty board published an empty developer pack over ten
+  // sealed archives, marked the generation completed, and locked resume out
+  // behind the published-campaign 409 — while the investigator's transcript sat
+  // on disk. An interrupted board must park, not publish.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  await db.pipeline.addItem({generationId:g.id,evalId:"e1",ordinal:1});
+  let interrupted=true,boardCalls=0;
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:"a"}},
+   async startPhase1(){return{operationId:"op"}},
+   async getPhase1Status(runId){return{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`}},
+   async runPhase2(campaign){
+    boardCalls++;
+    if(interrupted)throw new Phase2BoardInterruptedError("board stopped before filing every record",["phase2-hypotheses.yaml"],true);
+    return{developerPackSha256:"ab".repeat(32),developerPackZip:"/p/pack.zip",artifactDir:`/p/${campaign.id}`};
+   },
+   async publishFinalView({member}){return{finalArchiveViewId:`final-${member.runId}`,manifestSha256:"cd".repeat(32)}},
+  };
+  for(let i=0;i<10;i++){
+   const r=await advanceProjectPipeline({db,services,generationId:g.id});
+   if(r.generation.state==="paused")break;
+  }
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("paused");
+  // The campaign stays analyzing so a resume continues the same session.
+  const campaign=await db.phase2.getCampaignByGeneration(g.id);
+  expect(campaign?.state).toBe("analyzing");
+  expect(campaign?.developerPackSha256??null).toBeNull();
+  // Nothing attached, nothing published.
+  const items=(await db.pipeline.listItems(g.id,{cursor:null,limit:100})).items;
+  expect(items.map(i=>i.state)).toEqual(["phase1_published"]);
+  // A pause is not a failed attempt, so it must not burn the Phase-2 budget.
+  const evs=(await db.pipeline.listEvents(g.id,{cursor:null,limit:100})).items;
+  expect(evs.filter(e=>e.eventType==="phase2.attempt_failed")).toHaveLength(0);
+  expect(evs.filter(e=>e.eventType==="phase2.paused")).toHaveLength(1);
+  // The parked generation is left alone by the ticker until it is reopened.
+  await advanceProjectPipeline({db,services,generationId:g.id});
+  expect(boardCalls).toBe(1);
+  // Resuming reopens it, and the board that now files everything publishes.
+  interrupted=false;
+  const gen=(await db.pipeline.getGeneration(g.id))!;
+  await db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"phase2_running");
+  for(let i=0;i<10;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed")break;}
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
+  expect((await db.phase2.getCampaignByGeneration(g.id))?.state).toBe("published");
   await db.close();
  });
 });

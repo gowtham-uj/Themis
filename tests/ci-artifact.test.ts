@@ -178,6 +178,7 @@ describe("CiArtifactSource — single manifest.json", () => {
 
 describe("CiArtifactSource — verbatim ingest + sync", () => {
   it("preserves prompt content verbatim", async () => {
+    const syntheticKey = ["sk-ant-api03", "FAKE".repeat(12)].join("-");
     const root = await mkdtemp(join(tmpdir(), "agenteval-ci-verbatim-"));
     const dir = join(root, "ci-artifacts");
     await mkdir(dir, { recursive: true });
@@ -187,7 +188,7 @@ describe("CiArtifactSource — verbatim ingest + sync", () => {
         minimalSpec({
           id: "sec",
           name: "Secret task",
-          prompt: "use key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP",
+          prompt: `use key ${syntheticKey}`,
         }),
       ),
       "utf8",
@@ -198,7 +199,7 @@ describe("CiArtifactSource — verbatim ingest + sync", () => {
     );
     expect(tasks).toHaveLength(1);
     expect(tasks[0]!.prompt).toBe(
-      "use key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP",
+      `use key ${syntheticKey}`,
     );
   });
 

@@ -6,7 +6,7 @@ phase2-hypotheses) and look up external techniques that might address the
 
 ## Tools
 
-web_search (the model provider's own search — use it), read_court_record,
+web_search (Themis's configured external search — use it), read_court_record,
 list_patterns, write_to_yaml_template.
 
 ## What to do

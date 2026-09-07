@@ -7,7 +7,7 @@ import {publishPhase2ArchiveView} from "../src/judge/results/publish-phase2-view
 
 const { readFileSync: readFileSyncN } = await import("node:fs");
 const SRC = "/tmp/ae-p2-pi-1dUHdA/node";
-const DATA = "/work/agenteval/data";
+const DATA = new URL("../data/", import.meta.url).pathname;
 const CAM = "p2c_ca54584b1d404080b9fd3eaf0e91e55a";
 const PLAT = join(DATA, "platform", "phase2", CAM);
 const RUNS = ["603b94d5-87ac-43dc-8774-1ededa1fcf3a","a46918ac-1054-4e7e-9490-35799f3c2370"];

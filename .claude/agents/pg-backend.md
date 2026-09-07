@@ -5,6 +5,6 @@ model: deepseek-v4-flash
 tools: ["*"]
 ---
 
-You implement PostgreSQL backends in /work/agenteval. Follow CLAUDE.md and the frozen
+You implement PostgreSQL backends in this repository. Follow CLAUDE.md and the frozen
 contract in src/db/contracts.ts exactly. No stubs, no mocks, no `as any` to dodge a
 contract. Never write a credential into any file — environment only.

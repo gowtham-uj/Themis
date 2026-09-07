@@ -575,11 +575,11 @@ adds campaign-scoped tools to the Phase-1 set: `list_evals`, `list_patterns`,
 The researcher is the only role holding `web_search`; the reviewer cannot read raw
 lifecycle evidence, which keeps it reviewing rather than re-investigating.
 
-`web_search` uses the model provider's own search rather than a separate search service.
-When `THEMIS_WEB_SEARCH_ENDPOINT` is unset, the tool calls the same OpenAI-compatible proxy
-PI uses, declaring search as a function-typed tool. This detail is load-bearing: the proxy
-rejects a bare `type: "web_search"` entry before the query is ever sent, which silently
-denied 9 of 9 research queries until it was fixed.
+`web_search` uses Themis's pluggable search layer. Serper supplies general web results when its
+key is configured, a reader-backed provider is the no-key fallback, and arXiv is queried
+alongside general search for scholarly results. Providers use fixed hosts and URL-encoded
+queries, and every returned URL is recorded as a `web:` reference before it can support a
+research-backed recommendation.
 
 ## Durability and control
 

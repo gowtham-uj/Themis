@@ -59,6 +59,7 @@ import {
 } from "./runtime.js";
 import { deriveRunStatus } from "./status.js";
 import { commitWorkspaceBaseline } from "./workspace.js";
+import { archiveSealFailureMessage } from "./archive-status.js";
 import {
   ensureAdapterImageForCommit,
   type AdapterBuildService,
@@ -1685,6 +1686,18 @@ async function executeEval(input: {
     }
   } catch (err) {
     archiveError = err instanceof Error ? err.message : String(err);
+    const archiveFailure = archiveSealFailureMessage(archiveError);
+    // Agent failure is valid eval evidence, but archive failure is a platform
+    // failure. Persist it explicitly so the pipeline stops instead of waiting
+    // forever for an archive that will never appear.
+    queries.finalizeRun(run.id, {
+      status,
+      error: failureReason ? `${failureReason} — ${archiveFailure}` : archiveFailure,
+      controlState: status === "aborted" ? "aborted" : "done",
+    });
+    await writeJson(join(runDir, "finalization-error.json"), {
+      errors: [...finalizationErrors, archiveFailure],
+    }).catch(() => undefined);
   }
 
   input.setRecorder(null);

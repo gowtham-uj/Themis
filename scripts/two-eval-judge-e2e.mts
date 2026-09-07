@@ -12,11 +12,11 @@ import { mkdtemp, mkdir, rm, cp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { ModelGateway } = await import("/work/agenteval/src/judge/gateway/client.js");
-const { loadGatewayConfig } = await import("/work/agenteval/src/judge/gateway/config.js");
-const { runPhase1 } = await import("/work/agenteval/src/judge/graph/graph.js");
+const { ModelGateway } = await import("../src/judge/gateway/client.js");
+const { loadGatewayConfig } = await import("../src/judge/gateway/config.js");
+const { runPhase1 } = await import("../src/judge/graph/graph.js");
 const { publishJudgeArchiveView } = await import(
-  "/work/agenteval/src/judge/results/publish-view.js"
+  "../src/judge/results/publish-view.js"
 );
 
 const RUN_IDS = process.argv.slice(2);
@@ -25,7 +25,7 @@ if (RUN_IDS.length < 1) {
   process.exit(2);
 }
 
-const REPO = "/work/agenteval";
+const REPO = new URL("../", import.meta.url).pathname;
 const OUT_ROOT = join(REPO, "data", "judge_views");
 
 // Clean slate each run: clear prior resealed views and stale E2E scratch, so

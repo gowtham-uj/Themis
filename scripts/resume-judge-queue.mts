@@ -15,7 +15,7 @@ import { JudgeClaimWorker } from "../src/judge/worker/claim-worker.js";
 const queueId = process.argv[2];
 if (!queueId) throw new Error("usage: resume-judge-queue.mts <judgeQueueId>");
 
-const ROOT = "/work/agenteval/data";
+const ROOT = new URL("../data/", import.meta.url).pathname;
 const dbPath = join(ROOT, "themis.sqlite");
 const db = new Database(dbPath);
 let status = judgeQueueStatus(db, queueId);

@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
-import { migrate } from "/work/agenteval/src/db/sqlite/migrate.js";
-import { SqliteJudgeJobRepository } from "/work/agenteval/src/db/sqlite/store.js";
-const db = new Database("/work/agenteval/data/themis.sqlite");
+import { migrate } from "../src/db/sqlite/migrate.js";
+import { SqliteJudgeJobRepository } from "../src/db/sqlite/store.js";
+const db = new Database(new URL("../data/themis.sqlite", import.meta.url).pathname);
 migrate(db);
 const jobs = new SqliteJudgeJobRepository(db);
 const now = new Date(Date.now()+2*60*60*1000).toISOString();
