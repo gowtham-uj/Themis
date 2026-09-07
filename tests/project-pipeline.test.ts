@@ -256,6 +256,46 @@ describe("project pipeline coordinator",()=>{
   await db.close();
  });
 
+ it("reopens a completed generation that still holds in-flight items",async()=>{
+  // The live remediation case. A generation completed while two items were mid
+  // judgement, and nothing could reach them again: the ticker skips completed
+  // generations and the operator retry route only revives `failed` items. Their
+  // verdicts were stranded permanently. Advance must reopen that generation and
+  // finish the work rather than treating the state word as the truth.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  const done=await db.pipeline.addItem({generationId:g.id,evalId:"done",ordinal:1});
+  const stuck=await db.pipeline.addItem({generationId:g.id,evalId:"stuck",ordinal:2});
+  await db.pipeline.updateItem(done.id,"eval_pending",{state:"final_view_published",runId:"run-done",
+   baseArchiveId:"arch-done",phase1ResultVersionId:"rv-done",phase1ArchiveViewId:"view-done",finalArchiveViewId:"final-done"});
+  await db.pipeline.updateItem(stuck.id,"eval_pending",{state:"phase1_running",runId:"run-stuck",baseArchiveId:"arch-stuck"});
+  const campaign=await db.phase2.createCampaign({projectId:"p",pipelineGenerationId:g.id,
+   sutFingerprint:"f".repeat(64),ontologyVersion:"phase2-v1",membershipSha256:"e".repeat(64),configJson:"{}"});
+  await db.phase2.addMember({campaignId:campaign.id,pipelineItemId:done.id,runId:"run-done",
+   phase1ResultVersionId:"rv-done",phase1ArchiveViewId:"view-done",validForAgentLearning:true,ordinal:1});
+  await db.phase2.transitionCampaign(campaign.id,"draft",campaign.fencingToken,"published");
+  const gen=(await db.pipeline.getGeneration(g.id))!;
+  await db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"completed");
+
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:`arch-${item.evalId}`}},
+   async startPhase1(){return{operationId:"op"}},
+   async getPhase1Status(runId){return{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`}},
+   // The board already published; it must not run a second time.
+   async runPhase2(){throw new Error("published campaign must not re-run")},
+   async publishFinalView({member}){return{finalArchiveViewId:`final-${member.runId}`,manifestSha256:"cd".repeat(32)}},
+  };
+  for(let i=0;i<25;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed"&&i>0)break}
+
+  // The stranded verdict landed, and the generation settles back to completed.
+  expect((await db.pipeline.getItem(stuck.id))?.state).toBe("phase1_published");
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
+  expect((await db.pipeline.getItem(done.id))?.state).toBe("final_view_published");
+  await db.close();
+ });
+
  it("does not complete a generation while a revived item is still judging",async()=>{
   // Reviving an item while the board runs leaves it judging when Phase 2
   // publishes. Completing there is unrecoverable: the ticker skips completed

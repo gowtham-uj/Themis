@@ -60,6 +60,9 @@ export interface ProjectPipelineServices{
 
 export interface AdvanceResult{generation:PipelineGenerationRow;items:readonly PipelineItemRow[];changed:boolean;waitingFor:string|null}
 const PAGE={cursor:null,limit:1000} as const;
+/** Item states with work still owed. A generation holding any of these has not
+ *  finished, whatever its own state says. */
+const IN_FLIGHT:readonly PipelineItemState[]=["eval_pending","eval_running","archive_sealed","phase1_pending","phase1_running"];
 /** Bounded retries for a transient Phase-1 failure (e.g. the PI courtroom hit
  *  its context ceiling and ended without evalJudge.yaml). A manual or automatic
  *  re-advance resumes the SAME PI session via the worker's checkpoint recovery. */
@@ -150,6 +153,18 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
  const queue=await input.db.pipeline.getQueue(gen.queueId);if(!queue)throw new Error(`pipeline queue not found: ${gen.queueId}`);
  let items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];let changed=false;
  if(queue.status==="paused"||gen.state==="paused")return{generation:gen,items,changed:false,waitingFor:"resume"};
+ // A completed generation still holding in-flight items is unreachable work: the
+ // ticker skips completed generations, and the operator retry route only revives
+ // items that are `failed`. Nothing else would ever poll these, so their verdicts
+ // are lost. Reopen the generation and let the normal Phase-1 polling below
+ // finish them. This converges, because completion now requires an empty
+ // in-flight set. `failed` has its own operator retry and `cancelled` is
+ // deliberate, so neither reopens here.
+ if(gen.state==="completed"&&items.some(x=>IN_FLIGHT.includes(x.state))){
+  await input.db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"phase1_running");
+  gen=(await input.db.pipeline.getGeneration(gen.id))!;changed=true;
+  await input.db.pipeline.appendEvent({generationId:gen.id,itemId:null,operationId:`pipeline.reopened:${gen.id}:${gen.fencingToken}`,eventType:"pipeline.reopened_in_flight",payloadJson:JSON.stringify({items:items.filter(x=>IN_FLIGHT.includes(x.state)).map(x=>x.id)})});
+ }
  if(["completed","failed","cancelled"].includes(gen.state))return{generation:gen,items,changed:false,waitingFor:null};
  const transition=async(next:PipelineGenerationRow["state"])=>{const n=await input.db.pipeline.transitionGeneration(gen!.id,gen!.state,gen!.fencingToken,next);if(!n)throw new Error(`generation fenced during ${gen!.state}->${next}`);gen=n;changed=true};
  if(gen.state==="draft"){await transition("ready");}
@@ -207,7 +222,7 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
  // so the run panel names the stage that is actually working.
  if(gen.state==="eval_running"&&!items.some(x=>x.state==="eval_pending"||x.state==="eval_running")&&items.some(x=>x.state==="phase1_pending"||x.state==="phase1_running"))await transition("phase1_running");
  // One failed eval must not abandon siblings still in the courtroom.
- const stillGoing=items.some(x=>["eval_pending","eval_running","archive_sealed","phase1_pending","phase1_running"].includes(x.state));
+ const stillGoing=items.some(x=>IN_FLIGHT.includes(x.state));
  const PHASE2_ELIGIBLE=["phase1_published","phase2_attached","final_view_published"];
  // Phase 2 runs on the evals that actually produced a Phase-1 result. A failed
  // sibling is a finding about the tested agent (or an exhausted judge retry),
@@ -310,7 +325,7 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
   // the ticker skips: transitioning here would abandon that verdict mid-flight
   // with no route back. Stay in `finalizing` so the next tick keeps polling it.
   items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];
-  if(items.some(x=>["eval_pending","eval_running","archive_sealed","phase1_pending","phase1_running"].includes(x.state))){
+  if(items.some(x=>IN_FLIGHT.includes(x.state))){
    return{generation:gen,items,changed:true,waitingFor:"phase1"};
   }
   await transition("completed");items=[...(await input.db.pipeline.listItems(gen.id,PAGE)).items];return{generation:gen,items,changed:true,waitingFor:null};

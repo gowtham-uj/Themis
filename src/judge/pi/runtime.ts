@@ -9,7 +9,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile, readdir, copyFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, copyFile, stat } from "node:fs/promises";
 import { createWriteStream, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -724,6 +724,10 @@ export async function runPiOrchestrator(input: PiRunInput): Promise<PiRunResult>
   let stdoutBuf = "";
   let stderrBuf = "";
 
+  // Fixed before spawn so throttle detection can ignore child metadata left by
+  // earlier attempts in this same resumed working directory.
+  const attemptStartedMs = Date.now();
+
   const child = spawn(process.execPath, argv, {
     env,
     // pi must not block on stdin: with the default pipe the child waits for
@@ -771,7 +775,7 @@ export async function runPiOrchestrator(input: PiRunInput): Promise<PiRunResult>
   // the per-child metadata as the authority: HTTP 402/429 / quota / balance
   // exhaustion must pause the durable queue, not look like a clean courtroom
   // completion with missing reports.
-  const throttle = await detectPiThrottle(input.workDir, `${stdoutBuf}\n${stderrBuf}`);
+  const throttle = await detectPiThrottle(input.workDir, `${stdoutBuf}\n${stderrBuf}`, attemptStartedMs);
   if (throttle !== null) {
     throw new ProviderThrottledError(throttle.message, throttle.kind, throttle.status);
   }
@@ -796,8 +800,17 @@ interface DetectedThrottle {
  * Inspect the parent tail plus the child metadata files pi-subagents writes.
  * The child metadata is authoritative because a failed child can leave the
  * parent pi process with exit 0 and no top-level exception.
+ *
+ * `sinceMs` scopes the scan to the current attempt. A resumed courtroom reuses
+ * its working directory, so a quota failure from hours earlier is still sitting
+ * in these files: without the cutoff, a healthy resume reads that stale 402 and
+ * fails itself for a provider outage that is long over. Observed live — a case
+ * whose subagents were completing normally was killed by a 402 recorded twelve
+ * hours before. The parent tail is always in scope; only the on-disk artifacts
+ * are filtered, and an unreadable mtime keeps the file rather than dropping a
+ * real throttle.
  */
-export async function detectPiThrottle(workDir: string, tail: string): Promise<DetectedThrottle | null> {
+export async function detectPiThrottle(workDir: string, tail: string, sinceMs = 0): Promise<DetectedThrottle | null> {
   let text = tail;
   const roots = [
     join(workDir, "sessions", "subagent-artifacts"),
@@ -814,7 +827,17 @@ export async function detectPiThrottle(workDir: string, tail: string): Promise<D
     for (const name of names) {
       if (!name.endsWith("_meta.json") && !name.endsWith(".json")) continue;
       try {
-        const raw = await readFile(join(root, name), "utf8");
+        const path = join(root, name);
+        if (sinceMs > 0) {
+          // Skip artifacts last written before this attempt started. A file the
+          // current run has not touched cannot describe the current run.
+          try {
+            if ((await stat(path)).mtimeMs < sinceMs) continue;
+          } catch {
+            /* unreadable mtime: keep the file, a missed throttle is worse */
+          }
+        }
+        const raw = await readFile(path, "utf8");
         // Bounded: metadata is small, but never let a corrupt file explode the
         // classifier's memory.
         text += `\n${raw.slice(-200_000)}`;
