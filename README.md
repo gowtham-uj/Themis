@@ -121,45 +121,78 @@ Each project has one durable pipeline queue that advances eval execution → Pha
 automatically, with every stage separately triggerable, pausable, and resumable over the API. Resume is
 real: both courtrooms persist their PI session and re-attach with `--continue` rather than starting over.
 
-## What the console shows
+## The flow, screen by screen
 
-The screenshots below come from a real ten-eval run against ReaperCode, captured from the console at
-`web/`. Nothing in them is mocked.
+These screenshots come from a real ten-eval run against ReaperCode, captured from the console at `web/`.
+Nothing here is mocked. Read them in order and you have walked the whole platform.
 
-A project is one agent under test. It owns the adapters, the evals, the queue, and every run.
+### 1. Create a project
+
+A project is one agent under test. It owns the adapters, the evals, the queue, and every run. Nothing is
+global, so two agents never share state.
 
 ![Projects list](./docs/images/01-projects.png)
 
-Opening a project shows its run history and the controls that start a new one.
+Opening a project shows its run history and the button that starts the next one.
 
 ![Project overview](./docs/images/02-project.png)
 
-Project settings pick the agent adapter, the model for each stage, and the judge prompts.
+### 2. Point it at an agent and its models
+
+Settings pick the agent adapter, the model for each stage, and the judge prompts. The agent model and the
+judge model are separate on purpose: nothing should grade itself.
 
 ![Project settings](./docs/images/03-settings.png)
 
-Evals live in the project. The eval store is the shared catalog you copy them from.
+### 3. Load evals
+
+Evals live in the project. The eval store is the shared catalog you copy them from, so importing an eval
+never runs it.
 
 ![Project evals](./docs/images/04-evals.png)
 ![Eval store](./docs/images/05-eval-store.png)
 
-The queue blueprint is durable. Each start creates a new generation from it.
+### 4. Build the queue and start
+
+The queue blueprint is durable. Tick the evals, choose which stages this start should do, then start. Each
+start creates a new generation, so an earlier run's numbers never move.
 
 ![Queue blueprint](./docs/images/06-queue.png)
 
-The run panel is the one screen to watch during a run. Three stage cards track evals, Phase 1, and
-Phase 2. The activity feed below merges pipeline events, judge node progress, court filings, and the
-live agent stream.
+### 5. Watch the run panel
+
+This is the one screen to keep open. Three stage cards track evals, Phase 1, and Phase 2. The activity feed
+underneath merges pipeline events, judge node progress, court filings, and the live agent stream. Below is
+a finished run: ten evals worked, ten verdicts published, ten archives resealed with `phase2/`.
 
 ![Run panel](./docs/images/07-run-panel.png)
 
-Every run seals one archive, resealed after Phase 1 and again after Phase 2. The detail page opens the
-tree and downloads the bundle.
+Mid-run, the Phase 2 card shows the board reading across the verdicts it already has.
+
+![Phase 2 board](./docs/images/12-phase2-board.png)
+
+### 6. Pause and resume anything
+
+Pause freezes the stage that is actually running, not the checkbox. The judge holds its PI session and
+resume continues the same case rather than rejudging from scratch. No completed work is thrown away.
+
+![Paused judge](./docs/images/11-pause-resume.png)
+
+### 7. Read the archives
+
+Every run seals one archive. Phase 1 reseals it with `judge/`, Phase 2 reseals it again with `phase2/`,
+and the base bytes never change.
 
 ![Archive catalog](./docs/images/08-archives.png)
+
+The detail page opens the sealed tree and downloads the bundle. `judge/evalJudge.yaml` is the per-eval
+verdict: what the agent did, whether the process was legitimate, and what should change.
+
 ![Archive detail](./docs/images/09-archive-detail.png)
 
-Deployment model defaults apply to any project that does not override them.
+### Deployment defaults
+
+Model defaults apply to any project that does not override them.
 
 ![Models](./docs/images/10-models.png)
 
