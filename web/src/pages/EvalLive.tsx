@@ -657,8 +657,16 @@ export default function EvalLive() {
     ...(prog ? { progress: prog } : {}),
   })
 
+  // The agent's SSE feed only exists during the eval stage. Reading the hero's
+  // "last" line from it alone left the header stuck on an hour-old `end eval`
+  // line, stamped "feed 1h ago", while ten courtrooms were visibly in session.
+  // The merged stream carries every stage, so take the newest entry from it.
+  const lastActivity = merged.at(-1)
   const lastEvent = feed.at(-1)
-  const lastLine = lastEvent ? eventLine(lastEvent) : null
+  const lastTs = lastActivity?.ts ?? lastEvent?.ts
+  const lastLine = lastActivity
+    ? { kind: lastActivity.kind, text: lastActivity.text }
+    : lastEvent ? eventLine(lastEvent) : null
   // The judge queue is what actually gates claiming the next case, so its status
   // — not the live case's own state — is what says the judge is paused.
   const judgePaused = judgeQ.data?.status?.status === 'paused' || judgeQ.data?.queue?.status === 'paused'
@@ -719,7 +727,7 @@ export default function EvalLive() {
           <StateBadge state={statusWord} />
           <span className="chip accent">{phaseLabel(active)}</span>
           {currentItem && <span className="chip">{nameOf(currentItem.evalId)}</span>}
-          {lastEvent?.ts && <span className="hint">feed {ago(lastEvent.ts)}</span>}
+          {lastTs && <span className="hint">activity {ago(lastTs)}</span>}
         </div>
         <p className="now-line">{sentence}</p>
         {lastLine && (
