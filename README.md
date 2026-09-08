@@ -28,7 +28,10 @@ eval execution  →  sealed archive  →  PHASE 1 (per eval)  →  PHASE 2 (per 
 ### Phase 1: per-eval judgement
 
 A sealed archive goes through five nodes. Nodes 0 through 3 bind, extract, and condense the evidence
-so the courtroom receives a bounded case file.
+so the courtroom receives a bounded case file. This diagram shows the complete handoff and the rules that
+keep evidence gathering separate from the verdict.
+
+![Phase 1 system design: evidence preparation, adversarial courtroom, and immutable verdict](./docs/images/phase1-system-design.png)
 
 | Node | What it does |
 |---|---|
@@ -60,7 +63,10 @@ Full design: [`plan/themis-phase1-implementation.md`](./plan/themis-phase1-imple
 
 Phase 2 is deliberately black-box. It does not read the tested agent's source, generate patches, or run
 control/treatment experiments. It designs the experiments and hands them over. The recipient owns the
-source and is the one who can act.
+source and is the one who can act. The diagram shows how Themis keeps agent weaknesses separate from
+platform failures all the way to the final outputs.
+
+![Phase 2 system design: frozen campaign, pattern analysis, mediated research, and separated outputs](./docs/images/phase2-system-design.png)
 
 Five components, of which the first two are deterministic and model-free:
 
