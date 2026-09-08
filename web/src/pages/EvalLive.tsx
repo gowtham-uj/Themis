@@ -758,8 +758,11 @@ export default function EvalLive() {
           )}
           {active === 'across' && campaignId && (
             <>
-              <button onClick={() => pauseAcross.mutate()} disabled={busy}>Pause across</button>
-              <button onClick={() => resumeAcross.mutate()} disabled={busy}>Resume across</button>
+              {/* Both buttons were live at once, so a running board offered
+                  "Resume across" and a stopped one offered "Pause across".
+                  The eval and judge stages already gate on their own state. */}
+              <button onClick={() => pauseAcross.mutate()} disabled={acrossStopped || busy}>Pause across</button>
+              <button onClick={() => resumeAcross.mutate()} disabled={!acrossStopped || busy}>Resume across</button>
             </>
           )}
         </div>
