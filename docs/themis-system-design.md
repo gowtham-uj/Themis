@@ -29,11 +29,11 @@ A project has one durable pipeline queue. Starting a run creates a pipeline gene
 
 A project represents one agent under evaluation. It owns:
 
-- a versioned adapter that knows how to launch and parse the agent;
-- canonical eval packages;
-- one eval queue blueprint;
-- model settings for the evaluated agent, Phase 1, and Phase 2;
-- pipeline runs and their archives.
+- a versioned adapter that knows how to launch and parse the agent
+- canonical eval packages
+- one eval queue blueprint
+- model settings for the evaluated agent, Phase 1, and Phase 2
+- pipeline runs and their archives
 
 Source-built adapters pin an exact commit before a queue generation starts. The platform builds or reuses the image for that commit and records the build identity on every run.
 
@@ -105,7 +105,7 @@ A pipeline generation uses these major states:
 | `phase1_running` | At least one sealed archive is moving through the per-eval judge. |
 | `phase2_ready` | Every selected eval has a published Phase 1 result. |
 | `phase2_running` | The cross-eval campaign is analyzing the frozen membership. |
-| `finalizing` | Phase 2 artifacts are being attached to member archives. |
+| `finalizing` | The coordinator is attaching Phase 2 artifacts to member archives. |
 | `completed` | Every selected archive has its final view. |
 | `failed` | A typed terminal failure needs operator action. |
 | `paused` | New work is held while persisted sessions and artifacts stay intact. |
@@ -122,10 +122,10 @@ Node 0 reads the role-typed evidence manifest, binds each evidence source to a s
 
 Main outputs include:
 
-- `evalContext.yaml`;
-- `session.txt`;
-- `toolCalls.jsonl`;
-- `toolCalls.txt`.
+- `evalContext.yaml`
+- `session.txt`
+- `toolCalls.jsonl`
+- `toolCalls.txt`
 
 ### Node 1, deterministic extraction
 
@@ -156,14 +156,14 @@ The courtroom uses mediated tools rather than general filesystem or shell access
 
 `evalJudge.yaml` records:
 
-- whether the run is valid for agent learning;
-- who owns a failure;
-- the approach, integrity, competence, and reward reconciliation verdicts;
-- a grounded narrative;
-- strengths and improvements with evidence refs;
-- stable behavior signatures and affected agent subsystems;
-- research-backed remedies when a real `web:<url>` source supports them;
-- open questions, case coverage, and confidence.
+- whether the run is valid for agent learning
+- who owns a failure
+- the approach, integrity, competence, and reward reconciliation verdicts
+- a grounded narrative
+- strengths and improvements with evidence refs
+- stable behavior signatures and affected agent subsystems
+- research-backed remedies when a real `web:<url>` source supports them
+- open questions, case coverage, and confidence
 
 The deterministic quality gate checks structure, refs, groundedness, behavioral usefulness, and stability before publication.
 
@@ -193,10 +193,10 @@ Phase 2 has five jobs:
 
 The first two jobs are deterministic. The analytical board runs four PI roles in order:
 
-- investigator;
-- researcher;
-- designer;
-- reviewer.
+- investigator
+- researcher
+- designer
+- reviewer
 
 Phase 2 stays black-box. It does not read or patch the tested agent's source. It does not run control and treatment experiments. The agent developer owns those steps.
 
@@ -214,18 +214,18 @@ The pipeline stores stage and item state in SQLite. PI sessions write their sess
 
 If the API process stops:
 
-- queued and sealed work remains in the database and archive store;
-- a Phase 1 case with a persisted session can be relaunched from its checkpoint;
-- an eval run that died without resumable agent state becomes an explicit eval failure;
-- completed items stay completed;
-- operator retry creates only the missing fresh attempt.
+- queued and sealed work remains in the database and archive store
+- a Phase 1 case with a persisted session can be relaunched from its checkpoint
+- an eval run that died without resumable agent state becomes an explicit eval failure
+- completed items stay completed
+- operator retry creates only the missing fresh attempt
 
 ## Current storage model
 
 The local and test deployment uses two SQLite databases and local content-addressed files under `data/`:
 
-- `agenteval.db` owns projects, adapters, eval queues, agent runs, queue containers, and base archives;
-- `themis.sqlite` owns pipeline generations, Phase 1 result pointers, Phase 2 campaigns, and publications.
+- `agenteval.db` owns projects, adapters, eval queues, agent runs, queue containers, and base archives
+- `themis.sqlite` owns pipeline generations, Phase 1 result pointers, Phase 2 campaigns, and publications
 
 The repository also contains PostgreSQL and S3-compatible contracts for production work control and artifact storage. Read the implementation status before treating every planned scale property as shipped.
 

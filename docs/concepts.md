@@ -10,7 +10,7 @@ A project is the boundary for one agent evaluation program. It owns adapters, ev
 
 An adapter teaches Themis how to launch one CLI agent and turn its native output into canonical events. It defines the command, provider environment, parser, evidence files, setup, cleanup, and optional source build.
 
-A project adapter can pin a source repository and commit. An explicitly shared adapter can be selected by another project. Sharing is opt-in.
+A project adapter can pin a source repository and commit. Another project can select it only if its owner shares it. Sharing is opt-in.
 
 ## Eval package
 
@@ -89,10 +89,10 @@ A result version and its archive view stay linked. Rejudging can publish another
 
 Phase 1 uses four role boundaries:
 
-- the orchestrator assigns work and tracks rounds;
-- Kratos investigates process and trajectory;
-- Logos investigates source, diff, and artifacts;
-- Minos rules on filed reports.
+- the orchestrator assigns work and tracks rounds
+- Kratos investigates process and trajectory
+- Logos investigates source, diff, and artifacts
+- Minos rules on filed reports
 
 These boundaries stop one model from silently turning an unsupported guess into a final verdict.
 

@@ -337,11 +337,11 @@ cd web && npm ci && npm run lint && npm run build
 
 Also verify:
 
-- `/api/health` and `/api/judge/health` are healthy;
-- the API refuses unauthenticated non-loopback startup;
-- the three model health probes pass;
-- Podman can start and remove a queue container;
-- a real eval reaches a sealed base archive;
-- Phase 1 publishes `judge/evalJudge.yaml`;
-- Phase 2 publishes its pack and platform report;
-- archive downloads contain no changed base files.
+- `/api/health` and `/api/judge/health` are healthy
+- the API refuses unauthenticated non-loopback startup
+- the three model health probes pass
+- Podman can start and remove a queue container
+- a real eval reaches a sealed base archive
+- Phase 1 publishes `judge/evalJudge.yaml`
+- Phase 2 publishes its pack and platform report
+- archive downloads contain no changed base files

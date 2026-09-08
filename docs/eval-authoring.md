@@ -75,14 +75,14 @@ category contract) regardless of the suite's own `category` value.
 
 Every queue uses one platform fat base derived from `debian:bookworm-slim`. The image includes:
 
-- build-essential, git, apt, sudo, and common shell tools;
-- Node.js and npm;
-- Python, pip, and venv;
-- Go;
-- Rust and Cargo;
-- the non-root `agent` user with uid `10001`.
+- build-essential, git, apt, sudo, and common shell tools
+- Node.js and npm
+- Python, pip, and venv
+- Go
+- Rust and Cargo
+- the non-root `agent` user with uid `10001`
 
-The selected agent adapter is overlaid once. Python, Node, Go, Rust, C, C++, and shell evals can then run sequentially in the same persistent queue container without installing a language toolchain for each eval.
+The queue overlays the selected agent adapter once. Python, Node, Go, Rust, C, C++, and shell evals then run one after another in the same persistent container, with no language toolchain install per eval.
 
 ## environment/setup.sh and environment/cleanup.sh
 
@@ -109,7 +109,7 @@ The queue worker records setup, cleanup, and reset evidence. A cleanup or reset 
   whole address space, so egress is open today, because the agent has to reach whatever model endpoint the
   project points it at. Narrowing that is an edit to `SUITE_AGENT_ALLOWLIST` in `src/evals/package.ts`, not
   a switch to a different enforcement path. The suite's `internet=...` describes task/verifier network
-  intent and is honored by the isolated verifier (always offline), not by offlining the agent container.
+  intent. The isolated verifier honors it and always runs offline. It does not take the agent container offline.
 
 ## The verifier contract
 

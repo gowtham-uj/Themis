@@ -74,9 +74,9 @@ Five components, of which the first two are deterministic and model-free:
 5. **Review** keeps or drops each recommendation.
 
 Components 3 through 5 run as PI coding-agent subagents under a Phase-2 orchestrator: investigator,
-researcher, designer, reviewer, dispatched in that order, blocking. They reach evidence only through a
-mediated tool surface. `web_search` uses Themis's configured providers: Serper for general search,
-a reader-backed fallback, and arXiv for scholarly results.
+researcher, designer, reviewer, dispatched in that order, blocking. They reach evidence only through
+mediated tools. `web_search` uses Themis's configured providers: Serper for general search, a
+reader-backed fallback, and arXiv for scholarly results.
 
 The validity split in component 1 is the piece that took the longest to get right. A run where the
 harness broke before the agent started must never become "the agent performs poorly on undo/redo

@@ -1,4 +1,4 @@
-# agenteval — build conventions
+# Themis build conventions
 
 Read `plan/` first. The plan describes the API-only adapter, eval-package, queue execution, and archive
 platform. When code and plan diverge, update the plan or implementation explicitly rather than silently.
@@ -16,7 +16,7 @@ The HTTP API is the only application interface.
 - SQLite (`better-sqlite3`/Drizzle) for local/test plus PostgreSQL for production metadata/work control;
   JSONL and immutable content-addressed files under `data/` remain byte authority locally.
 - Backend/server/API only. There is no application frontend in this repository.
-- Themis Phase 1 is in scope: per-eval judgement (Nodes 0–4), judge queues/jobs/outbox/leases/fencing,
+- Themis Phase 1 is in scope: per-eval judgement (Nodes 0 through 4), judge queues/jobs/outbox/leases/fencing,
   mediated court tools, immutable `judge/` archive views, quality gates, result versions, and judge HTTP APIs.
 - Themis Phase 2 is in scope per `plan/themis-phase2-design.md`: black-box campaign analysis that finds
   systemic agent patterns, researches remedies, and produces developer implementation handoffs plus
