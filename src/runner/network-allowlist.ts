@@ -21,6 +21,9 @@
 
 import { spawn } from "node:child_process";
 import { lookup } from "node:dns/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /** nftables table name, scoped so a stray rule is identifiable as ours. */
 const TABLE = "agenteval_egress";
@@ -155,7 +158,7 @@ export async function installAllowlist(input: {
   const addresses = [...new Set(entries.flatMap((e) => e.addresses))];
   const prefix = input.sudo ? ["sudo", "-n"] : [];
   const res = await nftApply(
-    [...prefix, "nsenter", "-n", "-t", String(input.pid), "nft", "-f", "-"],
+    [...prefix, "nsenter", "-n", "-t", String(input.pid), "nft"],
     buildRuleset(addresses),
     input.timeoutMs ?? 30_000,
   );
@@ -170,42 +173,50 @@ export async function installAllowlist(input: {
   return { applied: true, entries, addresses };
 }
 
-/** Feed a ruleset to `nft -f -` and collect its exit status. */
-function nftApply(
+/** Apply a ruleset from a temporary regular file and collect nft's exit status. */
+async function nftApply(
   argv: string[],
   ruleset: string,
   timeoutMs: number,
 ): Promise<{ code: number; stderr: string }> {
-  return new Promise((resolve) => {
-    const [file, ...args] = argv;
-    if (!file) {
-      resolve({ code: 1, stderr: "empty argv" });
-      return;
-    }
-    const child = spawn(file, args, { stdio: ["pipe", "ignore", "pipe"] });
-    let stderr = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* already gone */
+  const dir = await mkdtemp(join(tmpdir(), "agenteval-nft-"));
+  const rulesPath = join(dir, "rules.nft");
+  try {
+    // Some nft builds reject `-f -` because /dev/stdin is not a regular file.
+    // A mode-0600 file also keeps the exact ruleset stable across nsenter.
+    await writeFile(rulesPath, ruleset, { encoding: "utf8", mode: 0o600 });
+    return await new Promise((resolve) => {
+      const [file, ...args] = [...argv, "-f", rulesPath];
+      if (!file) {
+        resolve({ code: 1, stderr: "empty argv" });
+        return;
       }
-    }, timeoutMs);
-    const finish = (code: number): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ code, stderr });
-    };
-    child.stderr?.on("data", (c: Buffer) => {
-      stderr += c.toString("utf8");
+      const child = spawn(file, args, { stdio: ["ignore", "ignore", "pipe"] });
+      let stderr = "";
+      let settled = false;
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }, timeoutMs);
+      const finish = (code: number): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ code, stderr });
+      };
+      child.stderr?.on("data", (c: Buffer) => {
+        stderr += c.toString("utf8");
+      });
+      child.on("error", (err) => {
+        stderr += String(err);
+        finish(127);
+      });
+      child.on("close", (code) => finish(code ?? 0));
     });
-    child.on("error", (err) => {
-      stderr += String(err);
-      finish(127);
-    });
-    child.on("close", (code) => finish(code ?? 0));
-    child.stdin?.end(ruleset);
-  });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
