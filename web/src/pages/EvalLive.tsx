@@ -202,7 +202,12 @@ function happening(it: PipelineItem, frozen = false): string {
     case 'eval_pending': return 'Waiting for the agent'
     case 'eval_running': return 'Agent is working'
     case 'archive_sealed': return 'Archive sealed. Waiting for the judge'
-    case 'phase1_pending': return 'Queued for the judge'
+    // A blocked item sits in phase1_pending, but "Queued for the judge" reads as
+    // normal progress while nothing can advance until an operator fixes the
+    // Phase-1 model settings. Say what is wrong and where to fix it.
+    case 'phase1_pending': return it.errorKind === 'phase1_blocked'
+      ? 'Judge cannot start: Phase 1 model is not configured. Fix it in Settings, then this resumes'
+      : 'Queued for the judge'
     case 'phase1_running': return 'Courtroom in session'
     case 'phase1_published': return 'Verdict in. Archive has judge/'
     case 'phase2_attached': return 'Attached to the across pass'

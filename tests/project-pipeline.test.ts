@@ -84,6 +84,45 @@ describe("project pipeline coordinator",()=>{
   expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
   await db.close();
  });
+ it("parks a Phase1 case blocked on model config without spending a retry",async()=>{
+  // A ten-eval generation lost every sealed archive to terminal `failed` because
+  // an unset Phase-1 credential was classified as a case failure and burned all
+  // three attempts on each item. Configuration is fixable; the archives are not
+  // reproducible. The item stays pending, retryCount stays 0, and the reason is
+  // on the row for the console to show.
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"blocked-p",evalQueueId:"blocked-eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  const item=await db.pipeline.addItem({generationId:g.id,evalId:"e",ordinal:1});
+  await db.pipeline.updateItem(item.id,"eval_pending",{state:"archive_sealed",runId:"run-e",baseArchiveId:"a"});
+  await db.pipeline.updateItem(item.id,"archive_sealed",{state:"phase1_pending"});
+  await db.pipeline.updateItem(item.id,"phase1_pending",{state:"phase1_running"});
+  let blocked=true;
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(){return{state:"completed",runId:"run-e",archiveId:"a"}},
+   async startPhase1(){return{operationId:"p1"}},
+   async getPhase1Status(){return blocked
+    ?{state:"blocked",error:"no API key for the phase1 model."}
+    :{state:"published",resultVersionId:"rv",archiveViewId:"v"}},
+   async runPhase2(){return{developerPackSha256:"a".repeat(64),developerPackZip:"/p2/pack.zip",artifactDir:"/p2"}},
+   async publishFinalView(){return{finalArchiveViewId:"fv",manifestSha256:"b".repeat(64)}},
+  };
+  // Three advances is more than MAX_PHASE1_RETRIES, so a misclassification here
+  // would already have made the item terminal.
+  for(let i=0;i<3;i++)await advanceProjectPipeline({db,services,generationId:g.id});
+  const held=await db.pipeline.getItem(item.id);
+  expect(held?.state).not.toBe("failed");
+  expect(held?.retryCount).toBe(0);
+  expect(held?.errorKind).toBe("phase1_blocked");
+  expect(held?.errorDetail).toContain("no API key");
+  expect((await db.pipeline.getGeneration(g.id))?.state).not.toBe("failed");
+  // Fixing the setting and re-advancing recovers the same sealed archive.
+  blocked=false;
+  for(let i=0;i<25;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed")break}
+  expect((await db.pipeline.getItem(item.id))?.state).toBe("final_view_published");
+  await db.close();
+ });
  it("holds an operator-paused Phase1 case without retrying or relaunching it",async()=>{
   const db=createSqlitePhase2Db(new Database(":memory:"));
   const q=await db.pipeline.createQueue({projectId:"paused-p",evalQueueId:"paused-eq",name:"q"});

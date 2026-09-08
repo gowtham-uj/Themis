@@ -41,7 +41,7 @@ export interface Phase1StartResult{operationId:string}
 /** `not_started` means no in-flight run AND no published result — i.e. the worker
  *  that owned this Phase-1 run was lost (crash/restart) and must be re-launched
  *  so its persisted PI session can be resumed. */
-export interface Phase1Status{state:"running"|"paused"|"published"|"failed"|"not_started";resultVersionId?:string;archiveViewId?:string;error?:string}
+export interface Phase1Status{state:"running"|"paused"|"published"|"blocked"|"failed"|"not_started";resultVersionId?:string;archiveViewId?:string;error?:string}
 export interface Phase2RunResult{developerPackSha256:string;developerPackZip:string;artifactDir:string}
 export interface FinalViewResult{finalArchiveViewId:string;manifestSha256:string}
 
@@ -238,6 +238,14 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
    }else{
     await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"failed",errorKind:"phase1",errorDetail:s.error??"Phase1 failed"});changed=true;
    }
+  }else if(s.state==="blocked"){
+   // Deployment configuration, not a case verdict: the Phase-1 stage has no base
+   // URL or no credential. Park the item back in `phase1_pending` with the reason
+   // visible and WITHOUT consuming a retry. Treating this as a case failure once
+   // drove all ten items of a generation to terminal `failed` and threw away ten
+   // sealed archives; fixing the setting and re-advancing now resumes them.
+   await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"phase1_pending",errorKind:"phase1_blocked",errorDetail:s.error??"Phase 1 model is not configured"});
+   await input.db.pipeline.appendEvent({generationId:gen.id,itemId:item.id,operationId:`phase1.blocked:${item.id}`,eventType:"phase1.blocked",payloadJson:JSON.stringify({error:s.error})});changed=true;
   }else if(s.state==="paused"){
    // An operator pause holds the item in phase1_running with its checkpoints
    // intact; resume restarts the same case from the last node boundary. This
