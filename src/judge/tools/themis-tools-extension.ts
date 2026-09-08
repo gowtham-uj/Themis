@@ -82,7 +82,14 @@ const TEMPLATE_TARGETS: Record<string, string> = {
   "kratos-report": "judge/kratos-report.yaml",
   "logos-report": "judge/logos-report.yaml",
   "minos-report": "judge/minos-report.yaml",
-  "evalJudge": "judge/evalJudge.yaml",
+  // The final report is a host projection of committed rulings, so the court
+  // never writes it. A live court filed its whole ruling under `evalJudge`,
+  // which overwrote the projection with the orchestrator's own prose and left
+  // minos-report.yaml empty — the assembler then had nothing to project and the
+  // finished judgement failed Tier B with no retry that could recover it. The
+  // template name stays valid because the court is taught to file a final
+  // report; the bytes land on the ruling the assembler actually reads.
+  "evalJudge": "judge/minos-report.yaml",
   "round-log": "judge/round-log.yaml",
   "tangent-log": "judge/tangent-log.yaml",
   "case-summary": "judge/case-summary.yaml",
@@ -94,6 +101,11 @@ const TEMPLATE_TARGETS: Record<string, string> = {
   "phase2-recommendations": "judge/phase2-recommendations.yaml",
   "phase2-review": "judge/phase2-review.yaml",
 };
+
+/** Where one court template's bytes land. Exposed so the rule is testable. */
+export function finalReportTemplateTarget(template: string): string | undefined {
+  return TEMPLATE_TARGETS[template];
+}
 
 function safeJoin(root: string, rel: string): string {
   const segs = rel.split(/[/\\]/).filter((s) => s.length > 0 && s !== "." && s !== "..");

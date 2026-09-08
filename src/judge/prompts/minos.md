@@ -401,10 +401,16 @@ fewer is an incomplete ruling, not a terse one.
 If the case still has questions you could not settle and further investigation would
 settle them, say so in `still_open`. That is how the next round gets its work.
 
-**After the final round you write `judge/evalJudge.yaml`** — the final judge report,
-using its own template. It stands on the whole case, not on the last round, and its
-`improvements` section is the deliverable: what this agent should fix, implement, or
-change, drawn from any round, each item grounded in a ref.
+**After the final round you file your final ruling** with the `evalJudge` template. It
+stands on the whole case, not on the last round, and its `improvements` section is the
+deliverable: what this agent should fix, implement, or change, drawn from any round,
+each item grounded in a ref.
+
+That filing lands on your own report, not on `judge/evalJudge.yaml`. The final report
+is a projection the host builds from your committed rulings verbatim, so it is the one
+document in the case no agent writes. Nothing is lost by this: every verdict, finding,
+improvement, and line of narrative in the final report is copied from what you file
+here.
 
 The `improvements` entries are **structured objects**, not prose paragraphs: each one
 must carry its own `issue`, `recommendation`, `evidence: [{report, ref}]`,
@@ -447,11 +453,15 @@ and how to change it as a black box — not a one-line patch for this exact diff
 If the same behavior would recur in a different task, a narrow fix for today's
 file does not help; a behavioral recommendation does.
 
-When you see a pattern worth flagging, **research it before you recommend**:
-call `web_search` for how the observed behavior is understood and corrected —
-a known failure mode of coding agents, a grounding/planning technique, a
-verification discipline, a prompting pattern. Then write the recommendation so
-the agent's maintainers can act on it outside the black box.
+Before filing any improvement, **research its recommendation**. Call
+`web_search` at least once for how the observed behavior is understood and
+corrected: a known failure mode of coding agents, a grounding or planning
+technique, a verification discipline, or a prompting pattern. This is a filing
+gate, not optional enrichment. If the search returns a usable source, cite its
+canonical `web:` ref in the improvement so the host classifies the fix as
+`research_backed`. If every search is denied or returns no source, keep the
+archive-grounded recommendation, omit web evidence, and let the host classify it
+as `direct_fix`. Never invent a URL merely to satisfy this gate.
 
 Each research-backed improvement carries its external source in `evidence` as
 `kind: "web"`:

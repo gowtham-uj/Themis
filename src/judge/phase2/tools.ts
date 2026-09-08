@@ -11,6 +11,11 @@ const LIFECYCLE_ALLOW = new Set([
   "verifier_res/verifier-result.json",
   "verifier_res/verifier-stderr.log",
   "judge/evalJudge.yaml",
+  // Remedy's per-case remediation deliverable. It carries researched
+  // recommendations with the `web:` sources it actually retrieved, and until
+  // now nothing downstream read it: every case sealed a file of finished
+  // research that no campaign ever opened.
+  "judge/developer-brief.yaml",
 ]);
 
 export interface Phase2ToolContext {
@@ -24,6 +29,7 @@ export const PHASE2_READ_TOOLS = [
   fnTool("list_evals", "List campaign evals with validity, reward, cohort, tokens.", {}, []),
   fnTool("read_judge_report", "Read evalJudge.yaml for one run (truncated).", { runId: { type: "string" } }, ["runId"]),
   fnTool("read_improvements", "Read minos improvement items for one run.", { runId: { type: "string" } }, ["runId"]),
+  fnTool("read_developer_brief", "Read Phase-1 remedy's researched recommendations for one run, including the web: sources it retrieved.", { runId: { type: "string" } }, ["runId"]),
   fnTool("read_lifecycle", "Read an allowlisted lifecycle/verifier file.", {
     runId: { type: "string" },
     path: { type: "string", description: "Allowlisted relative path" },
@@ -67,16 +73,26 @@ export async function executePhase2Tool(
     const c = ctx.cases.find((x) => x.runId === args.runId);
     return { text: c ? JSON.stringify(c.improvements) : "DENIED: unknown runId" };
   }
-  if (name === "read_judge_report" || name === "read_lifecycle") {
+  if (name === "read_judge_report" || name === "read_developer_brief" || name === "read_lifecycle") {
     const runId = String(args.runId ?? "");
     const view = ctx.viewDirs[runId];
     if (!view) return { text: "DENIED: unknown runId" };
-    const rel = name === "read_judge_report" ? "judge/evalJudge.yaml" : String(args.path ?? "");
+    const rel = name === "read_judge_report"
+      ? "judge/evalJudge.yaml"
+      : name === "read_developer_brief"
+        ? "judge/developer-brief.yaml"
+        : String(args.path ?? "");
     if (!LIFECYCLE_ALLOW.has(rel)) return { text: `DENIED: path not allowlisted: ${rel}` };
     try {
       const text = await readFile(join(view, ...rel.split("/")), "utf8");
       return { text: text.slice(0, 16_000) };
-    } catch {
+    } catch (e) {
+      // A case with no brief is not a refusal. Views sealed before remedy
+      // existed carry none, and reading "DENIED" there would tell the campaign
+      // it lacked permission for a file that simply is not part of that case.
+      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return { text: `ABSENT: ${rel} is not part of run ${runId}` };
+      }
       return { text: `DENIED: cannot read ${rel}` };
     }
   }

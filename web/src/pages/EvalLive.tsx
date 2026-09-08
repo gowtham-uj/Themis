@@ -81,6 +81,7 @@ interface Phase1CaseProgress {
   round: number | null
   judgeFiles: string[]
   published: boolean
+  paused: boolean
 }
 
 interface StageProgress {
@@ -95,6 +96,7 @@ interface StageProgress {
     campaignState: string | null
     resealed: number
     members: number
+    excludedFromCampaign?: number
     artifacts: string[]
     developerPack: boolean
   }
@@ -284,11 +286,23 @@ function nowCopy(opts: {
   if (opts.acrossRunning || opts.genState === 'phase2_running') return `Looking across ${p?.phase1.published ?? opts.total ?? 0} verdicts for patterns and a fix plan.`
   if (opts.genState === 'finalizing') return 'Sealing the across-evals view onto each archive.'
   if (p?.stage === 'phase1') {
-    const c = p.phase1.cases.find((x) => x.active)
+    const c = p.phase1.cases.find((x) => x.paused) ?? p.phase1.cases.find((x) => x.active)
+    if (c?.paused) {
+      const checkpoint = c.committedNode ? PHASE1_NODE_LABELS[c.committedNode].toLowerCase() : 'the start of the case'
+      return `The judge is paused after ${checkpoint} for ${who}. Resume continues from that checkpoint.`
+    }
     if (c?.active) return `The judge is on ${PHASE1_NODE_LABELS[c.active].toLowerCase()} for ${who}.`
     return `${p.phase1.published} of ${p.phase1.total} verdicts are in. ${p.phase1.pending} waiting.`
   }
-  if (opts.genState === 'completed') return 'This start finished. Each archive was resealed as it moved through evals, Phase 1, and Phase 2.'
+  if (opts.genState === 'completed') {
+    // Claiming every archive went through Phase 2 is false whenever a judgement
+    // published after the campaign froze. Say what the pack actually covered.
+    const left = p?.phase2.excludedFromCampaign ?? 0
+    if (left > 0) {
+      return `This start finished. Phase 2 covered ${p!.phase2.members} of ${p!.phase1.published} verdicts: ${left} judgement${left === 1 ? '' : 's'} published after the campaign froze, so ${left === 1 ? 'its archive is' : 'their archives are'} sealed at judge/ rather than phase2/.`
+    }
+    return 'This start finished. Each archive was resealed as it moved through evals, Phase 1, and Phase 2.'
+  }
   if (opts.genState === 'failed') return 'This start failed. Open the eval row for the error.'
   if (p?.stage === 'evals' || opts.live || opts.genState === 'eval_running') {
     if (p && p.evals.total > 0) {
@@ -643,6 +657,12 @@ export default function EvalLive() {
   // The judge queue is what actually gates claiming the next case, so its status
   // — not the live case's own state — is what says the judge is paused.
   const judgePaused = judgeQ.data?.status?.status === 'paused' || judgeQ.data?.queue?.status === 'paused'
+  // Pausing one case does not pause the queue, so `judgePaused` misses it and the
+  // row kept reading "judging" after the graph had already halted. The marker on
+  // disk is what actually stops the case, and `progress` reports it per run.
+  const pausedRuns = new Set((prog?.phase1.cases ?? []).filter((c) => c.paused).map((c) => c.runId))
+  const casePaused = (runId: string | null | undefined) => Boolean(runId && pausedRuns.has(runId))
+  const judgeStopped = judgePaused || pausedRuns.size > 0
   const busy = retryEval.isPending || control.isPending || pauseJudge.isPending || resumeJudge.isPending || pauseAcross.isPending || resumeAcross.isPending
   const runRows = runs.data?.runs ?? []
   const generationLabel = gen.data?.generation.name || `Run ${gen.data?.generation.ordinal ?? pipeline.data?.generation?.ordinal ?? ''}`
@@ -653,7 +673,7 @@ export default function EvalLive() {
   const TERMINAL = ['completed', 'failed', 'cancelled', 'paused']
   // A stopped board must not read as running. Its own card explains what
   // happened; the badge only has to stop claiming work is under way.
-  const statusWord = runPaused || (active === 'judge' && judgePaused)
+  const statusWord = runPaused || (active === 'judge' && judgeStopped)
     ? 'paused'
     : active === 'across' && acrossStopped
       ? 'stopped'
@@ -743,14 +763,14 @@ export default function EvalLive() {
           )}
         </div>
 
-        <div className={`phase-step${active === 'judge' ? ' active' : ''}${phase1Done ? ' done' : ''}${judgePaused && !phase1Done ? ' paused' : ''}`}>
+        <div className={`phase-step${active === 'judge' ? ' active' : ''}${phase1Done ? ' done' : ''}${judgeStopped && !phase1Done ? ' paused' : ''}`}>
           <div className="n">2 · Phase 1</div>
           <h3>Judge each eval</h3>
           <div className="meter"><i style={{ width: `${pct(prog?.phase1.published ?? evalCounts.judged, prog?.phase1.total ?? evalCounts.total)}%` }} /></div>
           <p>
             {(prog?.phase1.total ?? evalCounts.total) === 0
               ? 'Waits for a sealed archive.'
-              : `${prog?.phase1.published ?? evalCounts.judged} of ${prog?.phase1.total ?? evalCounts.total} verdicts${judgePaused ? ' · paused, resume continues the session' : (prog?.phase1.running ?? evalCounts.judging) ? ` · ${prog?.phase1.running ?? evalCounts.judging} in session` : ''}`}
+              : `${prog?.phase1.published ?? evalCounts.judged} of ${prog?.phase1.total ?? evalCounts.total} verdicts${judgeStopped ? ' · paused, resume continues from the last committed node' : (prog?.phase1.running ?? evalCounts.judging) ? ` · ${prog?.phase1.running ?? evalCounts.judging} in session` : ''}`}
           </p>
           {prog && prog.phase1.cases.length > 0 && (
             <ul className="lines">
@@ -792,6 +812,15 @@ export default function EvalLive() {
           )}
           {prog?.phase2.started && (
             <p className="hint">{prog.phase2.resealed} of {prog.phase2.members || prog.evals.total} archives resealed with phase2/</p>
+          )}
+          {(prog?.phase2.excludedFromCampaign ?? 0) > 0 && (
+            <p className="hint warn">
+              {prog!.phase2.excludedFromCampaign} judgement{prog!.phase2.excludedFromCampaign === 1 ? '' : 's'} published
+              after this campaign froze its membership, so the developer pack analyzed
+              {' '}{prog!.phase2.members} of {prog!.phase1.published}. The excluded
+              {prog!.phase2.excludedFromCampaign === 1 ? ' verdict is' : ' verdicts are'} complete: open
+              {prog!.phase2.excludedFromCampaign === 1 ? ' it' : ' them'} from the case list below, or in the archive under judge/.
+            </p>
           )}
         </div>
       </div>
@@ -882,9 +911,9 @@ export default function EvalLive() {
                       <td className="num">{it.ordinal ?? ''}</td>
                       <td style={{ color: 'var(--text)' }}>
                         {nameOf(it.evalId)}
-                        <div className="hint">{happening(it, it.state === 'eval_running' ? runPaused : judgePaused)}</div>
+                        <div className="hint">{happening(it, it.state === 'eval_running' ? runPaused : judgePaused || casePaused(it.runId))}</div>
                       </td>
-                      <td><StateBadge state={(it.state === 'eval_running' && runPaused) || (it.state === 'phase1_running' && judgePaused) ? 'paused' : it.state} /></td>
+                      <td><StateBadge state={(it.state === 'eval_running' && runPaused) || (it.state === 'phase1_running' && (judgePaused || casePaused(it.runId))) ? 'paused' : it.state} /></td>
                       <td><span className="chip">{archiveLayer(it.state)}</span></td>
                       <td>
                         {it.state === 'failed' && it.errorKind === 'eval' && (

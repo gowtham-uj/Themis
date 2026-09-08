@@ -209,7 +209,7 @@ The list below is a route map. `:id`, `:runId`, and similar segments are resourc
 | API | What it is for |
 |---|---|
 | `GET, POST /api/projects` | List projects or create a project. |
-| `GET, PATCH, DELETE /api/projects/:id` | Read, update, or delete one project. |
+| `GET, PATCH, DELETE /api/projects/:id` | Read, update, or archive one project. |
 | `GET /api/projects/:id/readiness` | Find missing configuration before starting work. |
 | `GET /api/projects/:id/eval-categories` | List the eval categories available in a project. |
 | `GET, POST /api/projects/:id/evals` | List project evals or import an eval package. |
@@ -377,3 +377,9 @@ The list below is a route map. `:id`, `:runId`, and similar segments are resourc
 
 Normative contracts live in [`plan/`](./plan/). The guides in [`docs/`](./docs/) are the operational
 path and must stay aligned with them.
+
+## License
+
+Themis is source-available for personal, non-commercial use. Corporate or organizational use, AI use,
+and AI training are not permitted without a separate written license. Read the complete
+[Themis Personal Use and No-AI License](./LICENSE) before using or distributing the software.

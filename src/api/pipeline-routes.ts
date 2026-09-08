@@ -81,10 +81,11 @@ export function registerPipelineRoutes(router:Router,phase1:Phase1Service):void{
   // A run id that does not exist answered 200 with paused:false, which reads the
   // same as "the judge was already stopped". A typo must not look like a pause.
   if(!app.queries.getRun(runId))throw notFound("run not found");
-  const {pausePiWorkDir}=await import("../judge/pi/runtime.js");
-  let out=await pausePiWorkDir(join(app.dataDir,"judge_work",`case_${runId}`,"node4"));
-  if(!out.killed)out=await pausePiWorkDir(join(app.dataDir,"judge_work",runId));
-  sendJson(res,200,{paused:out.killed,pid:out.pid,run_id:runId,resume:"POST /api/judge/runs/:runId/phase1"});
+  // Go through the service, not pausePiWorkDir directly: killing the court only
+  // stops a case that reached Node 4. Nodes 0-3 have no process to kill, so this
+  // route used to answer paused:false while the clerk kept spending model calls.
+  const out=await phase1.pause(runId);
+  sendJson(res,200,{paused:true,court_killed:out.killed,pid:out.pid,run_id:runId,resume:"POST /api/judge/runs/:runId/phase1"});
  });
  /** Every run of this project's pipeline, newest first, for the project page. */
  router.get("/api/projects/:id/pipeline/runs",async(_req,res,ctx)=>{

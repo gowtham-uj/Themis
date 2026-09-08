@@ -41,7 +41,7 @@ export interface Phase1StartResult{operationId:string}
 /** `not_started` means no in-flight run AND no published result — i.e. the worker
  *  that owned this Phase-1 run was lost (crash/restart) and must be re-launched
  *  so its persisted PI session can be resumed. */
-export interface Phase1Status{state:"running"|"published"|"failed"|"not_started";resultVersionId?:string;archiveViewId?:string;error?:string}
+export interface Phase1Status{state:"running"|"paused"|"published"|"failed"|"not_started";resultVersionId?:string;archiveViewId?:string;error?:string}
 export interface Phase2RunResult{developerPackSha256:string;developerPackZip:string;artifactDir:string}
 export interface FinalViewResult{finalArchiveViewId:string;manifestSha256:string}
 
@@ -214,6 +214,13 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
    }else{
     await input.db.pipeline.updateItem(item.id,"phase1_running",{state:"failed",errorKind:"phase1",errorDetail:s.error??"Phase1 failed"});changed=true;
    }
+  }else if(s.state==="paused"){
+   // An operator pause holds the item in phase1_running with its checkpoints
+   // intact; resume restarts the same case from the last node boundary. This
+   // arm exists so the worker-loss branch below can never see a paused case:
+   // once the graph halts, the service is no longer "running", and without this
+   // the item would fall through to `not_started` and be relaunched against the
+   // very pause that stopped it.
   }else if(s.state==="not_started"){
    // Worker loss: the run that owned this Phase-1 case is gone (server crash or
    // restart) and no result version exists. Re-launch WITHOUT consuming a retry —

@@ -6,7 +6,7 @@
 import type { ModelApiType } from "../../config/model-config.js";
 import { MemoryDocumentLedger } from "../documents/ledger.js";
 import { GatewayError, type ModelGateway } from "../gateway/client.js";
-import { loadCheckpoint } from "./checkpoint.js";
+import { GraphPaused, isGraphPaused, loadCheckpoint } from "./checkpoint.js";
 import { runNode0 } from "./node0-bind-summarize.js";
 import { runNode1 } from "./node1-extract.js";
 import { runNode2 } from "./node2-metrics.js";
@@ -52,6 +52,12 @@ export async function runPhase1(input: {
     // (timeout/pause). Skip only when the verdict actually exists; otherwise
     // --continue the same PI session.
     const node4Cp = await loadCheckpoint(input.workDir, "node4");
+    // A pause landing in the gap between Node 3 committing and the court writing
+    // its pi.pid has nothing to kill, so the marker is checked once more here.
+    // Without it that pause is silently swallowed and a full courtroom starts.
+    if (!node4Cp?.paths.evalJudgePath && (await isGraphPaused(input.workDir))) {
+      throw new GraphPaused("node3");
+    }
     if (!node4Cp?.paths.evalJudgePath) {
       const { state: piState, result } = await runNode4Pi(
         { ...state, round: 1 },
@@ -214,29 +220,43 @@ export async function resumePhase1Graph(input: {
   gateway: ModelGateway;
   attemptId: string;
 }): Promise<Phase1GraphState> {
+  // An operator pause during Nodes 0-3 has no PI process to kill, so it is
+  // enforced here. The check runs immediately before each node, which is the
+  // boundary the previous node's checkpoint was just committed at: a pause that
+  // arrives mid-node costs that one node and nothing more, and a pause already
+  // standing costs nothing at all. `last` names the node whose work is safe.
+  let last: Phase1GraphState["node"] = "node0";
+  const halt = async () => {
+    if (await isGraphPaused(input.workDir)) throw new GraphPaused(last);
+  };
   const cp =
     (await loadCheckpoint(input.workDir, "node3")) ??
     (await loadCheckpoint(input.workDir, "node2")) ??
     (await loadCheckpoint(input.workDir, "node1")) ??
     (await loadCheckpoint(input.workDir, "node0"));
-  if (!cp) {
-    let s = await runNode0(input);
-    s = await runNode1(s, input);
-    s = await runNode2(s, input);
-    s = await runNode3(s, input);
-    return s;
-  }
   let s = cp;
-  if (cp.node === "node0") {
-    s = await runNode1(s, input);
-    s = await runNode2(s, input);
-    s = await runNode3(s, input);
-  } else if (cp.node === "node1") {
-    s = await runNode2(s, input);
-    s = await runNode3(s, input);
-  } else if (cp.node === "node2") {
-    s = await runNode3(s, input);
+  if (s) last = s.node;
+  if (!s) {
+    await halt();
+    s = await runNode0(input);
+    last = "node0";
   }
+  if (s.node === "node0") {
+    await halt();
+    s = await runNode1(s, input);
+    last = "node1";
+  }
+  if (s.node === "node1") {
+    await halt();
+    s = await runNode2(s, input);
+    last = "node2";
+  }
+  if (s.node === "node2") {
+    await halt();
+    s = await runNode3(s, input);
+    last = "node3";
+  }
+  await halt();
   // node3 (or later): Nodes 0–3 are complete; proceed to Node 4.
   return s;
 }

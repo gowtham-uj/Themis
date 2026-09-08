@@ -8,6 +8,8 @@
  * These cover the parts that decide what gets retrieved: which providers run,
  * how their results merge, and the ref shape minos copies.
  */
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { providerSearch } from "../src/judge/phase2/agent-loop.ts";
 import { formatWebResults, webResearch, type WebResult } from "../src/judge/tools/web-research.ts";
@@ -59,6 +61,13 @@ const ARXIV_BODY = () =>
   `<summary>A study of agents that run their own tests.</summary></entry></feed>`;
 
 describe("web research providers", () => {
+  it("makes research a filing gate for every Phase1 improvement", async () => {
+    const prompt = await readFile(join(process.cwd(), "src", "judge", "prompts", "minos.md"), "utf8");
+    expect(prompt).toContain("Before filing any improvement");
+    expect(prompt).toMatch(/Call\s+`web_search` at least once/);
+    expect(prompt).toContain("If every search is denied or returns no source");
+  });
+
   it("queries the general web and arXiv together, papers first", async () => {
     process.env.SERPER_API_KEY = "test-key-not-real";
     delete process.env.SERPER_SEARCH_API_KEY;

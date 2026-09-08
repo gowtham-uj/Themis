@@ -51,7 +51,10 @@ describe("publishPhase2ArchiveView", () => {
     expect(manifest.layers).toEqual(["phase2"]);
   });
 
-  it("rejects a missing required artifact and a repeated publish", async () => {
+  // A missing artifact is still a hard failure. A repeat of an identical
+  // publish is not: the archive already holds every byte, which is what the
+  // caller asked for.
+  it("rejects a missing required artifact but accepts a repeated publish", async () => {
     const x = await fixture("r2");
     await rm(join(x.p2, "patterns.yaml"));
     await expect(
@@ -65,7 +68,12 @@ describe("publishPhase2ArchiveView", () => {
 
     const y = await fixture("r3");
     const args = { runId: "r3", campaignId: "c", archiveDir: y.base, phase2ArtifactDir: y.p2 };
-    await publishPhase2ArchiveView(args);
-    await expect(publishPhase2ArchiveView(args)).rejects.toThrow(/already carries layer phase2/);
+    const first = await publishPhase2ArchiveView(args);
+    const again = await publishPhase2ArchiveView(args);
+
+    expect(again.manifestSha256).toBe(first.manifestSha256);
+    expect(again.files).toBe(first.files);
+    const manifest = JSON.parse(await readFile(again.manifestPath, "utf8"));
+    expect(manifest.layers).toContain("phase2");
   });
 });

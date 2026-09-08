@@ -571,7 +571,8 @@ Subagents reach evidence only through the mediated tool surface in
 `themis-tools-extension.ts`. There is no filesystem, shell, or database access. Phase 2
 adds campaign-scoped tools to the Phase-1 set: `list_evals`, `list_patterns`,
 `read_pattern`, `read_improvements`, `read_lifecycle`, `read_judge_report`,
-`read_court_record`, `write_to_yaml_template`, and `web_search`. Each role gets a subset.
+`read_developer_brief`, `read_court_record`, `write_to_yaml_template`, and `web_search`.
+Each role gets a subset.
 The researcher is the only role holding `web_search`; the reviewer cannot read raw
 lifecycle evidence, which keeps it reviewing rather than re-investigating.
 
@@ -580,6 +581,13 @@ key is configured, a reader-backed provider is the no-key fallback, and arXiv is
 alongside general search for scholarly results. Providers use fixed hosts and URL-encoded
 queries, and every returned URL is recorded as a `web:` reference before it can support a
 research-backed recommendation.
+
+`read_developer_brief` returns Phase 1's own research for one run: remedy's
+`judge/developer-brief.yaml`, with the finding each recommendation answers and the `web:`
+sources it actually retrieved. Those URLs were fetched under the same recording rules, so a
+Phase-2 recommendation resting on them is legitimately `research_backed`. A run sealed before
+remedy existed answers `ABSENT`, which is not a denial. Without this the campaign could only
+cite its own searches, and every case's finished research was sealed and never read.
 
 ## Durability and control
 

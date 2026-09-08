@@ -157,7 +157,9 @@ export function SecretValueField({
           spellCheck={false}
           disabled={!ready || busy}
           onChange={(e) => setValue(e.target.value)}
-          placeholder={stored ? 'a key is saved for this variable' : 'paste the key to save it'}
+          // Three buttons share this row, so the input is never wide enough for a
+          // sentence. The hint below already says what "saved" means.
+          placeholder={stored ? 'saved' : 'paste key'}
         />
         <button
           type="button"
@@ -219,6 +221,12 @@ export function StageFields({
   // placeholder, so an empty target here would read as a dead control.
   const keyName = draft.apiKeyEnv.trim() || inherited?.apiKeyEnv || env?.apiKey || ''
   const webKeyName = draft.webSearchApiKeyEnv.trim() || inherited?.webSearchApiKeyEnv || 'SERPER_SEARCH_API_KEY'
+  // Report on the variable this field actually names. `inherited` describes the
+  // global stage, so on a project page it can answer for a different variable
+  // entirely: observed live as "name the environment variable holding the key"
+  // sitting next to a field reading "key saved" for the same name.
+  const keyFound = secrets?.has(keyName) || (inherited?.apiKeyPresent === true && inherited.apiKeyEnv === keyName)
+  const webKeyFound = secrets?.has(webKeyName) || (inherited?.webSearchApiKeyPresent === true && inherited.webSearchApiKeyEnv === webKeyName)
   return (
     <div className="form-grid">
       <div className="field">
@@ -250,11 +258,11 @@ export function StageFields({
           placeholder={inherited?.apiKeyEnv ?? env?.apiKey ?? ''}
         />
         <span className="hint">
-          {inherited?.apiKeyPresent ? (
-            <>key found in <Mono>{inherited.apiKeyEnv}</Mono></>
-          ) : (
-            <>name the environment variable holding the key.</>
-          )}
+          {!keyName
+            ? <>name the environment variable holding the key.</>
+            : keyFound
+              ? <>key found in <Mono>{keyName}</Mono></>
+              : <>no key found in <Mono>{keyName}</Mono> yet.</>}
         </span>
       </div>
       {secrets && (
@@ -278,11 +286,9 @@ export function StageFields({
             placeholder={inherited?.webSearchApiKeyEnv ?? 'SERPER_SEARCH_API_KEY'}
           />
           <span className="hint">
-            {inherited?.webSearchApiKeyPresent ? (
-              <>key found in <Mono>{inherited.webSearchApiKeyEnv}</Mono></>
-            ) : (
-              <>Serper covers the general web; arXiv runs alongside it.</>
-            )}
+            {webKeyFound
+              ? <>key found in <Mono>{webKeyName}</Mono>. Serper covers the general web; arXiv runs alongside it.</>
+              : <>Serper covers the general web; arXiv runs alongside it.</>}
           </span>
         </div>
       )}

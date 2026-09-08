@@ -306,8 +306,8 @@ Stage values resolve in this order: project override, deployment setting, stage 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/judge/runs/:runId/phase1` | Start or resume Phase 1. Returns `202`. |
-| `POST` | `/api/judge/runs/:runId/phase1/pause` | Pause the persisted PI courtroom. |
-| `GET` | `/api/judge/runs/:runId/phase1` | Read running, failed, not-started, or published status. |
+| `POST` | `/api/judge/runs/:runId/phase1/pause` | Pause the graph at its next committed node boundary and stop a live PI courtroom. Returns `paused: true`; `court_killed` says whether Node 4 had a process to stop. |
+| `GET` | `/api/judge/runs/:runId/phase1` | Read running, paused, failed, not-started, or published status. |
 | `GET` | `/api/judge/runs/:runId/results` | List immutable result versions for the run. |
 | `GET` | `/api/judge/results/:resultId` | Read one result version. |
 

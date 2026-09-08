@@ -756,13 +756,21 @@ function registerRoutes(router: Router): void {
     if (!body.name || !String(body.name).trim()) {
       throw badRequest("name is required");
     }
-    const slug =
+    const requestedSlug =
       body.slug?.trim() ||
       String(body.name)
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
         .replace(/^-|-$/g, "") ||
       "project";
+    // Projects are archived, not hard-deleted, so their globally unique slug
+    // remains occupied after the UI no longer lists them. Recreating the same
+    // project name used to leak SQLITE_CONSTRAINT_UNIQUE as a 500 on an
+    // otherwise empty Projects page. Keep old URLs stable and allocate the next
+    // readable slug instead.
+    const occupied = new Set(app.queries.listProjects({ includeArchived: true }).map((p) => p.slug));
+    let slug = requestedSlug;
+    for (let suffix = 2; occupied.has(slug); suffix += 1) slug = `${requestedSlug}-${suffix}`;
 
     const project = app.queries.createProject({
       name: String(body.name).trim(),

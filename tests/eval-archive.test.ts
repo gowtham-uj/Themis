@@ -270,7 +270,11 @@ describe("eval archive reseal", () => {
     expect(await verifyEvalArchive(archive!)).toMatchObject({ ok: true, errors: [] });
   });
 
-  it("rejects a second reseal of the same layer", async () => {
+  // A repeat of an identical reseal is a no-op, not a failure. Treating it as
+  // an error cost one live run its publication: its judge/ was already complete,
+  // the retry added nothing, and the item was marked failed beside a sealed
+  // ruling.
+  it("treats a second reseal of the same layer as a no-op", async () => {
     const { root, queries, dataDir } = await sealed("run_reseal_2");
     const src = join(dataDir, "judge-src");
     await mkdir(src, { recursive: true });
@@ -281,8 +285,13 @@ describe("eval archive reseal", () => {
       layers: [{ name: "judge", sourceDir: src }],
       queries,
     };
-    await resealEvalArchive(args);
-    await expect(resealEvalArchive(args)).rejects.toThrow(/already carries layer judge/);
+    const first = await resealEvalArchive(args);
+    const again = await resealEvalArchive(args);
+
+    expect(again.manifest.layers).toEqual(["judge"]);
+    expect(again.manifest.resealedAt).toBe(first.manifest.resealedAt);
+    expect(again.archive!.manifestSha256).toBe(first.archive!.manifestSha256);
+    expect(await verifyEvalArchive(again.archive!)).toMatchObject({ ok: true, errors: [] });
   });
 
   it("aborts when a base path changed under the seal", async () => {

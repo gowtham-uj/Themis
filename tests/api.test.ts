@@ -224,6 +224,21 @@ async function seedCompletedRun(
 }
 
 describe("REST API (P3c)", () => {
+  it("reuses an archived project's display name with a new stable slug", async () => {
+    const { base } = await boot();
+    const first = await http(base, "POST", "/api/projects", { body: { name: "Same project" } });
+    expect(first.status).toBe(201);
+    const old = first.json as { id: string; slug: string };
+    expect(old.slug).toBe("same-project");
+    expect((await http(base, "DELETE", `/api/projects/${old.id}`)).status).toBe(200);
+
+    // The archived row still owns `same-project`, but it no longer appears in
+    // the normal list. Creation must not turn that hidden row into a blanket 500.
+    const second = await http(base, "POST", "/api/projects", { body: { name: "Same project" } });
+    expect(second.status).toBe(201);
+    expect((second.json as { slug: string }).slug).toBe("same-project-2");
+  });
+
   it("project + canonical eval package creation, immutability, and 404 problem shape", async () => {
     const { base } = await boot();
 

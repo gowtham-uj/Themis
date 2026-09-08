@@ -84,6 +84,31 @@ describe("project pipeline coordinator",()=>{
   expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
   await db.close();
  });
+ it("holds an operator-paused Phase1 case without retrying or relaunching it",async()=>{
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"paused-p",evalQueueId:"paused-eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});
+  const item=await db.pipeline.addItem({generationId:g.id,evalId:"e",ordinal:1});
+  await db.pipeline.updateItem(item.id,"eval_pending",{state:"archive_sealed",runId:"run-e",baseArchiveId:"a"});
+  await db.pipeline.updateItem(item.id,"archive_sealed",{state:"phase1_pending"});
+  await db.pipeline.updateItem(item.id,"phase1_pending",{state:"phase1_running"});
+  let starts=0;
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(){return{state:"completed",runId:"run-e",archiveId:"a"}},
+   async startPhase1(){starts++;return{operationId:"must-not-start"}},
+   async getPhase1Status(){return{state:"paused"}},
+   async runPhase2(){throw new Error("Phase2 must not start while Phase1 is paused")},
+   async publishFinalView(){throw new Error("nothing to publish")},
+  };
+  const r=await advanceProjectPipeline({db,services,generationId:g.id});
+  const held=await db.pipeline.getItem(item.id);
+  expect(held?.state).toBe("phase1_running");
+  expect(held?.retryCount).toBe(0);
+  expect(starts).toBe(0);
+  expect(r.waitingFor).toBe("phase1");
+  await db.close();
+ });
  it("honors manual Phase2 trigger when autoPhase2 is disabled",async()=>{
   const db=createSqlitePhase2Db(new Database(":memory:"));
   const q=await db.pipeline.createQueue({projectId:"p2",evalQueueId:"eq2",name:"q",autoPhase2:false});const g=await db.pipeline.createGeneration({queueId:q.id,configJson:"{}"});const item=await db.pipeline.addItem({generationId:g.id,evalId:"e",ordinal:1});

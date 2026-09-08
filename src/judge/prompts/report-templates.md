@@ -333,7 +333,9 @@ still_open: |
 
 # 4. MINOS — FINAL judge report
 
-`judge/evalJudge.yaml` · **written once, after the final round**
+template `evalJudge` · **filed once, after the final round**
+
+Filed to your own report; the host projects `judge/evalJudge.yaml` from it verbatim.
 
 This is the deliverable for the eval. Everything above it was working material; this is
 what the case produced. It stands on the whole record — every round, every kratos and

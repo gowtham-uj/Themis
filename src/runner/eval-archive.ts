@@ -754,6 +754,63 @@ async function inventory(root: string, dir: string): Promise<EvalArchiveFile[]> 
 }
 
 /**
+ * Take the archive's single-writer seal lock, reclaiming one no live writer holds.
+ *
+ * The lock used to be an empty file removed only in the writer's `finally`. A
+ * killed or restarted worker therefore left it behind forever, and every later
+ * reseal of that run failed with "already in progress" against a writer that no
+ * longer existed. One live case lost a complete ruling that way. The lock now
+ * records the owning pid and the time it was taken, so a lock whose process is
+ * gone (or that is older than the staleness window, which covers a pid recycled
+ * onto another program) is reclaimed instead of blocking the run permanently.
+ */
+const SEAL_LOCK_STALE_MS = 60 * 60 * 1000;
+
+async function acquireSealLock(lockPath: string, runId: string) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      await handle.writeFile(`${JSON.stringify({ pid: process.pid, takenAt: new Date().toISOString() })}\n`);
+      return handle;
+    } catch (err) {
+      if (!err || typeof err !== "object" || (err as { code?: string }).code !== "EEXIST") throw err;
+      if (attempt === 1) break;
+      if (!(await sealLockIsStale(lockPath))) break;
+      await rm(lockPath, { force: true }).catch(() => undefined);
+    }
+  }
+  throw new Error(`eval archive reseal already in progress for run ${runId}`);
+}
+
+/** True when the recorded owner is gone, unreadable, or older than the window. */
+async function sealLockIsStale(lockPath: string): Promise<boolean> {
+  const raw = await readFile(lockPath, "utf8").catch(() => null);
+  if (raw === null) return false;
+  let owner: { pid?: unknown; takenAt?: unknown } = {};
+  try {
+    owner = JSON.parse(raw) as typeof owner;
+  } catch {
+    // A lock written before this format existed carries no owner at all, so it
+    // can only be judged by age.
+    const stat = await lstat(lockPath).catch(() => null);
+    return stat ? Date.now() - stat.mtimeMs > SEAL_LOCK_STALE_MS : false;
+  }
+  const takenAt = typeof owner.takenAt === "string" ? Date.parse(owner.takenAt) : Number.NaN;
+  if (Number.isFinite(takenAt) && Date.now() - takenAt > SEAL_LOCK_STALE_MS) return true;
+  const pid = typeof owner.pid === "number" ? owner.pid : null;
+  if (pid === null) return true;
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    // ESRCH: no such process. EPERM: it exists but belongs to another user, so
+    // it may well still be writing — leave that lock alone.
+    return (err as { code?: string }).code === "ESRCH";
+  }
+}
+
+/**
  * Reseal one sealed archive in place with a new layer of judgement output.
  *
  * The base evidence directory is the only archive an eval ever gets. Phase 1
@@ -796,15 +853,7 @@ export async function resealEvalArchive(input: {
   // One writer at a time. The lock lives beside the archive so it is never
   // inventoried as evidence.
   const lockPath = `${root}.seal.lock`;
-  let lock;
-  try {
-    lock = await open(lockPath, "wx", 0o600);
-  } catch (err) {
-    if (err && typeof err === "object" && (err as { code?: string }).code === "EEXIST") {
-      throw new Error(`eval archive reseal already in progress for run ${input.runId}`);
-    }
-    throw err;
-  }
+  const lock = await acquireSealLock(lockPath, input.runId);
   try {
     const prior = await readFile(manifestPath, "utf8");
     const priorManifest = JSON.parse(prior) as EvalArchiveManifest;
@@ -820,6 +869,7 @@ export async function resealEvalArchive(input: {
     // would change or drop a sealed path is still refused below.
     const present: { name: string; sourceDir: string }[] = [];
     const completed: string[] = [];
+    const satisfied: string[] = [];
     for (const l of layers) {
       const src = await lstat(l.sourceDir).catch(() => null);
       if (!src?.isDirectory()) continue;
@@ -828,16 +878,24 @@ export async function resealEvalArchive(input: {
       );
       if (priorLayers.includes(l.name) || sealedPaths.length > 0) {
         const additions = await newLayerFiles(root, l);
+        // Nothing to add means the archive already holds every byte this source
+        // carries, which is the postcondition the caller asked for. This used to
+        // throw, and a live case paid for it: a run whose judge/ was already
+        // complete retried, added nothing, and the publication was recorded as
+        // `failed` even though the sealed ruling was sitting right there. A
+        // no-op is not a failure.
         if (additions === 0) {
-          throw new Error(
-            `archive for run ${input.runId} already carries layer ${l.name} and the source adds nothing new`,
-          );
+          satisfied.push(l.name);
+          continue;
         }
         completed.push(l.name);
       }
       present.push(l);
     }
     if (present.length === 0) {
+      // Every requested layer is already sealed exactly as asked: return the
+      // archive as it stands rather than rewriting an identical manifest.
+      if (satisfied.length > 0) return { archive: existing ?? null, manifest: priorManifest };
       throw new Error(`no reseal layer source exists for run ${input.runId}`);
     }
 

@@ -40,6 +40,9 @@ export interface Phase1CaseProgress {
   /** Report/log files committed under judge/, newest last. */
   judgeFiles: readonly string[];
   published: boolean;
+  /** An operator pause is standing against this case. The graph stops at its
+   *  next node boundary, so `active` names the node that will be re-run. */
+  paused: boolean;
 }
 
 export interface StageProgress {
@@ -73,6 +76,16 @@ export interface StageProgress {
     /** Archives resealed with phase2/, i.e. items at final_view_published. */
     resealed: number;
     members: number;
+    /**
+     * Published Phase-1 judgements the campaign did not cover.
+     *
+     * A case whose Phase 1 publishes after the campaign froze its membership is
+     * a complete, addressable verdict that no developer pack analyzed. It was
+     * invisible before: the generation reported `completed` with 10 published
+     * judgements and an 8-member pack, and nothing said which two were left
+     * out. The next campaign covers them.
+     */
+    excludedFromCampaign: number;
     artifacts: readonly string[];
     developerPack: boolean;
   };
@@ -129,6 +142,7 @@ export async function readPhase1Case(
     round,
     judgeFiles: await listDir(join(workDir, "node4", "judge")),
     published,
+    paused: !published && (await exists(join(workDir, ".paused"))),
   };
 }
 
@@ -151,13 +165,20 @@ export async function stageProgress(input: {
   const phase1Items = items.filter((x) => x.runId);
   const cases = await Promise.all(phase1Items.map((x) => readPhase1Case(input.dataDir, x)));
 
-  const phase2Started = ["phase2_running", "finalizing", "completed"].includes(generation.state);
+  // A manual Phase-2 pause parks the generation in `paused` but deliberately
+  // leaves the campaign in `analyzing` so resume can continue the same board.
+  // Treat that combination as Phase 2. Falling back to item states labels the
+  // run "Evals" because all items are merely phase1_published at that moment.
+  const phase2CampaignActive = input.campaign?.state === "analyzing";
+  const phase2Started = ["phase2_running", "finalizing", "completed"].includes(generation.state)
+    || (["paused", "waiting_retry"].includes(generation.state) && phase2CampaignActive);
   const artifacts = input.campaign
     ? await listDir(join(input.dataDir, "phase2_artifacts", input.campaign.id))
     : [];
 
   const stage: StageKey | null =
     generation.state === "phase2_running" || generation.state === "finalizing" || input.phase2Running
+      || (["paused", "waiting_retry"].includes(generation.state) && phase2CampaignActive)
       ? "phase2"
       : generation.state === "phase2_ready" || items.some((x) => x.state === "phase1_running" || x.state === "phase1_pending")
         ? "phase1"
@@ -190,6 +211,11 @@ export async function stageProgress(input: {
       campaignState: input.campaign?.state ?? null,
       resealed: items.filter((x) => x.state === "final_view_published").length,
       members: input.campaignMembers ?? 0,
+      // Only meaningful once a campaign exists; before that every judgement is
+      // simply still waiting for one.
+      excludedFromCampaign: input.campaign
+        ? items.filter((x) => x.state === "phase1_published").length
+        : 0,
       artifacts,
       developerPack: artifacts.includes("developer-improvement-pack.zip"),
     },

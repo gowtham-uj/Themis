@@ -59,7 +59,11 @@ describe("WP-12 publishJudgeArchiveView", () => {
     expect(manifest.resealedAt).toMatch(/^\d{4}-/);
   });
 
-  it("refuses to publish the same layer twice", async () => {
+  // Republishing an identical judge/ is the postcondition already met, so it
+  // returns the standing view instead of failing. This used to throw, and a
+  // live run paid for it: its judge/ was complete, the retry added nothing, and
+  // the item was recorded `failed` beside a sealed ruling.
+  it("republishes an identical judge layer as a no-op", async () => {
     const root = await mkdtemp(join(tmpdir(), "ae-view2-"));
     const base = join(root, "base");
     const judge = join(root, "judge-src");
@@ -70,7 +74,14 @@ describe("WP-12 publishJudgeArchiveView", () => {
     await writeFile(join(judge, "evalJudge.yaml"), "final_report: true\n");
 
     const args = { runId: "run_2", trackId: "t", baseArchiveDir: base, judgeDir: judge };
-    await publishJudgeArchiveView(args);
-    await expect(publishJudgeArchiveView(args)).rejects.toThrow(/already carries layer judge/);
+    const first = await publishJudgeArchiveView(args);
+    const again = await publishJudgeArchiveView(args);
+
+    expect(again.result.reportSha256).toBe(first.result.reportSha256);
+    expect(await readFile(join(base, "judge", "evalJudge.yaml"), "utf8")).toBe(
+      "final_report: true\n",
+    );
+    const manifest = JSON.parse(await readFile(again.manifestPath, "utf8"));
+    expect(manifest.layers).toContain("judge");
   });
 });

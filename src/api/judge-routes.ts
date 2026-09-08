@@ -307,11 +307,10 @@ export function registerJudgeRoutes(router: Router, phase1: Phase1Service): void
     // Same reason as the project-scoped pause: an unknown run must be a 404, not a
     // 200 that reads like the judge was already stopped.
     if (!app.queries.getRun(runId)) throw notFound("run not found");
-    const { pausePiWorkDir } = await import("../judge/pi/runtime.js");
-    const primary = join(app.dataDir, "judge_work", `case_${runId}`, "node4");
-    let out = await pausePiWorkDir(primary);
-    if (!out.killed) out = await pausePiWorkDir(join(app.dataDir, "judge_work", runId));
-    sendJson(res, 200, { paused: out.killed, pid: out.pid, run_id: runId, resumable: true });
+    // Same reason as the project-scoped route: a pause during Nodes 0-3 has no
+    // PI process to kill, so it must write the graph pause marker as well.
+    const out = await phase1.pause(runId);
+    sendJson(res, 200, { paused: true, court_killed: out.killed, pid: out.pid, run_id: runId, resumable: true });
   });
 
   /** Resume is POST /api/judge/runs/:runId/phase1 — it --continues the PI session. */

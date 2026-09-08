@@ -176,7 +176,7 @@ export class GatewayPhase2Analyst implements Phase2Analyst {
             "RULES:",
             "1. Recommend ONLY on agent-owned patterns. Ignore harness-owned patterns.",
             "2. Ground every recommendation in evidence and in the investigator hypotheses when provided.",
-            "3. researchBasis MUST be empty unless a real URL was provided in research notes; class research_backed requires a non-empty researchBasis.",
+            "3. researchBasis MUST be empty unless a real URL was actually retrieved: one from the campaign research notes, or a web: source in a case's Phase-1 developer brief (read_developer_brief). class research_backed requires a non-empty researchBasis.",
             "4. If rewards were NOT attributable, do NOT use pass_rate as the primary metric; use process metrics. Do not recommend fixing the verifier as an agent change.",
             "5. Skip any recommendation id listed in memory.rejectedRecommendationIds.",
             "6. implementationHandoff.themisKnowsExactSourceLocation MUST be false. likelyInternalAreas are navigation hints, not file claims.",

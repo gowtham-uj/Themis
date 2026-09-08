@@ -70,6 +70,18 @@ export default function Queue() {
     enabled: Boolean(generationId),
     refetchInterval: 4000,
   })
+  // Per-case pause state. A single paused case never changes the judge queue's
+  // status, so without this the row keeps reading "judging" and still offers a
+  // Pause button after the graph has already halted.
+  const progress = useQuery({
+    queryKey: ['progress', id, generationId],
+    queryFn: () => api.get<{ phase1: { cases: { runId: string; paused: boolean }[] } }>(
+      `/api/projects/${id}/pipeline/generation/${generationId}/progress`,
+    ),
+    enabled: Boolean(generationId),
+    refetchInterval: 4000,
+    retry: false,
+  })
   const builtins = useQuery({
     queryKey: ['builtin-adapters'],
     queryFn: () => api.get<{ adapters: string[] }>('/api/adapters/builtin'),
@@ -249,6 +261,8 @@ export default function Queue() {
   const genItems = gen.data?.items ?? []
   const judgingNow = genItems.some((it) => it.state === 'phase1_running')
   const judgePaused = judgeQ.data?.status?.status === 'paused' || judgeQ.data?.queue?.status === 'paused'
+  const pausedRuns = new Set((progress.data?.phase1.cases ?? []).filter((c) => c.paused).map((c) => c.runId))
+  const casePaused = (runId: string | null | undefined) => Boolean(runId && pausedRuns.has(runId))
   // A paused board keeps its campaign in `analyzing` on purpose: that is what
   // makes resume continue the same session instead of publishing a half-filed
   // pass. So `analyzing` alone does not mean running — the generation parking in
@@ -275,7 +289,15 @@ export default function Queue() {
   const started = Boolean(generationId)
   // Before a run exists this panel describes the next one, so the previous
   // generation's terminal status must not be shown as if it were its state.
-  const runState = live ? (paused ? 'paused' : 'running') : (started ? (queue?.status ?? 'idle') : 'not started')
+  // A run is the generation, so once one exists its state is the run's state.
+  // `queue.status` only describes the eval container, and it reads `completed`
+  // the moment the last eval seals. Observed live: "Current run · completed"
+  // sitting beside "generation 1 · judging" while the courtroom was mid-session.
+  const runState = live
+    ? (paused ? 'paused' : 'running')
+    : started
+      ? (genState ?? queue?.status ?? 'idle')
+      : 'not started'
 
   return (
     <>
@@ -475,7 +497,10 @@ export default function Queue() {
                     <tr key={it.id}>
                       <td className="num">{it.ordinal ?? ''}</td>
                       <td style={{ color: 'var(--text)' }}>{t?.name ?? '—'} <Mono copy>{it.evalId}</Mono></td>
-                      <td><StateBadge state={it.state} /></td>
+                      {/* A judge pause freezes the PI session but leaves the item
+                          in `phase1_running`, so the row kept reading "judging"
+                          with a live Pause button after the courtroom stopped. */}
+                      <td><StateBadge state={it.state === 'phase1_running' && (judgePaused || casePaused(it.runId)) ? 'paused' : it.state} /></td>
                       <td>
                         {it.runId
                           ? <Link to={`/runs/${it.runId}`}><Mono copy>{it.runId}</Mono></Link>
@@ -485,13 +510,15 @@ export default function Queue() {
                         {it.phase1ResultVersionId
                           ? <Mono>{it.phase1ResultVersionId}</Mono>
                           : (it.state === 'phase1_running' && it.runId
-                            ? (
-                              <button
-                                onClick={() => api.post(`/api/projects/${id}/runs/${it.runId}/phase1/pause`).then(invalidate, (e) => setMsg({ tone: 'danger', text: errText(e) }))}
-                              >
-                                Pause this case
-                              </button>
-                            )
+                            ? (judgePaused || casePaused(it.runId)
+                              ? <span className="hint">Paused. Resume continues this case.</span>
+                              : (
+                                <button
+                                  onClick={() => api.post(`/api/projects/${id}/runs/${it.runId}/phase1/pause`).then(invalidate, (e) => setMsg({ tone: 'danger', text: errText(e) }))}
+                                >
+                                  Pause this case
+                                </button>
+                              ))
                             : '—')}
                       </td>
                     </tr>

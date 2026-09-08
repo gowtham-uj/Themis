@@ -119,18 +119,21 @@ describe("completing a partially sealed layer", () => {
     );
   });
 
-  it("still refuses a retry that adds nothing new", async () => {
+  it("accepts a retry that adds nothing new without touching the seal", async () => {
     const { archiveDir, root } = await sealedWithPartialJudge();
     const same = join(root, "same-judge");
     await put(same, "quality-report.json", '{"passed":false}');
 
-    await expect(
-      resealEvalArchive({
-        runId: "run_partial",
-        archiveDir,
-        layers: [{ name: "judge", sourceDir: same }],
-      }),
-    ).rejects.toThrow(/adds nothing new/);
+    const { manifest } = await resealEvalArchive({
+      runId: "run_partial",
+      archiveDir,
+      layers: [{ name: "judge", sourceDir: same }],
+    });
+
+    expect(manifest.layers).toContain("judge");
+    expect(await readFile(join(archiveDir, "judge", "quality-report.json"), "utf8")).toBe(
+      '{"passed":false}',
+    );
   });
 });
 

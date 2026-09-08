@@ -22,6 +22,9 @@ const projectId = arg("project", "");
 const generationId = arg("generation", "");
 const evalCount = Number(arg("evals", "10"));
 const maxMinutes = Number(arg("max-minutes", "720"));
+const evalPauseAlreadyChecked = arg("eval-pause-checked", "false") === "true";
+const phase1PauseAlreadyChecked = arg("phase1-pause-checked", "false") === "true";
+const phase2PauseAlreadyChecked = arg("phase2-pause-checked", "false") === "true";
 if (!projectId || !generationId) throw new Error("--project and --generation are required");
 
 await mkdir(outDir, { recursive: true });
@@ -41,9 +44,18 @@ async function shot(label) {
 }
 
 async function json(path) {
-  const res = await fetch(`${api}${path}`);
-  if (!res.ok) throw new Error(`${path} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  return res.json();
+  let last;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      const res = await fetch(`${api}${path}`);
+      if (!res.ok) throw new Error(`${path} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      return await res.json();
+    } catch (error) {
+      last = error;
+      if (attempt < 9) await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  throw last;
 }
 
 async function generation() {
@@ -93,9 +105,9 @@ async function exerciseStageControl(rowText, label) {
 await page.goto(`${base}/projects/${projectId}/runs/${generationId}`, { waitUntil: "networkidle" });
 await shot("attached-run-panel");
 
-let evalPauseChecked = false;
-let phase1PauseChecked = false;
-let phase2PauseChecked = false;
+let evalPauseChecked = evalPauseAlreadyChecked;
+let phase1PauseChecked = phase1PauseAlreadyChecked;
+let phase2PauseChecked = phase2PauseAlreadyChecked;
 let completed = false;
 let lastState = "";
 

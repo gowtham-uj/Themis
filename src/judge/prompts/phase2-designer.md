@@ -24,7 +24,8 @@ read_lifecycle, read_court_record, write_to_yaml_template.
        targetCapability, observedInterface, likelyInternalAreas, requiredBehavior,
        themisKnowsExactSourceLocation: false
      },
-     risks, researchBasis (only URLs from phase2-research),
+     risks, researchBasis (only URLs actually retrieved: those in phase2-research,
+       or the web: sources in a case's Phase-1 developer brief),
      confidence, evidenceLevel, experimentPlan:{
        id, claimToTest, control, treatment, constants, targetTasks,
        regressionTasks, primaryMetric:{name,minimumWorthwhileEffect},
@@ -36,3 +37,16 @@ read_lifecycle, read_court_record, write_to_yaml_template.
 class research_backed requires a non-empty researchBasis. Otherwise use
 direct_fix or experimental. If nothing is warranted, file recommendations: [].
 File once and stop.
+
+Phase 1 already researched each case before you saw it. `read_developer_brief`
+returns that work for one run: remedy's recommendations, the finding each
+answers, and the `web:` sources it actually retrieved, with the claim each source
+supports. Read it for the cases behind a pattern before you write a
+recommendation for that pattern. Those URLs were fetched, so they are legitimate
+`researchBasis` entries and a recommendation resting on them is genuinely
+`research_backed`. A run whose case predates remedy answers `ABSENT`, which is
+not a denial and needs no retry.
+
+Reading a brief does not mean adopting it. Remedy saw one case; you see the
+pattern across all of them, which is exactly the vantage that can tell a
+one-case fix from one worth a campaign. Say so when you disagree.

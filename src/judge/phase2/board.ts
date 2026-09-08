@@ -186,7 +186,8 @@ export class GatewayPhase2Board implements Phase2Board {
         "Recommend ONLY on agent-owned patterns. Do not recommend fixing the verifier as an agent change.",
         "If rewards are not attributable, do not use pass_rate as the primary metric.",
         "implementationHandoff.themisKnowsExactSourceLocation MUST be false.",
-        "researchBasis only from provided research notes with real URLs.",
+        "researchBasis only from URLs actually retrieved: the provided research notes, or the web: sources in a case's Phase-1 developer brief.",
+        "Call read_developer_brief on cases behind a pattern before recommending on it: Phase 1 already researched each case and its sources are real. ABSENT means the case predates that step, not a denial.",
         "When done, call submit_recommendations with a JSON array of recommendations (or {recommendations:[...]}).",
       ].join("\n"),
       user: JSON.stringify({
