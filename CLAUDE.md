@@ -81,6 +81,7 @@ Notes:
 
 ## Quality gates
 
+- Git commits list the GitHub account `gowtham-uj` as the sole author. Do not add `Co-Authored-By` or assistant attribution.
 - Typecheck and retained tests green.
 - Canonical trace faithfully reflects raw adapter output.
 - Verifier output is authoritative for eval reward.

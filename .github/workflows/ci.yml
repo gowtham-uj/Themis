@@ -27,10 +27,11 @@ jobs:
       - run: npm run lint
       - run: npm run build
       - name: Run retained tests
-        env:
-          AGENTEVAL_PODMAN: "1"
-          AGENTEVAL_PODMAN_SUDO: "0"
-        run: npm test
+        # The retained suite creates rootful Podman containers, enters their
+        # network namespaces to install nftables rules, and cleans up files
+        # written through root-owned bind mounts. Run the whole test process as
+        # root so namespace enforcement and cleanup use one consistent owner.
+        run: sudo env "PATH=$PATH" AGENTEVAL_PODMAN=1 AGENTEVAL_PODMAN_SUDO=0 npm test
 
   web:
     runs-on: ubuntu-24.04

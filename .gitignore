@@ -15,3 +15,4 @@ context.md
 .env.test
 .env
 .env.local
+.claude/
