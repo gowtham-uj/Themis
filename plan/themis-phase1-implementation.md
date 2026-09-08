@@ -23,7 +23,7 @@ Established by direct probe, not assumption:
 | `SCHEMA_VERSION` | 10 |
 | Postgres / S3 / CAS in repo | **absent** |
 | LLM client in repo | **absent entirely** — no SDK, no provider call path |
-| `@earendil-works/pi-coding-agent` | present as a **spawned CLI binary only**; SDK not resolvable from agenteval |
+| `@earendil-works/pi-coding-agent` | present as a **spawned CLI binary only**; SDK not resolvable from Themis |
 | `pi-subagents`, `@quintinshaw/pi-dynamic-workflows`, `@langchain/langgraph` | absent locally, **present on the registry** (0.54.0 / 3.7.0 / 1.4.12) |
 | `yaml` package | absent (repo uses a hand-rolled safe-subset parser, read-only) |
 | Archive hashing | full-buffer `readFile` + one-shot sha256 |

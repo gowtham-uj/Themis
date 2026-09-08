@@ -1,6 +1,6 @@
 # Adapter Generator Authoring Guide
 
-This guide is the executable contract for integrating a real CLI agent with agenteval through
+This guide is the executable contract for integrating a real CLI agent with Themis through
 `POST /api/projects/:projectId/adapters/from-generator`.
 
 An adapter generator is a user-authored **bash or Node.js script**. Agenteval optionally clones the

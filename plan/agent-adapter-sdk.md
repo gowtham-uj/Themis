@@ -1,9 +1,9 @@
 # Agent Adapter SDK — integrate a real CLI agent
 
-An agenteval project may own one agent adapter definition. A queue either uses that owned real CLI
+A Themis project may own one agent adapter definition. A queue either uses that owned real CLI
 agent or explicitly selects one enabled shared adapter-store row by `shared_adapter_id`; there is no
 implicit fallback. The selected agent runs inside the queue-owned Podman container. Its adapter teaches
-agenteval how to configure the CLI for a provider/model, verify the real connection, run prompts, parse
+Themis how to configure the CLI for a provider/model, verify the real connection, run prompts, parse
 live output, and collect native logs and trajectories.
 
 Adapters are project-scoped CRUD resources. They are not test doubles, model simulators, or agent
@@ -13,7 +13,7 @@ or failed explicitly; it is never replaced with a fake or mock.
 
 ## Lifecycle contract
 
-For each queue container, agenteval performs this order:
+For each queue container, Themis performs this order:
 
 1. Resolve the queue's owned adapter or explicit `shared_adapter_id`, plus its pinned provider/model.
 2. Start the adapter's pinned OCI image as the persistent queue container.
@@ -209,7 +209,7 @@ must treat stored traces and artifacts as sensitive.
 ## Canonical JSONL output
 
 A new third-party agent is easiest to integrate by adding a thin wrapper in its image that converts
-native CLI events to agenteval canonical JSONL. Each stdout line must validate against
+native CLI events to Themis canonical JSONL. Each stdout line must validate against
 [`event-schema.md`](event-schema.md). At minimum emit meaningful model messages/tool activity; the
 harness owns durable run boundaries and will normalize run ids and sequence numbers.
 

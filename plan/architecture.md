@@ -1,6 +1,6 @@
 # Architecture
 
-agenteval is an API-only backend. All project, adapter, eval-package, queue, container, run, event, and
+Themis is an API-only backend. All project, adapter, eval-package, queue, container, run, event, and
 archive operations are exposed through HTTP APIs.
 
 ## Components
