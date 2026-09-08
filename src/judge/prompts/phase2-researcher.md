@@ -16,7 +16,9 @@ list_patterns, write_to_yaml_template.
    eval id, not a file path).
 3. Cite only URLs that came back from web_search. If search returns DENIED or
    empty, techniques must be [].
-4. File template `phase2-research` with fields:
-   notes: [{hypothesisId, techniques:[{url,claim}], applicable, notes}]
+4. Call `write_to_yaml_template` with `template: "phase2-research"` and
+   the tool's outer `fields` argument set directly to:
+   `{notes: [{hypothesisId, techniques: [{url, claim}], applicable: true|false, notes}]}`.
+   Do not put another key named `fields` inside `fields`.
 
 Do not invent URLs. Do not re-diagnose the evals. File once and stop.

@@ -1,10 +1,13 @@
 /** Durable Phase-1 pause status across service restarts. */
+import Database from "better-sqlite3";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { isGraphPaused, markGraphPaused } from "../src/judge/graph/checkpoint.ts";
+import { migrate } from "../src/db/sqlite/migrate.ts";
+import { upsertResultVersion } from "../src/db/sqlite/results.ts";
 import { Phase1Service } from "../src/judge/phase1-service.ts";
 
 describe("Phase1Service pause status", () => {
@@ -18,6 +21,24 @@ describe("Phase1Service pause status", () => {
     // not_started and automatically relaunches the operator-paused case.
     const restarted = new Phase1Service(dataDir);
     await expect(restarted.status("run-1")).resolves.toEqual({ state: "paused" });
+  });
+
+  it("returns an opaque archive-view identity instead of its absolute host path", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "ae-p1-service-published-"));
+    const db = new Database(join(dataDir, "themis.sqlite"));
+    migrate(db);
+    upsertResultVersion(db, {
+      id: "jrv_run_1", runId: "run-1", trackId: "default",
+      reportSha256: "ab".repeat(32), reportPath: "judge/evalJudge.yaml",
+      archiveViewPath: "/work/agenteval/data/projects/p/evals/run-1",
+      publicationState: "published", schemaVersion: 1,
+    });
+    db.close();
+
+    const service = new Phase1Service(dataDir);
+    await expect(service.status("run-1")).resolves.toEqual({
+      state: "published", resultVersionId: "jrv_run_1", archiveViewId: "jrv_run_1",
+    });
   });
 
   it("resume clears the marker even while the current node is still running", async () => {

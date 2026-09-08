@@ -34,6 +34,8 @@ describe("writePhase2PiSubagentDefs", () => {
 
     const designer = await readFile(join(dir, "agents", "designer.md"), "utf8");
     expect(designer).toContain("write_to_yaml_template");
+    expect(designer).toContain("read_developer_brief");
+    expect(investigator).not.toContain("read_developer_brief");
     expect(designer).toContain("DESIGNER BODY");
 
     const reviewer = await readFile(join(dir, "agents", "reviewer.md"), "utf8");
@@ -45,10 +47,10 @@ describe("writePhase2PiSubagentDefs", () => {
 
 describe("resolveBoardOutcome", () => {
   const ROLES = {
-    "phase2-hypotheses.yaml": "hypotheses:\n  - id: h1\n    statement: agents skip the failing test\n",
-    "phase2-research.yaml": "notes:\n  - id: n1\n    hypothesisId: h1\n    summary: read the docs\n",
-    "phase2-recommendations.yaml": "recommendations:\n  - id: r1\n    title: run the tests first\n",
-    "phase2-review.yaml": "verdict: accept\n",
+    "phase2-hypotheses.yaml": "hypotheses:\n  - id: h1\n    patternId: p1\n    claim: agents skip the failing test\n    supportingObservations: [trace:r1]\n    contradictingObservations: []\n    likelyMechanism: [example-only probing]\n    confidence: high\n",
+    "phase2-research.yaml": "notes:\n  - hypothesisId: h1\n    techniques: []\n    applicable: false\n    notes: no source\n",
+    "phase2-recommendations.yaml": "recommendations:\n  - id: r1\n    patternIds: [p1]\n    class: direct_fix\n    priority: P1\n    targetCapability: verification\n    observedBehavior: skipped test\n    likelyMechanism: example-only probing\n    implementationRequirements: [run tests]\n    implementationHandoff: {targetCapability: verification, observedInterface: trace, likelyInternalAreas: [runbook], requiredBehavior: [run tests], themisKnowsExactSourceLocation: false}\n    risks: []\n    researchBasis: []\n    confidence: high\n    evidenceLevel: observational\n    experimentPlan: {id: e1, claimToTest: tests catch defects, control: current, treatment: test-first, constants: [task], targetTasks: [r1], regressionTasks: [clean], primaryMetric: {name: catch_rate, minimumWorthwhileEffect: one}, secondaryMetrics: [], regressionLimits: {pass_rate: no drop}, suggestedSample: {tasks: 1, seedsPerTask: 1}, successConditions: [defect caught]}\n",
+    "phase2-review.yaml": "keptIds: [r1]\ndropped: []\nnotes: keep\n",
   };
 
   async function board(files: Record<string, string>): Promise<string> {
@@ -65,6 +67,49 @@ describe("resolveBoardOutcome", () => {
     expect(out.hypotheses).toHaveLength(1);
     expect(out.research).toHaveLength(1);
     expect(out.recommendations).toHaveLength(1);
+  });
+
+  it("recovers later complete filings from the nested-fields shape emitted live", async () => {
+    const files = {
+      ...ROLES,
+      "phase2-hypotheses.yaml": [
+        "note: test",
+        "---",
+        "h1:",
+        "  id: h1",
+        "  patternId: p1",
+        "  likelyMechanism: example-only probing",
+        "  supportingObservations: [trace:r1]",
+        "  contradictingObservations: []",
+        "  confidence: high",
+      ].join("\n"),
+      "phase2-recommendations.yaml": [
+        "fields: false",
+        "---",
+        "fields:",
+        "  recommendations:",
+        "    - id: r1",
+        "      patternIds: [p1]",
+        "      class: research_backed",
+        "      priority: P1",
+        "      targetCapability: verification",
+        "      observedBehavior: skipped test",
+        "      likelyMechanism: example-only probing",
+        "      implementationRequirements: run tests",
+        "      implementationHandoff: {targetCapability: verification, observedInterface: trace, likelyInternalAreas: runbook, requiredBehavior: run tests, themisKnowsExactSourceLocation: false}",
+        "      risks: none",
+        "      researchBasis: [web:https://example.org/testing]",
+        "      confidence: high",
+        "      evidenceLevel: research-backed",
+        "      experimentPlan: {id: e1, claimToTest: tests catch defects, control: current, treatment: test-first, constants: task, targetTasks: r1, regressionTasks: clean, primaryMetric: {name: catch_rate, minimumWorthwhileEffect: one}, secondaryMetrics: none, regressionLimits: no-drop, suggestedSample: {tasks: 1, seedsPerTask: 1}, successConditions: defect-caught}",
+      ].join("\n"),
+    };
+    const out = await resolveBoardOutcome(await board(files));
+    expect(out.hypotheses).toHaveLength(1);
+    expect(out.hypotheses[0]?.claim).toBe("example-only probing");
+    expect(out.recommendations).toHaveLength(1);
+    expect(out.recommendations[0]?.implementationRequirements).toEqual(["run tests"]);
+    expect(out.recommendations[0]?.researchBasis).toEqual([{url: "https://example.org/testing", claim: ""}]);
   });
 
   it("refuses a board killed before its first role filed anything", async () => {

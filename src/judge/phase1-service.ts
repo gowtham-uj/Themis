@@ -20,7 +20,10 @@ export class Phase1Service{private running=new Map<string,Promise<void>>();priva
   // during a pause still reports `paused`. In memory it would come back
   // `not_started`, and the pipeline's worker-loss branch would relaunch the very
   // case an operator stopped.
-  const db=new Database(join(this.dataDir,"themis.sqlite"));let published:Phase1ServiceStatus|null=null;try{migrate(db);const rows=listResultVersionsByRun(db,runId);const r=rows.at(-1);if(r)published={state:"published",resultVersionId:r.id,archiveViewId:r.archiveViewPath??runId}}finally{db.close()}
+  // The pipeline needs an opaque immutable identity, not the local directory used
+  // to materialize that view. Returning archiveViewPath exposed absolute host
+  // paths through the generation API and made persisted membership host-bound.
+  const db=new Database(join(this.dataDir,"themis.sqlite"));let published:Phase1ServiceStatus|null=null;try{migrate(db);const rows=listResultVersionsByRun(db,runId);const r=rows.at(-1);if(r)published={state:"published",resultVersionId:r.id,archiveViewId:r.id}}finally{db.close()}
   // A published result wins over a standing marker: a pause can land after the
   // last node boundary, and reporting that finished case as paused would strand
   // a complete judgement the operator can never publish.

@@ -33,9 +33,18 @@ export function startPipelineTicker(input:{
     if(stopped)break;
     const queue=await db.pipeline.getQueueByProject(projectId);
     if(!queue||queue.status!=="running")continue;
-    const gen=await db.pipeline.getCurrentGeneration(queue.id);
+    // getCurrentGeneration deliberately excludes completed/failed/cancelled, so
+    // fall back to the newest generation of any state. A completed one still
+    // needs visiting: see the state filter below.
+    const gen=await db.pipeline.getCurrentGeneration(queue.id)
+      ??(await db.pipeline.listGenerations(queue.id,{cursor:null,limit:1})).items[0];
     if(!gen)continue;
-    if(["completed","failed","cancelled","paused"].includes(gen.state))continue;
+    // `completed` is NOT skipped. A Phase-1 verdict that published after the
+    // campaign froze leaves the generation completed with uncovered work, and
+    // advance reopens it for a follow-up campaign. Skipping here is what made
+    // that state need a hand-POSTed /advance to escape. A settled generation
+    // costs one indexed item read and bails.
+    if(["failed","cancelled","paused"].includes(gen.state))continue;
     if(inFlight.has(gen.id))continue;
     inFlight.add(gen.id);
     try{

@@ -34,6 +34,7 @@ import type {
 import { Type } from "typebox";
 import { stringify as yamlStringify } from "yaml";
 
+import { coerceRecommendations, validateRecommendations } from "../phase2/analyst.js";
 import { FINDING_SIGNATURES, isKnownSignature } from "../validity/signatures.js";
 import { formatWebResults, webResearch } from "./web-research.js";
 
@@ -393,6 +394,65 @@ export function validateDeveloperBrief(fields: Record<string, unknown>): string 
  * prose still becomes a block, and anything ambiguous is quoted. Round trips are
  * preserved either way; the emitter quotes what it must.
  */
+/** Reject malformed Phase-2 filings before append-only bytes become authoritative. */
+export function validatePhase2Template(template: string, fields: Record<string, unknown>): string | null {
+  if ("fields" in fields) {
+    return `${template} must put its document keys directly in the tool's fields object; do not nest another fields key`;
+  }
+  if (template === "phase2-hypotheses") {
+    if (!Array.isArray(fields.hypotheses)) return "hypotheses must be a list";
+    for (const [i, raw] of fields.hypotheses.entries()) {
+      if (!raw || typeof raw !== "object") return `hypotheses[${i}] must be a mapping`;
+      const h = raw as Record<string, unknown>;
+      for (const key of ["id", "patternId", "claim"] as const) {
+        if (typeof h[key] !== "string" || !h[key]) return `hypotheses[${i}].${key} must be a non-empty string`;
+      }
+      for (const key of ["supportingObservations", "contradictingObservations", "likelyMechanism"] as const) {
+        if (!Array.isArray(h[key])) return `hypotheses[${i}].${key} must be a list`;
+      }
+      if (!['high','medium','low'].includes(String(h.confidence))) return `hypotheses[${i}].confidence must be high|medium|low`;
+    }
+    return null;
+  }
+  if (template === "phase2-research") {
+    if (!Array.isArray(fields.notes)) return "notes must be a list";
+    for (const [i, raw] of fields.notes.entries()) {
+      if (!raw || typeof raw !== "object") return `notes[${i}] must be a mapping`;
+      const n = raw as Record<string, unknown>;
+      if (typeof n.hypothesisId !== "string" || !n.hypothesisId) return `notes[${i}].hypothesisId must be a non-empty string`;
+      if (!Array.isArray(n.techniques)) return `notes[${i}].techniques must be a list`;
+      if (typeof n.applicable !== "boolean") return `notes[${i}].applicable must be true|false`;
+      if (typeof n.notes !== "string") return `notes[${i}].notes must be a string`;
+      for (const [j, rawTechnique] of n.techniques.entries()) {
+        if (!rawTechnique || typeof rawTechnique !== "object") return `notes[${i}].techniques[${j}] must be a mapping`;
+        const t = rawTechnique as Record<string, unknown>;
+        if (typeof t.url !== "string" || !/^web:https?:\/\//.test(t.url)) return `notes[${i}].techniques[${j}].url must be a retrieved web:<url>`;
+        if (typeof t.claim !== "string" || !t.claim) return `notes[${i}].techniques[${j}].claim must be a non-empty string`;
+      }
+    }
+    return null;
+  }
+  if (template === "phase2-recommendations") {
+    if (!Array.isArray(fields.recommendations)) return "recommendations must be a list";
+    fields.recommendations = coerceRecommendations(fields.recommendations);
+    return validateRecommendations(fields.recommendations);
+  }
+  if (template === "phase2-review") {
+    if (!Array.isArray(fields.keptIds)) return "keptIds must be a list";
+    if (!Array.isArray(fields.dropped)) return "dropped must be a list";
+    if (typeof fields.notes !== "string") return "notes must be a string";
+    for (const [i, raw] of fields.dropped.entries()) {
+      if (!raw || typeof raw !== "object") return `dropped[${i}] must be a mapping`;
+      const d = raw as Record<string, unknown>;
+      if (typeof d.id !== "string" || !d.id || typeof d.reason !== "string" || !d.reason) {
+        return `dropped[${i}] requires non-empty id and reason strings`;
+      }
+    }
+    return null;
+  }
+  return null;
+}
+
 export function serializeYaml(fields: Record<string, unknown>): string {
   return yamlStringify(fields, {
     lineWidth: 0,
@@ -413,7 +473,7 @@ export default function registerThemisTools(pi: ExtensionAPI): void {
     name: "write_to_yaml_template",
     label: "Write YAML template",
     description:
-      "Write a canonical YAML document for a court record (kratos-report, logos-report, minos-report, evalJudge, round-log, tangent-log, case-summary, access-log, channel). Append-only: same-id writes are no-ops or conflicts.",
+      "Write one schema-validated canonical YAML court record. Pass document keys directly inside fields; never nest a second fields object. Append-only: malformed probes are rejected and later valid corrections supersede earlier valid documents.",
     parameters: schema({
       template: Type.String(),
       fields: Type.Record(Type.String(), Type.Unknown()),
@@ -451,6 +511,10 @@ export default function registerThemisTools(pi: ExtensionAPI): void {
         // The remediation deliverable is schema-validated before it is written.
         if (template === "developer-brief") {
           const reason = validateDeveloperBrief(fields);
+          if (reason !== null) return err(reason);
+        }
+        if (template.startsWith("phase2-")) {
+          const reason = validatePhase2Template(template, fields);
           if (reason !== null) return err(reason);
         }
         await mkdir(join(judgeDir(), "judge"), { recursive: true });

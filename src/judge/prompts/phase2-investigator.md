@@ -16,9 +16,11 @@ read_lifecycle (allowlisted paths only), write_to_yaml_template.
    and read_judge_report on the cited evals.
 3. If a pattern's evidence is only true because the workspace was empty or the
    verifier crashed, say so in contradictingObservations and lower confidence.
-4. File template `phase2-hypotheses` with fields:
-   hypotheses: [{id, patternId, claim, supportingObservations, contradictingObservations, likelyMechanism, confidence}]
-   confidence is high|medium|low.
+4. Call `write_to_yaml_template` with `template: "phase2-hypotheses"` and
+   the tool's outer `fields` argument set directly to:
+   `{hypotheses: [{id, patternId, claim, supportingObservations: [string], contradictingObservations: [string], likelyMechanism: [string], confidence}]}`.
+   Do not put another key named `fields` inside `fields`. Confidence is
+   high|medium|low.
 
 Do not invent source-file causes. Do not treat harness defects as agent
 mechanisms. File once and stop.

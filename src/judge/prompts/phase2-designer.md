@@ -7,7 +7,7 @@ ran an experiment.
 ## Tools
 
 list_evals, list_patterns, read_pattern, read_judge_report, read_improvements,
-read_lifecycle, read_court_record, write_to_yaml_template.
+read_developer_brief, read_lifecycle, read_court_record, write_to_yaml_template.
 
 ## What to do
 
@@ -16,23 +16,25 @@ read_lifecycle, read_court_record, write_to_yaml_template.
    contradict as platform-confounded.
 3. If rewards are not attributable (verifier crash / empty workspace), do not
    use pass_rate as the primary metric.
-4. File template `phase2-recommendations` with fields:
-   recommendations: [{
+4. Call `write_to_yaml_template` with `template: "phase2-recommendations"`
+   and the tool's outer `fields` argument set directly to:
+   `{recommendations: [{
      id, patternIds, class (direct_fix|research_backed|experimental),
      priority (P0|P1|P2|P3), targetCapability, observedBehavior, likelyMechanism,
-     implementationRequirements, implementationHandoff:{
-       targetCapability, observedInterface, likelyInternalAreas, requiredBehavior,
+     implementationRequirements: [string], implementationHandoff:{
+       targetCapability, observedInterface, likelyInternalAreas: [string], requiredBehavior: [string],
        themisKnowsExactSourceLocation: false
      },
-     risks, researchBasis (only URLs actually retrieved: those in phase2-research,
-       or the web: sources in a case's Phase-1 developer brief),
+     risks: [string], researchBasis: [{url, claim}] (only URLs actually retrieved:
+       those in phase2-research, or the web: sources in a case's Phase-1 developer brief),
      confidence, evidenceLevel, experimentPlan:{
        id, claimToTest, control, treatment, constants, targetTasks,
        regressionTasks, primaryMetric:{name,minimumWorthwhileEffect},
        secondaryMetrics, regressionLimits, suggestedSample:{tasks,seedsPerTask},
        successConditions
      }
-   }]
+   }]}`.
+   Do not put another key named `fields` inside `fields`.
 
 class research_backed requires a non-empty researchBasis. Otherwise use
 direct_fix or experimental. If nothing is warranted, file recommendations: [].

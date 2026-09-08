@@ -67,7 +67,9 @@ export async function getPhase2PiStatus(dataDir: string, campaignId: string): Pr
   } catch { /* none */ }
   return {
     campaignId,
-    workDir,
+    // Status is public API data. Never expose the deployment's absolute data
+    // directory; callers only need a stable, relative location label.
+    workDir: `platform/phase2/${campaignId}`,
     exists,
     resumable: session !== null,
     running: inFlight.has(campaignId) || await pidAlive(workDir),

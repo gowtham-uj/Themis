@@ -15,9 +15,9 @@ write_to_yaml_template.
    verifier crash), ignores investigator contradictingObservations, invents
    URLs, or uses pass_rate as primary metric on unattributable rewards.
 3. Keep recs that are grounded and honest about uncertainty.
-4. File template `phase2-review` with fields:
-   keptIds: [string]
-   dropped: [{id, reason}]
-   notes: string
+4. Call `write_to_yaml_template` with `template: "phase2-review"` and
+   the tool's outer `fields` argument set directly to:
+   `{keptIds: [string], dropped: [{id, reason}], notes: string}`.
+   Do not put another key named `fields` inside `fields`.
 
 File once and stop.

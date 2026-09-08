@@ -63,6 +63,8 @@ const PAGE={cursor:null,limit:1000} as const;
 /** Item states with work still owed. A generation holding any of these has not
  *  finished, whatever its own state says. */
 const IN_FLIGHT:readonly PipelineItemState[]=["eval_pending","eval_running","archive_sealed","phase1_pending","phase1_running"];
+/** Item states holding a published Phase-1 verdict a campaign can analyze. */
+const PHASE2_ELIGIBLE:readonly PipelineItemState[]=["phase1_published","phase2_attached","final_view_published"];
 /** Bounded retries for a transient Phase-1 failure (e.g. the PI courtroom hit
  *  its context ceiling and ended without evalJudge.yaml). A manual or automatic
  *  re-advance resumes the SAME PI session via the worker's checkpoint recovery. */
@@ -165,6 +167,28 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
   gen=(await input.db.pipeline.getGeneration(gen.id))!;changed=true;
   await input.db.pipeline.appendEvent({generationId:gen.id,itemId:null,operationId:`pipeline.reopened:${gen.id}:${gen.fencingToken}`,eventType:"pipeline.reopened_in_flight",payloadJson:JSON.stringify({items:items.filter(x=>IN_FLIGHT.includes(x.state)).map(x=>x.id)})});
  }
+ // The same unreachable-work problem, one stage later: an item revived after the
+ // campaign froze reaches `phase1_published` and the generation settles back to
+ // `completed`. It is no longer IN_FLIGHT, so the reopen above does not see it,
+ // and the return below skips the follow-up campaign block entirely. That is the
+ // live state: eight items analyzed, two holding sealed verdicts no campaign
+ // covers. Reopen to phase2_ready and let that block create the follow-up.
+ // An uncovered verdict is exactly an item left at `phase1_published`: a covered
+ // one is attached and moves on. Checking that first keeps the common case (a
+ // settled generation the ticker revisits) to the item read it already does.
+ if(gen.state==="completed"&&items.some(x=>x.state==="phase1_published")){
+  const covered=new Set<string>();
+  for(const c of await input.db.phase2.listCampaignsByGeneration(gen.id))
+   for(const m of (await input.db.phase2.listMembers(c.id,PAGE)).items)covered.add(m.pipelineItemId);
+  const uncovered=items.filter(x=>PHASE2_ELIGIBLE.includes(x.state)&&!covered.has(x.id));
+  // Only reopen when a campaign exists. A generation that completed without one
+  // was completed for some other reason and reopening would loop.
+  if(uncovered.length>0&&covered.size>0){
+   await input.db.pipeline.transitionGeneration(gen.id,gen.state,gen.fencingToken,"phase2_ready");
+   gen=(await input.db.pipeline.getGeneration(gen.id))!;changed=true;
+   await input.db.pipeline.appendEvent({generationId:gen.id,itemId:null,operationId:`pipeline.reopened_uncovered:${gen.id}:${gen.fencingToken}`,eventType:"pipeline.reopened_uncovered",payloadJson:JSON.stringify({items:uncovered.map(x=>x.id)})});
+  }
+ }
  if(["completed","failed","cancelled"].includes(gen.state))return{generation:gen,items,changed:false,waitingFor:null};
  const transition=async(next:PipelineGenerationRow["state"])=>{const n=await input.db.pipeline.transitionGeneration(gen!.id,gen!.state,gen!.fencingToken,next);if(!n)throw new Error(`generation fenced during ${gen!.state}->${next}`);gen=n;changed=true};
  if(gen.state==="draft"){await transition("ready");}
@@ -237,7 +261,6 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
  if(gen.state==="eval_running"&&!items.some(x=>x.state==="eval_pending"||x.state==="eval_running")&&items.some(x=>x.state==="phase1_pending"||x.state==="phase1_running"))await transition("phase1_running");
  // One failed eval must not abandon siblings still in the courtroom.
  const stillGoing=items.some(x=>IN_FLIGHT.includes(x.state));
- const PHASE2_ELIGIBLE=["phase1_published","phase2_attached","final_view_published"];
  // Phase 2 runs on the evals that actually produced a Phase-1 result. A failed
  // sibling is a finding about the tested agent (or an exhausted judge retry),
  // not a reason to throw away every completed judgement in the generation: the
@@ -271,9 +294,23 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
  // the generation straight back to completed instead.
  const priorCampaign=await input.db.phase2.getCampaignByGeneration(gen.id);
  if(priorCampaign?.state==="published"){
-  // `stillGoing` is false here, so nothing is mid-flight and completing is safe.
-  if(gen.state!=="completed")await transition("completed");
-  return{generation:gen,items,changed,waitingFor:null};
+  // ...unless that campaign left published Phase-1 verdicts uncovered. An item
+  // whose retries were exhausted goes to `failed`, so `stillGoing` is false and
+  // the campaign correctly freezes without it; retryFailedPhase1 then revives it
+  // and it publishes a complete verdict afterwards. Observed live: two of ten
+  // runs judged, sealed, and analyzed by nothing. Cover them with a follow-up
+  // campaign rather than completing over them.
+  const covered=new Set<string>();
+  for(const c of await input.db.phase2.listCampaignsByGeneration(gen.id))
+   for(const m of (await input.db.phase2.listMembers(c.id,PAGE)).items)covered.add(m.pipelineItemId);
+  const uncovered=eligible.filter(x=>!covered.has(x.id));
+  if(uncovered.length===0){
+   // `stillGoing` is false here, so nothing is mid-flight and completing is safe.
+   if(gen.state!=="completed")await transition("completed");
+   return{generation:gen,items,changed,waitingFor:null};
+  }
+  if(gen.state!=="phase2_ready")await transition("phase2_ready");
+  gen=(await input.db.pipeline.getGeneration(gen.id))!;
  }
  if(["phase2_ready","phase2_running","finalizing"].includes(gen.state)&&isAllowed(trigger,queue.autoPhase2)&&(trigger==="auto"||trigger==="phase2")){
   // Phase 2 is one long PI board run. Without a bound, a board that throws on
@@ -290,7 +327,19 @@ export async function advanceProjectPipeline(input:{db:Phase2Db;services:Project
    return{generation:gen,items,changed,waitingFor:"phase2_operator_retry"};
   }
   try{
-  let campaign=await input.db.phase2.getCampaignByGeneration(gen.id);if(!campaign){campaign=await input.db.phase2.createCampaign({projectId:queue.projectId,pipelineGenerationId:gen.id,sutFingerprint:createHash("sha256").update(gen.configJson).digest("hex"),ontologyVersion:"phase2-v1",membershipSha256:shaMembers(eligible),configJson:gen.configJson});for(const x of eligible){await input.db.phase2.addMember({campaignId:campaign.id,pipelineItemId:x.id,runId:x.runId!,phase1ResultVersionId:x.phase1ResultVersionId!,phase1ArchiveViewId:x.phase1ArchiveViewId!,validForAgentLearning:true,ordinal:x.ordinal})}}
+  let campaign=await input.db.phase2.getCampaignByGeneration(gen.id);
+  // A published campaign is final and immutable. Reaching here with one means
+  // uncovered verdicts exist (checked above), so start a follow-up over exactly
+  // those and leave the published campaign's members and pack untouched.
+  if(campaign?.state==="published")campaign=null;
+  if(!campaign){
+   const covered=new Set<string>();
+   for(const c of await input.db.phase2.listCampaignsByGeneration(gen.id))
+    for(const m of (await input.db.phase2.listMembers(c.id,PAGE)).items)covered.add(m.pipelineItemId);
+   const members=eligible.filter(x=>!covered.has(x.id));
+   campaign=await input.db.phase2.createCampaign({projectId:queue.projectId,pipelineGenerationId:gen.id,sutFingerprint:createHash("sha256").update(gen.configJson).digest("hex"),ontologyVersion:"phase2-v1",membershipSha256:shaMembers(members),configJson:gen.configJson});
+   for(const x of members){await input.db.phase2.addMember({campaignId:campaign.id,pipelineItemId:x.id,runId:x.runId!,phase1ResultVersionId:x.phase1ResultVersionId!,phase1ArchiveViewId:x.phase1ArchiveViewId!,validForAgentLearning:true,ordinal:x.ordinal})}
+  }
   // Every campaign and generation step below is re-entrant: it advances only from
   // the state it expects, so a resumed tick skips whatever the lost run finished.
   const step=async(from:Phase2CampaignRow["state"],to:Phase2CampaignRow["state"],c:Phase2CampaignRow):Promise<Phase2CampaignRow>=>{

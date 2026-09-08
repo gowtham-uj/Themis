@@ -26,6 +26,7 @@ const PHASE2_TOOLS =
   "subagent,list_evals,list_patterns,read_pattern,read_improvements,read_lifecycle,read_judge_report,read_court_record,write_to_yaml_template,web_search";
 
 const READ_TOOLS = "list_evals,list_patterns,read_pattern,read_improvements,read_lifecycle,read_judge_report,read_court_record,write_to_yaml_template";
+const DESIGNER_TOOLS = `${READ_TOOLS},read_developer_brief`;
 
 export async function writePhase2PiSubagentDefs(
   agentDir: string,
@@ -71,7 +72,7 @@ export async function writePhase2PiSubagentDefs(
     {
       name: "designer",
       description: "Phase-2 designer: black-box implementation handoffs and developer-run experiment plans",
-      tools: READ_TOOLS,
+      tools: DESIGNER_TOOLS,
       body: prompts.designer,
     },
     {
@@ -110,9 +111,49 @@ function parseYamlFile(raw: string): Record<string, unknown> {
   const merged: Record<string, unknown> = {};
   for (const d of docs) {
     const v = d.toJS();
-    if (v && typeof v === "object") Object.assign(merged, v as object);
+    if (!v || typeof v !== "object" || Array.isArray(v)) continue;
+    const row = v as Record<string, unknown>;
+    // Early live agents misunderstood "with fields" and put a second fields
+    // envelope inside the tool's fields argument. Preserve that completed work:
+    // ignore probe scalars such as fields:false, unwrap a mapping, and let later
+    // append-only documents supersede earlier keys.
+    const body = row.fields && typeof row.fields === "object" && !Array.isArray(row.fields)
+      ? row.fields as Record<string, unknown>
+      : row;
+    Object.assign(merged, body);
   }
   return merged;
+}
+
+const strings = (v: unknown): string[] => Array.isArray(v)
+  ? v.map(String).filter(Boolean)
+  : typeof v === "string" && v ? [v] : [];
+
+/** Canonical hypotheses, plus lossless recovery for pre-validation h1/h2 filings. */
+function hypothesesFrom(doc: Record<string, unknown>): Phase2Hypothesis[] | null {
+  const raw = Array.isArray(doc.hypotheses)
+    ? doc.hypotheses
+    : Object.entries(doc).filter(([key, value]) => /^h\d+$/i.test(key) && value && typeof value === "object").map(([, value]) => value);
+  if (!Array.isArray(raw) || (raw.length === 0 && !Array.isArray(doc.hypotheses))) return null;
+  return raw.flatMap((value) => {
+    if (!value || typeof value !== "object") return [];
+    const h = value as Record<string, unknown>;
+    const id = String(h.id ?? "");
+    const patternId = String(h.patternId ?? "");
+    const mechanism = strings(h.likelyMechanism);
+    const claim = String(h.claim ?? mechanism[0] ?? "");
+    if (!id || !patternId || !claim) return [];
+    const confidenceText = String(h.confidence ?? "medium").toLowerCase();
+    const confidence: Phase2Hypothesis["confidence"] = confidenceText.includes("low")
+      ? "low" : confidenceText.includes("high") ? "high" : "medium";
+    return [{
+      id, patternId, claim,
+      supportingObservations: strings(h.supportingObservations),
+      contradictingObservations: strings(h.contradictingObservations),
+      likelyMechanism: mechanism,
+      confidence,
+    }];
+  });
 }
 
 async function loadYaml(workDir: string, name: string): Promise<Record<string, unknown>> {
@@ -132,10 +173,13 @@ async function readFiledBoard(workDir: string): Promise<Phase2PiResult | null> {
     loadYaml(workDir, "phase2-review.yaml"),
   ]);
   if ([hypDoc, resDoc, recDoc, revDoc].some((d) => Object.keys(d).length === 0)) return null;
-  const recommendations = coerceRecommendations(recDoc.recommendations ?? recDoc) as Phase2Recommendation[];
+  const hypotheses = hypothesesFrom(hypDoc);
+  if (!hypotheses || !Array.isArray(resDoc.notes) || !Array.isArray(recDoc.recommendations)) return null;
+  if (!Array.isArray(revDoc.keptIds) || !Array.isArray(revDoc.dropped) || typeof revDoc.notes !== "string") return null;
+  const recommendations = coerceRecommendations(recDoc.recommendations) as Phase2Recommendation[];
   return {
-    hypotheses: (Array.isArray(hypDoc.hypotheses) ? hypDoc.hypotheses : []) as Phase2Hypothesis[],
-    research: (Array.isArray(resDoc.notes) ? resDoc.notes : []) as Phase2ResearchNote[],
+    hypotheses,
+    research: resDoc.notes as Phase2ResearchNote[],
     recommendations,
     review: coerceReview(revDoc, recommendations.map((r) => r.id)),
     workDir,

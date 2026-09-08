@@ -260,4 +260,75 @@ export function migrate(db: Database.Database): void {
   if (!itemCols.some((c) => c.name === "retry_count")) {
     db.exec(`ALTER TABLE project_pipeline_items ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`);
   }
+  // Drop the one-campaign-per-generation constraint. SQLite cannot remove a
+  // UNIQUE column constraint in place, so the table is rebuilt. Existing rows
+  // are all the first campaign of their generation, hence ordinal 1.
+  const campCols = db.prepare(`PRAGMA table_info(phase2_campaigns)`).all() as Array<{name:string}>;
+  if (campCols.length > 0 && !campCols.some((c) => c.name === "ordinal")) {
+    // Child tables reference phase2_campaigns(id), so the DROP trips foreign
+    // keys even though every id is preserved. `foreign_keys` is a no-op inside
+    // a transaction, hence the toggle sits outside the one below. A failed
+    // earlier attempt can leave the scratch table behind; the rebuild owns that
+    // name, so reclaim it rather than aborting every subsequent startup.
+    db.pragma("foreign_keys = OFF");
+    try {
+      db.exec(`
+      DROP TABLE IF EXISTS phase2_campaigns_new;
+      BEGIN;
+      CREATE TABLE phase2_campaigns_new (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL, pipeline_generation_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL DEFAULT 1,
+        state TEXT NOT NULL, fencing_token INTEGER NOT NULL DEFAULT 0, sut_fingerprint TEXT NOT NULL,
+        ontology_version TEXT NOT NULL, membership_sha256 TEXT NOT NULL, config_json TEXT NOT NULL,
+        developer_pack_sha256 TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, published_at TEXT,
+        UNIQUE(pipeline_generation_id, ordinal));
+      INSERT INTO phase2_campaigns_new
+        (id, project_id, pipeline_generation_id, ordinal, state, fencing_token, sut_fingerprint,
+         ontology_version, membership_sha256, config_json, developer_pack_sha256,
+         created_at, updated_at, published_at)
+        SELECT id, project_id, pipeline_generation_id, 1, state, fencing_token, sut_fingerprint,
+               ontology_version, membership_sha256, config_json, developer_pack_sha256,
+               created_at, updated_at, published_at FROM phase2_campaigns;
+      DROP TABLE phase2_campaigns;
+      ALTER TABLE phase2_campaigns_new RENAME TO phase2_campaigns;
+      CREATE INDEX IF NOT EXISTS idx_phase2_campaign_project ON phase2_campaigns(project_id, created_at, id);
+      COMMIT;
+    `);
+      const broken = db.prepare(`PRAGMA foreign_key_check`).all();
+      if (broken.length > 0) throw new Error(`phase2_campaigns rebuild broke ${broken.length} foreign key rows`);
+    } catch (err) {
+      if (db.inTransaction) db.exec(`ROLLBACK`);
+      throw err;
+    } finally {
+      db.pragma("foreign_keys = ON");
+    }
+  }
+
+  // Early Phase-1 pipeline rows used archive_view_path as the archive view ID.
+  // That value is a local absolute directory, but these Phase-2 columns are
+  // logical identities and are serialized by pipeline APIs. Replace the path
+  // with the immutable Phase-1 result version ID already stored beside it.
+  // Phase-2 always resolves materialized archives from run_id, never this ID.
+  db.exec(`
+    UPDATE project_pipeline_items
+       SET phase1_archive_view_id = phase1_result_version_id
+     WHERE phase1_archive_view_id LIKE '/%'
+       AND phase1_result_version_id IS NOT NULL;
+    UPDATE phase2_campaign_members
+       SET phase1_archive_view_id = phase1_result_version_id
+     WHERE phase1_archive_view_id LIKE '/%';
+    UPDATE phase2_artifact_publications
+       SET phase1_archive_view_id = (
+         SELECT m.phase1_result_version_id
+           FROM phase2_campaign_members m
+          WHERE m.campaign_id = phase2_artifact_publications.campaign_id
+            AND m.run_id = phase2_artifact_publications.run_id
+       )
+     WHERE phase1_archive_view_id LIKE '/%'
+       AND EXISTS (
+         SELECT 1 FROM phase2_campaign_members m
+          WHERE m.campaign_id = phase2_artifact_publications.campaign_id
+            AND m.run_id = phase2_artifact_publications.run_id
+       );
+  `);
 }

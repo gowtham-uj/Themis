@@ -1,6 +1,7 @@
 /** Campaign-scoped tools for agentic Phase-2 roles. */
 import {readFile} from "node:fs/promises";
 import {join} from "node:path";
+import {parseAllDocuments} from "yaml";
 import {fnTool, type AgentToolResult} from "./agent-loop.js";
 import type {Phase2Case, Phase2Hypothesis, Phase2Pattern} from "./types.js";
 
@@ -44,6 +45,76 @@ export const PHASE2_SEARCH_TOOLS = [
 
 export function submitTool(name: string, description: string): ReturnType<typeof fnTool> {
   return fnTool(name, description, { payload: { type: "object" } }, ["payload"]);
+}
+
+export interface Phase1ResearchBriefDigest {
+  runId: string;
+  status: "present" | "absent";
+  recommendations: Array<{
+    id: string;
+    findingIds: string[];
+    changes: string[];
+    targetSubsystem: string;
+    researchBasis: Array<{ source: string; claim: string }>;
+  }>;
+}
+
+const briefString = (x: unknown, max = 800): string => typeof x === "string" ? x.slice(0, max) : "";
+const briefStrings = (x: unknown, maxItems: number, maxChars = 800): string[] =>
+  Array.isArray(x) ? x.slice(0, maxItems).map((v) => briefString(v, maxChars)).filter(Boolean) : [];
+
+/**
+ * Code-enforced Phase-1 research load for the recommendation designer.
+ *
+ * A prompt telling the model to call read_developer_brief was not enough: the
+ * live follow-up designer read court records and then submitted recommendations
+ * without calling it. Preloading a bounded digest makes every relevant brief
+ * pass through the same mediated tool before the designer can run.
+ */
+export async function readPhase1ResearchBriefs(
+  ctx: Phase2ToolContext,
+  runIds: readonly string[],
+): Promise<Phase1ResearchBriefDigest[]> {
+  const out: Phase1ResearchBriefDigest[] = [];
+  for (const runId of [...new Set(runIds)]) {
+    const result = await executePhase2Tool(ctx, "read_developer_brief", {runId});
+    if (result.text.startsWith("ABSENT:")) {
+      out.push({runId, status: "absent", recommendations: []});
+      continue;
+    }
+    if (result.text.startsWith("DENIED:")) {
+      throw new Error(`cannot preload developer brief for ${runId}: ${result.text}`);
+    }
+    const value = parseAllDocuments(result.text)[0]?.toJSON() as {recommendations?: unknown} | undefined;
+    const recommendations = Array.isArray(value?.recommendations) ? value.recommendations : [];
+    out.push({
+      runId,
+      status: "present",
+      recommendations: recommendations.slice(0, 8).flatMap((raw) => {
+        if (!raw || typeof raw !== "object") return [];
+        const r = raw as Record<string, unknown>;
+        const basis = Array.isArray(r.research_basis) ? r.research_basis : [];
+        const researchBasis = basis.slice(0, 8).flatMap((entry) => {
+          if (!entry || typeof entry !== "object") return [];
+          const b = entry as Record<string, unknown>;
+          const source = briefString(b.source, 500);
+          if (!source.startsWith("web:")) return [];
+          return [{source, claim: briefString(b.claim, 800)}];
+        });
+        // Direct fixes are already available through read_improvements. Keep this
+        // digest focused on the otherwise-lost retrieved research.
+        if (researchBasis.length === 0) return [];
+        return [{
+          id: briefString(r.id, 100),
+          findingIds: briefStrings(r.finding_ids, 12, 100),
+          changes: briefStrings(r.change, 4, 800),
+          targetSubsystem: briefString(r.target_subsystem, 500),
+          researchBasis,
+        }];
+      }),
+    });
+  }
+  return out;
 }
 
 export async function executePhase2Tool(

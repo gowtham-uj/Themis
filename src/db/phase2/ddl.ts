@@ -30,11 +30,20 @@ export const PHASE2_SQLITE_DDL: readonly string[] = [
   item_id TEXT, operation_id TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL,
   payload_json TEXT NOT NULL, created_at TEXT NOT NULL)`,
 `CREATE INDEX IF NOT EXISTS idx_pipeline_events_generation ON project_pipeline_events(generation_id, created_at, id)`,
+// One generation can need more than one campaign. A campaign freezes its
+// membership at creation, so a Phase-1 verdict that publishes later (an item
+// revived by retryFailedPhase1 after its retries were exhausted) belongs to no
+// campaign at all. With `pipeline_generation_id` UNIQUE that verdict could
+// never be analyzed by anything: the generation already held its one campaign.
+// Campaigns are now ordinaled per generation and a follow-up covers the
+// stragglers. Published campaigns stay immutable; nothing is re-run.
 `CREATE TABLE IF NOT EXISTS phase2_campaigns (
-  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, pipeline_generation_id TEXT NOT NULL UNIQUE,
+  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, pipeline_generation_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL DEFAULT 1,
   state TEXT NOT NULL, fencing_token INTEGER NOT NULL DEFAULT 0, sut_fingerprint TEXT NOT NULL,
   ontology_version TEXT NOT NULL, membership_sha256 TEXT NOT NULL, config_json TEXT NOT NULL,
-  developer_pack_sha256 TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, published_at TEXT)`,
+  developer_pack_sha256 TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, published_at TEXT,
+  UNIQUE(pipeline_generation_id, ordinal))`,
 `CREATE INDEX IF NOT EXISTS idx_phase2_campaign_project ON phase2_campaigns(project_id, created_at, id)`,
 `CREATE TABLE IF NOT EXISTS phase2_campaign_members (
   campaign_id TEXT NOT NULL REFERENCES phase2_campaigns(id), pipeline_item_id TEXT NOT NULL,

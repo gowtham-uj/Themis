@@ -73,7 +73,18 @@ export function coerceRecommendations(v: unknown): unknown {
     if (!priorities.includes(String(x.priority))) x.priority = "P2";
     x.confidence = normConfidence(x.confidence);
     x.evidenceLevel = normEvidenceLevel(x.evidenceLevel);
-    if (!Array.isArray(x.researchBasis)) x.researchBasis = [];
+    const rawBasis = Array.isArray(x.researchBasis) ? x.researchBasis : [];
+    x.researchBasis = rawBasis.flatMap((entry) => {
+      if (typeof entry === "string") {
+        const url = entry.replace(/^web:/, "").trim();
+        return /^https?:\/\//.test(url) ? [{url, claim: ""}] : [];
+      }
+      if (!entry || typeof entry !== "object") return [];
+      const b = entry as Record<string, unknown>;
+      const url = String(b.url ?? b.source ?? "").replace(/^web:/, "").trim();
+      if (!/^https?:\/\//.test(url)) return [];
+      return [{url, claim: String(b.claim ?? "")}];
+    });
     x.implementationRequirements = Array.isArray(x.implementationRequirements)
       ? x.implementationRequirements
       : [String(x.implementationRequirements ?? "")].filter((t) => t);
@@ -90,6 +101,36 @@ export function coerceRecommendations(v: unknown): unknown {
     h.requiredBehavior = toStrList(h.requiredBehavior);
     h.themisKnowsExactSourceLocation = false;
     x.implementationHandoff = h;
+    const p = (x.experimentPlan && typeof x.experimentPlan === "object")
+      ? x.experimentPlan as Record<string, unknown>
+      : {};
+    p.id = String(p.id ?? `EXP-${String(x.id ?? "unknown")}`);
+    p.claimToTest = String(p.claimToTest ?? "");
+    p.control = String(p.control ?? "");
+    p.treatment = String(p.treatment ?? "");
+    p.constants = toStrList(p.constants);
+    p.targetTasks = toStrList(p.targetTasks);
+    p.regressionTasks = toStrList(p.regressionTasks);
+    p.secondaryMetrics = toStrList(p.secondaryMetrics);
+    p.successConditions = toStrList(p.successConditions);
+    const primary = (p.primaryMetric && typeof p.primaryMetric === "object")
+      ? p.primaryMetric as Record<string, unknown>
+      : {};
+    p.primaryMetric = {
+      name: String(primary.name ?? "unspecified"),
+      minimumWorthwhileEffect: String(primary.minimumWorthwhileEffect ?? "unspecified"),
+    };
+    p.regressionLimits = p.regressionLimits && typeof p.regressionLimits === "object" && !Array.isArray(p.regressionLimits)
+      ? p.regressionLimits
+      : {policy: String(p.regressionLimits ?? "")};
+    const sample = (p.suggestedSample && typeof p.suggestedSample === "object")
+      ? p.suggestedSample as Record<string, unknown>
+      : {};
+    p.suggestedSample = {
+      tasks: Math.max(1, Number(sample.tasks ?? 1) || 1),
+      seedsPerTask: Math.max(1, Number(sample.seedsPerTask ?? p.seedsPerTask ?? 1) || 1),
+    };
+    x.experimentPlan = p;
     if (x.class === "research_backed" && !(x.researchBasis as unknown[]).length) x.class = "direct_fix";
   }
   return raw;
@@ -119,7 +160,8 @@ export function coerceReview(v: unknown, fallbackIds: string[]): { keptIds: stri
   return { keptIds: kept, dropped, notes: String(doc.notes ?? "") };
 }
 
-function validate(v: unknown): string | null {
+/** Validate and normalize a model-authored recommendation list. */
+export function validateRecommendations(v: unknown): string | null {
   v = coerceRecommendations(v);
   if (!Array.isArray(v)) return "root must be an array";
   for (let i = 0; i < v.length; i++) {
@@ -137,6 +179,12 @@ function validate(v: unknown): string | null {
     if (!levels.includes(String(x.confidence))) return `bad confidence`;
     if (String(x.class) === "research_backed" && !(Array.isArray(x.researchBasis) && (x.researchBasis as unknown[]).length > 0)) {
       return `recommendation ${i} claims research_backed with empty researchBasis`;
+    }
+    for (const [j, basis] of ((x.researchBasis as unknown[]) ?? []).entries()) {
+      if (!basis || typeof basis !== "object") return `recommendation ${i} researchBasis ${j} must be object`;
+      const b = basis as Record<string, unknown>;
+      if (typeof b.url !== "string" || !/^https?:\/\//.test(b.url)) return `recommendation ${i} researchBasis ${j} has invalid url`;
+      if (typeof b.claim !== "string") return `recommendation ${i} researchBasis ${j} claim must be string`;
     }
     const h = x.implementationHandoff as Record<string, unknown> | undefined;
     if (!h || typeof h !== "object" || !h.targetCapability || !h.observedInterface || !Array.isArray(h.likelyInternalAreas) || !Array.isArray(h.requiredBehavior)) {
@@ -199,7 +247,7 @@ export class GatewayPhase2Analyst implements Phase2Analyst {
           }),
         },
       ],
-      validate,
+      validate: validateRecommendations,
     });
     return coerceRecommendations(value) as Phase2Recommendation[];
   }

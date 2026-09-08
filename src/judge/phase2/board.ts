@@ -8,7 +8,7 @@ import type {ModelGateway} from "../gateway/client.js";
 import {coerceRecommendations, type Phase2Analyst, type Phase2RecommendInput} from "./analyst.js";
 import {runPhase2AgentLoop} from "./agent-loop.js";
 import {
-  executePhase2Tool, PHASE2_READ_TOOLS, PHASE2_SEARCH_TOOLS, submitTool,
+  executePhase2Tool, PHASE2_READ_TOOLS, PHASE2_SEARCH_TOOLS, readPhase1ResearchBriefs, submitTool,
   type Phase2ToolContext,
 } from "./tools.js";
 import type {
@@ -167,6 +167,10 @@ export class GatewayPhase2Board implements Phase2Board {
     const agent = input.patterns.filter((p) => p.owner === "agent" || p.owner === "mixed");
     if (agent.length === 0) return [];
     const ctx = toolCtx(input.ctx, input.patterns, input.hypotheses ?? []);
+    // Prompt compliance is not a data contract. The live designer ignored the
+    // instruction to call read_developer_brief, so load every case supporting an
+    // agent-owned pattern through the mediated tool before the model starts.
+    const developerBriefs = await readPhase1ResearchBriefs(ctx, agent.flatMap((p) => p.evalIds));
     return runPhase2AgentLoop({
       gateway: this.gateway,
       attemptId: this.attemptId,
@@ -187,7 +191,7 @@ export class GatewayPhase2Board implements Phase2Board {
         "If rewards are not attributable, do not use pass_rate as the primary metric.",
         "implementationHandoff.themisKnowsExactSourceLocation MUST be false.",
         "researchBasis only from URLs actually retrieved: the provided research notes, or the web: sources in a case's Phase-1 developer brief.",
-        "Call read_developer_brief on cases behind a pattern before recommending on it: Phase 1 already researched each case and its sources are real. ABSENT means the case predates that step, not a denial.",
+        "developerBriefs was loaded by code through read_developer_brief for every case behind an agent-owned pattern. Use those sources when applicable; call read_developer_brief yourself only when you need the full brief. ABSENT means the case predates that step, not a denial.",
         "When done, call submit_recommendations with a JSON array of recommendations (or {recommendations:[...]}).",
       ].join("\n"),
       user: JSON.stringify({
@@ -196,6 +200,9 @@ export class GatewayPhase2Board implements Phase2Board {
         platformContext: input.platformContext,
         hypotheses: input.hypotheses ?? [],
         research: input.research ?? [],
+        // Bounded, code-loaded Phase-1 remedy research. This exists even when
+        // the model makes no read_developer_brief tool call of its own.
+        developerBriefs,
         memory: input.memory ?? null,
         patternIds: agent.map((p) => p.id),
       }),

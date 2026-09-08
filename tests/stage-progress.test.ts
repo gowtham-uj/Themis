@@ -47,9 +47,31 @@ describe("run-panel stage progress", () => {
       ],
       campaign: { id: "c", state: "published" },
       campaignMembers: 2,
+      coveredItemIds: ["i-run-1", "i-run-2"],
     });
     expect(p.phase2.excludedFromCampaign).toBe(1);
     expect(p.phase1.published).toBe(3);
+  });
+
+  // Exclusion is campaign membership, not item state. A straggler covered by a
+  // follow-up campaign has reached `phase2_attached`/`final_view_published`
+  // eventually, but it is already covered the moment it joins, and a member
+  // still mid-publish must not read as excluded.
+  it("counts a straggler covered by a follow-up campaign as covered", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "ae-progress-followup-"));
+    const p = await stageProgress({
+      dataDir,
+      generation: generation("phase2_running"),
+      items: [
+        item("final_view_published", "run-1"),
+        item("final_view_published", "run-2"),
+        item("phase1_published", "run-3"),
+      ],
+      campaign: { id: "c2", state: "analyzing" },
+      campaignMembers: 1,
+      coveredItemIds: ["i-run-1", "i-run-2", "i-run-3"],
+    });
+    expect(p.phase2.excludedFromCampaign).toBe(0);
   });
 
   it("counts nothing excluded before a campaign exists", async () => {

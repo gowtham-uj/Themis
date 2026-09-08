@@ -125,13 +125,19 @@ export function registerPipelineRoutes(router:Router,phase1:Phase1Service):void{
    const g=await db.pipeline.getGeneration(ctx.params.generationId!);if(!g)throw notFound("generation not found");
    const items=(await db.pipeline.listItems(g.id,{cursor:null,limit:1000})).items;
    const campaign=await db.phase2.getCampaignByGeneration(g.id);
-   let members=0;let running=false;
+   let members=0;let running=false;const coveredItemIds:string[]=[];
    if(campaign){
-    members=(await db.phase2.listMembers(campaign.id,{cursor:null,limit:1000})).items.length;
+    // Coverage spans every campaign of the generation, so a straggler analyzed
+    // by a follow-up does not keep reporting as excluded.
+    for(const c of await db.phase2.listCampaignsByGeneration(g.id)){
+     const ms=(await db.phase2.listMembers(c.id,{cursor:null,limit:1000})).items;
+     for(const m of ms)coveredItemIds.push(m.pipelineItemId);
+     if(c.id===campaign.id)members=ms.length;
+    }
     const {getPhase2PiStatus}=await import("../judge/phase2/control.js");
     running=Boolean((await getPhase2PiStatus(app.dataDir,campaign.id)).running);
    }
-   sendJson(res,200,await stageProgress({dataDir:app.dataDir,generation:g,items,campaign,campaignMembers:members,phase2Running:running}));
+   sendJson(res,200,await stageProgress({dataDir:app.dataDir,generation:g,items,campaign,campaignMembers:members,coveredItemIds,phase2Running:running}));
   }finally{await db.close()}
  });
  /** One ordered account of what the run is doing right now, across all three

@@ -83,7 +83,8 @@ export interface StageProgress {
      * a complete, addressable verdict that no developer pack analyzed. It was
      * invisible before: the generation reported `completed` with 10 published
      * judgements and an 8-member pack, and nothing said which two were left
-     * out. The next campaign covers them.
+     * out. A follow-up campaign now covers them, so a nonzero count here means
+     * that campaign has not run yet, not that the work is lost.
      */
     excludedFromCampaign: number;
     artifacts: readonly string[];
@@ -153,9 +154,14 @@ export async function stageProgress(input: {
   items: readonly PipelineItemRow[];
   campaign: { id: string; state: string } | null;
   campaignMembers?: number;
+  /** Pipeline item ids covered by ANY campaign of this generation, not just the
+   *  newest. Exclusion is membership across all campaigns; a straggler picked up
+   *  by a follow-up is covered even though the first campaign froze without it. */
+  coveredItemIds?: readonly string[];
   phase2Running?: boolean;
 }): Promise<StageProgress> {
   const {items, generation} = input;
+  const covered = new Set(input.coveredItemIds ?? []);
   const total = items.length;
   const doneEvals = items.filter((x) => SEALED_OR_BEYOND.has(x.state)).length;
   const runningEvals = items.filter((x) => x.state === "eval_running").length;
@@ -214,7 +220,7 @@ export async function stageProgress(input: {
       // Only meaningful once a campaign exists; before that every judgement is
       // simply still waiting for one.
       excludedFromCampaign: input.campaign
-        ? items.filter((x) => x.state === "phase1_published").length
+        ? items.filter((x) => JUDGED.has(x.state) && !covered.has(x.id)).length
         : 0,
       artifacts,
       developerPack: artifacts.includes("developer-improvement-pack.zip"),

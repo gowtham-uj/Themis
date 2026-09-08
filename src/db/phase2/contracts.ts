@@ -55,6 +55,10 @@ export type Phase2RecordKind =
 
 export interface Phase2CampaignRow {
   id: string; projectId: string; pipelineGenerationId: string;
+  /** 1-based position among the campaigns of one generation. A follow-up
+   *  campaign covers Phase-1 verdicts that published after an earlier campaign
+   *  froze its membership. */
+  ordinal: number;
   state: Phase2CampaignState; fencingToken: number; sutFingerprint: string;
   ontologyVersion: string; membershipSha256: string; configJson: string;
   developerPackSha256: string | null; createdAt: Phase2Timestamp;
@@ -122,7 +126,10 @@ export interface PipelineRepository {
 export interface Phase2Repository {
   createCampaign(input: CreatePhase2CampaignInput): Promise<Phase2CampaignRow>;
   getCampaign(id: string): Promise<Phase2CampaignRow | null>;
+  /** The newest campaign of a generation, or null when it has none. */
   getCampaignByGeneration(generationId: string): Promise<Phase2CampaignRow | null>;
+  /** Every campaign of a generation, oldest first. */
+  listCampaignsByGeneration(generationId: string): Promise<readonly Phase2CampaignRow[]>;
   transitionCampaign(id: string, expectedState: Phase2CampaignState, expectedToken: number, next: Phase2CampaignState): Promise<Phase2CampaignRow | null>;
   /** Record the digest of the developer pack this campaign produced. The column
    *  existed from the first migration but nothing ever wrote it, so every

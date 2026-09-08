@@ -338,14 +338,22 @@ describe("project pipeline coordinator",()=>{
    async pollEvalItem(item){return{state:"completed",runId:`run-${item.evalId}`,archiveId:`arch-${item.evalId}`}},
    async startPhase1(){return{operationId:"op"}},
    async getPhase1Status(runId){return{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`}},
-   // The board already published; it must not run a second time.
-   async runPhase2(){throw new Error("published campaign must not re-run")},
+   // The published campaign is immutable: it must never be re-run over its own
+   // members. A follow-up over the straggler is a different campaign, and
+   // refusing it is what stranded the verdict in the first place.
+   async runPhase2(c,ms){
+    expect(c.ordinal).toBe(2);
+    expect(ms.map(m=>m.runId)).toEqual(["run-stuck"]);
+    return{developerPackSha256:"ab".repeat(32),developerPackZip:"/p/pack.zip",artifactDir:`/p/${c.id}`};
+   },
    async publishFinalView({member}){return{finalArchiveViewId:`final-${member.runId}`,manifestSha256:"cd".repeat(32)}},
   };
   for(let i=0;i<25;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed"&&i>0)break}
 
-  // The stranded verdict landed, and the generation settles back to completed.
-  expect((await db.pipeline.getItem(stuck.id))?.state).toBe("phase1_published");
+  // The stranded verdict landed, got covered by a follow-up campaign, and the
+  // generation settles back to completed.
+  expect((await db.pipeline.getItem(stuck.id))?.state).toBe("final_view_published");
+  expect((await db.phase2.listCampaignsByGeneration(g.id)).map(c=>c.ordinal)).toEqual([1,2]);
   expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
   expect((await db.pipeline.getItem(done.id))?.state).toBe("final_view_published");
   await db.close();
@@ -395,10 +403,13 @@ describe("project pipeline coordinator",()=>{
   expect((await db.pipeline.getItem(late.id))?.state).toBe("phase1_running");
 
   // Once its verdict lands, the generation finishes and the verdict survives.
+  // It used to survive as an orphan: this assertion read `phase1_published` and
+  // called that success, when it actually meant a sealed verdict no campaign
+  // could ever analyze. A follow-up campaign now covers it and reseals it.
   lateDone=true;
   for(let i=0;i<10;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed")break}
   expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
-  expect((await db.pipeline.getItem(late.id))?.state).toBe("phase1_published");
+  expect((await db.pipeline.getItem(late.id))?.state).toBe("final_view_published");
   await db.close();
  });
 
@@ -504,5 +515,99 @@ describe("project pipeline coordinator",()=>{
   expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
   expect((await db.phase2.getCampaignByGeneration(g.id))?.state).toBe("published");
   await db.close();
+ });
+});
+
+// A Phase-1 case whose retries are exhausted goes to `failed`, which is not
+// IN_FLIGHT, so the campaign correctly freezes without it. retryFailedPhase1
+// then revives it and it publishes a complete verdict. Live, two of ten runs
+// finished exactly this way and were analyzed by nothing: the generation held
+// its one campaign (pipeline_generation_id was UNIQUE) and the published-campaign
+// early return took it straight back to `completed`. The verdicts were sealed,
+// addressable, and permanently outside every developer pack.
+describe("Phase-1 stragglers revived after a campaign published",()=>{
+ it("covers them with a follow-up campaign instead of completing over them",async()=>{
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:'{"agent":"reapercode"}'});
+  for(const [i,e] of ["e1","e2","e3"].entries())await db.pipeline.addItem({generationId:g.id,evalId:e,ordinal:i+1});
+  // e3's judge fails every attempt until its retries are gone, then succeeds
+  // once an operator revives it.
+  let e3Revived=false;const memberCounts:number[]=[];
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(item){const runId=`run-${item.evalId}`;return{state:"completed",runId,archiveId:`archive-${runId}`}},
+   async startPhase1(item){return{operationId:`p1-${item.id}`}},
+   async getPhase1Status(runId){
+    if(runId==="run-e3"&&!e3Revived)return{state:"failed",error:"courtroom hit its context ceiling"};
+    return{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`};
+   },
+   async runPhase2(campaign,members){memberCounts.push(members.length);return{developerPackSha256:"ab".repeat(32),developerPackZip:`/phase2/${campaign.id}/developer-improvement-pack.zip`,artifactDir:`/phase2/${campaign.id}`}},
+   async publishFinalView({member}){return{finalArchiveViewId:`final-${member.runId}`,manifestSha256:"cd".repeat(32)}},
+  };
+  for(let i=0;i<30;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed")break;}
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
+  const first=(await db.pipeline.listItems(g.id,{cursor:null,limit:10})).items;
+  expect(first.find(x=>x.evalId==="e3")?.state).toBe("failed");
+  expect(memberCounts).toEqual([2]);
+
+  // The operator revives it and it publishes a real verdict.
+  e3Revived=true;
+  const {revived}=await retryFailedPhase1({db,generationId:g.id});
+  expect(revived).toHaveLength(1);
+  for(let i=0;i<30;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed")break;}
+
+  // A second campaign covers exactly the straggler, and the first campaign's
+  // published pack is untouched.
+  const campaigns=await db.phase2.listCampaignsByGeneration(g.id);
+  expect(campaigns.map(c=>c.ordinal)).toEqual([1,2]);
+  expect(campaigns.every(c=>c.state==="published")).toBe(true);
+  expect(memberCounts).toEqual([2,1]);
+  const second=(await db.phase2.listMembers(campaigns[1]!.id,{cursor:null,limit:10})).items;
+  expect(second.map(m=>m.runId)).toEqual(["run-e3"]);
+  const items=(await db.pipeline.listItems(g.id,{cursor:null,limit:10})).items;
+  expect(items.map(x=>x.state)).toEqual(["final_view_published","final_view_published","final_view_published"]);
+ });
+
+ // The straggler can also arrive at `phase1_published` while the generation is
+ // already back at `completed`: its judge pass finished on a tick that then took
+ // the published-campaign early return. Nothing is IN_FLIGHT, so the in-flight
+ // reopen does not fire, and the completed-state return skips the follow-up
+ // block. This is the state the live pipeline was found in: eight items covered,
+ // two holding sealed verdicts that no campaign could ever read.
+ it("reopens a completed generation holding an uncovered published verdict",async()=>{
+  const db=createSqlitePhase2Db(new Database(":memory:"));
+  const q=await db.pipeline.createQueue({projectId:"p",evalQueueId:"eq",name:"q"});
+  const g=await db.pipeline.createGeneration({queueId:q.id,configJson:'{"agent":"reapercode"}'});
+  for(const [i,e] of ["e1","e2"].entries())await db.pipeline.addItem({generationId:g.id,evalId:e,ordinal:i+1});
+  const memberCounts:number[]=[];
+  const services:ProjectPipelineServices={
+   async startEvalQueue(){return{started:true}},
+   async pollEvalItem(item){const runId=`run-${item.evalId}`;return{state:"completed",runId,archiveId:`archive-${runId}`}},
+   async startPhase1(item){return{operationId:`p1-${item.id}`}},
+   async getPhase1Status(runId){return{state:"published",resultVersionId:`rv-${runId}`,archiveViewId:`view-${runId}`}},
+   async runPhase2(campaign,members){memberCounts.push(members.length);return{developerPackSha256:"ab".repeat(32),developerPackZip:`/phase2/${campaign.id}/developer-improvement-pack.zip`,artifactDir:`/phase2/${campaign.id}`}},
+   async publishFinalView({member}){return{finalArchiveViewId:`final-${member.runId}`,manifestSha256:"cd".repeat(32)}},
+  };
+  for(let i=0;i<30;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed")break;}
+  expect(memberCounts).toEqual([2]);
+
+  // A third eval judged late and published straight into a completed generation.
+  const late=await db.pipeline.addItem({generationId:g.id,evalId:"e3",ordinal:3});
+  await db.pipeline.updateItem(late.id,"eval_pending",{state:"phase1_published",runId:"run-e3",baseArchiveId:"archive-run-e3",phase1ResultVersionId:"rv-run-e3",phase1ArchiveViewId:"view-run-e3"});
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
+
+  for(let i=0;i<30;i++){const r=await advanceProjectPipeline({db,services,generationId:g.id});if(r.generation.state==="completed"&&i>0)break;}
+
+  const campaigns=await db.phase2.listCampaignsByGeneration(g.id);
+  expect(campaigns.map(c=>c.ordinal)).toEqual([1,2]);
+  expect(memberCounts).toEqual([2,1]);
+  expect((await db.pipeline.getItem(late.id))?.state).toBe("final_view_published");
+  // And it settles: a covered generation must not reopen on the next tick.
+  const before=await db.pipeline.getGeneration(g.id);
+  await advanceProjectPipeline({db,services,generationId:g.id});
+  expect((await db.pipeline.getGeneration(g.id))?.state).toBe("completed");
+  expect((await db.pipeline.getGeneration(g.id))?.fencingToken).toBe(before?.fencingToken);
+  expect(memberCounts).toEqual([2,1]);
  });
 });
