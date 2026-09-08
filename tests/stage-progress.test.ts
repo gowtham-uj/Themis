@@ -47,7 +47,8 @@ describe("run-panel stage progress", () => {
       ],
       campaign: null,
     });
-    expect(p.phase1.cases.map((c) => c.runId)).toEqual(["run-3"]);
+    // A sealed archive is genuinely queued for the judge, so it stays listed.
+    expect(p.phase1.cases.map((c) => c.runId)).toEqual(["run-2", "run-3"]);
     expect(p.evals.running).toBe(1);
   });
 

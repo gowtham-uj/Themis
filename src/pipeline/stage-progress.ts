@@ -97,14 +97,12 @@ const SEALED_OR_BEYOND = new Set([
   "phase2_attached", "final_view_published",
 ]);
 const JUDGED = new Set(["phase1_published", "phase2_attached", "final_view_published"]);
-/** Items that have actually reached the judge. An item still executing its eval
- *  has a runId too, so listing every run as a Phase-1 case made the console show
- *  an eval whose agent was mid-run as a case "waiting" for a verdict, directly
- *  contradicting the evals table one panel above it. */
-const AT_JUDGE = new Set([
-  "phase1_pending", "phase1_running", "phase1_published",
-  "phase2_attached", "final_view_published",
-]);
+/** Items whose eval is finished, so the judge either has them or is about to.
+ *  An item still executing its eval has a runId too, so listing every run as a
+ *  Phase-1 case made the console show an eval whose agent was mid-run as a case
+ *  "waiting" for a verdict, contradicting the evals table one panel above it.
+ *  A sealed archive really is waiting for the judge and stays on the list. */
+const AT_JUDGE = SEALED_OR_BEYOND;
 
 async function exists(path: string): Promise<boolean> {
   try { await stat(path); return true; } catch { return false; }
