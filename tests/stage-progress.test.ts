@@ -31,6 +31,26 @@ describe("run-panel stage progress", () => {
     expect(p.phase2.running).toBe(false);
   });
 
+  // An item still executing its eval already has a runId, so listing every run
+  // as a Phase-1 case made the console show a case "waiting" for a verdict for
+  // an eval whose agent was mid-run, contradicting the evals table right above
+  // it. Only items that reached the judge are cases.
+  it("lists no Phase-1 case for an eval that is still running", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "ae-progress-evalstage-"));
+    const p = await stageProgress({
+      dataDir,
+      generation: generation("running"),
+      items: [
+        item("eval_running", "run-1"),
+        item("archive_sealed", "run-2"),
+        item("phase1_running", "run-3"),
+      ],
+      campaign: null,
+    });
+    expect(p.phase1.cases.map((c) => c.runId)).toEqual(["run-3"]);
+    expect(p.evals.running).toBe(1);
+  });
+
   // A judgement that publishes after the campaign froze is complete but
   // uncovered by the developer pack. A live generation finished `completed`
   // with 10 published judgements against an 8-member pack and no sign of which

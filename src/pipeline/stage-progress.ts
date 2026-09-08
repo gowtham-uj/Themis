@@ -97,6 +97,14 @@ const SEALED_OR_BEYOND = new Set([
   "phase2_attached", "final_view_published",
 ]);
 const JUDGED = new Set(["phase1_published", "phase2_attached", "final_view_published"]);
+/** Items that have actually reached the judge. An item still executing its eval
+ *  has a runId too, so listing every run as a Phase-1 case made the console show
+ *  an eval whose agent was mid-run as a case "waiting" for a verdict, directly
+ *  contradicting the evals table one panel above it. */
+const AT_JUDGE = new Set([
+  "phase1_pending", "phase1_running", "phase1_published",
+  "phase2_attached", "final_view_published",
+]);
 
 async function exists(path: string): Promise<boolean> {
   try { await stat(path); return true; } catch { return false; }
@@ -168,7 +176,7 @@ export async function stageProgress(input: {
   const failed = items.filter((x) => x.state === "failed").length;
   const current = items.find((x) => x.state === "eval_running");
 
-  const phase1Items = items.filter((x) => x.runId);
+  const phase1Items = items.filter((x) => x.runId && AT_JUDGE.has(x.state));
   const cases = await Promise.all(phase1Items.map((x) => readPhase1Case(input.dataDir, x)));
 
   // A manual Phase-2 pause parks the generation in `paused` but deliberately
