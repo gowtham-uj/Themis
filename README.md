@@ -2,7 +2,7 @@
 
 ![THEMIS | An Agent Evaluation and Improvement Platform](./docs/images/themis-brand.svg)
 
-Themis is an evaluation platform for coding agents. It runs an agent against containerized eval tasks, keeps the evidence from each run, judges individual runs, then looks across a campaign for failures that repeat.
+Themis is an evaluation platform for coding agents. It runs an agent against containerized eval tasks, keeps the evidence from each run, judges individual runs, then looks across a campaign for behaviors and weaknesses that repeat. Passing runs can contribute evidence too.
 
 The pass/fail reward comes from a deterministic verifier outside the agent container. The judge has a different job. It explains what the agent did, whether the process was sound, and what evidence supports that conclusion.
 
@@ -27,9 +27,14 @@ agent run + deterministic verifier
    v
 sealed evidence archive
    |
-   +------ Phase 1 ------ one run, one judgement
+   v
+Phase 1 ------ one run, one judgement
    |
-   +------ Phase 2 ------ many judgements, repeated patterns, experiments
+   v
+published Phase 1 results
+   |
+   v
+Phase 2 ------ many judgements, repeated patterns, experiments
 ```
 
 ## What Themis keeps separate
@@ -42,11 +47,11 @@ Archives are append-only. Phase 1 and Phase 2 add new material without changing 
 
 ## What you get from a campaign
 
-A completed campaign leaves two different outputs.
+A completed campaign always produces the agent-facing output. It contains repeated behaviors, the evidence behind them, suggested changes, and experiment plans.
 
-The agent developer gets a package with the repeated behaviors, the evidence behind them, suggested changes, and experiment plans.
+If the campaign found harness or infrastructure problems, Themis also writes a separate platform report for the operator. Clean campaigns do not create an empty platform report.
 
-The platform operator gets a separate report for harness and infrastructure failures. Themis does not mix those into the agent recommendations.
+Themis does not mix platform-owned failures into the agent recommendations.
 
 ## Related projects
 
