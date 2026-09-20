@@ -1,0 +1,72 @@
+#!/bin/sh
+# Keep commit authorship and trailers consistent with this repository's policy.
+set -e
+
+file="$1"
+[ -n "$file" ] && [ -f "$file" ] || exit 0
+
+expected_primary="108682700+gowtham-uj@users.noreply.github.com"
+author_ident="$(git var GIT_AUTHOR_IDENT 2>/dev/null || true)"
+author_email="$(printf '%s\n' "$author_ident" | sed -n 's/.*<\([^>]*\)>.*/\1/p')"
+
+if [ "$author_email" != "$expected_primary" ]; then
+  printf '%s\n' "Refusing commit: author email is '$author_email'." >&2
+  printf '%s\n' "Expected: $expected_primary" >&2
+  printf '%s\n' "Set the repository Git author to gowtham-uj before committing." >&2
+  exit 1
+fi
+
+python3 - "$file" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines()
+
+# Ignore trailing blank lines while locating the final paragraph. Git trailers
+# live in the final paragraph, so examples in the body are left untouched.
+end = len(lines)
+while end and not lines[end - 1].strip():
+    end -= 1
+
+start = end
+while start and lines[start - 1].strip():
+    start -= 1
+
+footer = lines[start:end]
+trailer = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*:\s+.+$")
+coauthor = re.compile(r"^Co-Authored-By:\s*.+$", re.IGNORECASE)
+session = re.compile(r"^Claude-Session:\s*.+$", re.IGNORECASE)
+ai_footer = re.compile(
+    r"^(?:🤖\s*)?Generated\s+(?:with|by)\s+.*"
+    r"(?:Claude|Codex|ChatGPT|OpenAI|Gemini|Copilot|Cursor|Windsurf|Devin|Replit|\bAI\b).*$",
+    re.IGNORECASE,
+)
+
+# Only edit a footer/trailer paragraph. If the final paragraph contains normal
+# prose, leave it exactly as written.
+is_footer_block = bool(footer) and all(
+    trailer.match(line.strip())
+    or coauthor.match(line.strip())
+    or session.match(line.strip())
+    or ai_footer.match(line.strip())
+    for line in footer
+)
+
+if is_footer_block:
+    kept_footer = [
+        line for line in footer
+        if not (
+            coauthor.match(line.strip())
+            or session.match(line.strip())
+            or ai_footer.match(line.strip())
+        )
+    ]
+    lines = lines[:start] + kept_footer + lines[end:]
+
+while lines and not lines[-1].strip():
+    lines.pop()
+
+path.write_text("\n".join(lines) + "\n")
+PY
