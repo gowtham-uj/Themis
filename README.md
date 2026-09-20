@@ -18,24 +18,7 @@ Themis has three parts.
 2. **Phase 1** reads one archive and produces a per-run judgement with references to the evidence.
 3. **Phase 2** reads a fixed set of Phase 1 results, finds repeated patterns, researches possible fixes, and writes experiments the agent developer can run.
 
-```text
-eval task
-   |
-   v
-agent run + deterministic verifier
-   |
-   v
-sealed evidence archive
-   |
-   v
-Phase 1 ------ one run, one judgement
-   |
-   v
-published Phase 1 results
-   |
-   v
-Phase 2 ------ many judgements, repeated patterns, experiments
-```
+![Themis evaluation pipeline](./docs/images/readme-pipeline.svg)
 
 ## What Themis keeps separate
 
