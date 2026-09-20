@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="620" viewBox="0 0 1400 620">
+  <defs>
+    <style>
+      .bg{fill:#000}
+      .box{fill:#050505;stroke:#3f3f46;stroke-width:1.5}
+      .boxA{fill:#050505;stroke:#22c55e;stroke-width:1.5}
+      .t{font-family:Inter,Segoe UI,Arial,sans-serif;fill:#f4f4f5}
+      .m{font-family:Inter,Segoe UI,Arial,sans-serif;fill:#a1a1aa}
+      .line{stroke:#52525b;stroke-width:2;fill:none;marker-end:url(#arrow)}
+      .lineA{stroke:#22c55e;stroke-width:2;fill:none;marker-end:url(#arrowA)}
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0 L0 6 L9 3 z" fill="#52525b"/></marker>
+    <marker id="arrowA" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0 L0 6 L9 3 z" fill="#22c55e"/></marker>
+  </defs>
+  <rect width="1400" height="620" class="bg"/>
+  <text x="60" y="70" class="t" font-size="34" font-weight="700">Themis evaluation pipeline</text>
+  <text x="60" y="106" class="m" font-size="18">Execution creates evidence. Phase 1 judges each run. Phase 2 analyzes published Phase 1 results.</text>
+
+  <rect x="65" y="235" width="170" height="100" rx="10" class="box"/>
+  <text x="150" y="276" text-anchor="middle" class="t" font-size="20" font-weight="600">Eval task</text>
+  <text x="150" y="306" text-anchor="middle" class="m" font-size="14">agent + package</text>
+
+  <rect x="305" y="215" width="220" height="140" rx="10" class="box"/>
+  <text x="415" y="255" text-anchor="middle" class="t" font-size="20" font-weight="600">Execution</text>
+  <text x="415" y="288" text-anchor="middle" class="m" font-size="14">agent run</text>
+  <text x="415" y="315" text-anchor="middle" class="m" font-size="14">deterministic verifier</text>
+
+  <rect x="600" y="235" width="220" height="100" rx="10" class="boxA"/>
+  <text x="710" y="276" text-anchor="middle" class="t" font-size="20" font-weight="600">Sealed archive</text>
+  <text x="710" y="306" text-anchor="middle" class="m" font-size="14">logs, traces, diff, metrics</text>
+
+  <rect x="900" y="180" width="210" height="125" rx="10" class="box"/>
+  <text x="1005" y="223" text-anchor="middle" class="t" font-size="20" font-weight="600">Phase 1</text>
+  <text x="1005" y="253" text-anchor="middle" class="m" font-size="14">one run</text>
+  <text x="1005" y="280" text-anchor="middle" class="m" font-size="14">evidence-backed judgement</text>
+
+  <rect x="900" y="365" width="210" height="125" rx="10" class="box"/>
+  <text x="1005" y="408" text-anchor="middle" class="t" font-size="20" font-weight="600">Phase 2</text>
+  <text x="1005" y="438" text-anchor="middle" class="m" font-size="14">many Phase 1 results</text>
+  <text x="1005" y="465" text-anchor="middle" class="m" font-size="14">patterns + experiments</text>
+
+  <rect x="1180" y="365" width="170" height="125" rx="10" class="box"/>
+  <text x="1265" y="407" text-anchor="middle" class="t" font-size="18" font-weight="600">Developer pack</text>
+  <text x="1265" y="437" text-anchor="middle" class="m" font-size="13">evidence</text>
+  <text x="1265" y="462" text-anchor="middle" class="m" font-size="13">changes to try</text>
+
+  <path d="M235 285 H305" class="lineA"/>
+  <path d="M525 285 H600" class="line"/>
+  <path d="M820 285 C860 285 860 242 900 242" class="lineA"/>
+  <path d="M1005 305 V365" class="lineA"/>
+  <path d="M1110 428 H1180" class="lineA"/>
+
+  <text x="65" y="555" class="m" font-size="15">Harness-owned failures stay out of agent pattern analysis. Clean campaigns do not create an empty platform report.</text>
+</svg>

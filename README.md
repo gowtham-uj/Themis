@@ -2,28 +2,46 @@
 
 ![THEMIS | An Agent Evaluation and Improvement Platform](./docs/images/themis-brand.svg)
 
-Themis runs coding agents against real eval tasks in containers, judges each run in depth, then
-aggregates many judgements into an improvement pack for the agent's developer. The reward tells you
-whether an eval passed. Themis exists to answer the harder questions: how the agent got there, whether
-the process was sound, and what its developer should change.
+Themis is an evaluation platform for coding agents. It runs an agent against containerized eval tasks, keeps the evidence from each run, judges individual runs, then looks across a campaign for behaviors and weaknesses that repeat. Passing runs can contribute evidence too.
 
-Everything is an HTTP API. A React console ships in `web/`, but it consumes the same public API and
-nothing else.
+The pass/fail reward comes from a deterministic verifier outside the agent container. The judge has a different job. It explains what the agent did, whether the process was sound, and what evidence supports that conclusion.
+
+The result is not a leaderboard score by itself. Themis produces a record a developer can inspect and an improvement pack that points back to the runs behind each recommendation.
+
+Everything is available through an HTTP API. The React console in `web/` uses that same API.
+
+## How the system is split
+
+Themis has three parts.
+
+1. **Execution** runs the eval in a persistent Podman environment and seals the run evidence into an archive.
+2. **Phase 1** reads one archive and produces a per-run judgement with references to the evidence.
+3. **Phase 2** reads a fixed set of Phase 1 results, finds repeated patterns, researches possible fixes, and writes experiments the agent developer can run.
+
+![Themis evaluation pipeline](./docs/images/readme-pipeline.svg)
+
+## What Themis keeps separate
+
+A broken eval harness should not become evidence that the agent is bad at the task. Themis records who owns a failure and excludes harness-owned failures from agent-level pattern analysis.
+
+The same separation applies to judging. The agents that investigate evidence do not issue the final verdict. The agent that issues the verdict does not gather new evidence.
+
+Archives are append-only. Phase 1 and Phase 2 add new material without changing the base run evidence.
+
+## What you get from a campaign
+
+A completed campaign always produces the agent-facing output. It contains repeated behaviors, the evidence behind them, suggested changes, and experiment plans.
+
+If the campaign found harness or infrastructure problems, Themis also writes a separate platform report for the operator. Clean campaigns do not create an empty platform report.
+
+Themis does not mix platform-owned failures into the agent recommendations.
+
+## Related projects
+
+- [ReaperCode](https://github.com/gowtham-uj/ReaperCode) is the coding-agent runtime used in the example runs shown below.
+- [Reaper Dev Server](https://github.com/gowtham-uj/Reaper-Dev-Server) provides persistent Linux project environments and terminal sessions for development work.
 
 ## The two phases
-
-Two phases sit on top of the execution platform, and they work at different scales.
-
-**Phase 1 is a microscope.** It explains one eval run.
-
-**Phase 2 is an intelligence system.** It reads many Phase-1 reports, finds the weaknesses that recur,
-researches ways to address them, and hands the developer a prioritized pack with experiments they can
-run to check each recommendation.
-
-```text
-eval execution  →  sealed archive  →  PHASE 1 (per eval)  →  PHASE 2 (per campaign)
-                                          judge/                    phase2/
-```
 
 ### Phase 1: per-eval judgement
 
